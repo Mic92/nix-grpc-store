@@ -43,6 +43,20 @@
         ];
       };
 
+      checks = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          vm = import ./tests/nixos-test.nix {
+            inherit pkgs;
+            nixPkgs = nix.packages.${system};
+            module = self.nixosModules.default;
+          };
+        }
+      );
+
       devShells = forAllSystems (system: {
         default = nixpkgs.legacyPackages.${system}.mkShell {
           inputsFrom = [ self.packages.${system}.default ];
