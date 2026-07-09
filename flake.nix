@@ -34,6 +34,14 @@
         }
       );
 
+      nixosModules = {
+        server = ./nixos/server.nix;
+        client = ./nixos/client.nix;
+        default.imports = [
+          self.nixosModules.server
+          self.nixosModules.client
+        ];
+      };
 
       devShells = forAllSystems (system: {
         default = nixpkgs.legacyPackages.${system}.mkShell {
