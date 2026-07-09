@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package nix.remote;
+
+// A zstd-compressed chunk of the Nix worker protocol byte stream. The
+// concatenation of all chunks in one direction is a single zstd stream; each
+// chunk ends on a ZSTD_e_flush boundary so it can be decoded in isolation.
+message Chunk {
+  bytes data = 1;
+}
+
+// Bidirectional tunnel that carries the same byte stream `nix-daemon --stdio`
+// would exchange over stdin/stdout. The server side hands the stream to
+// `nix::daemon::processConnection`, the client side to `nix::RemoteStore`.
+service NixRemote {
+  rpc Connect(stream Chunk) returns (stream Chunk);
+}
