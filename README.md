@@ -9,7 +9,10 @@ reach a builder or store host through infrastructure that speaks HTTP/2
 
 Everything that works over `ssh-ng://` works here: remote builds,
 `nix copy`, path queries, GC. The gRPC layer is a thin tunnel to the
-`nix-daemon` on the other side.
+`nix-daemon` on the other side. The `nix copy` hot path (path info queries,
+bulk import, NAR download) uses dedicated RPCs instead of the tunnel: a whole
+batch of paths shares one zstd stream, so copying many small paths needs one
+round trip instead of one per path.
 
 ## Install
 

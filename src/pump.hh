@@ -24,6 +24,7 @@
 
 #include <nix/util/error.hh>
 #include <nix/util/file-descriptor.hh>
+#include <nix/util/serialise.hh>
 
 #include "nix_remote.grpc.pb.h"
 
@@ -160,5 +161,111 @@ inline void pumpStreamToFd(Stream & stream, int fd)
         }
     }
 }
+
+// Sink that zstd-compresses written data into gRPC messages of type `Msg`
+// (must have a `data` bytes field) sent through `writer`. Unlike the tunnel
+// pump above there is no per-batch flush: the Sink's lifetime is one zstd
+// stream, so the window spans all paths of a bulk import. Call finish()
+// before WritesDone().
+template<class Writer, class Msg>
+struct ZstdWriterSink : nix::Sink
+{
+    Writer & writer;
+    Msg msg;
+    std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> cctx{ZSTD_createCCtx(), ZSTD_freeCCtx};
+
+    explicit ZstdWriterSink(Writer & writer)
+        : writer(writer)
+    {
+        ZSTD_CCtx_setParameter(cctx.get(), ZSTD_c_compressionLevel, 1);
+        // The buffer is reused across ship() calls; avoid regrowing it.
+        msg.mutable_data()->reserve(kChunkSize + ZSTD_CStreamOutSize());
+    }
+
+    void ship()
+    {
+        if (msg.data().empty())
+            return;
+        if (!writer.Write(msg))
+            throw nix::Error("gRPC stream closed by peer during bulk import");
+        msg.mutable_data()->clear();
+    }
+
+    void compress(ZSTD_inBuffer zin, ZSTD_EndDirective op)
+    {
+        auto * out = msg.mutable_data();
+        size_t rc;
+        do {
+            size_t off = out->size();
+            out->resize(off + ZSTD_CStreamOutSize());
+            ZSTD_outBuffer zout{out->data() + off, out->size() - off, 0};
+            rc = ZSTD_compressStream2(cctx.get(), &zout, &zin, op);
+            zstdCheck(rc, "compress");
+            out->resize(off + zout.pos);
+            if (out->size() >= kChunkSize)
+                ship();
+            // ZSTD_e_flush / ZSTD_e_end must be repeated until they return 0;
+            // ZSTD_e_continue only until the input is consumed (its return
+            // value is a hint).
+        } while (op == ZSTD_e_continue ? zin.pos < zin.size : rc != 0);
+    }
+
+    void operator()(std::string_view data) override
+    {
+        compress({data.data(), data.size(), 0}, ZSTD_e_continue);
+    }
+
+    // Make everything written so far decodable by the peer without ending the
+    // zstd stream.
+    void flush()
+    {
+        compress({nullptr, 0, 0}, ZSTD_e_flush);
+        ship();
+    }
+
+    void finish()
+    {
+        compress({nullptr, 0, 0}, ZSTD_e_end);
+        ship();
+    }
+};
+
+// Inverse of ZstdWriterSink: reads `Msg`s from `reader` and yields the
+// decompressed byte stream.
+template<class Reader, class Msg>
+struct ZstdReaderSource : nix::Source
+{
+    Reader & reader;
+    Msg msg;
+    ZSTD_inBuffer zin{nullptr, 0, 0};
+    std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx{ZSTD_createDCtx(), ZSTD_freeDCtx};
+
+    // `initial`: compressed bytes already read from the stream (the first
+    // message may carry flags alongside data).
+    ZstdReaderSource(Reader & reader, std::string initial)
+        : reader(reader)
+    {
+        *msg.mutable_data() = std::move(initial);
+        zin = {msg.data().data(), msg.data().size(), 0};
+    }
+
+    size_t read(char * data, size_t len) override
+    {
+        while (true) {
+            // Always run the decoder first: it may hold buffered output from a
+            // previous call whose destination buffer was smaller than the
+            // decompressed data, even when all input has been consumed.
+            ZSTD_outBuffer zout{data, len, 0};
+            zstdCheck(ZSTD_decompressStream(dctx.get(), &zout, &zin), "decompress");
+            if (zout.pos)
+                return zout.pos;
+            if (zin.pos == zin.size) {
+                if (!reader.Read(&msg))
+                    throw nix::EndOfFile("gRPC stream ended");
+                zin = {msg.data().data(), msg.data().size(), 0};
+            }
+        }
+    }
+};
 
 } // namespace nixgrpc

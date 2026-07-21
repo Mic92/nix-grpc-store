@@ -156,6 +156,45 @@ pkgs.testers.runNixOSTest {
         )
         machine.succeed(f"test -e '{up}'")
 
+    with subtest("many small paths round-trip (native AddMultipleToStore / NarsFromPaths)"):
+        import time
+
+        # 200 small referencing paths: exercises one bulk-import RPC on upload
+        # and per-path NarFromPath streams on download.
+        machine.succeed(
+            "mkdir -p /root/small && "
+            "for i in $(seq 200); do "
+            "  head -c 4096 /dev/urandom | base64 > /root/small/f$i; "
+            "done"
+        )
+        # One invocation: per-path `nix store add` would spend most of the
+        # time on CLI startup and store opening.
+        small = machine.succeed(
+            "cd /root/small && nix-store --store /root/smallsrc --add f*"
+        ).splitlines()
+        assert len(small) == 200, small
+        paths = " ".join(f"'{p}'" for p in small)
+
+        t0 = time.monotonic()
+        machine.succeed(
+            f"nix copy --no-check-sigs --from /root/smallsrc --to '{store}' {paths}"
+        )
+        print(f"[bench] small/upload   {time.monotonic() - t0:6.2f}s (200 paths)")
+        for p in small[:3]:
+            machine.succeed(f"test -e '{p}'")
+
+        t0 = time.monotonic()
+        machine.succeed(
+            f"nix copy --no-check-sigs --from '{store}' --to /root/smalldst {paths}"
+        )
+        print(f"[bench] small/download {time.monotonic() - t0:6.2f}s (200 paths)")
+        for p in small[:3]:
+            machine.succeed(f"test -e /root/smalldst/nix/store/$(basename '{p}')")
+            machine.succeed(
+                f"cmp /root/smallsrc/nix/store/$(basename '{p}') "
+                f"/root/smalldst/nix/store/$(basename '{p}')"
+            )
+
     with subtest("throughput benchmark: gRPC vs unix-socket daemon"):
         import time
 

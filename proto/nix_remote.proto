@@ -9,9 +9,67 @@ message Chunk {
   bytes data = 1;
 }
 
+// Batched validity query. Paths are store path base names ("<hash>-<name>").
+message QueryValidPathsRequest {
+  repeated string paths = 1;
+  // If true, the server may try to substitute missing paths.
+  bool substitute = 2;
+}
+
+message QueryValidPathsReply {
+  repeated string paths = 1;
+}
+
+// One message of a client-streamed bulk import. The concatenation of all
+// `data` fields is a single zstd stream; its decompressed content uses the
+// worker-protocol AddMultipleToStore framing: a count, then for each path a
+// ValidPathInfo (protocol 1.16 serialisation) followed by its NAR.
+message AddMultipleChunk {
+  // Only meaningful on the first message of the stream.
+  bool repair = 1;
+  bool check_sigs = 2;
+  bytes data = 3;
+}
+
+message AddMultipleReply {}
+
+message QueryPathInfosRequest {
+  repeated string paths = 1;
+}
+
+// `info` is the worker-protocol UnkeyedValidPathInfo (protocol 1.16)
+// serialisation. Paths unknown to the store are omitted from the reply.
+message PathInfo {
+  string path = 1;
+  bytes info = 2;
+}
+
+message QueryPathInfosReply {
+  repeated PathInfo infos = 1;
+}
+
+message NarRequest {
+  string path = 1;
+}
+
+// One message of a NAR download. The concatenation of all `data` fields in
+// one NarsFromPaths call is a single zstd stream containing the raw NARs of
+// the requested paths, in request order, so the compression window is shared
+// across paths. NARs are self-delimiting; the stream is flushed after each so
+// the client never blocks on a NAR that is still buffered in the encoder.
+message NarChunk {
+  bytes data = 1;
+}
+
 // Bidirectional tunnel that carries the same byte stream `nix-daemon --stdio`
 // would exchange over stdin/stdout. The server side hands the stream to
 // `nix::daemon::processConnection`, the client side to `nix::RemoteStore`.
+// QueryValidPaths / AddMultipleToStore bypass the tunnel for the `nix copy`
+// hot path so many small paths share one zstd stream and one round trip.
 service NixRemote {
   rpc Connect(stream Chunk) returns (stream Chunk);
+  rpc QueryValidPaths(QueryValidPathsRequest) returns (QueryValidPathsReply);
+  rpc AddMultipleToStore(stream AddMultipleChunk) returns (AddMultipleReply);
+  rpc QueryPathInfos(QueryPathInfosRequest) returns (QueryPathInfosReply);
+  rpc NarsFromPaths(stream NarRequest) returns (stream NarChunk);
 }

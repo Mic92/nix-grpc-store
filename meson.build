@@ -59,6 +59,7 @@ shared_module('nix-grpc-store',
 executable('nix-grpc-daemon',
   sources : ['src/nix-grpc-daemon.cc', gen],
   include_directories : gen_inc,
-  dependencies : pump_deps,
+  # nix-store: native QueryValidPaths / AddMultipleToStore handlers.
+  dependencies : pump_deps + [nix_store_dep],
   install : true,
 )
