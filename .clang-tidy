@@ -1,0 +1,33 @@
+# Everything except:
+#  - vendor style guides (mostly aliases of other checks or rules specific to
+#    those projects)
+#  - portability-avoid-pragma-once: all supported compilers handle #pragma once
+#  - portability-template-virtual-member-function: fires only inside gRPC's
+#    sync_stream.h template definitions; nothing to fix on our side
+#  - clang-analyzer-optin.cplusplus.VirtualCall: fires only inside Nix's
+#    serialise.hh (EnsureRead destructor); nothing to fix on our side
+Checks: >
+  *,
+  -portability-avoid-pragma-once,
+  -portability-template-virtual-member-function,
+  -clang-analyzer-optin.cplusplus.VirtualCall,
+  -abseil-*,
+  -altera-*,
+  -android-*,
+  -boost-*,
+  -darwin-*,
+  -fuchsia-*,
+  -google-*,
+  -hicpp-*,
+  -linuxkernel-*,
+  -llvm-*,
+  -llvmlibc-*,
+  -mpi-*,
+  -objc-*,
+  -zircon-*
+
+WarningsAsErrors: '*'
+HeaderFilterRegex: 'src/.*\.hh$'
+FormatStyle: none
+# Do not lint third-party headers (gRPC, Nix) pulled in from the store.
+ExcludeHeaderFilterRegex: '.*/nix/store/.*'

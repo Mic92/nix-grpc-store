@@ -48,7 +48,22 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
         in
-        nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        {
+          clang-tidy = self.packages.${system}.default.overrideAttrs (old: {
+            pname = "nix-grpc-store-clang-tidy";
+            nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.clang-tools ];
+            # Meson generates a clang-tidy target from .clang-tidy; the
+            # generated protobuf headers must exist before it runs.
+            buildPhase = ''
+              ninja nix_remote.pb.h nix_remote.grpc.pb.h
+              ninja clang-tidy
+            '';
+            installPhase = "touch $out";
+            doCheck = false;
+            dontFixup = true;
+          });
+        }
+        // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           vm = import ./tests/nixos-test.nix {
             inherit pkgs;
             nixPkgs = nix.packages.${system};
@@ -60,6 +75,7 @@
       devShells = forAllSystems (system: {
         default = nixpkgs.legacyPackages.${system}.mkShell {
           inputsFrom = [ self.packages.${system}.default ];
+          packages = [ nixpkgs.legacyPackages.${system}.clang-tools ];
         };
       });
     };

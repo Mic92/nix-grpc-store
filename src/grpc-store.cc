@@ -7,22 +7,44 @@
 // URI: grpc://host:port
 // Params: insecure, ca-cert, client-cert, client-key
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <grpcpp/security/credentials.h>
+#include <grpcpp/support/channel_arguments.h>
+#include <grpcpp/support/status.h>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <nix/store/path.hh>
+#include <nix/store/store-api.hh>
+#include <nix/store/store-reference.hh>
+#include <nix/util/configuration.hh>
+#include <nix/util/file-system.hh>
+#include <nix/util/logging.hh>
+#include <nix/util/ref.hh>
+#include <nix/util/repair-flag.hh>
+#include <nix/util/serialise.hh>
+#include <nix/util/types.hh>
+#include <nix/util/util.hh>
+#include <optional>
 #include <thread>
 
 #include <grpcpp/grpcpp.h>
 
 #include <nix/store/path-info.hh>
-#include <nix/store/remote-store.hh>
 #include <nix/store/remote-store-connection.hh>
+#include <nix/store/remote-store.hh>
 #include <nix/store/store-registration.hh>
 #include <nix/store/worker-protocol.hh>
 #include <nix/util/archive.hh>
 #include <nix/util/callback.hh>
 #include <nix/util/file-descriptor.hh>
 #include <nix/util/url.hh>
+#include <utility>
 
+#include "nix_remote.grpc.pb.h"
+#include "nix_remote.pb.h"
 #include "pump.hh"
 
 using GrpcStream = grpc::ClientReaderWriter<nix::remote::Chunk, nix::remote::Chunk>;
@@ -31,112 +53,105 @@ namespace nix {
 
 struct GrpcStoreConfig : std::enable_shared_from_this<GrpcStoreConfig>, virtual RemoteStoreConfig
 {
+private:
+    friend struct GrpcStore;
+
+    ParsedURL::Authority authority;
+
+    Setting<bool> insecure{this, false, "insecure", "Use plaintext instead of TLS. Only for local testing."};
+
+    Setting<std::string> caCert{
+        this, "", "ca-cert", "Path to a PEM file with the CA certificate used to verify the server."};
+
+    Setting<std::string> clientCert{
+        this, "", "client-cert", "Path to a PEM client certificate chain to present for mTLS."};
+
+    Setting<std::string> clientKey{this, "", "client-key", "Path to the PEM private key for `client-cert`."};
+
+public:
     GrpcStoreConfig(const Params & params)
         : StoreConfig(params, FilePathType::Unix)
         , RemoteStoreConfig(params, FilePathType::Unix)
     {
     }
 
-    GrpcStoreConfig(const ParsedURL::Authority & authority, const Params & params)
-        : StoreConfig(params, FilePathType::Unix)
-        , RemoteStoreConfig(params, FilePathType::Unix)
-        , authority(authority)
-    {
+    GrpcStoreConfig(ParsedURL::Authority authority, const Params &params)
+        : StoreConfig(params, FilePathType::Unix),
+          RemoteStoreConfig(params, FilePathType::Unix),
+          authority(std::move(authority)) {}
+
+    static auto name() -> std::string { return "gRPC Store"; }
+
+    static auto uriSchemes() -> StringSet { return {"grpc"}; }
+
+    static auto doc() -> std::string {
+      return "Connects to a `nix-grpc-daemon` and tunnels the Nix worker "
+             "protocol over a gRPC bidirectional stream.";
     }
 
-    ParsedURL::Authority authority;
-
-    Setting<bool> insecure{
-        this,
-        false,
-        "insecure",
-        "Use plaintext instead of TLS. Only for local testing."};
-
-    Setting<std::string> caCert{
-        this,
-        "",
-        "ca-cert",
-        "Path to a PEM file with the CA certificate used to verify the server."};
-
-    Setting<std::string> clientCert{
-        this,
-        "",
-        "client-cert",
-        "Path to a PEM client certificate chain to present for mTLS."};
-
-    Setting<std::string> clientKey{
-        this,
-        "",
-        "client-key",
-        "Path to the PEM private key for `client-cert`."};
-
-    static const std::string name() { return "gRPC Store"; }
-
-    static StringSet uriSchemes() { return {"grpc"}; }
-
-    static std::string doc()
-    {
-        return "Connects to a `nix-grpc-daemon` and tunnels the Nix worker "
-               "protocol over a gRPC bidirectional stream.";
+    auto getReference() const -> StoreReference override {
+      return {
+          .variant =
+              StoreReference::Specified{
+                  .scheme = *uriSchemes().begin(),
+                  .authority = authority.to_string(),
+              },
+          .params = getQueryParams(),
+      };
     }
 
-    StoreReference getReference() const override
-    {
-        return {
-            .variant = StoreReference::Specified{
-                .scheme = *uriSchemes().begin(),
-                .authority = authority.to_string(),
-            },
-            .params = getQueryParams(),
-        };
-    }
-
-    ref<Store> openStore() const override;
+    auto openStore() const -> ref<Store> override;
 };
 
 struct GrpcStore : virtual RemoteStore
 {
     using Config = GrpcStoreConfig;
 
+private:
     ref<const Config> config;
 
     /* One channel is shared by all connections in the pool; gRPC multiplexes
        streams over it internally. The stub keeps the channel alive. */
     std::unique_ptr<remote::NixRemote::Stub> stub;
 
-    GrpcStore(ref<const Config> config)
-        : Store{*config}
-        , RemoteStore{*config}
-        , config{config}
-    {
-        std::shared_ptr<grpc::ChannelCredentials> creds;
-        if (config->insecure) {
-            creds = grpc::InsecureChannelCredentials();
-        } else {
-            grpc::SslCredentialsOptions ssl;
-            if (!config->caCert.get().empty())
-                ssl.pem_root_certs = readFile(config->caCert.get());
-            if (!config->clientCert.get().empty()) {
-                ssl.pem_cert_chain = readFile(config->clientCert.get());
-                ssl.pem_private_key = readFile(config->clientKey.get());
-            }
-            creds = grpc::SslCredentials(ssl);
+public:
+    GrpcStore(const ref<const Config> &config)
+        : Store{*config}, RemoteStore{*config}, config{config} {
+      std::shared_ptr<grpc::ChannelCredentials> creds;
+      if (config->insecure) {
+        creds = grpc::InsecureChannelCredentials();
+      } else {
+        grpc::SslCredentialsOptions ssl;
+        if (!config->caCert.get().empty()) {
+          ssl.pem_root_certs = readFile(config->caCert.get());
         }
+        if (!config->clientCert.get().empty()) {
+          ssl.pem_cert_chain = readFile(config->clientCert.get());
+          ssl.pem_private_key = readFile(config->clientKey.get());
+        }
+        creds = grpc::SslCredentials(ssl);
+      }
 
-        grpc::ChannelArguments args;
-        // The worker protocol streams NARs; do not cap message size.
-        args.SetMaxReceiveMessageSize(-1);
-        args.SetMaxSendMessageSize(-1);
+      grpc::ChannelArguments args;
+      // The worker protocol streams NARs; do not cap message size.
+      args.SetMaxReceiveMessageSize(-1);
+      args.SetMaxSendMessageSize(-1);
 
-        stub = remote::NixRemote::NewStub(
-            grpc::CreateCustomChannel(config->authority.to_string(), creds, args));
+      stub = remote::NixRemote::NewStub(grpc::CreateCustomChannel(
+          config->authority.to_string(), creds, args));
     }
 
-    std::optional<std::string> getBuildLogExact(const StorePath &) override
-    {
-        unsupported("getBuildLogExact");
+    GrpcStore(const GrpcStore &) = delete;
+    GrpcStore(GrpcStore &&) = delete;
+    auto operator=(const GrpcStore &) -> GrpcStore & = delete;
+    auto operator=(GrpcStore &&) -> GrpcStore & = delete;
+
+    auto getBuildLogExact(const StorePath & /*path*/)
+        -> std::optional<std::string> override {
+      unsupported("getBuildLogExact");
     }
 
+private:
     /* ValidPathInfo serialisation used by the bulk RPCs, matching the worker
        protocol's AddMultipleToStore framing. */
     static constexpr WorkerProto::Version::Number infoVersion{.major = 1, .minor = 16};
@@ -147,46 +162,54 @@ struct GrpcStore : virtual RemoteStore
     std::optional<bool> nativeOps;
     std::mutex nativeOpsMutex;
 
-    static void checkStatus(const grpc::Status & status, const char * op)
+    static void checkStatus(const grpc::Status & status, const char * opName)
     {
-        if (!status.ok())
-            throw Error("gRPC %s failed: %s", op, status.error_message());
+      if (!status.ok()) {
+        throw Error("gRPC %s failed: %s", opName, status.error_message());
+      }
     }
 
-    bool hasNativeOps()
-    {
-        std::lock_guard<std::mutex> lock(nativeOpsMutex);
-        if (!nativeOps) {
-            grpc::ClientContext ctx;
-            remote::QueryValidPathsRequest request;
-            remote::QueryValidPathsReply reply;
-            auto status = stub->QueryValidPaths(&ctx, request, &reply);
-            nativeOps = status.ok();
-            if (!status.ok())
-                debug("gRPC store '%s' lacks native ops, using tunnel: %s",
-                    config->authority.to_string(), status.error_message());
-        }
-        return *nativeOps;
-    }
-
-    StorePathSet queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute) override
-    {
-        if (!hasNativeOps())
-            return RemoteStore::queryValidPaths(paths, maybeSubstitute);
-
+    auto hasNativeOps() -> bool {
+      std::scoped_lock const lock(nativeOpsMutex);
+      if (!nativeOps) {
         grpc::ClientContext ctx;
-        remote::QueryValidPathsRequest request;
-        request.set_substitute(maybeSubstitute == Substitute);
-        for (auto & p : paths)
-            request.add_paths(std::string(p.to_string()));
+        remote::QueryValidPathsRequest const request;
         remote::QueryValidPathsReply reply;
-        checkStatus(stub->QueryValidPaths(&ctx, request, &reply), "QueryValidPaths");
-        StorePathSet res;
-        for (auto & p : reply.paths())
-            res.insert(StorePath(p));
-        return res;
+        auto status = stub->QueryValidPaths(&ctx, request, &reply);
+        nativeOps = status.ok();
+        if (!status.ok()) {
+          debug("gRPC store '%s' lacks native ops, using tunnel: %s",
+                config->authority.to_string(), status.error_message());
+        }
+      }
+      return *nativeOps;
     }
 
+public:
+    auto queryValidPaths(const StorePathSet &paths,
+                         SubstituteFlag maybeSubstitute)
+        -> StorePathSet override {
+      if (!hasNativeOps()) {
+        return RemoteStore::queryValidPaths(paths, maybeSubstitute);
+      }
+
+      grpc::ClientContext ctx;
+      remote::QueryValidPathsRequest request;
+      request.set_substitute(maybeSubstitute == Substitute);
+      for (const auto &path : paths) {
+        request.add_paths(std::string(path.to_string()));
+      }
+      remote::QueryValidPathsReply reply;
+      checkStatus(stub->QueryValidPaths(&ctx, request, &reply),
+                  "QueryValidPaths");
+      StorePathSet res;
+      for (const auto &path : reply.paths()) {
+        res.insert(StorePath(path));
+      }
+      return res;
+    }
+
+private:
     using PathInfoMap = std::map<StorePath, std::shared_ptr<const ValidPathInfo>>;
 
     /* Path infos fetched in bulk by topoSortPaths(), consumed by
@@ -195,58 +218,65 @@ struct GrpcStore : virtual RemoteStore
     std::mutex prefetchMutex;
     PathInfoMap prefetchedInfos;
 
-    PathInfoMap queryPathInfosNative(const StorePathSet & paths)
-    {
-        grpc::ClientContext ctx;
-        remote::QueryPathInfosRequest request;
-        for (auto & p : paths)
-            request.add_paths(std::string(p.to_string()));
-        remote::QueryPathInfosReply reply;
-        checkStatus(stub->QueryPathInfos(&ctx, request, &reply), "QueryPathInfos");
+    auto queryPathInfosNative(const StorePathSet &paths) -> PathInfoMap {
+      grpc::ClientContext ctx;
+      remote::QueryPathInfosRequest request;
+      for (const auto &path : paths) {
+        request.add_paths(std::string(path.to_string()));
+      }
+      remote::QueryPathInfosReply reply;
+      checkStatus(stub->QueryPathInfos(&ctx, request, &reply),
+                  "QueryPathInfos");
 
-        PathInfoMap res;
-        for (auto & pi : reply.infos()) {
-            StorePath path(pi.path());
-            StringSource source(pi.info());
-            auto info = WorkerProto::Serialise<UnkeyedValidPathInfo>::read(
-                *this, WorkerProto::ReadConn{.from = source, .version = {.number = infoVersion}});
-            res.insert_or_assign(path, std::make_shared<ValidPathInfo>(StorePath(path), std::move(info)));
-        }
-        return res;
+      PathInfoMap res;
+      for (const auto &entry : reply.infos()) {
+        StorePath const path(entry.path());
+        StringSource source(entry.info());
+        auto info = WorkerProto::Serialise<UnkeyedValidPathInfo>::read(
+            *this, WorkerProto::ReadConn{.from = source,
+                                         .version = {.number = infoVersion}});
+        res.insert_or_assign(path, std::make_shared<ValidPathInfo>(
+                                       StorePath(path), std::move(info)));
+      }
+      return res;
     }
 
-    StorePaths topoSortPaths(const StorePathSet & paths) override
-    {
-        // copyPaths() hands the source store the full set of paths to copy
-        // here, right before querying their info one by one; prefetch them in
-        // a single RPC.
-        if (hasNativeOps() && !paths.empty()) {
-            auto infos = queryPathInfosNative(paths);
-            std::lock_guard<std::mutex> lock(prefetchMutex);
-            prefetchedInfos.merge(infos);
-        }
-        return Store::topoSortPaths(paths);
+public:
+    auto topoSortPaths(const StorePathSet &paths) -> StorePaths override {
+      // copyPaths() hands the source store the full set of paths to copy
+      // here, right before querying their info one by one; prefetch them in
+      // a single RPC.
+      if (hasNativeOps() && !paths.empty()) {
+        auto infos = queryPathInfosNative(paths);
+        std::scoped_lock const lock(prefetchMutex);
+        prefetchedInfos.merge(infos);
+      }
+      return Store::topoSortPaths(paths);
     }
 
     void queryPathInfoUncached(
         const StorePath & path, Callback<std::shared_ptr<const ValidPathInfo>> callback) noexcept override
     {
         try {
-            if (!hasNativeOps())
-                return RemoteStore::queryPathInfoUncached(path, std::move(callback));
+          if (!hasNativeOps()) {
+            RemoteStore::queryPathInfoUncached(path, std::move(callback));
+            return;
+          }
 
             {
-                std::lock_guard<std::mutex> lock(prefetchMutex);
-                if (auto it = prefetchedInfos.find(path); it != prefetchedInfos.end()) {
-                    auto info = std::move(it->second);
-                    prefetchedInfos.erase(it);
-                    return callback(std::move(info));
-                }
+              std::scoped_lock const lock(prefetchMutex);
+              if (auto found = prefetchedInfos.find(path);
+                  found != prefetchedInfos.end()) {
+                auto info = std::move(found->second);
+                prefetchedInfos.erase(found);
+                callback(std::move(info));
+                return;
+              }
             }
 
             auto infos = queryPathInfosNative({path});
-            auto it = infos.find(path);
-            callback(it == infos.end() ? nullptr : std::move(it->second));
+            auto found = infos.find(path);
+            callback(found == infos.end() ? nullptr : std::move(found->second));
         } catch (...) {
             callback.rethrow();
         }
@@ -259,71 +289,97 @@ struct GrpcStore : virtual RemoteStore
        length framing is needed. */
     using NarStream = grpc::ClientReaderWriter<remote::NarRequest, remote::NarChunk>;
 
+private:
     struct NarSession
     {
+    private:
+        friend struct GrpcStore;
+
         grpc::ClientContext ctx;
         std::unique_ptr<NarStream> stream;
-        std::optional<nixgrpc::ZstdReaderSource<NarStream, remote::NarChunk>> source;
+        nixgrpc::ZstdReaderSource<NarStream, remote::NarChunk> source;
+
+        static auto requireStream(std::unique_ptr<NarStream> stream, const GrpcStoreConfig & config)
+            -> std::unique_ptr<NarStream>
+        {
+            if (!stream) {
+                throw Error(
+                    "failed to open gRPC NarsFromPaths stream to '%s'", config.authority.to_string());
+            }
+            return stream;
+        }
+
+    public:
+        NarSession(remote::NixRemote::Stub & stub, const GrpcStoreConfig & config)
+            : stream(requireStream(stub.NarsFromPaths(&ctx), config))
+            , source(*stream, std::string{})
+        {
+        }
     };
 
     std::mutex narMutex;
     std::unique_ptr<NarSession> narSession;
 
+public:
     void narFromPath(const StorePath & path, Sink & sink) override
     {
-        if (!hasNativeOps())
-            return RemoteStore::narFromPath(path, sink);
+      if (!hasNativeOps()) {
+        RemoteStore::narFromPath(path, sink);
+        return;
+      }
 
-        std::lock_guard<std::mutex> lock(narMutex);
+      std::scoped_lock const lock(narMutex);
 
-        if (!narSession) {
-            auto session = std::make_unique<NarSession>();
-            session->stream = stub->NarsFromPaths(&session->ctx);
-            if (!session->stream)
-                throw Error("failed to open gRPC NarsFromPaths stream to '%s'", config->authority.to_string());
-            session->source.emplace(*session->stream, std::string{});
-            narSession = std::move(session);
-        }
+      if (!narSession) {
+        narSession = std::make_unique<NarSession>(*stub, *config);
+      }
 
         try {
             remote::NarRequest request;
             request.set_path(std::string(path.to_string()));
-            if (!narSession->stream->Write(request))
-                throw Error("gRPC stream closed by peer");
-            copyNAR(*narSession->source, sink);
+            if (!narSession->stream->Write(request)) {
+              throw Error("gRPC stream closed by peer");
+            }
+            copyNAR(narSession->source, sink);
         } catch (...) {
             // The session is unusable after an error (the stream position is
             // unknown); surface the server-side status if there is one.
             auto session = std::move(narSession);
             session->ctx.TryCancel();
             auto status = session->stream->Finish();
-            if (!status.ok() && status.error_code() != grpc::StatusCode::CANCELLED)
-                throw Error("gRPC NarsFromPaths failed: %s", status.error_message());
+            if (!status.ok() &&
+                status.error_code() != grpc::StatusCode::CANCELLED) {
+              throw Error("gRPC NarsFromPaths failed: %s",
+                          status.error_message());
+            }
             throw;
         }
     }
 
-    ~GrpcStore()
-    {
-        // Let the server end its NarsFromPaths handler cleanly.
-        if (narSession) {
-            narSession->stream->WritesDone();
-            remote::NarChunk chunk;
-            while (narSession->stream->Read(&chunk))
-                ;
-            (void) narSession->stream->Finish();
+    ~GrpcStore() override {
+      // Let the server end its NarsFromPaths handler cleanly.
+      if (narSession) {
+        narSession->stream->WritesDone();
+        remote::NarChunk chunk;
+        while (narSession->stream->Read(&chunk)) {
+          ;
         }
+        (void)narSession->stream->Finish();
+      }
     }
 
     void addMultipleToStore(
         PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs) override
     {
-        if (!hasNativeOps())
-            return RemoteStore::addMultipleToStore(std::move(pathsToCopy), act, repair, checkSigs);
+      if (!hasNativeOps()) {
+        RemoteStore::addMultipleToStore(std::move(pathsToCopy), act, repair, checkSigs);
+        return;
+      }
 
         uint64_t bytesExpected = 0;
-        for (auto & [pathInfo, _] : pathsToCopy)
-            bytesExpected += pathInfo.narSize;
+        for (auto &[pathInfo, pathSource] : pathsToCopy) {
+          bytesExpected += pathInfo.narSize;
+        }
         act.setExpected(actCopyPath, bytesExpected);
 
         grpc::ClientContext ctx;
@@ -336,15 +392,16 @@ struct GrpcStore : virtual RemoteStore
             remote::AddMultipleChunk flags;
             flags.set_repair(repair == Repair);
             flags.set_check_sigs(checkSigs == CheckSigs);
-            if (!writer->Write(flags))
-                throw Error("gRPC stream closed by peer");
+            if (!writer->Write(flags)) {
+              throw Error("gRPC stream closed by peer");
+            }
 
             nixgrpc::ZstdWriterSink<grpc::ClientWriter<remote::AddMultipleChunk>, remote::AddMultipleChunk> sink(
                 *writer);
-            size_t nrTotal = pathsToCopy.size();
+            size_t const nrTotal = pathsToCopy.size();
             sink << nrTotal;
             // Reverse, so we can release memory at the original start.
-            std::reverse(pathsToCopy.begin(), pathsToCopy.end());
+            std::ranges::reverse(pathsToCopy);
             while (!pathsToCopy.empty()) {
                 act.progress(nrTotal - pathsToCopy.size(), nrTotal, size_t(1), size_t(0));
                 auto & [pathInfo, pathSource] = pathsToCopy.back();
@@ -366,13 +423,15 @@ struct GrpcStore : virtual RemoteStore
         checkStatus(writer->Finish(), "AddMultipleToStore");
     }
 
-    void setOptions(RemoteStore::Connection &) override
-    {
-        // As with SSHStore, do not forward local settings automatically.
+    void setOptions(RemoteStore::Connection & /*conn*/) override {
+      // As with SSHStore, do not forward local settings automatically.
     }
 
     struct Connection : RemoteStore::Connection
     {
+    private:
+        friend struct GrpcStore;
+
         // RemoteStore::Connection speaks through FdSink/FdSource, so bridge the
         // gRPC stream to a pair of pipes with pump threads. This keeps the
         // blocking, ordered semantics the worker protocol relies on without
@@ -386,6 +445,13 @@ struct GrpcStore : virtual RemoteStore
         std::thread reader;
         std::thread writer;
 
+    public:
+        Connection() = default;
+        Connection(const Connection &) = delete;
+        Connection(Connection &&) = delete;
+        auto operator=(const Connection &) -> Connection & = delete;
+        auto operator=(Connection &&) -> Connection & = delete;
+
         void closeWrite() override
         {
             // Closing the write side of the pipe makes the reader thread hit
@@ -393,70 +459,79 @@ struct GrpcStore : virtual RemoteStore
             toRemote.writeSide.close();
         }
 
-        ~Connection()
-        {
-            // Unblock the reader pump (poll() on toRemote.readSide sees EOF)
-            // and the writer pump (stream->Read() returns false), then join.
-            // The pipe ends drained by the pump threads are owned by those
-            // threads; touching them here would race with their own close().
-            toRemote.writeSide.close();
-            ctx.TryCancel();
-            if (reader.joinable()) reader.join();
-            if (writer.joinable()) writer.join();
-            if (stream)
-                (void) stream->Finish();
+        ~Connection() override {
+          // Unblock the reader pump (poll() on toRemote.readSide sees EOF)
+          // and the writer pump (stream->Read() returns false), then join.
+          // The pipe ends drained by the pump threads are owned by those
+          // threads; touching them here would race with their own close().
+          toRemote.writeSide.close();
+          ctx.TryCancel();
+          if (reader.joinable()) {
+            reader.join();
+          }
+          if (writer.joinable()) {
+            writer.join();
+          }
+          if (stream) {
+            (void)stream->Finish();
+          }
         }
     };
 
-    ref<RemoteStore::Connection> openConnection() override;
+    auto openConnection() -> ref<RemoteStore::Connection> override;
 };
 
-ref<RemoteStore::Connection> GrpcStore::openConnection()
-{
-    auto conn = make_ref<Connection>();
+auto GrpcStore::openConnection() -> ref<RemoteStore::Connection> {
+  auto conn = make_ref<Connection>();
 
-    conn->stream = stub->Connect(&conn->ctx);
-    if (!conn->stream)
-        throw Error("failed to open gRPC stream to '%s'", config->authority.to_string());
+  conn->stream = stub->Connect(&conn->ctx);
+  if (!conn->stream) {
+    throw Error("failed to open gRPC stream to '%s'",
+                config->authority.to_string());
+  }
 
-    conn->toRemote.create();
-    conn->fromRemote.create();
-    nixgrpc::growPipe(conn->toRemote);
-    nixgrpc::growPipe(conn->fromRemote);
+  conn->toRemote.create();
+  conn->fromRemote.create();
+  nixgrpc::growPipe(conn->toRemote);
+  nixgrpc::growPipe(conn->fromRemote);
 
-    conn->reader = std::thread([c = &*conn] {
-        try {
-            nixgrpc::pumpFdToStream(c->toRemote.readSide.get(), *c->stream);
-        } catch (...) {
-            ignoreExceptionInDestructor();
-        }
-        c->stream->WritesDone();
-        // If the stream broke, RemoteStore may be blocked in FdSink writing to
-        // a full pipe with no drainer. Closing the read side turns that into
-        // EPIPE so the error surfaces instead of hanging.
-        c->toRemote.readSide.close();
-    });
+  conn->reader = std::thread([connPtr = &*conn] -> void {
+    try {
+      nixgrpc::pumpFdToStream(connPtr->toRemote.readSide.get(), *connPtr->stream);
+    } catch (...) {
+      ignoreExceptionInDestructor();
+    }
+    connPtr->stream->WritesDone();
+    // If the stream broke, RemoteStore may be blocked in FdSink writing to
+    // a full pipe with no drainer. Closing the read side turns that into
+    // EPIPE so the error surfaces instead of hanging.
+    connPtr->toRemote.readSide.close();
+  });
 
-    conn->writer = std::thread([c = &*conn] {
-        try {
-            nixgrpc::pumpStreamToFd(*c->stream, c->fromRemote.writeSide.get());
-        } catch (...) {
-            ignoreExceptionInDestructor();
-        }
-        // Propagate EOF / error to the worker-protocol reader.
-        c->fromRemote.writeSide.close();
-    });
+  conn->writer = std::thread([connPtr = &*conn] -> void {
+    try {
+      nixgrpc::pumpStreamToFd(*connPtr->stream, connPtr->fromRemote.writeSide.get());
+    } catch (...) {
+      ignoreExceptionInDestructor();
+    }
+    // Propagate EOF / error to the worker-protocol reader.
+    connPtr->fromRemote.writeSide.close();
+  });
 
-    conn->to = FdSink(conn->toRemote.writeSide.get());
-    conn->from = FdSource(conn->fromRemote.readSide.get());
-    return conn;
+  conn->to = FdSink(conn->toRemote.writeSide.get());
+  conn->from = FdSource(conn->fromRemote.readSide.get());
+  return conn;
 }
 
-ref<Store> GrpcStoreConfig::openStore() const
-{
-    return make_ref<GrpcStore>(ref{shared_from_this()});
+auto GrpcStoreConfig::openStore() const -> ref<Store> {
+  return make_ref<GrpcStore>(ref{shared_from_this()});
 }
 
-static RegisterStoreImplementation<GrpcStoreConfig> regGrpcStore;
+namespace {
+// Store registration is inherently a non-const global whose constructor may
+// allocate; this is the standard Nix plugin pattern.
+// NOLINTNEXTLINE(cert-err58-cpp,cppcoreguidelines-avoid-non-const-global-variables)
+RegisterStoreImplementation<GrpcStoreConfig> regGrpcStore;
+} // namespace
 
 } // namespace nix

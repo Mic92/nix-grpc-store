@@ -7,60 +7,82 @@
 // avoids the tunnel's per-batch zstd flushes and per-path round trips.
 
 #include <csignal>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <filesystem>
+#include <memory>
 #include <mutex>
-#include <sys/socket.h>
+#include <span>
+#include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 
+#include <sys/socket.h>
+
+#include <grpc/grpc_security_constants.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
+#include <grpcpp/security/server_credentials.h>
+#include <grpcpp/support/status.h>
+#include <grpcpp/support/sync_stream.h>
 
 #include <nix/store/globals.hh>
 #include <nix/store/path-info.hh>
+#include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
 #include <nix/store/store-open.hh>
 #include <nix/store/worker-protocol.hh>
+#include <nix/util/error.hh>
 #include <nix/util/file-descriptor.hh>
 #include <nix/util/file-system.hh>
+#include <nix/util/fmt.hh>
 #include <nix/util/logging.hh>
+#include <nix/util/ref.hh>
+#include <nix/util/repair-flag.hh>
+#include <nix/util/serialise.hh>
 #include <nix/util/unix-domain-socket.hh>
 #include <nix/util/util.hh>
 
+#include "nix_remote.grpc.pb.h"
+#include "nix_remote.pb.h"
 #include "pump.hh"
 
-using namespace nix;
-using GrpcStream = grpc::ServerReaderWriter<remote::Chunk, remote::Chunk>;
+using GrpcStream = grpc::ServerReaderWriter<nix::remote::Chunk, nix::remote::Chunk>;
+using AddMultipleReader = grpc::ServerReader<nix::remote::AddMultipleChunk>;
+using NarsStream = grpc::ServerReaderWriter<nix::remote::NarChunk, nix::remote::NarRequest>;
 
-class NixRemoteService final : public remote::NixRemote::Service
+class NixRemoteService final : public nix::remote::NixRemote::Service
 {
-    /* ValidPathInfo serialisation used by the bulk RPCs, matching the worker
+    /* nix::ValidPathInfo serialisation used by the bulk RPCs, matching the worker
        protocol's AddMultipleToStore framing. */
-    static constexpr WorkerProto::Version::Number infoVersion{.major = 1, .minor = 16};
+    static constexpr nix::WorkerProto::Version::Number infoVersion{.major = 1, .minor = 16};
 
     std::string socketPath;
 
     std::mutex storeMutex;
-    std::shared_ptr<Store> store_;
+    std::shared_ptr<nix::Store> store;
 
     // The Store connects lazily and pools connections, but opening it can
     // still throw (e.g. daemon socket missing), so defer to first use.
-    ref<Store> getStore()
+    auto getStore() -> nix::ref<nix::Store>
     {
-        std::lock_guard<std::mutex> lock(storeMutex);
-        if (!store_)
-            store_ = openStore("unix://" + socketPath).get_ptr();
-        return ref<Store>(store_);
+        std::scoped_lock const lock(storeMutex);
+        if (!store) {
+            store = nix::openStore("unix://" + socketPath).get_ptr();
+        }
+        return nix::ref<nix::Store>(store);
     }
 
     // gRPC aborts the process if a handler lets an exception escape.
     template<typename F>
-    static grpc::Status guarded(F && f)
+    static auto guarded(F && func) -> grpc::Status
     {
         try {
-            return f();
-        } catch (Error & e) {
-            return {grpc::StatusCode::INTERNAL, e.what()};
-        } catch (std::exception & e) {
-            return {grpc::StatusCode::INTERNAL, e.what()};
+            return std::forward<F>(func)();
+        } catch (std::exception & err) {
+            return {grpc::StatusCode::INTERNAL, err.what()};
         }
     }
 
@@ -70,20 +92,20 @@ public:
     {
     }
 
-    grpc::Status Connect(grpc::ServerContext *, GrpcStream * stream) override
+    auto Connect(grpc::ServerContext * /*context*/, GrpcStream * stream) -> grpc::Status override
     {
-        AutoCloseFD sock;
+        nix::AutoCloseFD sock;
         try {
             sock = nix::connect(std::filesystem::path{socketPath});
-        } catch (Error & e) {
-            return {grpc::StatusCode::UNAVAILABLE, e.what()};
+        } catch (nix::Error & err) {
+            return {grpc::StatusCode::UNAVAILABLE, err.what()};
         }
 
-        std::thread recvT([&] {
+        std::thread receiver([&]() -> void {
             try {
                 nixgrpc::pumpStreamToFd(*stream, sock.get());
             } catch (...) {
-                ignoreExceptionInDestructor();
+                nix::ignoreExceptionInDestructor();
             }
             ::shutdown(sock.get(), SHUT_WR);
         });
@@ -91,99 +113,101 @@ public:
         try {
             nixgrpc::pumpFdToStream(sock.get(), *stream);
         } catch (...) {
-            ignoreExceptionInDestructor();
+            nix::ignoreExceptionInDestructor();
         }
 
-        recvT.join();
+        receiver.join();
         return grpc::Status::OK;
     }
 
-    grpc::Status QueryValidPaths(
-        grpc::ServerContext *,
-        const remote::QueryValidPathsRequest * request,
-        remote::QueryValidPathsReply * reply) override
+    auto QueryValidPaths(
+        grpc::ServerContext * /*context*/,
+        const nix::remote::QueryValidPathsRequest * request,
+        nix::remote::QueryValidPathsReply * reply) -> grpc::Status override
     {
-        return guarded([&] {
-            auto store = getStore();
-            StorePathSet paths;
-            for (auto & p : request->paths())
-                paths.insert(StorePath(p));
-            for (auto & p : store->queryValidPaths(paths, request->substitute() ? Substitute : NoSubstitute))
-                reply->add_paths(std::string(p.to_string()));
+        return guarded([&]() -> grpc::Status {
+            auto localStore = getStore();
+            nix::StorePathSet paths;
+            for (const auto & path : request->paths()) {
+                paths.insert(nix::StorePath(path));
+            }
+            for (const auto & path :
+                 localStore->queryValidPaths(paths, request->substitute() ? nix::Substitute : nix::NoSubstitute)) {
+                reply->add_paths(std::string(path.to_string()));
+            }
             return grpc::Status::OK;
         });
     }
 
-    grpc::Status AddMultipleToStore(
-        grpc::ServerContext *,
-        grpc::ServerReader<remote::AddMultipleChunk> * reader,
-        remote::AddMultipleReply *) override
+    auto AddMultipleToStore(
+        grpc::ServerContext * /*context*/,
+        AddMultipleReader * reader,
+        nix::remote::AddMultipleReply * /*reply*/) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto store = getStore();
+            auto localStore = getStore();
 
-            remote::AddMultipleChunk first;
-            if (!reader->Read(&first))
+            nix::remote::AddMultipleChunk first;
+            if (!reader->Read(&first)) {
                 return {grpc::StatusCode::INVALID_ARGUMENT, "empty AddMultipleToStore stream"};
-            auto repair = first.repair() ? Repair : NoRepair;
+            }
+            auto repair = first.repair() ? nix::Repair : nix::NoRepair;
             // The nix-daemon downgrades this to CheckSigs if we are not a
             // trusted user, same as for the tunnelled protocol.
-            auto checkSigs = first.check_sigs() ? CheckSigs : NoCheckSigs;
+            auto checkSigs = first.check_sigs() ? nix::CheckSigs : nix::NoCheckSigs;
 
-            nixgrpc::ZstdReaderSource<grpc::ServerReader<remote::AddMultipleChunk>, remote::AddMultipleChunk> source(
+            nixgrpc::ZstdReaderSource<AddMultipleReader, nix::remote::AddMultipleChunk> source(
                 *reader, std::move(*first.mutable_data()));
 
-            // Same framing as WorkerProto::Op::AddMultipleToStore.
-            auto expected = readNum<uint64_t>(source);
-            for (uint64_t i = 0; i < expected; ++i) {
-                auto info = WorkerProto::Serialise<ValidPathInfo>::read(
-                    *store, WorkerProto::ReadConn{.from = source, .version = {.number = infoVersion}});
+            // Same framing as nix::WorkerProto::Op::AddMultipleToStore.
+            auto expected = nix::readNum<uint64_t>(source);
+            for (uint64_t idx = 0; idx < expected; ++idx) {
+                auto info = nix::WorkerProto::Serialise<nix::ValidPathInfo>::read(
+                    *localStore, nix::WorkerProto::ReadConn{.from = source, .version = {.number = infoVersion}});
                 info.ultimate = false;
-                EnsureRead wrapper{source, info.narSize};
-                store->addToStore(info, wrapper, repair, checkSigs);
+                nix::EnsureRead wrapper{source, info.narSize};
+                localStore->addToStore(info, wrapper, repair, checkSigs);
                 wrapper.finish();
             }
             return grpc::Status::OK;
         });
     }
 
-    grpc::Status QueryPathInfos(
-        grpc::ServerContext *,
-        const remote::QueryPathInfosRequest * request,
-        remote::QueryPathInfosReply * reply) override
+    auto QueryPathInfos(
+        grpc::ServerContext * /*context*/,
+        const nix::remote::QueryPathInfosRequest * request,
+        nix::remote::QueryPathInfosReply * reply) -> grpc::Status override
     {
-        return guarded([&] {
-            auto store = getStore();
-            for (auto & p : request->paths()) {
-                std::shared_ptr<const ValidPathInfo> info;
+        return guarded([&]() -> grpc::Status {
+            auto localStore = getStore();
+            for (const auto & path : request->paths()) {
+                std::shared_ptr<const nix::ValidPathInfo> info;
                 try {
-                    info = store->queryPathInfo(StorePath(p));
-                } catch (InvalidPath &) {
+                    info = localStore->queryPathInfo(nix::StorePath(path));
+                } catch (nix::InvalidPath &) {
                     continue;
                 }
                 auto * out = reply->add_infos();
                 out->set_path(std::string(info->path.to_string()));
-                StringSink sink;
-                WorkerProto::Serialise<UnkeyedValidPathInfo>::write(
-                    *store,
-                    WorkerProto::WriteConn{.to = sink, .version = {.number = infoVersion}},
-                    static_cast<const UnkeyedValidPathInfo &>(*info));
+                nix::StringSink sink;
+                nix::WorkerProto::Serialise<nix::UnkeyedValidPathInfo>::write(
+                    *localStore,
+                    nix::WorkerProto::WriteConn{.to = sink, .version = {.number = infoVersion}},
+                    static_cast<const nix::UnkeyedValidPathInfo &>(*info));
                 *out->mutable_info() = std::move(sink.s);
             }
             return grpc::Status::OK;
         });
     }
 
-    grpc::Status NarsFromPaths(
-        grpc::ServerContext *, grpc::ServerReaderWriter<remote::NarChunk, remote::NarRequest> * stream) override
+    auto NarsFromPaths(grpc::ServerContext * /*context*/, NarsStream * stream) -> grpc::Status override
     {
-        return guarded([&] {
-            auto store = getStore();
-            nixgrpc::ZstdWriterSink<grpc::ServerReaderWriter<remote::NarChunk, remote::NarRequest>, remote::NarChunk>
-                sink(*stream);
-            remote::NarRequest request;
+        return guarded([&]() -> grpc::Status {
+            auto localStore = getStore();
+            nixgrpc::ZstdWriterSink<NarsStream, nix::remote::NarChunk> sink(*stream);
+            nix::remote::NarRequest request;
             while (stream->Read(&request)) {
-                store->narFromPath(StorePath(request.path()), sink);
+                localStore->narFromPath(nix::StorePath(request.path()), sink);
                 // The client blocks on this NAR before sending the next
                 // request, so it must not linger in the encoder.
                 sink.flush();
@@ -194,73 +218,97 @@ public:
     }
 };
 
-int main(int argc, char ** argv)
+namespace {
+
+struct Options
+{
+    std::string listen = "0.0.0.0:50051";
+    std::string socketPath = "/nix/var/nix/daemon-socket/socket";
+    std::string tlsCert;
+    std::string tlsKey;
+    std::string clientCA;
+};
+
+auto parseOptions(std::span<char *> args) -> Options
+{
+    Options options;
+    for (size_t idx = 1; idx < args.size(); ++idx) {
+        std::string_view const arg = args[idx];
+        auto next = [&]() -> std::string {
+            if (++idx >= args.size()) {
+                throw nix::Error("flag '%s' requires an argument", arg);
+            }
+            return args[idx];
+        };
+        if (arg == "--listen") {
+            options.listen = next();
+        } else if (arg == "--proxy-socket") {
+            options.socketPath = next();
+        } else if (arg == "--tls-cert") {
+            options.tlsCert = next();
+        } else if (arg == "--tls-key") {
+            options.tlsKey = next();
+        } else if (arg == "--client-ca") {
+            options.clientCA = next();
+        } else {
+            throw nix::Error("unknown flag '%s'", arg);
+        }
+    }
+    return options;
+}
+
+auto makeServerCredentials(const Options & options) -> std::shared_ptr<grpc::ServerCredentials>
+{
+    if (options.tlsCert.empty()) {
+        if (!options.clientCA.empty()) {
+            throw nix::Error("--client-ca requires --tls-cert/--tls-key");
+        }
+        return grpc::InsecureServerCredentials();
+    }
+    // With --client-ca the server requires and verifies a client certificate
+    // (mTLS); without it, plain server-auth TLS.
+    grpc::SslServerCredentialsOptions ssl(
+        options.clientCA.empty() ? GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE
+                                 : GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY);
+    ssl.pem_key_cert_pairs.push_back({nix::readFile(options.tlsKey), nix::readFile(options.tlsCert)});
+    if (!options.clientCA.empty()) {
+        ssl.pem_root_certs = nix::readFile(options.clientCA);
+    }
+    return grpc::SslServerCredentials(ssl);
+}
+
+} // namespace
+
+auto main(int argc, char ** argv) -> int
 try {
     // Pump threads write to a socket whose peer may already be gone; we want
     // EPIPE, not process death.
-    std::signal(SIGPIPE, SIG_IGN);
+    // NOLINTNEXTLINE(misc-include-cleaner): SIGPIPE comes from <csignal>.
+    static_cast<void>(std::signal(SIGPIPE, SIG_IGN));
 
-    // Required before openStore() in the native RPC handlers.
-    initLibStore();
+    // Required before nix::openStore() in the native RPC handlers.
+    nix::initLibStore();
 
-    std::string listen = "0.0.0.0:50051";
-    std::string socketPath = "/nix/var/nix/daemon-socket/socket";
-    std::string tlsCert, tlsKey, clientCA;
+    auto options = parseOptions(std::span(argv, static_cast<size_t>(argc)));
 
-    for (int i = 1; i < argc; ++i) {
-        std::string_view a = argv[i];
-        auto next = [&]() -> std::string {
-            if (++i >= argc)
-                throw Error("flag '%s' requires an argument", a);
-            return argv[i];
-        };
-        if (a == "--listen")
-            listen = next();
-        else if (a == "--proxy-socket")
-            socketPath = next();
-        else if (a == "--tls-cert")
-            tlsCert = next();
-        else if (a == "--tls-key")
-            tlsKey = next();
-        else if (a == "--client-ca")
-            clientCA = next();
-        else
-            throw Error("unknown flag '%s'", a);
-    }
-
-    NixRemoteService service(socketPath);
+    NixRemoteService service(options.socketPath);
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
     builder.SetMaxReceiveMessageSize(-1);
     builder.SetMaxSendMessageSize(-1);
-
-    if (!tlsCert.empty()) {
-        // With --client-ca the server requires and verifies a client
-        // certificate (mTLS); without it, plain server-auth TLS.
-        grpc::SslServerCredentialsOptions ssl(
-            clientCA.empty() ? GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE
-                             : GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY);
-        ssl.pem_key_cert_pairs.push_back({readFile(tlsKey), readFile(tlsCert)});
-        if (!clientCA.empty())
-            ssl.pem_root_certs = readFile(clientCA);
-        builder.AddListeningPort(listen, grpc::SslServerCredentials(ssl));
-    } else {
-        if (!clientCA.empty())
-            throw Error("--client-ca requires --tls-cert/--tls-key");
-        builder.AddListeningPort(listen, grpc::InsecureServerCredentials());
-    }
-
+    builder.AddListeningPort(options.listen, makeServerCredentials(options));
     builder.RegisterService(&service);
 
     auto server = builder.BuildAndStart();
-    if (!server)
-        throw Error("failed to start gRPC server on '%s'", listen);
+    if (!server) {
+        throw nix::Error("failed to start gRPC server on '%s'", options.listen);
+    }
 
-    printInfo("nix-grpc-daemon listening on %s → %s", listen, socketPath);
+    nix::logger->log(nix::lvlInfo, nix::fmt("nix-grpc-daemon listening on %s → %s", options.listen, options.socketPath));
     server->Wait();
     return 0;
-} catch (Error & e) {
-    printError("nix-grpc-daemon: %s", e.what());
+} catch (nix::Error & err) {
+    nix::logger->log(nix::lvlError, nix::fmt("nix-grpc-daemon: %s", err.what()));
     return 1;
 }
