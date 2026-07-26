@@ -58,14 +58,14 @@ client then has trusted-user privileges, so require client certs
 ## Remote builder
 
     nix.buildMachines = [{
-      hostName = "grpc://builder:50051?client-cert=/run/keys/client.crt&client-key=/run/keys/client.key&ca-cert=/etc/ssl/certs/ca-bundle.crt";
+      hostName = "grpc://builder:50051";
       protocol = null;
       systems = [ "x86_64-linux" "aarch64-linux" ];
       maxJobs = 64;
     }];
 
-Only the nix-daemon needs the plugin loaded. Pass `ca-cert` explicitly; gRPC
-does not use the system trust store.
+Only the nix-daemon needs the plugin loaded. TLS uses the system CA bundle
+and the client key pair from `/run/nix-grpc-store` by default (see below).
 
 ## Quick start (manual)
 
@@ -105,8 +105,12 @@ presenting a certificate signed by that CA are accepted.
 ## URI parameters
 
   * `insecure` — plaintext, no TLS (testing only)
-  * `ca-cert` — PEM CA to verify the server
-  * `client-cert`, `client-key` — PEM pair to present for mTLS
+  * `ca-cert` — PEM CA to verify the server; defaults to `$NIX_SSL_CERT_FILE`,
+    `$SSL_CERT_FILE` or the system CA bundle
+  * `client-cert`, `client-key` — PEM pair to present for mTLS; default to
+    `$NIX_GRPC_CLIENT_CERT`/`$NIX_GRPC_CLIENT_KEY`, then `client.crt`/`client.key`
+    in `$XDG_DATA_HOME/nix-grpc-store`, then `/run/nix-grpc-store`
+    (unreadable candidates are skipped)
 
 ## Server flags
 

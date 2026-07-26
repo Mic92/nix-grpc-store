@@ -6,6 +6,8 @@
 //
 // URI: grpc://host:port
 // Params: insecure, ca-cert, client-cert, client-key
+// Unset TLS params fall back to standard locations, see defaultCaCert() and
+// defaultClientCred().
 
 #include <algorithm>
 #include <cstddef>
@@ -20,6 +22,7 @@
 #include <nix/store/store-api.hh>
 #include <nix/store/store-reference.hh>
 #include <nix/util/configuration.hh>
+#include <nix/util/environment-variables.hh>
 #include <nix/util/file-system.hh>
 #include <nix/util/logging.hh>
 #include <nix/util/ref.hh>
@@ -29,6 +32,8 @@
 #include <nix/util/util.hh>
 #include <optional>
 #include <thread>
+#include <unistd.h>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 
@@ -49,6 +54,48 @@
 
 using GrpcStream = grpc::ClientReaderWriter<nix::remote::Chunk, nix::remote::Chunk>;
 
+namespace {
+
+// First readable candidate, or empty.
+auto firstReadable(const std::vector<std::string> &candidates) -> std::string {
+  for (const auto &path : candidates) {
+    if (::access(path.c_str(), R_OK) == 0) {
+      return path;
+    }
+  }
+  return "";
+}
+
+// Same lookup order as Nix's ssl-cert-file setting.
+auto defaultCaCert() -> std::string {
+  std::vector<std::string> candidates;
+  for (const auto *env : {"NIX_SSL_CERT_FILE", "SSL_CERT_FILE"}) {
+    if (auto value = nix::getEnv(env)) {
+      candidates.push_back(*value);
+    }
+  }
+  candidates.emplace_back("/etc/ssl/certs/ca-certificates.crt");
+  candidates.emplace_back("/nix/var/nix/profiles/default/etc/ssl/certs/ca-bundle.crt");
+  return firstReadable(candidates);
+}
+
+// Env override, then per-user XDG data dir, then system-wide location.
+auto defaultClientCred(const char *envVar, const std::string &fileName) -> std::string {
+  std::vector<std::string> candidates;
+  if (auto value = nix::getEnv(envVar)) {
+    candidates.push_back(*value);
+  }
+  if (auto dataHome = nix::getEnv("XDG_DATA_HOME")) {
+    candidates.push_back(*dataHome + "/nix-grpc-store/" + fileName);
+  } else if (auto home = nix::getEnv("HOME")) {
+    candidates.push_back(*home + "/.local/share/nix-grpc-store/" + fileName);
+  }
+  candidates.push_back("/run/nix-grpc-store/" + fileName);
+  return firstReadable(candidates);
+}
+
+} // namespace
+
 namespace nix {
 
 struct GrpcStoreConfig : std::enable_shared_from_this<GrpcStoreConfig>, virtual RemoteStoreConfig
@@ -61,12 +108,26 @@ private:
     Setting<bool> insecure{this, false, "insecure", "Use plaintext instead of TLS. Only for local testing."};
 
     Setting<std::string> caCert{
-        this, "", "ca-cert", "Path to a PEM file with the CA certificate used to verify the server."};
+        this,
+        "",
+        "ca-cert",
+        "Path to a PEM file with the CA certificate used to verify the server. "
+        "Defaults to `$NIX_SSL_CERT_FILE`, `$SSL_CERT_FILE` or the system CA bundle."};
 
     Setting<std::string> clientCert{
-        this, "", "client-cert", "Path to a PEM client certificate chain to present for mTLS."};
+        this,
+        "",
+        "client-cert",
+        "Path to a PEM client certificate chain to present for mTLS. Defaults to "
+        "`$NIX_GRPC_CLIENT_CERT`, then `client.crt` in `$XDG_DATA_HOME/nix-grpc-store` "
+        "or `/run/nix-grpc-store`."};
 
-    Setting<std::string> clientKey{this, "", "client-key", "Path to the PEM private key for `client-cert`."};
+    Setting<std::string> clientKey{
+        this,
+        "",
+        "client-key",
+        "Path to the PEM private key for `client-cert`. Defaults to "
+        "`$NIX_GRPC_CLIENT_KEY`, then `client.key` next to the default `client-cert`."};
 
 public:
     GrpcStoreConfig(const Params & params)
@@ -122,12 +183,19 @@ public:
         creds = grpc::InsecureChannelCredentials();
       } else {
         grpc::SslCredentialsOptions ssl;
-        if (!config->caCert.get().empty()) {
-          ssl.pem_root_certs = readFile(config->caCert.get());
+        auto caCert = config->caCert.get().empty() ? defaultCaCert() : config->caCert.get();
+        if (!caCert.empty()) {
+          ssl.pem_root_certs = readFile(caCert);
         }
-        if (!config->clientCert.get().empty()) {
-          ssl.pem_cert_chain = readFile(config->clientCert.get());
-          ssl.pem_private_key = readFile(config->clientKey.get());
+        auto clientCert = config->clientCert.get();
+        auto clientKey = config->clientKey.get();
+        if (clientCert.empty() && clientKey.empty()) {
+          clientCert = defaultClientCred("NIX_GRPC_CLIENT_CERT", "client.crt");
+          clientKey = defaultClientCred("NIX_GRPC_CLIENT_KEY", "client.key");
+        }
+        if (!clientCert.empty() && !clientKey.empty()) {
+          ssl.pem_cert_chain = readFile(clientCert);
+          ssl.pem_private_key = readFile(clientKey);
         }
         creds = grpc::SslCredentials(ssl);
       }

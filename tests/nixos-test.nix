@@ -47,6 +47,9 @@ pkgs.testers.runNixOSTest {
       };
 
       programs.nix-grpc-store.enable = true;
+      # The client module only loads the plugin in the nix-daemon; the test
+      # drives `nix --store grpc://` directly, so load it globally too.
+      nix.settings.plugin-files = [ "${config.programs.nix-grpc-store.package}/lib/nix/plugins" ];
       services.nix-grpc-daemon = {
         enable = true;
         listen = "127.0.0.1:50051";
@@ -56,7 +59,7 @@ pkgs.testers.runNixOSTest {
       };
       # Bulk-upload subtest needs the daemon to be a trusted user so
       # nix copy --to can add unsigned paths.
-      nix.settings.trusted-users = [ "nix-grpc-daemon" ];
+      services.nix-grpc-daemon.trustClients = true;
 
       environment.systemPackages = [ pkgs.perf ];
       # Allow perf to resolve kernel symbols and record system-wide as root.

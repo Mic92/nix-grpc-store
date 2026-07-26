@@ -29,6 +29,10 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    nix.settings.plugin-files = [ "${cfg.package}/lib/nix/plugins/nix-grpc-store.so" ];
+    # Only the daemon loads the plugin; via global nix.conf every other nix
+    # binary on the system would dlopen an ABI-incompatible plugin and crash.
+    systemd.services.nix-daemon.environment.NIX_CONFIG = ''
+      plugin-files = ${cfg.package}/lib/nix/plugins
+    '';
   };
 }
