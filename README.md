@@ -38,8 +38,34 @@ Add the flake and enable the modules:
     programs.nix-grpc-store.enable = true;
 
 The client module builds the plugin against `config.nix.package.libs`, so it
-tracks whatever Nix your system uses. The server module runs the daemon as an unprivileged `nix-grpc-daemon` user;
-add it to `nix.settings.trusted-users` if gRPC clients should be trusted.
+tracks whatever Nix your system uses. The server module runs the daemon as an
+unprivileged `nix-grpc-daemon` user and adds it to `extra-allowed-users` so it
+can reach the local `nix-daemon` even when `allowed-users` is restricted.
+
+## Trust model
+
+gRPC clients act as the `nix-grpc-daemon` user, which is not trusted by
+default. That is enough for `nix build --store 'grpc://…'`, `nix copy`,
+path queries and GC: sources and derivations are content-addressed, signed
+cache paths are accepted, and the server builds everything itself.
+
+Using the server as a remote builder (`builders = grpc://…`) also imports
+unsigned outputs built on the client, which only trusted users may do. Set
+`services.nix-grpc-daemon.trustClients = true` for that; every authenticated
+client then has trusted-user privileges, so require client certs
+(`tls.clientCaFile`).
+
+## Remote builder
+
+    nix.buildMachines = [{
+      hostName = "grpc://builder:50051";
+      protocol = null;
+      systems = [ "x86_64-linux" "aarch64-linux" ];
+      maxJobs = 64;
+    }];
+
+Only the nix-daemon needs the plugin loaded. TLS uses the system CA bundle
+and the client key pair from `/run/nix-grpc-store` by default (see below).
 
 ## Quick start (manual)
 
@@ -79,8 +105,12 @@ presenting a certificate signed by that CA are accepted.
 ## URI parameters
 
   * `insecure` — plaintext, no TLS (testing only)
-  * `ca-cert` — PEM CA to verify the server
-  * `client-cert`, `client-key` — PEM pair to present for mTLS
+  * `ca-cert` — PEM CA to verify the server; defaults to `$NIX_SSL_CERT_FILE`,
+    `$SSL_CERT_FILE` or the system CA bundle
+  * `client-cert`, `client-key` — PEM pair to present for mTLS; default to
+    `$NIX_GRPC_CLIENT_CERT`/`$NIX_GRPC_CLIENT_KEY`, then `client.crt`/`client.key`
+    in `$XDG_DATA_HOME/nix-grpc-store`, then `/run/nix-grpc-store`
+    (unreadable candidates are skipped)
 
 ## Server flags
 

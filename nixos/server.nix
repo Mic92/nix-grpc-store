@@ -22,6 +22,17 @@ in
       description = "Package providing {command}`nix-grpc-daemon`.";
     };
 
+    trustClients = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Add the proxy user to `nix.settings.trusted-users`. Needed to use
+        this daemon as a remote builder (clients import unsigned store
+        paths); gives every authenticated gRPC client trusted-user
+        privileges.
+      '';
+    };
+
     listen = lib.mkOption {
       type = lib.types.str;
       default = "0.0.0.0:50051";
@@ -73,6 +84,10 @@ in
         message = "services.nix-grpc-daemon.tls.certFile and tls.keyFile must be set together";
       }
     ];
+
+    # Reach the local nix-daemon even when allowed-users is restricted.
+    nix.settings.extra-allowed-users = [ "nix-grpc-daemon" ];
+    nix.settings.extra-trusted-users = lib.mkIf cfg.trustClients [ "nix-grpc-daemon" ];
 
     # gRPC clients inherit the store privileges of this uid via the proxied
     # nix-daemon connection, so default to a dedicated unprivileged user.

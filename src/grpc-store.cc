@@ -6,6 +6,8 @@
 //
 // URI: grpc://host:port
 // Params: insecure, ca-cert, client-cert, client-key
+// Unset TLS params fall back to standard locations, see defaultCaCert() and
+// defaultClientCred().
 
 #include <algorithm>
 #include <cstddef>
@@ -20,6 +22,7 @@
 #include <nix/store/store-api.hh>
 #include <nix/store/store-reference.hh>
 #include <nix/util/configuration.hh>
+#include <nix/util/environment-variables.hh>
 #include <nix/util/file-system.hh>
 #include <nix/util/logging.hh>
 #include <nix/util/ref.hh>
@@ -28,7 +31,10 @@
 #include <nix/util/types.hh>
 #include <nix/util/util.hh>
 #include <optional>
+#include <string>
 #include <thread>
+#include <unistd.h>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 
@@ -49,8 +55,53 @@
 
 using GrpcStream = grpc::ClientReaderWriter<nix::remote::Chunk, nix::remote::Chunk>;
 
+namespace {
+
+// First readable candidate, or empty.
+auto firstReadable(const std::vector<std::string> &candidates) -> std::string {
+  for (const auto &path : candidates) {
+    // NOLINTNEXTLINE(misc-include-cleaner): R_OK comes from <unistd.h>
+    if (::access(path.c_str(), R_OK) == 0) {
+      return path;
+    }
+  }
+  return "";
+}
+
+// Same lookup order as Nix's ssl-cert-file setting.
+auto defaultCaCert() -> std::string {
+  std::vector<std::string> candidates;
+  for (const auto *env : {"NIX_SSL_CERT_FILE", "SSL_CERT_FILE"}) {
+    if (auto value = nix::getEnv(env)) {
+      candidates.push_back(*value);
+    }
+  }
+  candidates.emplace_back("/etc/ssl/certs/ca-certificates.crt");
+  candidates.emplace_back("/nix/var/nix/profiles/default/etc/ssl/certs/ca-bundle.crt");
+  return firstReadable(candidates);
+}
+
+// Env override, then per-user XDG data dir, then system-wide location.
+auto defaultClientCred(const char *envVar, const std::string &fileName) -> std::string {
+  std::vector<std::string> candidates;
+  if (auto value = nix::getEnv(envVar)) {
+    candidates.push_back(*value);
+  }
+  if (auto dataHome = nix::getEnv("XDG_DATA_HOME")) {
+    candidates.push_back(*dataHome + "/nix-grpc-store/" + fileName);
+  } else if (auto home = nix::getEnv("HOME")) {
+    candidates.push_back(*home + "/.local/share/nix-grpc-store/" + fileName);
+  }
+  candidates.push_back("/run/nix-grpc-store/" + fileName);
+  return firstReadable(candidates);
+}
+
+} // namespace
+
 namespace nix {
 
+// Follows Nix's own StoreConfig pattern (e.g. DummyStoreConfig).
+// NOLINTNEXTLINE(misc-multiple-inheritance,misc-use-internal-linkage)
 struct GrpcStoreConfig : std::enable_shared_from_this<GrpcStoreConfig>, virtual RemoteStoreConfig
 {
 private:
@@ -61,12 +112,26 @@ private:
     Setting<bool> insecure{this, false, "insecure", "Use plaintext instead of TLS. Only for local testing."};
 
     Setting<std::string> caCert{
-        this, "", "ca-cert", "Path to a PEM file with the CA certificate used to verify the server."};
+        this,
+        "",
+        "ca-cert",
+        "Path to a PEM file with the CA certificate used to verify the server. "
+        "Defaults to `$NIX_SSL_CERT_FILE`, `$SSL_CERT_FILE` or the system CA bundle."};
 
     Setting<std::string> clientCert{
-        this, "", "client-cert", "Path to a PEM client certificate chain to present for mTLS."};
+        this,
+        "",
+        "client-cert",
+        "Path to a PEM client certificate chain to present for mTLS. Defaults to "
+        "`$NIX_GRPC_CLIENT_CERT`, then `client.crt` in `$XDG_DATA_HOME/nix-grpc-store` "
+        "or `/run/nix-grpc-store`."};
 
-    Setting<std::string> clientKey{this, "", "client-key", "Path to the PEM private key for `client-cert`."};
+    Setting<std::string> clientKey{
+        this,
+        "",
+        "client-key",
+        "Path to the PEM private key for `client-cert`. Defaults to "
+        "`$NIX_GRPC_CLIENT_KEY`, then `client.key` next to the default `client-cert`."};
 
 public:
     GrpcStoreConfig(const Params & params)
@@ -103,6 +168,7 @@ public:
     auto openStore() const -> ref<Store> override;
 };
 
+// NOLINTNEXTLINE(misc-multiple-inheritance): inherited from Nix's store hierarchy
 struct GrpcStore : virtual RemoteStore
 {
     using Config = GrpcStoreConfig;
@@ -122,12 +188,19 @@ public:
         creds = grpc::InsecureChannelCredentials();
       } else {
         grpc::SslCredentialsOptions ssl;
-        if (!config->caCert.get().empty()) {
-          ssl.pem_root_certs = readFile(config->caCert.get());
+        auto caCert = config->caCert.get().empty() ? defaultCaCert() : config->caCert.get();
+        if (!caCert.empty()) {
+          ssl.pem_root_certs = readFile(caCert);
         }
-        if (!config->clientCert.get().empty()) {
-          ssl.pem_cert_chain = readFile(config->clientCert.get());
-          ssl.pem_private_key = readFile(config->clientKey.get());
+        auto clientCert = config->clientCert.get();
+        auto clientKey = config->clientKey.get();
+        if (clientCert.empty() && clientKey.empty()) {
+          clientCert = defaultClientCred("NIX_GRPC_CLIENT_CERT", "client.crt");
+          clientKey = defaultClientCred("NIX_GRPC_CLIENT_KEY", "client.key");
+        }
+        if (!clientCert.empty() && !clientKey.empty()) {
+          ssl.pem_cert_chain = readFile(clientCert);
+          ssl.pem_private_key = readFile(clientKey);
         }
         creds = grpc::SslCredentials(ssl);
       }
@@ -321,6 +394,7 @@ private:
     std::unique_ptr<NarSession> narSession;
 
 public:
+    // NOLINTNEXTLINE(misc-override-with-different-visibility): Store and RemoteStore already disagree
     void narFromPath(const StorePath & path, Sink & sink) override
     {
       if (!hasNativeOps()) {
@@ -403,7 +477,8 @@ public:
             // Reverse, so we can release memory at the original start.
             std::ranges::reverse(pathsToCopy);
             while (!pathsToCopy.empty()) {
-                act.progress(nrTotal - pathsToCopy.size(), nrTotal, size_t(1), size_t(0));
+                act.progress(
+                    nrTotal - pathsToCopy.size(), nrTotal, static_cast<size_t>(1), static_cast<size_t>(0));
                 auto & [pathInfo, pathSource] = pathsToCopy.back();
                 WorkerProto::Serialise<ValidPathInfo>::write(
                     *this, WorkerProto::WriteConn{.to = sink, .version = {.number = infoVersion}}, pathInfo);
@@ -423,6 +498,7 @@ public:
         checkStatus(writer->Finish(), "AddMultipleToStore");
     }
 
+    // NOLINTNEXTLINE(misc-override-with-different-visibility): see narFromPath
     void setOptions(RemoteStore::Connection & /*conn*/) override {
       // As with SSHStore, do not forward local settings automatically.
     }
@@ -478,6 +554,7 @@ public:
         }
     };
 
+    // NOLINTNEXTLINE(misc-override-with-different-visibility): see narFromPath
     auto openConnection() -> ref<RemoteStore::Connection> override;
 };
 
@@ -530,7 +607,7 @@ auto GrpcStoreConfig::openStore() const -> ref<Store> {
 namespace {
 // Store registration is inherently a non-const global whose constructor may
 // allocate; this is the standard Nix plugin pattern.
-// NOLINTNEXTLINE(cert-err58-cpp,cppcoreguidelines-avoid-non-const-global-variables)
+// NOLINTNEXTLINE(cert-err58-cpp,cppcoreguidelines-avoid-non-const-global-variables,bugprone-throwing-static-initialization)
 RegisterStoreImplementation<GrpcStoreConfig> regGrpcStore;
 } // namespace
 
