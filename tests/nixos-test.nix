@@ -14,12 +14,12 @@ let
   # Generated at build time so the test is hermetic.
   certs = pkgs.runCommand "nix-grpc-certs" { nativeBuildInputs = [ pkgs.openssl ]; } ''
     mkdir -p $out
-    openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
       -keyout $out/ca.key -out $out/ca.pem -subj /CN=nix-grpc-ca
     for n in server client; do
       openssl req -newkey rsa:2048 -nodes \
         -keyout $out/$n.key -out $out/$n.csr -subj /CN=localhost
-      openssl x509 -req -in $out/$n.csr -days 1 \
+      openssl x509 -req -in $out/$n.csr -days 3650 \
         -CA $out/ca.pem -CAkey $out/ca.key -set_serial 0x$RANDOM \
         -extfile <(printf 'subjectAltName=DNS:localhost') \
         -out $out/$n.pem
