@@ -10,21 +10,9 @@
 }:
 
 let
-  # Self-signed CA plus server/client leaf certs for the mTLS subtest.
-  # Generated at build time so the test is hermetic.
-  certs = pkgs.runCommand "nix-grpc-certs" { nativeBuildInputs = [ pkgs.openssl ]; } ''
-    mkdir -p $out
-    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-      -keyout $out/ca.key -out $out/ca.pem -subj /CN=nix-grpc-ca
-    for n in server client; do
-      openssl req -newkey rsa:2048 -nodes \
-        -keyout $out/$n.key -out $out/$n.csr -subj /CN=localhost
-      openssl x509 -req -in $out/$n.csr -days 3650 \
-        -CA $out/ca.pem -CAkey $out/ca.key -set_serial 0x$RANDOM \
-        -extfile <(printf 'subjectAltName=DNS:localhost') \
-        -out $out/$n.pem
-    done
-  '';
+  # Certs live under /run so they are freshly generated on every test run
+  # (a store path would be cached and eventually expire).
+  certDir = "/run/nix-grpc-certs";
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-store";
@@ -76,15 +64,45 @@ pkgs.testers.runNixOSTest {
         }
       '';
 
+      # Self-signed CA plus server/client leaf certs for the mTLS subtest.
+      systemd.services.nix-grpc-certs = {
+        wantedBy = [ "multi-user.target" ];
+        path = [ pkgs.openssl ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          RuntimeDirectory = "nix-grpc-certs";
+          RuntimeDirectoryPreserve = true;
+        };
+        script = ''
+          cd ${certDir}
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout ca.key -out ca.pem -subj /CN=nix-grpc-ca
+          for n in server client; do
+            openssl req -newkey rsa:2048 -nodes \
+              -keyout $n.key -out $n.csr -subj /CN=localhost
+            openssl x509 -req -in $n.csr -days 1 \
+              -CA ca.pem -CAkey ca.key -set_serial 0x$RANDOM \
+              -extfile <(printf 'subjectAltName=DNS:localhost') \
+              -out $n.pem
+          done
+          chmod a+r ${certDir}/*
+        '';
+      };
+
       # Second instance with mTLS enabled (module covers only one; hand-roll).
       systemd.services.nix-grpc-daemon-mtls = {
         wantedBy = [ "multi-user.target" ];
-        after = [ "nix-daemon.socket" ];
+        after = [
+          "nix-daemon.socket"
+          "nix-grpc-certs.service"
+        ];
+        requires = [ "nix-grpc-certs.service" ];
         serviceConfig.ExecStart = ''
           ${lib.getExe config.services.nix-grpc-daemon.package} --listen 127.0.0.1:50052 \
             --proxy-socket /nix/var/nix/daemon-socket/socket \
-            --tls-cert ${certs}/server.pem --tls-key ${certs}/server.key \
-            --client-ca ${certs}/ca.pem
+            --tls-cert ${certDir}/server.pem --tls-key ${certDir}/server.key \
+            --client-ca ${certDir}/ca.pem
         '';
       };
     };
@@ -97,9 +115,9 @@ pkgs.testers.runNixOSTest {
     store = "grpc://127.0.0.1:50051?insecure=1"
     store_mtls = (
         "grpc://localhost:50052"
-        "?ca-cert=${certs}/ca.pem"
-        "&client-cert=${certs}/client.pem"
-        "&client-key=${certs}/client.key"
+        "?ca-cert=${certDir}/ca.pem"
+        "&client-cert=${certDir}/client.pem"
+        "&client-key=${certDir}/client.key"
     )
 
     with subtest("store ping over gRPC"):
@@ -136,7 +154,7 @@ pkgs.testers.runNixOSTest {
         # Without a client cert the handshake must fail.
         machine.fail(
             "nix store info --store "
-            "'grpc://localhost:50052?ca-cert=${certs}/ca.pem'"
+            "'grpc://localhost:50052?ca-cert=${certDir}/ca.pem'"
         )
         # With a client cert it succeeds and can round-trip a build.
         machine.succeed(f"nix store info --json --store '{store_mtls}'")
