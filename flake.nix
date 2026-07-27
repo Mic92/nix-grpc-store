@@ -50,7 +50,7 @@
         {
           clang-tidy = self.packages.${system}.default.overrideAttrs (old: {
             pname = "nix-grpc-store-clang-tidy";
-            nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.clang-tools ];
+            nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.llvmPackages_latest.clang-tools ];
             # Meson generates a clang-tidy target from .clang-tidy; the
             # generated protobuf headers must exist before it runs.
             buildPhase = ''
@@ -74,7 +74,7 @@
       devShells = forAllSystems (system: {
         default = nixpkgs.legacyPackages.${system}.mkShell {
           inputsFrom = [ self.packages.${system}.default ];
-          packages = [ nixpkgs.legacyPackages.${system}.clang-tools ];
+          packages = [ nixpkgs.legacyPackages.${system}.llvmPackages_latest.clang-tools ];
         };
       });
     };

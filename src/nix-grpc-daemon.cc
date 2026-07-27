@@ -9,6 +9,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <memory>
@@ -18,6 +19,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <sys/socket.h>
 
@@ -52,6 +54,8 @@
 using GrpcStream = grpc::ServerReaderWriter<nix::remote::Chunk, nix::remote::Chunk>;
 using AddMultipleReader = grpc::ServerReader<nix::remote::AddMultipleChunk>;
 using NarsStream = grpc::ServerReaderWriter<nix::remote::NarChunk, nix::remote::NarRequest>;
+
+namespace {
 
 class NixRemoteService final : public nix::remote::NixRemote::Service
 {
@@ -218,8 +222,6 @@ public:
     }
 };
 
-namespace {
-
 struct Options
 {
     std::string listen = "0.0.0.0:50051";
@@ -229,16 +231,16 @@ struct Options
     std::string clientCA;
 };
 
-auto parseOptions(std::span<char *> args) -> Options
+auto parseOptions(const std::vector<std::string_view> & args) -> Options
 {
     Options options;
     for (size_t idx = 1; idx < args.size(); ++idx) {
-        std::string_view const arg = args[idx];
-        auto next = [&]() -> std::string {
+        std::string_view const arg = args.at(idx);
+        auto next = [&]() -> std::string_view {
             if (++idx >= args.size()) {
                 throw nix::Error("flag '%s' requires an argument", arg);
             }
-            return args[idx];
+            return args.at(idx);
         };
         if (arg == "--listen") {
             options.listen = next();
@@ -270,7 +272,8 @@ auto makeServerCredentials(const Options & options) -> std::shared_ptr<grpc::Ser
     grpc::SslServerCredentialsOptions ssl(
         options.clientCA.empty() ? GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE
                                  : GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY);
-    ssl.pem_key_cert_pairs.push_back({nix::readFile(options.tlsKey), nix::readFile(options.tlsCert)});
+    ssl.pem_key_cert_pairs.push_back(
+        {.private_key = nix::readFile(options.tlsKey), .cert_chain = nix::readFile(options.tlsCert)});
     if (!options.clientCA.empty()) {
         ssl.pem_root_certs = nix::readFile(options.clientCA);
     }
@@ -289,7 +292,8 @@ try {
     // Required before nix::openStore() in the native RPC handlers.
     nix::initLibStore();
 
-    auto options = parseOptions(std::span(argv, static_cast<size_t>(argc)));
+    const std::span args(argv, static_cast<size_t>(argc));
+    auto options = parseOptions({args.begin(), args.end()});
 
     NixRemoteService service(options.socketPath);
 
@@ -308,7 +312,11 @@ try {
     nix::logger->log(nix::lvlInfo, nix::fmt("nix-grpc-daemon listening on %s → %s", options.listen, options.socketPath));
     server->Wait();
     return 0;
-} catch (nix::Error & err) {
-    nix::logger->log(nix::lvlError, nix::fmt("nix-grpc-daemon: %s", err.what()));
+} catch (const std::exception & err) {
+    // Formatting or logging could itself throw and escape main; use plain
+    // C stdio which cannot.
+    static_cast<void>(std::fputs("nix-grpc-daemon: ", stderr));
+    static_cast<void>(std::fputs(err.what(), stderr));
+    static_cast<void>(std::fputc('\n', stderr));
     return 1;
 }

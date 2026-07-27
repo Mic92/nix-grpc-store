@@ -60,6 +60,7 @@ namespace {
 // First readable candidate, or empty.
 auto firstReadable(const std::vector<std::string> &candidates) -> std::string {
   for (const auto &path : candidates) {
+    // NOLINTNEXTLINE(misc-include-cleaner): R_OK comes from <unistd.h>
     if (::access(path.c_str(), R_OK) == 0) {
       return path;
     }
@@ -99,6 +100,8 @@ auto defaultClientCred(const char *envVar, const std::string &fileName) -> std::
 
 namespace nix {
 
+// Follows Nix's own StoreConfig pattern (e.g. DummyStoreConfig).
+// NOLINTNEXTLINE(misc-multiple-inheritance,misc-use-internal-linkage)
 struct GrpcStoreConfig : std::enable_shared_from_this<GrpcStoreConfig>, virtual RemoteStoreConfig
 {
 private:
@@ -165,6 +168,7 @@ public:
     auto openStore() const -> ref<Store> override;
 };
 
+// NOLINTNEXTLINE(misc-multiple-inheritance): inherited from Nix's store hierarchy
 struct GrpcStore : virtual RemoteStore
 {
     using Config = GrpcStoreConfig;
@@ -390,6 +394,7 @@ private:
     std::unique_ptr<NarSession> narSession;
 
 public:
+    // NOLINTNEXTLINE(misc-override-with-different-visibility): Store and RemoteStore already disagree
     void narFromPath(const StorePath & path, Sink & sink) override
     {
       if (!hasNativeOps()) {
@@ -472,7 +477,8 @@ public:
             // Reverse, so we can release memory at the original start.
             std::ranges::reverse(pathsToCopy);
             while (!pathsToCopy.empty()) {
-                act.progress(nrTotal - pathsToCopy.size(), nrTotal, size_t(1), size_t(0));
+                act.progress(
+                    nrTotal - pathsToCopy.size(), nrTotal, static_cast<size_t>(1), static_cast<size_t>(0));
                 auto & [pathInfo, pathSource] = pathsToCopy.back();
                 WorkerProto::Serialise<ValidPathInfo>::write(
                     *this, WorkerProto::WriteConn{.to = sink, .version = {.number = infoVersion}}, pathInfo);
@@ -492,6 +498,7 @@ public:
         checkStatus(writer->Finish(), "AddMultipleToStore");
     }
 
+    // NOLINTNEXTLINE(misc-override-with-different-visibility): see narFromPath
     void setOptions(RemoteStore::Connection & /*conn*/) override {
       // As with SSHStore, do not forward local settings automatically.
     }
@@ -547,6 +554,7 @@ public:
         }
     };
 
+    // NOLINTNEXTLINE(misc-override-with-different-visibility): see narFromPath
     auto openConnection() -> ref<RemoteStore::Connection> override;
 };
 
@@ -599,7 +607,7 @@ auto GrpcStoreConfig::openStore() const -> ref<Store> {
 namespace {
 // Store registration is inherently a non-const global whose constructor may
 // allocate; this is the standard Nix plugin pattern.
-// NOLINTNEXTLINE(cert-err58-cpp,cppcoreguidelines-avoid-non-const-global-variables)
+// NOLINTNEXTLINE(cert-err58-cpp,cppcoreguidelines-avoid-non-const-global-variables,bugprone-throwing-static-initialization)
 RegisterStoreImplementation<GrpcStoreConfig> regGrpcStore;
 } // namespace
 
