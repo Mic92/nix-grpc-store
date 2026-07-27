@@ -31,6 +31,7 @@
 #include <nix/util/types.hh>
 #include <nix/util/util.hh>
 #include <optional>
+#include <string>
 #include <thread>
 #include <unistd.h>
 #include <vector>
