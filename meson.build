@@ -57,7 +57,9 @@ pump_deps = [grpc_dep, protobuf_dep, zstd_dep, threads_dep, nix_util_dep]
 shared_module('nix-grpc-store',
   sources : ['src/grpc-store.cc', gen],
   include_directories : gen_inc,
-  cpp_args : nix_compat_args,
+  # nix_plugin_entry() skips registering the store when the running Nix
+  # version differs from the one the plugin was built against.
+  cpp_args : nix_compat_args + ['-DNIX_GRPC_BUILT_AGAINST_NIX="' + nix_store_dep.version() + '"'],
   dependencies : pump_deps + [nix_store_dep],
   name_prefix : '',
   install : true,
