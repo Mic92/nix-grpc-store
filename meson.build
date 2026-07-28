@@ -10,6 +10,8 @@ protobuf_dep = dependency('protobuf')
 zstd_dep     = dependency('libzstd')
 threads_dep  = dependency('threads')
 
+prometheus_dep = [dependency('prometheus-cpp-core'), dependency('prometheus-cpp-pull')]
+
 nix_store_dep = dependency('nix-store')
 nix_util_dep  = dependency('nix-util')
 
@@ -99,6 +101,6 @@ executable('nix-grpc-daemon',
   include_directories : gen_inc,
   cpp_args : nix_compat_args,
   # nix-store: native QueryValidPaths / AddMultipleToStore handlers.
-  dependencies : common_deps + [nix_util_dep, nix_store_dep],
+  dependencies : common_deps + prometheus_dep + [nix_util_dep, nix_store_dep],
   install : true,
 )

@@ -45,7 +45,10 @@ pkgs.testers.runNixOSTest {
       # nix copy --to can add unsigned paths.
       services.nix-grpc-daemon.trustClients = true;
 
-      environment.systemPackages = [ pkgs.perf ];
+      environment.systemPackages = [
+        pkgs.perf
+        pkgs.curl
+      ];
       # Allow perf to resolve kernel symbols and record system-wide as root.
       boot.kernel.sysctl."kernel.kptr_restrict" = 0;
       boot.kernel.sysctl."kernel.perf_event_paranoid" = -1;
@@ -98,7 +101,8 @@ pkgs.testers.runNixOSTest {
           ${lib.getExe config.services.nix-grpc-daemon.package} --listen 127.0.0.1:50052 \
             --proxy-socket /nix/var/nix/daemon-socket/socket \
             --tls-cert ${certDir}/server.pem --tls-key ${certDir}/server.key \
-            --client-ca ${certDir}/ca.pem
+            --client-ca ${certDir}/ca.pem \
+            --metrics-listen 127.0.0.1:9464
         '';
       };
     };
@@ -167,6 +171,12 @@ pkgs.testers.runNixOSTest {
         machine.succeed(
             "journalctl -u nix-grpc-daemon.service | "
             "grep -E 'event=session_end method=Connect cn=- '"
+        )
+
+    with subtest("prometheus metrics labelled by certificate CN"):
+        machine.succeed(
+            "curl -sf http://127.0.0.1:9464/metrics | "
+            "grep -E 'nix_grpc_rpcs_total\\{.*cn=\"localhost\".*method=\"Connect\".*\\} [0-9]+'"
         )
 
     with subtest("bulk upload over gRPC"):

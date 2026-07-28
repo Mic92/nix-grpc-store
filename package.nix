@@ -6,6 +6,7 @@
   pkg-config,
   protobuf,
   grpc,
+  prometheus-cpp,
   zstd,
   # Nix component libraries. When building the client plugin these must be
   # ABI-compatible with the `nix` binary that will dlopen() the .so; the NixOS
@@ -30,6 +31,7 @@ stdenv.mkDerivation {
   buildInputs = [
     grpc
     protobuf
+    prometheus-cpp
     zstd
     nix-store
     nix-util
