@@ -1,18 +1,29 @@
 # nix-grpc-store
 
-**Status: Alpha.** Interfaces may change; plugin ABI is tied to a specific Nix
-version.
+**Status: Beta.** Interfaces may change. Plugin ABI is tied to a specific Nix version.
 
-Remote Nix store access over gRPC instead of SSH. Use it when you want to
-reach a builder or store host through infrastructure that speaks HTTP/2
-(load balancers, service meshes, mTLS) rather than opening SSH.
+Remote Nix store access over gRPC instead of SSH.
+
+Why gRPC instead of `ssh-ng://`?
+
+  * **Faster handshakes.** A TLS handshake is much cheaper than an SSH
+    connection setup (no subprocess, no shell, no SSH key exchange and
+    session negotiation), and connections are multiplexed over HTTP/2, so
+    frequent short-lived store operations start quickly.
+  * **Standard TLS certificates.** Authentication uses plain X.509 certs
+    instead of SSH keys, so you can plug into existing PKI — for example a
+    [step-ca](https://smallstep.com/docs/step-ca/) issuing short-lived client
+    and server certs — and reuse load balancers, service meshes and mTLS
+    policies that already speak HTTP/2.
+  * **Compression.** All traffic is zstd-compressed. The `nix copy` hot
+    path uses dedicated streaming RPCs where a whole batch of paths shares a
+    single zstd stream (one compression window across all NARs), so copying
+    many small paths needs one round trip instead of one per path.
 
 Everything that works over `ssh-ng://` works here: remote builds,
 `nix copy`, path queries, GC. The gRPC layer is a thin tunnel to the
-`nix-daemon` on the other side. The `nix copy` hot path (path info queries,
-bulk import, NAR download) uses dedicated RPCs instead of the tunnel: a whole
-batch of paths shares one zstd stream, so copying many small paths needs one
-round trip instead of one per path.
+`nix-daemon` on the other side, with dedicated RPCs for the `nix copy` hot
+path (path info queries, bulk import, NAR download).
 
 ## Install
 
