@@ -159,6 +159,16 @@ pkgs.testers.runNixOSTest {
             "--no-link --print-out-paths"
         )
 
+    with subtest("access log attributes clients by certificate CN"):
+        machine.succeed(
+            "journalctl -u nix-grpc-daemon-mtls.service | "
+            "grep -E 'event=session_end method=Connect cn=localhost .*bytes_out=[0-9]+'"
+        )
+        machine.succeed(
+            "journalctl -u nix-grpc-daemon.service | "
+            "grep -E 'event=session_end method=Connect cn=- '"
+        )
+
     with subtest("bulk upload over gRPC"):
         # Exercises server-side writeFull() on the daemon socket under
         # backpressure (readCoalesced() shares the fd with this write path).

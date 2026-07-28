@@ -6,6 +6,8 @@
 // handled natively (via a Store opened on the same socket) so `nix copy`
 // avoids the tunnel's per-batch zstd flushes and per-path round trips.
 
+#include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -39,14 +41,13 @@
 #include <nix/util/error.hh>
 #include <nix/util/file-descriptor.hh>
 #include <nix/util/file-system.hh>
-#include <nix/util/fmt.hh>
-#include <nix/util/logging.hh>
 #include <nix/util/ref.hh>
 #include <nix/util/repair-flag.hh>
 #include <nix/util/serialise.hh>
 #include <nix/util/unix-domain-socket.hh>
 #include <nix/util/util.hh>
 
+#include "logfmt.hh"
 #include "nix-compat.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
@@ -87,14 +88,25 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         }
     }
 
+    static auto secondsSince(std::chrono::steady_clock::time_point start) -> std::string
+    {
+        auto const elapsed = std::chrono::steady_clock::now() - start;
+        return std::to_string(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
+    }
+
 public:
     explicit NixRemoteService(std::string socketPath)
         : socketPath(std::move(socketPath))
     {
     }
 
-    auto Connect(grpc::ServerContext * /*context*/, GrpcStream * stream) -> grpc::Status override
+    auto Connect(grpc::ServerContext * context, GrpcStream * stream) -> grpc::Status override
     {
+        auto const commonName = nixgrpc::clientCommonName(*context);
+        auto const peer = context->peer();
+        auto const start = std::chrono::steady_clock::now();
+        nixgrpc::logLine({{"event", "session_start"}, {"method", "Connect"}, {"cn", commonName}, {"peer", peer}});
+
         nix::AutoCloseFD sock;
         try {
             sock = nix::connect(std::filesystem::path{socketPath});
@@ -102,31 +114,47 @@ public:
             return {grpc::StatusCode::UNAVAILABLE, err.what()};
         }
 
+        std::atomic<uint64_t> bytesIn{0};
         std::thread receiver([&]() -> void {
             try {
-                nixgrpc::pumpStreamToFd(*stream, sock.get());
+                bytesIn = nixgrpc::pumpStreamToFd(*stream, sock.get());
             } catch (...) {
                 nix::ignoreExceptionInDestructor();
             }
             ::shutdown(sock.get(), SHUT_WR);
         });
 
+        uint64_t bytesOut = 0;
         try {
-            nixgrpc::pumpFdToStream(sock.get(), *stream);
+            bytesOut = nixgrpc::pumpFdToStream(sock.get(), *stream);
         } catch (...) {
             nix::ignoreExceptionInDestructor();
         }
 
         receiver.join();
+        nixgrpc::logLine(
+            {{"event", "session_end"},
+             {"method", "Connect"},
+             {"cn", commonName},
+             {"peer", peer},
+             {"duration_s", secondsSince(start)},
+             {"bytes_in", std::to_string(bytesIn.load())},
+             {"bytes_out", std::to_string(bytesOut)}});
         return grpc::Status::OK;
     }
 
     auto QueryValidPaths(
-        grpc::ServerContext * /*context*/,
+        grpc::ServerContext * context,
         const nix::remote::QueryValidPathsRequest * request,
         nix::remote::QueryValidPathsReply * reply) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
+            nixgrpc::logLine(
+                {{"event", "rpc"},
+                 {"method", "QueryValidPaths"},
+                 {"cn", nixgrpc::clientCommonName(*context)},
+                 {"peer", context->peer()},
+                 {"paths", std::to_string(request->paths_size())}});
             auto localStore = getStore();
             nix::StorePathSet paths;
             for (const auto & path : request->paths()) {
@@ -141,11 +169,14 @@ public:
     }
 
     auto AddMultipleToStore(
-        grpc::ServerContext * /*context*/,
+        grpc::ServerContext * context,
         AddMultipleReader * reader,
         nix::remote::AddMultipleReply * /*reply*/) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
+            auto const commonName = nixgrpc::clientCommonName(*context);
+            auto const peer = context->peer();
+            auto const start = std::chrono::steady_clock::now();
             auto localStore = getStore();
 
             nix::remote::AddMultipleChunk first;
@@ -162,6 +193,7 @@ public:
 
             // Same framing as nix::WorkerProto::Op::AddMultipleToStore.
             auto expected = nix::readNum<uint64_t>(source);
+            uint64_t narBytes = 0;
             for (uint64_t idx = 0; idx < expected; ++idx) {
                 auto info = nix::WorkerProto::Serialise<nix::ValidPathInfo>::read(
                     *localStore,
@@ -170,17 +202,32 @@ public:
                 nixcompat::EnsureRead wrapper{source, info.narSize};
                 localStore->addToStore(info, wrapper, repair, checkSigs);
                 wrapper.finish();
+                narBytes += info.narSize;
             }
+            nixgrpc::logLine(
+                {{"event", "rpc"},
+                 {"method", "AddMultipleToStore"},
+                 {"cn", commonName},
+                 {"peer", peer},
+                 {"duration_s", secondsSince(start)},
+                 {"paths", std::to_string(expected)},
+                 {"nar_bytes_in", std::to_string(narBytes)}});
             return grpc::Status::OK;
         });
     }
 
     auto QueryPathInfos(
-        grpc::ServerContext * /*context*/,
+        grpc::ServerContext * context,
         const nix::remote::QueryPathInfosRequest * request,
         nix::remote::QueryPathInfosReply * reply) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
+            nixgrpc::logLine(
+                {{"event", "rpc"},
+                 {"method", "QueryPathInfos"},
+                 {"cn", nixgrpc::clientCommonName(*context)},
+                 {"peer", context->peer()},
+                 {"paths", std::to_string(request->paths_size())}});
             auto localStore = getStore();
             for (const auto & path : request->paths()) {
                 std::shared_ptr<const nix::ValidPathInfo> info;
@@ -202,19 +249,37 @@ public:
         });
     }
 
-    auto NarsFromPaths(grpc::ServerContext * /*context*/, NarsStream * stream) -> grpc::Status override
+    auto NarsFromPaths(grpc::ServerContext * context, NarsStream * stream) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
+            auto const start = std::chrono::steady_clock::now();
             auto localStore = getStore();
             nixgrpc::ZstdWriterSink<NarsStream, nix::remote::NarChunk> sink(*stream);
+
+            uint64_t narBytes = 0;
+            nix::LambdaSink counting([&](std::string_view data) -> void {
+                sink(data);
+                narBytes += data.size();
+            });
+
+            uint64_t paths = 0;
             nix::remote::NarRequest request;
             while (stream->Read(&request)) {
-                localStore->narFromPath(nix::StorePath(request.path()), sink);
+                localStore->narFromPath(nix::StorePath(request.path()), counting);
                 // The client blocks on this NAR before sending the next
                 // request, so it must not linger in the encoder.
                 sink.flush();
+                ++paths;
             }
             sink.finish();
+            nixgrpc::logLine(
+                {{"event", "rpc"},
+                 {"method", "NarsFromPaths"},
+                 {"cn", nixgrpc::clientCommonName(*context)},
+                 {"peer", context->peer()},
+                 {"duration_s", secondsSince(start)},
+                 {"paths", std::to_string(paths)},
+                 {"nar_bytes_out", std::to_string(narBytes)}});
             return grpc::Status::OK;
         });
     }
@@ -307,7 +372,7 @@ try {
         throw nix::Error("failed to start gRPC server on '%s'", options.listen);
     }
 
-    nix::logger->log(nix::lvlInfo, nix::fmt("nix-grpc-daemon listening on %s → %s", options.listen, options.socketPath));
+    nixgrpc::logLine({{"event", "startup"}, {"listen", options.listen}, {"proxy_socket", options.socketPath}});
     server->Wait();
     return 0;
 } catch (const std::exception & err) {
