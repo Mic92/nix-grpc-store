@@ -1,5 +1,4 @@
-# Package set with one plugin per supported Nix version plus the dispatcher
-# bundle.
+# Package set with one plugin per supported Nix version plus the dispatcher bundle.
 {
   lib,
   newScope,
@@ -23,8 +22,8 @@ lib.makeScope newScope (
       inherit (nixPackages) nix-store nix-util;
     };
 
-    # One plugin per supported Nix version. "git" is only a compile check for
-    # the next release.
+    # One plugin per supported Nix version.
+    # "git" is only a compile check for the next release.
     versionPlugins = lib.listToAttrs (
       map (
         version:
@@ -36,14 +35,14 @@ lib.makeScope newScope (
       ) (supportedNixVersions ++ [ "git" ])
     );
 
-    # Merged per-version builds. The loader picks the one matching the
-    # running Nix, see meson.build.
+    # The loader picks the one matching the running Nix, see meson.build.
     plugin-dispatcher = symlinkJoin {
       name = "nix-grpc-store-dispatcher";
       paths = [
         self.default
       ]
       ++ map (version: self.versionPlugins."plugin-${version}") supportedNixVersions;
+      meta.mainProgram = "nix-grpc-daemon";
     };
   }
 )

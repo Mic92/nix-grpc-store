@@ -1,6 +1,6 @@
 # nix-grpc-store
 
-**Status: Beta.** Interfaces may change. Plugin ABI is tied to a specific Nix version.
+**Status: Beta.** Interfaces may change.
 
 Remote Nix store access over gRPC instead of SSH.
 
@@ -49,10 +49,11 @@ Add the flake and enable the modules:
     imports = [ nix-grpc-store.nixosModules.client ];
     programs.nix-grpc-store.enable = true;
 
-The client module builds the plugin against `config.nix.package.libs`, so it
-tracks whatever Nix your system uses. The server module runs the daemon as an
-unprivileged `nix-grpc-daemon` user and adds it to `extra-allowed-users` so it
-can reach the local `nix-daemon` even when `allowed-users` is restricted.
+The client module ships plugin builds for the supported Nix versions and a
+loader that picks the one matching the running Nix. The server module runs
+the daemon as an unprivileged `nix-grpc-daemon` user and adds it to
+`extra-allowed-users` so it can reach the local `nix-daemon` even when
+`allowed-users` is restricted.
 
 ## Trust model
 
@@ -76,8 +77,8 @@ client then has trusted-user privileges, so require client certs
       maxJobs = 64;
     }];
 
-Only the nix-daemon needs the plugin loaded. TLS uses the system CA bundle
-and the client key pair from `/run/nix-grpc-store` by default (see below).
+TLS uses the system CA bundle and the client key pair from
+`/run/nix-grpc-store` by default (see below).
 
 ## Quick start (manual)
 
@@ -87,7 +88,7 @@ On the builder:
 
 On the client, add to `nix.conf`:
 
-    plugin-files = /path/to/nix-grpc-store.so
+    plugin-files = /path/to/lib/nix/plugins
 
 and use it like any other store URI:
 

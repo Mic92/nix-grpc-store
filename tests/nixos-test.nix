@@ -1,5 +1,5 @@
-# End-to-end test: run nix-grpc-daemon backed by the system nix-daemon, then
-# drive it from a Nix client that loads the plugin and speaks grpc://.
+# End-to-end test: run nix-grpc-daemon backed by the system nix-daemon,
+# then drive it from a Nix client that loads the plugin and speaks grpc://.
 #
 # Verifies the whole stack:
 #   nix CLI → plugin → gRPC → nix-grpc-daemon → unix:// nix-daemon → LocalStore
@@ -25,8 +25,7 @@ pkgs.testers.runNixOSTest {
       virtualisation.memorySize = 2048;
       virtualisation.cores = 2;
 
-      # The client module builds the plugin against `nix.package.libs`, so this
-      # must be a package that exposes them (nix-everything / nixpkgs' `nix`).
+      # Must be a Nix version the plugin bundle contains a build for.
       nix.package = nixPkgs.nix-everything;
       nix.settings = {
         experimental-features = [ "nix-command" ];
@@ -35,14 +34,10 @@ pkgs.testers.runNixOSTest {
       };
 
       programs.nix-grpc-store.enable = true;
-      # The client module only loads the plugin in the nix-daemon; the test
-      # drives `nix --store grpc://` directly, so load it globally too.
-      nix.settings.plugin-files = [ "${config.programs.nix-grpc-store.package}/lib/nix/plugins" ];
       services.nix-grpc-daemon = {
         enable = true;
         listen = "127.0.0.1:50051";
-        # Reuse the client build (against nix.package.libs) so the test
-        # doesn't compile the project twice.
+        # Reuse the client bundle so the test doesn't compile the project twice.
         package = config.programs.nix-grpc-store.package;
       };
       # Bulk-upload subtest needs the daemon to be a trusted user so

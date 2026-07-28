@@ -15,6 +15,11 @@
     }:
     let
       lib = nixpkgs.lib;
+      packageSetFor =
+        pkgs:
+        pkgs.callPackage ./packages.nix {
+          nixPackages = nix.packages.${pkgs.stdenv.hostPlatform.system};
+        };
       forAllSystems = lib.genAttrs [
         "x86_64-linux"
         "aarch64-linux"
@@ -25,9 +30,7 @@
       packages = forAllSystems (
         system:
         let
-          scope = nixpkgs.legacyPackages.${system}.callPackage ./packages.nix {
-            nixPackages = nix.packages.${system};
-          };
+          scope = packageSetFor nixpkgs.legacyPackages.${system};
         in
         {
           inherit (scope) default plugin-dispatcher;
@@ -37,7 +40,14 @@
 
       nixosModules = {
         server = ./nixos/server.nix;
-        client = ./nixos/client.nix;
+        # Reuse the flake's package set so hosts get the same derivations as
+        # `nix build` instead of rebuilding the plugins per machine.
+        client =
+          { pkgs, ... }:
+          {
+            imports = [ ./nixos/client.nix ];
+            programs.nix-grpc-store.packageSet = lib.mkDefault (packageSetFor pkgs);
+          };
         default.imports = [
           self.nixosModules.server
           self.nixosModules.client
