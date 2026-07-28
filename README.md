@@ -130,6 +130,41 @@ presenting a certificate signed by that CA are accepted.
   * `--listen ADDR` — default `0.0.0.0:50051`
   * `--proxy-socket PATH` — nix-daemon socket, default `/nix/var/nix/daemon-socket/socket`
   * `--tls-cert`, `--tls-key`, `--client-ca` — see above
+  * `--metrics-listen ADDR` — serve Prometheus metrics; disabled if unset
+
+## Monitoring
+
+All gRPC clients act as the same local user, so activity is attributed to the
+client certificate CN (`cn=-` without mTLS). Have your CA put a user name in
+the CN and logs and metrics are per user.
+
+### Access log
+
+One logfmt line per RPC on stderr (journald):
+
+    ts=2025-01-15T12:03:41Z level=info event=session_end method=Connect cn=alice peer=ipv4:10.0.0.5:53211 duration_s=1832 bytes_in=52341 bytes_out=812345678
+
+  * `session_start` / `session_end` — tunnelled `Connect` sessions;
+    `session_end` adds `duration_s` and uncompressed `bytes_in` / `bytes_out`
+  * `rpc` — native RPCs (`QueryValidPaths`, `QueryPathInfos`,
+    `AddMultipleToStore`, `NarsFromPaths`) with `paths` and, for bulk
+    transfers, `duration_s` and `nar_bytes_in` / `nar_bytes_out`
+
+Every event carries `cn` and `peer`:
+`journalctl -u nix-grpc-daemon | grep cn=alice`.
+
+### Prometheus metrics
+
+With `--metrics-listen 127.0.0.1:9464` (NixOS:
+`services.nix-grpc-daemon.metricsListen`) the daemon serves `/metrics`:
+
+  * `nix_grpc_rpcs_total{method,cn}` — RPCs handled
+  * `nix_grpc_tunnel_bytes_total{direction,cn}` — uncompressed bytes through
+    the `Connect` tunnel
+  * `nix_grpc_nar_bytes_total{direction,cn}` — uncompressed NAR bytes
+    imported (`in`) / exported (`out`)
+
+Only CA-issued CNs appear as labels, so cardinality stays bounded.
 
 ## Tests
 
