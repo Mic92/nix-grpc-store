@@ -24,7 +24,7 @@ in
           inherit (config.nix.package.libs) nix-store nix-util;
         }
       '';
-      description = "Package providing `lib/nix/plugins/nix-grpc-store.so`.";
+      description = "Package providing the plugin loader under `lib/nix/plugins`.";
     };
   };
 

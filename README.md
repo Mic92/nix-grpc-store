@@ -30,7 +30,8 @@ path (path info queries, bulk import, NAR download).
     nix build
 
 This produces `result/bin/nix-grpc-daemon` for the server and
-`result/lib/nix/plugins/nix-grpc-store.so` for the client.
+`result/lib/nix/plugins/nix-grpc-store-loader.so` for the client, which
+dispatches to the plugin build matching the running Nix version.
 
 ## Quick start (NixOS)
 
