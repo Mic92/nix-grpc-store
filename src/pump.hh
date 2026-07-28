@@ -14,6 +14,7 @@
 
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <string>
@@ -131,9 +132,11 @@ inline void zstdCompressInto(
 // Read from `sourceFd` until EOF, forwarding zstd-compressed batches to the
 // gRPC stream. Each batch is flushed as a self-contained decodable unit so
 // the peer never stalls waiting for more compressed bytes.
+// Returns the number of uncompressed bytes forwarded.
 template<class Stream>
-inline void pumpFdToStream(int sourceFd, Stream & stream)
+inline auto pumpFdToStream(int sourceFd, Stream & stream) -> uint64_t
 {
+    uint64_t total = 0;
     nix::remote::Chunk chunk;
     chunk.mutable_data()->reserve(ZSTD_compressBound(kChunkSize));
     std::string input(kChunkSize, '\0');
@@ -157,9 +160,10 @@ inline void pumpFdToStream(int sourceFd, Stream & stream)
         if (count <= 0) {
             break;
         }
+        total += static_cast<uint64_t>(count);
         encode({.src = input.data(), .size = static_cast<size_t>(count), .pos = 0}, ZSTD_e_flush);
         if (!stream.Write(chunk)) {
-            return;
+            return total;
         }
     }
 
@@ -167,13 +171,16 @@ inline void pumpFdToStream(int sourceFd, Stream & stream)
     if (!chunk.data().empty()) {
         stream.Write(chunk);
     }
+    return total;
 }
 
 // Read Chunks from the gRPC stream until it closes, forwarding
 // zstd-decompressed bytes into `sinkFd`.
+// Returns the number of decompressed bytes forwarded.
 template<class Stream>
-inline void pumpStreamToFd(Stream & stream, int sinkFd)
+inline auto pumpStreamToFd(Stream & stream, int sinkFd) -> uint64_t
 {
+    uint64_t total = 0;
     nix::remote::Chunk chunk;
     std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> const dctx{ZSTD_createDCtx(), ZSTD_freeDCtx};
     std::string out;
@@ -188,12 +195,14 @@ inline void pumpStreamToFd(Stream & stream, int sinkFd)
             zstdCheck(ZSTD_decompressStream(dctx.get(), &zout, &zin), "decompress");
             if (zout.pos != 0) {
                 nix::writeFull(sinkFd, {out.data(), zout.pos});
+                total += zout.pos;
             }
             if (zin.pos == zin.size && zout.pos < zout.size) {
                 break;
             }
         }
     }
+    return total;
 }
 
 // Sink that zstd-compresses written data into gRPC messages of type `Msg`
