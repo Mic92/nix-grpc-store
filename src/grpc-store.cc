@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <nix/store/globals.hh>
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
 #include <nix/store/store-reference.hh>
@@ -32,6 +33,7 @@
 #include <nix/util/util.hh>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -614,11 +616,30 @@ auto GrpcStoreConfig::openStore() const -> ref<Store> {
   return make_ref<GrpcStore>(ref{shared_from_this()});
 }
 
+} // namespace nix
+
 namespace {
-// Store registration is inherently a non-const global whose constructor may
-// allocate; this is the standard Nix plugin pattern.
-// NOLINTNEXTLINE(cert-err58-cpp,cppcoreguidelines-avoid-non-const-global-variables,bugprone-throwing-static-initialization)
-RegisterStoreImplementation<GrpcStoreConfig> regGrpcStore;
+
+// "2.31.5" / "2.35pre20260619_f8bb823a" -> "2.31" / "2.35"
+auto majorMinor(std::string_view version) -> std::string_view {
+  auto firstDot = version.find('.');
+  auto end = version.find_first_not_of("0123456789", firstDot + 1);
+  return version.substr(0, end);
+}
+
 } // namespace
 
-} // namespace nix
+// Called by Nix right after dlopen(). Registering here instead of in a static
+// initializer lets a version mismatch degrade to a warning.
+extern "C" void nix_plugin_entry() {
+  auto running = majorMinor(nix::nixVersion);
+  auto builtAgainst = majorMinor(NIX_GRPC_BUILT_AGAINST_NIX);
+  if (running != builtAgainst) {
+    nix::warn(
+        "nix-grpc-store plugin was built against Nix %s but is being loaded by Nix %s. "
+        "grpc:// stores are unavailable",
+        std::string(builtAgainst), std::string(running));
+    return;
+  }
+  static const nix::RegisterStoreImplementation<nix::GrpcStoreConfig> regGrpcStore;
+}
