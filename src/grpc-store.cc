@@ -49,6 +49,7 @@
 #include <nix/util/url.hh>
 #include <utility>
 
+#include "nix-compat.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
 #include "pump.hh"
@@ -135,14 +136,23 @@ private:
 
 public:
     GrpcStoreConfig(const Params & params)
-        : StoreConfig(params, FilePathType::Unix)
-        , RemoteStoreConfig(params, FilePathType::Unix)
+        : StoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params))
+        , RemoteStoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params))
     {
     }
 
+#if !NIX_COMPAT_AT_LEAST(2, 34)
+    // Nix < 2.34 constructs store configs from the raw scheme and authority
+    // strings instead of a pre-parsed ParsedURL::Authority.
+    GrpcStoreConfig(std::string_view /*scheme*/, std::string_view authority, const Params &params)
+        : StoreConfig(params),
+          RemoteStoreConfig(params),
+          authority(ParsedURL::Authority::parse(authority)) {}
+#endif
+
     GrpcStoreConfig(ParsedURL::Authority authority, const Params &params)
-        : StoreConfig(params, FilePathType::Unix),
-          RemoteStoreConfig(params, FilePathType::Unix),
+        : StoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params)),
+          RemoteStoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params)),
           authority(std::move(authority)) {}
 
     static auto name() -> std::string { return "gRPC Store"; }
@@ -225,10 +235,6 @@ public:
     }
 
 private:
-    /* ValidPathInfo serialisation used by the bulk RPCs, matching the worker
-       protocol's AddMultipleToStore framing. */
-    static constexpr WorkerProto::Version::Number infoVersion{.major = 1, .minor = 16};
-
     /* Whether the server implements the native (non-tunnelled) RPCs. Probed
        once with an empty QueryValidPaths so bulk operations can decide
        between the native path and the tunnel before consuming any data. */
@@ -307,7 +313,7 @@ private:
         StringSource source(entry.info());
         auto info = WorkerProto::Serialise<UnkeyedValidPathInfo>::read(
             *this, WorkerProto::ReadConn{.from = source,
-                                         .version = {.number = infoVersion}});
+                                         .version = nixcompat::infoProtocolVersion()});
         res.insert_or_assign(path, std::make_shared<ValidPathInfo>(
                                        StorePath(path), std::move(info)));
       }
@@ -315,6 +321,9 @@ private:
     }
 
 public:
+// topoSortPaths() only became virtual in Nix 2.35; without the hook, `nix
+// copy` falls back to one QueryPathInfos RPC per path.
+#if NIX_COMPAT_AT_LEAST(2, 35)
     auto topoSortPaths(const StorePathSet &paths) -> StorePaths override {
       // copyPaths() hands the source store the full set of paths to copy
       // here, right before querying their info one by one; prefetch them in
@@ -326,6 +335,7 @@ public:
       }
       return Store::topoSortPaths(paths);
     }
+#endif
 
     void queryPathInfoUncached(
         const StorePath & path, Callback<std::shared_ptr<const ValidPathInfo>> callback) noexcept override
@@ -481,7 +491,7 @@ public:
                     nrTotal - pathsToCopy.size(), nrTotal, static_cast<size_t>(1), static_cast<size_t>(0));
                 auto & [pathInfo, pathSource] = pathsToCopy.back();
                 WorkerProto::Serialise<ValidPathInfo>::write(
-                    *this, WorkerProto::WriteConn{.to = sink, .version = {.number = infoVersion}}, pathInfo);
+                    *this, WorkerProto::WriteConn{.to = sink, .version = nixcompat::infoProtocolVersion()}, pathInfo);
                 pathSource->drainInto(sink);
                 pathsToCopy.pop_back();
             }
