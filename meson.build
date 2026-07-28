@@ -13,6 +13,15 @@ threads_dep  = dependency('threads')
 nix_store_dep = dependency('nix-store')
 nix_util_dep  = dependency('nix-util')
 
+# Version macros for src/nix-compat.hh; see that header for the differences
+# between supported Nix versions.
+nix_ver = nix_store_dep.version().split('.')
+nix_compat_args = [
+  '-DNIX_COMPAT_VERSION_MAJOR=' + nix_ver[0],
+  # Pre-release versions look like "2.35pre20260619_f8bb823a".
+  '-DNIX_COMPAT_VERSION_MINOR=' + nix_ver[1].split('pre')[0],
+]
+
 # --- protobuf / gRPC codegen -----------------------------------------------
 
 protoc          = find_program('protoc')
@@ -48,6 +57,7 @@ pump_deps = [grpc_dep, protobuf_dep, zstd_dep, threads_dep, nix_util_dep]
 shared_module('nix-grpc-store',
   sources : ['src/grpc-store.cc', gen],
   include_directories : gen_inc,
+  cpp_args : nix_compat_args,
   dependencies : pump_deps + [nix_store_dep],
   name_prefix : '',
   install : true,
@@ -59,6 +69,7 @@ shared_module('nix-grpc-store',
 executable('nix-grpc-daemon',
   sources : ['src/nix-grpc-daemon.cc', gen],
   include_directories : gen_inc,
+  cpp_args : nix_compat_args,
   # nix-store: native QueryValidPaths / AddMultipleToStore handlers.
   dependencies : pump_deps + [nix_store_dep],
   install : true,

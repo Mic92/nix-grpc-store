@@ -14,7 +14,16 @@
       nix,
     }:
     let
-      forAllSystems = nixpkgs.lib.genAttrs [
+      lib = nixpkgs.lib;
+      # Nix versions from nixpkgs that expose split component libraries
+      # (`.libs.nix-store`, `.libs.nix-util`) which the plugin builds against.
+      supportedNixVersions = [
+        "nix_2_31"
+        "nix_2_34"
+        "nix_2_35"
+        "git"
+      ];
+      forAllSystems = lib.genAttrs [
         "x86_64-linux"
         "aarch64-linux"
         "aarch64-darwin"
@@ -31,6 +40,18 @@
             inherit (nix.packages.${system}) nix-store nix-util;
           };
         }
+        # One plugin per supported Nix version; the plugin is ABI-coupled to
+        # the Nix that dlopen()s it.
+        // lib.listToAttrs (
+          map (
+            version:
+            lib.nameValuePair "plugin-${version}" (
+              pkgs.callPackage ./package.nix {
+                inherit (pkgs.nixVersions.${version}.libs) nix-store nix-util;
+              }
+            )
+          ) supportedNixVersions
+        )
       );
 
       nixosModules = {
@@ -47,7 +68,9 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
         in
-        {
+        # Every per-version plugin package doubles as a compile check.
+        lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) self.packages.${system}
+        // {
           clang-tidy = self.packages.${system}.default.overrideAttrs (old: {
             pname = "nix-grpc-store-clang-tidy";
             nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.llvmPackages_latest.clang-tools ];
@@ -62,7 +85,7 @@
             dontFixup = true;
           });
         }
-        // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           vm = import ./tests/nixos-test.nix {
             inherit pkgs;
             nixPkgs = nix.packages.${system};

@@ -47,6 +47,7 @@
 #include <nix/util/unix-domain-socket.hh>
 #include <nix/util/util.hh>
 
+#include "nix-compat.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
 #include "pump.hh"
@@ -59,10 +60,6 @@ namespace {
 
 class NixRemoteService final : public nix::remote::NixRemote::Service
 {
-    /* nix::ValidPathInfo serialisation used by the bulk RPCs, matching the worker
-       protocol's AddMultipleToStore framing. */
-    static constexpr nix::WorkerProto::Version::Number infoVersion{.major = 1, .minor = 16};
-
     std::string socketPath;
 
     std::mutex storeMutex;
@@ -167,9 +164,10 @@ public:
             auto expected = nix::readNum<uint64_t>(source);
             for (uint64_t idx = 0; idx < expected; ++idx) {
                 auto info = nix::WorkerProto::Serialise<nix::ValidPathInfo>::read(
-                    *localStore, nix::WorkerProto::ReadConn{.from = source, .version = {.number = infoVersion}});
+                    *localStore,
+                    nix::WorkerProto::ReadConn{.from = source, .version = nixcompat::infoProtocolVersion()});
                 info.ultimate = false;
-                nix::EnsureRead wrapper{source, info.narSize};
+                nixcompat::EnsureRead wrapper{source, info.narSize};
                 localStore->addToStore(info, wrapper, repair, checkSigs);
                 wrapper.finish();
             }
@@ -196,7 +194,7 @@ public:
                 nix::StringSink sink;
                 nix::WorkerProto::Serialise<nix::UnkeyedValidPathInfo>::write(
                     *localStore,
-                    nix::WorkerProto::WriteConn{.to = sink, .version = {.number = infoVersion}},
+                    nix::WorkerProto::WriteConn{.to = sink, .version = nixcompat::infoProtocolVersion()},
                     static_cast<const nix::UnkeyedValidPathInfo &>(*info));
                 *out->mutable_info() = std::move(sink.s);
             }
