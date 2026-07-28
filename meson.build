@@ -49,9 +49,21 @@ gen = custom_target('nix_remote_proto',
 
 gen_inc = include_directories('.')
 
-pump_deps = [grpc_dep, protobuf_dep, zstd_dep, threads_dep, nix_util_dep]
+common_deps = [grpc_dep, protobuf_dep, zstd_dep, threads_dep]
 
 # --- client plugin ----------------------------------------------------------
+
+# Compile against the Nix headers only. The symbols resolve at dlopen() time
+# from the host `nix` process, avoiding a second copy of the Nix libraries.
+nix_header_deps = [
+  nix_store_dep.partial_dependency(compile_args : true, includes : true),
+  nix_util_dep.partial_dependency(compile_args : true, includes : true),
+]
+if host_machine.system() == 'darwin'
+  plugin_link_args = ['-Wl,-undefined,dynamic_lookup']
+else
+  plugin_link_args = ['-Wl,--unresolved-symbols=ignore-all']
+endif
 
 # Built as a shared module so it can be loaded via nix.conf `plugin-files`.
 shared_module('nix-grpc-store',
@@ -60,7 +72,8 @@ shared_module('nix-grpc-store',
   # nix_plugin_entry() skips registering the store when the running Nix
   # version differs from the one the plugin was built against.
   cpp_args : nix_compat_args + ['-DNIX_GRPC_BUILT_AGAINST_NIX="' + nix_store_dep.version() + '"'],
-  dependencies : pump_deps + [nix_store_dep],
+  dependencies : common_deps + nix_header_deps,
+  link_args : plugin_link_args,
   name_prefix : '',
   install : true,
   install_dir : get_option('libdir') / 'nix' / 'plugins',
@@ -73,6 +86,6 @@ executable('nix-grpc-daemon',
   include_directories : gen_inc,
   cpp_args : nix_compat_args,
   # nix-store: native QueryValidPaths / AddMultipleToStore handlers.
-  dependencies : pump_deps + [nix_store_dep],
+  dependencies : common_deps + [nix_util_dep, nix_store_dep],
   install : true,
 )
