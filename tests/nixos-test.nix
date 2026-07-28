@@ -16,6 +16,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-store";
+  globalTimeout = 600;
 
   nodes.machine =
     { config, lib, ... }:
