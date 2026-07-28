@@ -39,6 +39,13 @@ in
       description = "Address to listen on, in gRPC `host:port` form.";
     };
 
+    metricsListen = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "127.0.0.1:9464";
+      description = "Address to serve Prometheus metrics on. Disabled if unset.";
+    };
+
     proxySocket = lib.mkOption {
       type = lib.types.path;
       default = "/nix/var/nix/daemon-socket/socket";
@@ -128,6 +135,10 @@ in
           ++ lib.optionals (cfg.tls.clientCaFile != null) [
             "--client-ca"
             cfg.tls.clientCaFile
+          ]
+          ++ lib.optionals (cfg.metricsListen != null) [
+            "--metrics-listen"
+            cfg.metricsListen
           ]
           ++ cfg.extraFlags
         );

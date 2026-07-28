@@ -48,6 +48,7 @@
 #include <nix/util/util.hh>
 
 #include "logfmt.hh"
+#include "metrics.hh"
 #include "nix-compat.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
@@ -62,6 +63,7 @@ namespace {
 class NixRemoteService final : public nix::remote::NixRemote::Service
 {
     std::string socketPath;
+    nixgrpc::Metrics & metrics;
 
     std::mutex storeMutex;
     std::shared_ptr<nix::Store> store;
@@ -95,8 +97,9 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     }
 
 public:
-    explicit NixRemoteService(std::string socketPath)
+    NixRemoteService(std::string socketPath, nixgrpc::Metrics & metrics)
         : socketPath(std::move(socketPath))
+        , metrics(metrics)
     {
     }
 
@@ -106,6 +109,7 @@ public:
         auto const peer = context->peer();
         auto const start = std::chrono::steady_clock::now();
         nixgrpc::logLine({{"event", "session_start"}, {"method", "Connect"}, {"cn", commonName}, {"peer", peer}});
+        metrics.countRpc("Connect", commonName);
 
         nix::AutoCloseFD sock;
         try {
@@ -140,6 +144,7 @@ public:
              {"duration_s", secondsSince(start)},
              {"bytes_in", std::to_string(bytesIn.load())},
              {"bytes_out", std::to_string(bytesOut)}});
+        metrics.countTunnelBytes(commonName, bytesIn, bytesOut);
         return grpc::Status::OK;
     }
 
@@ -149,12 +154,14 @@ public:
         nix::remote::QueryValidPathsReply * reply) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
+            auto const commonName = nixgrpc::clientCommonName(*context);
             nixgrpc::logLine(
                 {{"event", "rpc"},
                  {"method", "QueryValidPaths"},
-                 {"cn", nixgrpc::clientCommonName(*context)},
+                 {"cn", commonName},
                  {"peer", context->peer()},
                  {"paths", std::to_string(request->paths_size())}});
+            metrics.countRpc("QueryValidPaths", commonName);
             auto localStore = getStore();
             nix::StorePathSet paths;
             for (const auto & path : request->paths()) {
@@ -212,6 +219,8 @@ public:
                  {"duration_s", secondsSince(start)},
                  {"paths", std::to_string(expected)},
                  {"nar_bytes_in", std::to_string(narBytes)}});
+            metrics.countRpc("AddMultipleToStore", commonName);
+            metrics.countNarBytes("in", commonName, narBytes);
             return grpc::Status::OK;
         });
     }
@@ -222,12 +231,14 @@ public:
         nix::remote::QueryPathInfosReply * reply) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
+            auto const commonName = nixgrpc::clientCommonName(*context);
             nixgrpc::logLine(
                 {{"event", "rpc"},
                  {"method", "QueryPathInfos"},
-                 {"cn", nixgrpc::clientCommonName(*context)},
+                 {"cn", commonName},
                  {"peer", context->peer()},
                  {"paths", std::to_string(request->paths_size())}});
+            metrics.countRpc("QueryPathInfos", commonName);
             auto localStore = getStore();
             for (const auto & path : request->paths()) {
                 std::shared_ptr<const nix::ValidPathInfo> info;
@@ -252,6 +263,7 @@ public:
     auto NarsFromPaths(grpc::ServerContext * context, NarsStream * stream) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
+            auto const commonName = nixgrpc::clientCommonName(*context);
             auto const start = std::chrono::steady_clock::now();
             auto localStore = getStore();
             nixgrpc::ZstdWriterSink<NarsStream, nix::remote::NarChunk> sink(*stream);
@@ -275,11 +287,13 @@ public:
             nixgrpc::logLine(
                 {{"event", "rpc"},
                  {"method", "NarsFromPaths"},
-                 {"cn", nixgrpc::clientCommonName(*context)},
+                 {"cn", commonName},
                  {"peer", context->peer()},
                  {"duration_s", secondsSince(start)},
                  {"paths", std::to_string(paths)},
                  {"nar_bytes_out", std::to_string(narBytes)}});
+            metrics.countRpc("NarsFromPaths", commonName);
+            metrics.countNarBytes("out", commonName, narBytes);
             return grpc::Status::OK;
         });
     }
@@ -292,6 +306,7 @@ struct Options
     std::string tlsCert;
     std::string tlsKey;
     std::string clientCA;
+    std::string metricsListen;
 };
 
 auto parseOptions(const std::vector<std::string_view> & args) -> Options
@@ -315,6 +330,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.tlsKey = next();
         } else if (arg == "--client-ca") {
             options.clientCA = next();
+        } else if (arg == "--metrics-listen") {
+            options.metricsListen = next();
         } else {
             throw nix::Error("unknown flag '%s'", arg);
         }
@@ -358,7 +375,8 @@ try {
     const std::span args(argv, static_cast<size_t>(argc));
     auto options = parseOptions({args.begin(), args.end()});
 
-    NixRemoteService service(options.socketPath);
+    nixgrpc::Metrics metrics(options.metricsListen);
+    NixRemoteService service(options.socketPath, metrics);
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
