@@ -13,13 +13,15 @@ threads_dep  = dependency('threads')
 nix_store_dep = dependency('nix-store')
 nix_util_dep  = dependency('nix-util')
 
-# Version macros for src/nix-compat.hh; see that header for the differences
-# between supported Nix versions.
+# Pre-release versions look like "2.35pre20260619_f8bb823a".
 nix_ver = nix_store_dep.version().split('.')
+nix_ver_minor = nix_ver[1].split('pre')[0]
+nix_ver_major_minor = nix_ver[0] + '.' + nix_ver_minor
+
+# Version macros for src/nix-compat.hh.
 nix_compat_args = [
   '-DNIX_COMPAT_VERSION_MAJOR=' + nix_ver[0],
-  # Pre-release versions look like "2.35pre20260619_f8bb823a".
-  '-DNIX_COMPAT_VERSION_MINOR=' + nix_ver[1].split('pre')[0],
+  '-DNIX_COMPAT_VERSION_MINOR=' + nix_ver_minor,
 ]
 
 # --- protobuf / gRPC codegen -----------------------------------------------
@@ -65,7 +67,6 @@ else
   plugin_link_args = ['-Wl,--unresolved-symbols=ignore-all']
 endif
 
-# Built as a shared module so it can be loaded via nix.conf `plugin-files`.
 shared_module('nix-grpc-store',
   sources : ['src/grpc-store.cc', gen],
   include_directories : gen_inc,
@@ -73,6 +74,18 @@ shared_module('nix-grpc-store',
   # version differs from the one the plugin was built against.
   cpp_args : nix_compat_args + ['-DNIX_GRPC_BUILT_AGAINST_NIX="' + nix_store_dep.version() + '"'],
   dependencies : common_deps + nix_header_deps,
+  link_args : plugin_link_args,
+  name_prefix : '',
+  install : true,
+  install_dir : get_option('libdir') / 'nix' / 'nix-grpc-store-versions' / nix_ver_major_minor,
+)
+
+# Loaded via nix.conf `plugin-files`. It dlopen()s the build matching the
+# running Nix from the versions directory above, so merged installs of
+# several builds support all of their Nix versions.
+shared_module('nix-grpc-store-loader',
+  sources : ['src/plugin-loader.cc'],
+  dependencies : dependency('dl'),
   link_args : plugin_link_args,
   name_prefix : '',
   install : true,
