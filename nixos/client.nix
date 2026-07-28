@@ -12,27 +12,28 @@ in
   options.programs.nix-grpc-store = {
     enable = lib.mkEnableOption "the grpc:// Nix store plugin";
 
-    package = lib.mkOption {
-      type = lib.types.package;
-      # Build against the component libraries of the system's Nix so the
-      # plugin's C++ ABI matches the `nix` binary that will dlopen() it.
-      default = pkgs.callPackage ../package.nix {
-        inherit (config.nix.package.libs) nix-store nix-util;
+    packageSet = lib.mkOption {
+      type = lib.types.raw;
+      default = pkgs.callPackage ../packages.nix {
+        nixPackages = config.nix.package.libs;
       };
       defaultText = lib.literalExpression ''
-        pkgs.callPackage ./package.nix {
-          inherit (config.nix.package.libs) nix-store nix-util;
-        }
+        pkgs.callPackage ./packages.nix { nixPackages = config.nix.package.libs; }
       '';
+      description = "Package set from packages.nix providing the per-version plugins.";
+    };
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = cfg.packageSet.plugin-dispatcher;
+      defaultText = lib.literalExpression "config.programs.nix-grpc-store.packageSet.plugin-dispatcher";
       description = "Package providing the plugin loader under `lib/nix/plugins`.";
     };
   };
 
   config = lib.mkIf cfg.enable {
-    # Only the daemon loads the plugin; via global nix.conf every other nix
-    # binary on the system would dlopen an ABI-incompatible plugin and crash.
-    systemd.services.nix-daemon.environment.NIX_CONFIG = ''
-      plugin-files = ${cfg.package}/lib/nix/plugins
-    '';
+    # The loader warns and disables grpc:// stores on a version mismatch
+    # instead of crashing, so it is safe to load in every nix invocation.
+    nix.settings.plugin-files = [ "${cfg.package}/lib/nix/plugins" ];
   };
 }
