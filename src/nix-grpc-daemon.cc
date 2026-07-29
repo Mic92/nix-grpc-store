@@ -10,6 +10,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstddef>
+#include <initializer_list>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -64,6 +65,7 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
 {
     std::string socketPath;
     nixgrpc::Metrics & metrics;
+    nixgrpc::LogLevel logLevel;
 
     std::mutex storeMutex;
     std::shared_ptr<nix::Store> store;
@@ -90,6 +92,13 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         }
     }
 
+    void logDebug(std::initializer_list<std::pair<std::string_view, std::string>> fields)
+    {
+        if (logLevel == nixgrpc::LogLevel::debug) {
+            nixgrpc::logLine(nixgrpc::LogLevel::debug, fields);
+        }
+    }
+
     static auto secondsSince(std::chrono::steady_clock::time_point start) -> std::string
     {
         auto const elapsed = std::chrono::steady_clock::now() - start;
@@ -97,9 +106,10 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     }
 
 public:
-    NixRemoteService(std::string socketPath, nixgrpc::Metrics & metrics)
+    NixRemoteService(std::string socketPath, nixgrpc::Metrics & metrics, nixgrpc::LogLevel logLevel)
         : socketPath(std::move(socketPath))
         , metrics(metrics)
+        , logLevel(logLevel)
     {
     }
 
@@ -108,7 +118,7 @@ public:
         auto const commonName = nixgrpc::clientCommonName(*context);
         auto const peer = context->peer();
         auto const start = std::chrono::steady_clock::now();
-        nixgrpc::logLine({{"event", "session_start"}, {"method", "Connect"}, {"cn", commonName}, {"peer", peer}});
+        logDebug({{"event", "session_start"}, {"method", "Connect"}, {"cn", commonName}, {"peer", peer}});
         metrics.countRpc("Connect", commonName);
 
         nix::AutoCloseFD sock;
@@ -137,6 +147,7 @@ public:
 
         receiver.join();
         nixgrpc::logLine(
+            nixgrpc::LogLevel::info,
             {{"event", "session_end"},
              {"method", "Connect"},
              {"cn", commonName},
@@ -155,7 +166,7 @@ public:
     {
         return guarded([&]() -> grpc::Status {
             auto const commonName = nixgrpc::clientCommonName(*context);
-            nixgrpc::logLine(
+            logDebug(
                 {{"event", "rpc"},
                  {"method", "QueryValidPaths"},
                  {"cn", commonName},
@@ -212,6 +223,7 @@ public:
                 narBytes += info.narSize;
             }
             nixgrpc::logLine(
+                nixgrpc::LogLevel::info,
                 {{"event", "rpc"},
                  {"method", "AddMultipleToStore"},
                  {"cn", commonName},
@@ -232,7 +244,7 @@ public:
     {
         return guarded([&]() -> grpc::Status {
             auto const commonName = nixgrpc::clientCommonName(*context);
-            nixgrpc::logLine(
+            logDebug(
                 {{"event", "rpc"},
                  {"method", "QueryPathInfos"},
                  {"cn", commonName},
@@ -285,6 +297,7 @@ public:
             }
             sink.finish();
             nixgrpc::logLine(
+                nixgrpc::LogLevel::info,
                 {{"event", "rpc"},
                  {"method", "NarsFromPaths"},
                  {"cn", commonName},
@@ -307,6 +320,7 @@ struct Options
     std::string tlsKey;
     std::string clientCA;
     std::string metricsListen;
+    nixgrpc::LogLevel logLevel = nixgrpc::LogLevel::info;
 };
 
 auto parseOptions(const std::vector<std::string_view> & args) -> Options
@@ -332,6 +346,13 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.clientCA = next();
         } else if (arg == "--metrics-listen") {
             options.metricsListen = next();
+        } else if (arg == "--log-level") {
+            auto value = next();
+            if (value == "debug") {
+                options.logLevel = nixgrpc::LogLevel::debug;
+            } else if (value != "info") {
+                throw nix::Error("--log-level must be 'info' or 'debug'");
+            }
         } else {
             throw nix::Error("unknown flag '%s'", arg);
         }
@@ -376,7 +397,7 @@ try {
     auto options = parseOptions({args.begin(), args.end()});
 
     nixgrpc::Metrics metrics(options.metricsListen);
-    NixRemoteService service(options.socketPath, metrics);
+    NixRemoteService service(options.socketPath, metrics, options.logLevel);
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
@@ -390,7 +411,9 @@ try {
         throw nix::Error("failed to start gRPC server on '%s'", options.listen);
     }
 
-    nixgrpc::logLine({{"event", "startup"}, {"listen", options.listen}, {"proxy_socket", options.socketPath}});
+    nixgrpc::logLine(
+        nixgrpc::LogLevel::info,
+        {{"event", "startup"}, {"listen", options.listen}, {"proxy_socket", options.socketPath}});
     server->Wait();
     return 0;
 } catch (const std::exception & err) {

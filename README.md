@@ -131,6 +131,7 @@ presenting a certificate signed by that CA are accepted.
   * `--proxy-socket PATH` — nix-daemon socket, default `/nix/var/nix/daemon-socket/socket`
   * `--tls-cert`, `--tls-key`, `--client-ca` — see above
   * `--metrics-listen ADDR` — serve Prometheus metrics; disabled if unset
+  * `--log-level info|debug` — access log verbosity, default `info`
 
 ## Monitoring
 
@@ -144,11 +145,13 @@ One logfmt line per RPC on stderr (journald):
 
     ts=2025-01-15T12:03:41Z level=info event=session_end method=Connect cn=alice peer=ipv4:10.0.0.5:53211 duration_s=1832 bytes_in=52341 bytes_out=812345678
 
-  * `session_start` / `session_end` — tunnelled `Connect` sessions;
-    `session_end` adds `duration_s` and uncompressed `bytes_in` / `bytes_out`
-  * `rpc` — native RPCs (`QueryValidPaths`, `QueryPathInfos`,
-    `AddMultipleToStore`, `NarsFromPaths`) with `paths` and, for bulk
-    transfers, `duration_s` and `nar_bytes_in` / `nar_bytes_out`
+  * `session_end` — tunnelled `Connect` session with `duration_s` and
+    uncompressed `bytes_in` / `bytes_out`
+  * `rpc` — bulk transfers (`AddMultipleToStore`, `NarsFromPaths`) with
+    `paths`, `duration_s` and `nar_bytes_in` / `nar_bytes_out`
+
+With `--log-level debug`, `session_start` and the path-query RPCs
+(`QueryValidPaths`, `QueryPathInfos`) are logged as well.
 
 Every event carries `cn` and `peer`:
 `journalctl -u nix-grpc-daemon | grep cn=alice`.

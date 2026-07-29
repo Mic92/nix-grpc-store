@@ -38,6 +38,7 @@ pkgs.testers.runNixOSTest {
       services.nix-grpc-daemon = {
         enable = true;
         listen = "127.0.0.1:50051";
+        logLevel = "debug";
         # Reuse the client bundle so the test doesn't compile the project twice.
         package = config.programs.nix-grpc-store.package;
       };
@@ -171,6 +172,14 @@ pkgs.testers.runNixOSTest {
         machine.succeed(
             "journalctl -u nix-grpc-daemon.service | "
             "grep -E 'event=session_end method=Connect cn=- '"
+        )
+        # Path queries only show up at --log-level debug.
+        machine.succeed(
+            "journalctl -u nix-grpc-daemon.service | "
+            "grep -q 'level=debug event=rpc method=QueryValidPaths'"
+        )
+        machine.fail(
+            "journalctl -u nix-grpc-daemon-mtls.service | grep -q level=debug"
         )
 
     with subtest("prometheus metrics labelled by certificate CN"):
