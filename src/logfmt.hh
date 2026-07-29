@@ -4,6 +4,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <ctime>
 #include <initializer_list>
@@ -46,8 +47,10 @@ inline auto logfmtValue(std::string_view value) -> std::string
     return out;
 }
 
-// Emit one logfmt line: ts=… level=info key=value …
-inline void logLine(std::initializer_list<std::pair<std::string_view, std::string>> fields)
+enum class LogLevel : std::uint8_t { info, debug };
+
+// Emit one logfmt line: ts=… level=… key=value …
+inline void logLine(LogLevel level, std::initializer_list<std::pair<std::string_view, std::string>> fields)
 {
     auto const now = std::chrono::system_clock::now();
     auto const secs = std::chrono::system_clock::to_time_t(now);
@@ -58,7 +61,7 @@ inline void logLine(std::initializer_list<std::pair<std::string_view, std::strin
 
     std::string line = "ts=";
     line += timestamp.data();
-    line += " level=info";
+    line += level == LogLevel::debug ? " level=debug" : " level=info";
     for (const auto & [key, value] : fields) {
         line += ' ';
         line += key;

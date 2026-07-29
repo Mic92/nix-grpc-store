@@ -39,11 +39,23 @@ in
       description = "Address to listen on, in gRPC `host:port` form.";
     };
 
+    logLevel = lib.mkOption {
+      type = lib.types.enum [
+        "info"
+        "debug"
+      ];
+      default = "info";
+      description = ''
+        Access log verbosity; `info` logs Connect sessions and bulk
+        transfers, `debug` also logs path queries and session starts.
+      '';
+    };
+
     metricsListen = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
       example = "127.0.0.1:9464";
-      description = "Address to serve Prometheus metrics on. Disabled if unset.";
+      description = "Address to serve Prometheus metrics on; disabled if unset.";
     };
 
     proxySocket = lib.mkOption {
@@ -139,6 +151,10 @@ in
           ++ lib.optionals (cfg.metricsListen != null) [
             "--metrics-listen"
             cfg.metricsListen
+          ]
+          ++ [
+            "--log-level"
+            cfg.logLevel
           ]
           ++ cfg.extraFlags
         );
