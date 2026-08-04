@@ -14,7 +14,7 @@ lib.makeScope newScope (
     supportedNixVersions = builtins.filter (
       name:
       builtins.match "nix_[0-9]+_[0-9]+" name != null
-      && (builtins.tryEval (nixVersions.${name}.libs ? nix-store)).value or false
+      && (builtins.tryEval ((nixVersions.${name}.libs or { }) ? nix-store)).value or false
     ) (builtins.attrNames nixVersions);
   in
   {

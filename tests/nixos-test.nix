@@ -164,6 +164,19 @@ pkgs.testers.runNixOSTest {
             "--no-link --print-out-paths"
         )
 
+    with subtest("default client cert lookup in /var/lib/nix-grpc-store"):
+        machine.succeed(
+            "install -d /var/lib/nix-grpc-store",
+            "install -m 0644 ${certDir}/client.pem /var/lib/nix-grpc-store/client.crt",
+            "install -m 0600 ${certDir}/client.key /var/lib/nix-grpc-store/client.key",
+        )
+        # No client-cert/client-key URI params: falls back to /var/lib.
+        machine.succeed(
+            "nix store info --json --store "
+            "'grpc://localhost:50052?ca-cert=${certDir}/ca.pem'"
+        )
+        machine.succeed("rm -r /var/lib/nix-grpc-store")
+
     with subtest("access log attributes clients by certificate CN"):
         machine.succeed(
             "journalctl -u nix-grpc-daemon-mtls.service | "
