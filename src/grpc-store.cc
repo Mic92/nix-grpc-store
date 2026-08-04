@@ -96,6 +96,7 @@ auto defaultClientCred(const char *envVar, const std::string &fileName) -> std::
     candidates.push_back(*home + "/.local/share/nix-grpc-store/" + fileName);
   }
   candidates.push_back("/run/nix-grpc-store/" + fileName);
+  candidates.push_back("/var/lib/nix-grpc-store/" + fileName);
   return firstReadable(candidates);
 }
 
@@ -126,8 +127,8 @@ private:
         "",
         "client-cert",
         "Path to a PEM client certificate chain to present for mTLS. Defaults to "
-        "`$NIX_GRPC_CLIENT_CERT`, then `client.crt` in `$XDG_DATA_HOME/nix-grpc-store` "
-        "or `/run/nix-grpc-store`."};
+        "`$NIX_GRPC_CLIENT_CERT`, then `client.crt` in `$XDG_DATA_HOME/nix-grpc-store`, "
+        "`/run/nix-grpc-store` or `/var/lib/nix-grpc-store`."};
 
     Setting<std::string> clientKey{
         this,

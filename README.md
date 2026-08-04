@@ -78,7 +78,7 @@ client then has trusted-user privileges, so require client certs
     }];
 
 TLS uses the system CA bundle and the client key pair from
-`/run/nix-grpc-store` by default (see below).
+`/run/nix-grpc-store` or `/var/lib/nix-grpc-store` by default (see below).
 
 ## Quick start (manual)
 
@@ -122,8 +122,8 @@ presenting a certificate signed by that CA are accepted.
     `$SSL_CERT_FILE` or the system CA bundle
   * `client-cert`, `client-key` — PEM pair to present for mTLS; default to
     `$NIX_GRPC_CLIENT_CERT`/`$NIX_GRPC_CLIENT_KEY`, then `client.crt`/`client.key`
-    in `$XDG_DATA_HOME/nix-grpc-store`, then `/run/nix-grpc-store`
-    (unreadable candidates are skipped)
+    in `$XDG_DATA_HOME/nix-grpc-store`, then `/run/nix-grpc-store`, then
+    `/var/lib/nix-grpc-store` (unreadable candidates are skipped)
 
 ## Server flags
 
