@@ -35,8 +35,14 @@ void warn(const std::string &message) {
       message.c_str()));
 }
 
-// <this .so's directory>/../nix-grpc-store-versions/<major.minor>/nix-grpc-store.so
+// <this module's directory>/../nix-grpc-store-versions/<major.minor>/nix-grpc-store.<platform suffix>
 auto pluginForRunningNix() -> std::filesystem::path {
+#ifdef __APPLE__
+  constexpr auto pluginFile = "nix-grpc-store.dylib";
+#else
+  constexpr auto pluginFile = "nix-grpc-store.so";
+#endif
+
   Dl_info info{};
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): dladdr needs a data pointer
   if (dladdr(reinterpret_cast<void *>(&pluginForRunningNix), &info) == 0 ||
@@ -45,7 +51,7 @@ auto pluginForRunningNix() -> std::filesystem::path {
   }
   return std::filesystem::path(info.dli_fname).parent_path().parent_path() /
          "nix-grpc-store-versions" / majorMinor(nix::nixVersion) /
-         "nix-grpc-store.so";
+         pluginFile;
 }
 
 } // namespace
