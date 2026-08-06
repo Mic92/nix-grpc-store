@@ -11,10 +11,14 @@ lib.makeScope newScope (
   self:
   let
     # Nix releases from nixpkgs that ship split component libraries.
+    # 2.31 is the oldest release with ParsedURL::Authority and
+    # StoreConfig::getReference(), which the plugin relies on.
     supportedNixVersions = builtins.filter (
       name:
       builtins.match "nix_[0-9]+_[0-9]+" name != null
-      && (builtins.tryEval ((nixVersions.${name}.libs or { }) ? nix-store)).value or false
+      && (builtins.tryEval (
+        lib.versionAtLeast nixVersions.${name}.version "2.31" && (nixVersions.${name}.libs or { }) ? nix-store
+      )).value or false
     ) (builtins.attrNames nixVersions);
   in
   {
