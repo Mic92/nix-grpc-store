@@ -65,8 +65,10 @@ nix_header_deps = [
 ]
 if host_machine.system() == 'darwin'
   plugin_link_args = ['-Wl,-undefined,dynamic_lookup']
+  module_suffix = 'dylib'
 else
   plugin_link_args = ['-Wl,--unresolved-symbols=ignore-all']
+  module_suffix = 'so'
 endif
 
 shared_module('nix-grpc-store',
@@ -87,6 +89,7 @@ shared_module('nix-grpc-store',
 # several builds support all of their Nix versions.
 shared_module('nix-grpc-store-loader',
   sources : ['src/plugin-loader.cc'],
+  cpp_args : ['-DNIX_GRPC_MODULE_SUFFIX="' + module_suffix + '"'],
   dependencies : dependency('dl'),
   link_args : plugin_link_args,
   name_prefix : '',
