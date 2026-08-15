@@ -153,20 +153,20 @@ the CN and logs and metrics are per user.
 
 ### Access log
 
-One logfmt line per RPC on stderr (journald):
+The daemon writes one logfmt line per RPC to stderr (journald):
 
     ts=2025-01-15T12:03:41Z level=info event=session_end method=Connect cn=alice peer=ipv4:10.0.0.5:53211 duration_s=1832 bytes_in=52341 bytes_out=812345678
 
-  * `session_end` — tunnelled `Connect` session with `duration_s` and
-    uncompressed `bytes_in` / `bytes_out`
-  * `rpc` — bulk transfers (`AddMultipleToStore`, `NarsFromPaths`) with
-    `paths`, `duration_s` and `nar_bytes_in` / `nar_bytes_out`
+| event | logged for | extra fields |
+|---|---|---|
+| `session_end` | finished tunnel sessions | duration, uncompressed bytes in/out |
+| `rpc` | bulk transfers | path count, duration, NAR bytes |
+| `session_start`, path queries | only at `--log-level debug` | |
 
-With `--log-level debug`, `session_start` and the path-query RPCs
-(`QueryValidPaths`, `QueryPathInfos`) are logged as well.
+Every line carries the client certificate CN and the peer address, so one
+user's activity is a grep away:
 
-Every event carries `cn` and `peer`:
-`journalctl -u nix-grpc-daemon | grep cn=alice`.
+    journalctl -u nix-grpc-daemon | grep cn=alice
 
 ### Prometheus metrics
 
