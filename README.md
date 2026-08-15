@@ -31,6 +31,8 @@ Everything that works over `ssh-ng://` works here: remote builds,
 `nix copy`, path queries, GC. The gRPC layer is a thin tunnel to the
 `nix-daemon` on the other side, with dedicated RPCs for the `nix copy` hot
 path (path info queries, bulk import, NAR download).
+[docs/latency.md](docs/latency.md) shows the round trips each
+operation costs as sequence diagrams.
 
 ## Benchmark
 
@@ -45,8 +47,7 @@ remote builds, GC and mTLS through the same endpoint.
 
 Reproduce with `./scripts/bench-transports.py`.
 
-Remote builds benefit too. There are two ways to build on a remote
-machine:
+There are two ways to build on a remote machine:
 
 - **hook**: the machine is listed in `builders =`. For every
   derivation Nix spawns a fresh `build-remote` helper process that
