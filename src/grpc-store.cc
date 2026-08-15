@@ -13,13 +13,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <grpc/impl/channel_arg_names.h>
 #include <grpcpp/security/credentials.h>
 #include <grpcpp/support/channel_arguments.h>
 #include <grpcpp/support/status.h>
-#include <deque>
+#include <condition_variable>
 #include <map>
 #include <memory>
-#include <condition_variable>
 #include <mutex>
 #include <nix/store/globals.hh>
 #include <nix/store/path.hh>
@@ -60,6 +60,7 @@
 #include <utility>
 
 #include "nix-compat.hh"
+#include "nar-fetcher.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
 #include "pump.hh"
@@ -145,6 +146,12 @@ private:
         "Path to the PEM private key for `client-cert`. Defaults to "
         "`$NIX_GRPC_CLIENT_KEY`, then `client.key` next to the default `client-cert`."};
 
+    Setting<unsigned> narConnections{
+        this,
+        4,
+        "nar-connections",
+        "Number of parallel TCP connections used for NAR downloads."};
+
 public:
     GrpcStoreConfig(const Params & params)
         : StoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params))
@@ -197,14 +204,36 @@ struct GrpcStore : virtual RemoteStore
 private:
     ref<const Config> config;
 
+    std::shared_ptr<grpc::ChannelCredentials> creds;
+
     /* One channel is shared by all connections in the pool; gRPC multiplexes
        streams over it internally. The stub keeps the channel alive. */
     std::unique_ptr<remote::NixRemote::Stub> stub;
 
+    nixgrpc::NarFetcher narFetcher;
+
+    auto makeChannel(bool ownConnection) -> std::shared_ptr<grpc::Channel>
+    {
+      grpc::ChannelArguments args;
+      // The worker protocol streams NARs; do not cap message size.
+      args.SetMaxReceiveMessageSize(-1);
+      args.SetMaxSendMessageSize(-1);
+      if (ownConnection) {
+        // Private subchannel pool = own TCP connection.
+        args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);
+      }
+      auto channel = grpc::CreateCustomChannel(config->authority.to_string(), creds, args);
+      // Start TCP+TLS setup now instead of stalling the first RPC.
+      channel->GetState(true);
+      return channel;
+    }
+
 public:
     GrpcStore(const ref<const Config> &config)
-        : Store{*config}, RemoteStore{*config}, config{config} {
-      std::shared_ptr<grpc::ChannelCredentials> creds;
+        : Store{*config}, RemoteStore{*config}, config{config},
+          narFetcher{
+              [this] -> std::shared_ptr<grpc::Channel> { return makeChannel(true); },
+              config->authority.to_string(), config->narConnections} {
       if (config->insecure) {
         creds = grpc::InsecureChannelCredentials();
       } else {
@@ -226,15 +255,7 @@ public:
         creds = grpc::SslCredentials(ssl);
       }
 
-      grpc::ChannelArguments args;
-      // The worker protocol streams NARs; do not cap message size.
-      args.SetMaxReceiveMessageSize(-1);
-      args.SetMaxSendMessageSize(-1);
-
-      auto channel = grpc::CreateCustomChannel(config->authority.to_string(), creds, args);
-      // Start TCP+TLS setup now instead of stalling the first RPC.
-      channel->GetState(true);
-      stub = remote::NixRemote::NewStub(std::move(channel));
+      stub = remote::NixRemote::NewStub(makeChannel(false));
     }
 
     GrpcStore(const GrpcStore &) = delete;
@@ -621,12 +642,7 @@ public:
       // copyPaths() consumes the sources in reverse topological order.
       // Record it so narFromPath() can pipeline its NAR requests.
       auto sorted = Store::topoSortPaths(paths);
-      {
-        std::scoped_lock const lock(narMutex);
-        narExpectedOrder.assign(sorted.rbegin(), sorted.rend());
-        narCursor = 0;
-        narSizes = std::move(sizes);
-      }
+      narFetcher.recordOrder({sorted.rbegin(), sorted.rend()}, std::move(sizes));
       return sorted;
     }
 #endif
@@ -701,71 +717,7 @@ public:
         }
     }
 
-    /* One long-lived NarsFromPaths stream shared by all narFromPath() calls:
-       the server compresses all NARs into a single zstd stream, so many small
-       paths share the compression window and there is no per-path RPC setup.
-       Serialised by narMutex. NARs are self-delimiting (copyNAR), so no
-       length framing is needed.
-
-       Requests are pipelined in the order recorded by topoSortPaths(), so
-       copying many small paths costs ~1 round trip instead of one per path.
-       The server answers in request order. NARs arriving before their
-       narFromPath() call are spooled to unlinked temp files. The path and
-       byte caps sit well above the bandwidth-delay product of a fast WAN
-       link (~19 MB), so they only bound spool size and the bytes wasted on
-       an aborted copy. */
-    static constexpr size_t kNarPipelineWindow = 64;
-    static constexpr uint64_t kNarPipelineWindowBytes = 128ULL * 1024 * 1024;
-
-    using NarStream = grpc::ClientReaderWriter<remote::NarRequest, remote::NarChunk>;
-
 private:
-    struct NarSession
-    {
-    private:
-        friend struct GrpcStore;
-
-        grpc::ClientContext ctx;
-        std::unique_ptr<NarStream> stream;
-        nixgrpc::ZstdReaderSource<NarStream, remote::NarChunk> source;
-
-        // Requested paths whose NAR has not been consumed yet, with their
-        // narSize (0 if unknown).
-        std::deque<std::pair<StorePath, uint64_t>> inflight;
-        uint64_t inflightBytes = 0;
-        StorePathSet requested;
-        std::map<StorePath, AutoCloseFD> spool;
-
-        void request(const StorePath & path, uint64_t narSize)
-        {
-            remote::NarRequest req;
-            req.set_path(std::string(path.to_string()));
-            if (!stream->Write(req)) {
-                throw Error("gRPC stream closed by peer");
-            }
-            inflight.emplace_back(path, narSize);
-            inflightBytes += narSize;
-            requested.insert(path);
-        }
-
-        static auto requireStream(std::unique_ptr<NarStream> stream, const GrpcStoreConfig & config)
-            -> std::unique_ptr<NarStream>
-        {
-            if (!stream) {
-                throw Error(
-                    "failed to open gRPC NarsFromPaths stream to '%s'", config.authority.to_string());
-            }
-            return stream;
-        }
-
-    public:
-        NarSession(remote::NixRemote::Stub & stub, const GrpcStoreConfig & config)
-            : stream(requireStream(stub.NarsFromPaths(&ctx), config))
-            , source(*stream, std::string{})
-        {
-        }
-    };
-
     struct Connection : RemoteStore::Connection
     {
     private:
@@ -817,91 +769,13 @@ private:
         }
     };
 
-    std::mutex narMutex;
-    std::unique_ptr<NarSession> narSession;
-
-    // Predicted narFromPath() call order. Guarded by narMutex.
-    std::vector<StorePath> narExpectedOrder;
-    std::map<StorePath, uint64_t> narSizes;
-    size_t narCursor = 0;
-
-    auto narSizeOf(const StorePath & path) const -> uint64_t {
-      auto found = narSizes.find(path);
-      return found == narSizes.end() ? 0 : found->second;
-    }
-
 public:
     // NOLINTNEXTLINE(misc-override-with-different-visibility): Store and RemoteStore already disagree
     void narFromPath(const StorePath & path, Sink & sink) override
     {
-      std::scoped_lock const lock(narMutex);
-
-      if (!narSession) {
-        narSession = std::make_unique<NarSession>(*stub, *config);
-      }
-
-        try {
-            if (auto found = narSession->spool.find(path); found != narSession->spool.end()) {
-              auto spoolFd = std::move(found->second);
-              narSession->spool.erase(found);
-              if (::lseek(spoolFd.get(), 0, SEEK_SET) == -1) {
-                throw SysError("seeking NAR spool file");
-              }
-              FdSource spooled(spoolFd.get());
-              copyNAR(spooled, sink);
-              return;
-            }
-
-            if (!narSession->requested.contains(path)) {
-              narSession->request(path, narSizeOf(path));
-            }
-
-            // Top up the pipeline. Mispredicted consumption order lands in
-            // the spool instead of stalling the pipeline.
-            while (narSession->inflight.size() < kNarPipelineWindow && narCursor < narExpectedOrder.size()) {
-              const auto & candidate = narExpectedOrder.at(narCursor);
-              if (narSession->requested.contains(candidate)) {
-                ++narCursor;
-                continue;
-              }
-              // Allow one overshoot so a NAR larger than the whole budget
-              // cannot wedge the pipeline.
-              if (narSession->inflightBytes >= kNarPipelineWindowBytes) {
-                break;
-              }
-              narSession->request(candidate, narSizeOf(candidate));
-              ++narCursor;
-            }
-
-            // Spool everything queued ahead of the path we need.
-            while (true) {
-              auto [current, size] = narSession->inflight.front();
-              narSession->inflight.pop_front();
-              narSession->inflightBytes -= size;
-              if (current == path) {
-                copyNAR(narSession->source, sink);
-                return;
-              }
-              auto [tmpFd, tmpPath] = createTempFile("nix-grpc-nar");
-              ::unlink(tmpPath.c_str());
-              FdSink tmpSink(tmpFd.get());
-              copyNAR(narSession->source, tmpSink);
-              tmpSink.flush();
-              narSession->spool.emplace(std::move(current), std::move(tmpFd));
-            }
-        } catch (...) {
-            // The session is unusable after an error (the stream position is
-            // unknown); surface the server-side status if there is one.
-            auto session = std::move(narSession);
-            session->ctx.TryCancel();
-            auto status = session->stream->Finish();
-            if (!status.ok() &&
-                status.error_code() != grpc::StatusCode::CANCELLED) {
-              throw Error("gRPC NarsFromPaths failed: %s",
-                          status.error_message());
-            }
-            throw;
-        }
+      auto spoolFd = narFetcher.fetch(path);
+      FdSource spooled(spoolFd.get());
+      copyNAR(spooled, sink);
     }
 
     ~GrpcStore() override {
@@ -913,24 +787,6 @@ public:
       if (infoBatchWorker.joinable()) {
         infoBatchWorker.join();
       }
-
-      if (!narSession) {
-        return;
-      }
-      // With NARs still in flight (aborted copy), draining would download
-      // them all just to close the stream. Cancel instead.
-      if (!narSession->inflight.empty()) {
-        narSession->ctx.TryCancel();
-        (void)narSession->stream->Finish();
-        return;
-      }
-      // Let the server end its NarsFromPaths handler cleanly.
-      narSession->stream->WritesDone();
-      remote::NarChunk chunk;
-      while (narSession->stream->Read(&chunk)) {
-        ;
-      }
-      (void)narSession->stream->Finish();
     }
 
     void addMultipleToStore(
