@@ -27,6 +27,13 @@ Why gRPC instead of `ssh-ng://`?
     NARs), unlike ssh's optional zlib, which made the benchmark below
     slower instead of faster.
 
+Everything that works over `ssh-ng://` works here: remote builds,
+`nix copy`, path queries, GC. The gRPC layer is a thin tunnel to the
+`nix-daemon` on the other side, with dedicated RPCs for the `nix copy` hot
+path (path info queries, bulk import, NAR download).
+
+## Benchmark
+
 ![nix copy transport comparison](docs/bench.png)
 
 Reproduce with `./scripts/bench-transports.py`.*
@@ -40,10 +47,6 @@ faster than `ssh-ng://`:
 
 Reproduce with `./scripts/bench-builds.py`.*
 
-Everything that works over `ssh-ng://` works here: remote builds,
-`nix copy`, path queries, GC. The gRPC layer is a thin tunnel to the
-`nix-daemon` on the other side, with dedicated RPCs for the `nix copy` hot
-path (path info queries, bulk import, NAR download).
 
 ## Install
 
