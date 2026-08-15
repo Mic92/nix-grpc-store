@@ -40,6 +40,7 @@
 #include <string_view>
 #include <thread>
 #include <unistd.h>
+#include <variant>
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
@@ -49,6 +50,9 @@
 #include <nix/store/remote-store.hh>
 #include <nix/store/store-registration.hh>
 #include <nix/store/worker-protocol.hh>
+// Generic definitions for the std::vector serialiser wrappers, which
+// libnixstore does not instantiate explicitly.
+#include <nix/store/worker-protocol-impl.hh> // IWYU pragma: keep
 #include <nix/util/archive.hh>
 #include <nix/util/callback.hh>
 #include <nix/util/file-descriptor.hh>
@@ -271,6 +275,44 @@ public:
       return res;
     }
 
+    // RemoteStore would tunnel this. One RPC, with a fallback to the
+    // client-side walk for servers without QueryMissing.
+    auto queryMissing(const std::vector<DerivedPath> & targets)
+        -> MissingPaths override {
+      grpc::ClientContext ctx;
+      remote::QueryMissingRequest request;
+      for (const auto & target : targets) {
+        request.add_targets(target.to_string(*this));
+      }
+      remote::QueryMissingReply reply;
+      auto status = stub->QueryMissing(&ctx, request, &reply);
+      if (status.error_code() == grpc::StatusCode::UNIMPLEMENTED) {
+        // Deliberate: RemoteStore::queryMissing would tunnel, the generic
+        // Store walk works with native path queries.
+        // NOLINTNEXTLINE(bugprone-parent-virtual-call)
+        return Store::queryMissing(targets);
+      }
+      checkStatus(status, "QueryMissing");
+      MissingPaths res;
+      for (const auto & path : reply.will_build()) {
+        res.willBuild.insert(StorePath(path));
+      }
+      for (const auto & path : reply.will_substitute()) {
+        res.willSubstitute.insert(StorePath(path));
+      }
+      for (const auto & path : reply.unknown()) {
+        res.unknown.insert(StorePath(path));
+      }
+      res.downloadSize = reply.download_size();
+      res.narSize = reply.nar_size();
+      return res;
+    }
+
+    // Same: keep read-only clients off the tunnel.
+    auto isValidPathUncached(const StorePath & path) -> bool override {
+      return queryValidPaths({path}, NoSubstitute).contains(path);
+    }
+
     // The build hook probes reachability at store open. One StoreInfo RPC
     // answers it and caches the trust flag, no tunnel needed.
     void connect() override { isTrustedClient(); }
@@ -288,22 +330,67 @@ public:
       return trusted;
     }
 
+    // nix copy "builds" opaque paths; answering already-valid ones here
+    // avoids the tunnel, which read-only clients may not open.
+    auto alreadyValidResults(const std::vector<DerivedPath> & reqs)
+        -> std::optional<std::vector<KeyedBuildResult>> {
+      StorePathSet paths;
+      for (const auto & req : reqs) {
+        const auto * opaque = std::get_if<DerivedPath::Opaque>(&req.raw());
+        if (opaque == nullptr) {
+          return std::nullopt;
+        }
+        paths.insert(opaque->path);
+      }
+      if (queryValidPaths(paths, NoSubstitute).size() != paths.size()) {
+        return std::nullopt;
+      }
+      std::vector<KeyedBuildResult> results;
+      results.reserve(reqs.size());
+      for (const auto & req : reqs) {
+        KeyedBuildResult res{{}, req};
+        nixcompat::setAlreadyValid(res);
+        results.push_back(std::move(res));
+      }
+      return results;
+    }
+
 #if NIX_COMPAT_HAS_BUILDER
     auto getBuilder(std::shared_ptr<Store> evalStore) -> ref<Builder> override {
       class GrpcBuilder : public Builder {
         GrpcStore * store;
+        std::shared_ptr<Store> evalStore;
         ref<Builder> inner;
 
       public:
-        GrpcBuilder(GrpcStore * store, ref<Builder> inner)
-            : store(store), inner(std::move(inner)) {}
+        GrpcBuilder(GrpcStore * store, std::shared_ptr<Store> evalStore,
+                    ref<Builder> inner)
+            : store(store), evalStore(std::move(evalStore)),
+              inner(std::move(inner)) {}
         void buildPaths(const std::vector<DerivedPath> & reqs,
                         BuildMode buildMode) override {
+          if (buildMode == bmNormal && store->alreadyValidResults(reqs)) {
+            return;
+          }
+          store->copyDrvsFromEvalStore(reqs, evalStore);
+          if (auto results = store->buildPathsWithResultsNative(reqs, buildMode)) {
+            store->throwOnFailedBuilds(*results);
+            return;
+          }
           inner->buildPaths(reqs, buildMode);
         }
         auto buildPathsWithResults(const std::vector<DerivedPath> & reqs,
                                    BuildMode buildMode)
             -> std::vector<KeyedBuildResult> override {
+          if (buildMode == bmNormal) {
+            if (auto results = store->alreadyValidResults(reqs)) {
+              return std::move(*results);
+            }
+          }
+          store->copyDrvsFromEvalStore(reqs, evalStore);
+          if (auto results = store->buildPathsWithResultsNative(reqs, buildMode)) {
+            return std::move(*results);
+          }
           return inner->buildPathsWithResults(reqs, buildMode);
         }
         auto buildDerivation(const StorePath & drvPath,
@@ -318,10 +405,38 @@ public:
           inner->repairPath(path);
         }
       };
-      return make_ref<GrpcBuilder>(this,
-                                   RemoteStore::getBuilder(std::move(evalStore)));
+      return make_ref<GrpcBuilder>(this, evalStore,
+                                   RemoteStore::getBuilder(evalStore));
     }
 #else
+    void buildPaths(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
+                    std::shared_ptr<Store> evalStore) override {
+      if (buildMode == bmNormal && alreadyValidResults(reqs)) {
+        return;
+      }
+      copyDrvsFromEvalStore(reqs, evalStore);
+      if (auto results = buildPathsWithResultsNative(reqs, buildMode)) {
+        throwOnFailedBuilds(*results);
+        return;
+      }
+      RemoteStore::buildPaths(reqs, buildMode, std::move(evalStore));
+    }
+    auto buildPathsWithResults(const std::vector<DerivedPath> & reqs,
+                               BuildMode buildMode,
+                               std::shared_ptr<Store> evalStore)
+        -> std::vector<KeyedBuildResult> override {
+      if (buildMode == bmNormal) {
+        if (auto results = alreadyValidResults(reqs)) {
+          return std::move(*results);
+        }
+      }
+      copyDrvsFromEvalStore(reqs, evalStore);
+      if (auto results = buildPathsWithResultsNative(reqs, buildMode)) {
+        return std::move(*results);
+      }
+      return RemoteStore::buildPathsWithResults(reqs, buildMode,
+                                                std::move(evalStore));
+    }
     auto buildDerivation(const StorePath & drvPath, const BasicDerivation & drv,
                          BuildMode buildMode) -> BuildResult override {
       return buildDerivationNative(drvPath, drv, buildMode);
@@ -371,6 +486,79 @@ public:
         prefetchedInfos.merge(infos);
       }
       return std::move(*res);
+    }
+
+    // Builds run server-side under the proxy user, so the write role
+    // suffices where the raw worker-protocol tunnel would not. Returns
+    // nullopt for servers without the RPC.
+    [[nodiscard]] auto buildPathsWithResultsNative(
+        const std::vector<DerivedPath> & reqs, BuildMode buildMode)
+        -> std::optional<std::vector<KeyedBuildResult>> {
+      remote::BuildPathsRequest request;
+      for (const auto & req : reqs) {
+        request.add_targets(req.to_string(*this));
+      }
+      request.set_build_mode(static_cast<uint32_t>(buildMode));
+      request.set_protocol(nixcompat::kBuildProtocolWire);
+
+      grpc::ClientContext ctx;
+      auto reader = stub->BuildPaths(&ctx, request);
+
+      std::optional<std::vector<KeyedBuildResult>> results;
+      PathInfoMap infos;
+      remote::BuildPathsChunk msg;
+      while (reader->Read(&msg)) {
+        if (msg.has_log_line()) {
+          printError(msg.log_line());
+        } else if (msg.has_done()) {
+          StringSource source(msg.done().results());
+          results = WorkerProto::Serialise<std::vector<KeyedBuildResult>>::read(
+              *this, WorkerProto::ReadConn{.from = source,
+                                           .version = nixcompat::buildProtocolVersion()});
+          for (const auto & entry : msg.done().outputs()) {
+            infos.insert(parseInfoEntry(entry));
+          }
+        }
+      }
+      auto status = reader->Finish();
+      if (status.error_code() == grpc::StatusCode::UNIMPLEMENTED) {
+        return std::nullopt;
+      }
+      checkStatus(status, "BuildPaths");
+      if (!results) {
+        throw Error("gRPC BuildPaths stream ended without a result");
+      }
+      if (!infos.empty()) {
+        std::scoped_lock const lock(prefetchMutex);
+        prefetchedInfos.merge(infos);
+      }
+      return results;
+    }
+
+    // The server cannot reach the client's eval store, so the .drvs are
+    // imported first (content-addressed, passes signature checks).
+    void copyDrvsFromEvalStore(const std::vector<DerivedPath> & paths,
+                               const std::shared_ptr<Store> & evalStore) {
+      if (evalStore && evalStore.get() != this) {
+        StorePathSet drvPaths;
+        for (const auto & req : paths) {
+          if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
+            drvPaths.insert(built->drvPath->getBaseStorePath());
+          }
+        }
+        if (!drvPaths.empty()) {
+          copyClosure(*evalStore, *this, drvPaths);
+        }
+      }
+    }
+
+    void throwOnFailedBuilds(std::vector<KeyedBuildResult> & results) {
+      for (auto & res : results) {
+        if (auto errorMsg = nixcompat::buildFailureMsg(res)) {
+          throw Error("build of '%s' failed: %s", res.path.to_string(*this),
+                      *errorMsg);
+        }
+      }
     }
 
 private:
@@ -578,6 +766,57 @@ private:
         }
     };
 
+    struct Connection : RemoteStore::Connection
+    {
+    private:
+        friend struct GrpcStore;
+
+        // RemoteStore::Connection speaks through FdSink/FdSource, so bridge the
+        // gRPC stream to a pair of pipes with pump threads. This keeps the
+        // blocking, ordered semantics the worker protocol relies on without
+        // reimplementing Source/Sink on top of gRPC.
+        grpc::ClientContext ctx;
+        std::unique_ptr<GrpcStream> stream;
+
+        Pipe toRemote;   // plugin writes → reader thread sends over gRPC
+        Pipe fromRemote; // writer thread receives from gRPC → plugin reads
+
+        std::thread reader;
+        std::thread writer;
+
+    public:
+        Connection() = default;
+        Connection(const Connection &) = delete;
+        Connection(Connection &&) = delete;
+        auto operator=(const Connection &) -> Connection & = delete;
+        auto operator=(Connection &&) -> Connection & = delete;
+
+        void closeWrite() override
+        {
+            // Closing the write side of the pipe makes the reader thread hit
+            // EOF, which then calls WritesDone() on the stream.
+            toRemote.writeSide.close();
+        }
+
+        ~Connection() override {
+          // Unblock the reader pump (poll() on toRemote.readSide sees EOF)
+          // and the writer pump (stream->Read() returns false), then join.
+          // The pipe ends drained by the pump threads are owned by those
+          // threads; touching them here would race with their own close().
+          toRemote.writeSide.close();
+          ctx.TryCancel();
+          if (reader.joinable()) {
+            reader.join();
+          }
+          if (writer.joinable()) {
+            writer.join();
+          }
+          if (stream) {
+            (void)stream->Finish();
+          }
+        }
+    };
+
     std::mutex narMutex;
     std::unique_ptr<NarSession> narSession;
 
@@ -750,57 +989,6 @@ public:
     void setOptions(RemoteStore::Connection & /*conn*/) override {
       // As with SSHStore, do not forward local settings automatically.
     }
-
-    struct Connection : RemoteStore::Connection
-    {
-    private:
-        friend struct GrpcStore;
-
-        // RemoteStore::Connection speaks through FdSink/FdSource, so bridge the
-        // gRPC stream to a pair of pipes with pump threads. This keeps the
-        // blocking, ordered semantics the worker protocol relies on without
-        // reimplementing Source/Sink on top of gRPC.
-        grpc::ClientContext ctx;
-        std::unique_ptr<GrpcStream> stream;
-
-        Pipe toRemote;   // plugin writes → reader thread sends over gRPC
-        Pipe fromRemote; // writer thread receives from gRPC → plugin reads
-
-        std::thread reader;
-        std::thread writer;
-
-    public:
-        Connection() = default;
-        Connection(const Connection &) = delete;
-        Connection(Connection &&) = delete;
-        auto operator=(const Connection &) -> Connection & = delete;
-        auto operator=(Connection &&) -> Connection & = delete;
-
-        void closeWrite() override
-        {
-            // Closing the write side of the pipe makes the reader thread hit
-            // EOF, which then calls WritesDone() on the stream.
-            toRemote.writeSide.close();
-        }
-
-        ~Connection() override {
-          // Unblock the reader pump (poll() on toRemote.readSide sees EOF)
-          // and the writer pump (stream->Read() returns false), then join.
-          // The pipe ends drained by the pump threads are owned by those
-          // threads; touching them here would race with their own close().
-          toRemote.writeSide.close();
-          ctx.TryCancel();
-          if (reader.joinable()) {
-            reader.join();
-          }
-          if (writer.joinable()) {
-            writer.join();
-          }
-          if (stream) {
-            (void)stream->Finish();
-          }
-        }
-    };
 
     // NOLINTNEXTLINE(misc-override-with-different-visibility): see narFromPath
     auto openConnection() -> ref<RemoteStore::Connection> override;

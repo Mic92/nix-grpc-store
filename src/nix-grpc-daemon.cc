@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -44,6 +45,9 @@
 #include <nix/store/store-api.hh>
 #include <nix/store/store-open.hh>
 #include <nix/store/worker-protocol.hh>
+// Generic definitions for the std::vector serialiser wrappers used by
+// BuildPaths, which libnixstore does not instantiate explicitly.
+#include <nix/store/worker-protocol-impl.hh> // IWYU pragma: keep
 #include <nix/util/error.hh>
 #include <nix/util/file-descriptor.hh>
 #include <nix/util/file-system.hh>
@@ -53,6 +57,7 @@
 #include <nix/util/unix-domain-socket.hh>
 #include <nix/util/util.hh>
 
+#include "acl.hh"
 #include "logfmt.hh"
 #include "metrics.hh"
 #include "nix-compat.hh"
@@ -64,6 +69,7 @@ using GrpcStream = grpc::ServerReaderWriter<nix::remote::Chunk, nix::remote::Chu
 using AddMultipleReader = grpc::ServerReader<nix::remote::AddMultipleChunk>;
 using NarsStream = grpc::ServerReaderWriter<nix::remote::NarChunk, nix::remote::NarRequest>;
 using BuildWriter = grpc::ServerWriter<nix::remote::BuildDerivationChunk>;
+using BuildPathsWriter = grpc::ServerWriter<nix::remote::BuildPathsChunk>;
 
 namespace {
 
@@ -73,6 +79,7 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     std::string storeUri;
     nixgrpc::Metrics & metrics;
     nixgrpc::LogLevel logLevel;
+    nixgrpc::Acl acl;
 
     std::mutex storeMutex;
     std::shared_ptr<nix::Store> store;
@@ -114,19 +121,63 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         return std::to_string(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
     }
 
+    // Builds need write, except repair, which rewrites existing store paths.
+    auto authorizeBuild(const std::optional<std::string> & cert, std::string_view method, uint32_t buildMode)
+        -> grpc::Status
+    {
+        if (auto status = authorize(cert, method, nixgrpc::Role::write); !status.ok()) {
+            return status;
+        }
+        if (buildMode == static_cast<uint32_t>(nix::bmRepair)) {
+            return authorize(cert, std::string(method) + "(repair)", nixgrpc::Role::trusted);
+        }
+        return grpc::Status::OK;
+    }
+
+    auto authorize(const std::optional<std::string> & cert, std::string_view method, nixgrpc::Role minRole)
+        -> grpc::Status
+    {
+        auto const commonName = cert.value_or("-");
+        auto const role = acl.roleFor(cert);
+        if (role && *role >= minRole) {
+            return grpc::Status::OK;
+        }
+        nixgrpc::logLine(
+            nixgrpc::LogLevel::info,
+            {{"event", "denied"},
+             {"method", std::string(method)},
+             {"cn", commonName},
+             {"role", role ? std::string(nixgrpc::roleName(*role)) : "none"}});
+        auto const detail = role
+                                ? "role '" + std::string(nixgrpc::roleName(*role)) + "' may not call "
+                                      + std::string(method)
+                                : "no access rule matches certificate CN '" + commonName + "'";
+        return {grpc::StatusCode::PERMISSION_DENIED, detail};
+    }
+
 public:
     NixRemoteService(
-        std::string socketPath, std::string storeUri, nixgrpc::Metrics & metrics, nixgrpc::LogLevel logLevel)
+        std::string socketPath,
+        std::string storeUri,
+        nixgrpc::Metrics & metrics,
+        nixgrpc::LogLevel logLevel,
+        nixgrpc::Acl acl)
         : socketPath(std::move(socketPath))
         , storeUri(std::move(storeUri))
         , metrics(metrics)
         , logLevel(logLevel)
+        , acl(std::move(acl))
     {
     }
 
     auto Connect(grpc::ServerContext * context, GrpcStream * stream) -> grpc::Status override
     {
-        auto const commonName = nixgrpc::clientCommonName(*context);
+        auto const cert = nixgrpc::clientCommonName(*context);
+        auto const commonName = cert.value_or("-");
+        // The opaque worker protocol cannot be inspected here.
+        if (auto status = authorize(cert, "Connect", nixgrpc::Role::trusted); !status.ok()) {
+            return status;
+        }
         auto const peer = context->peer();
         auto const start = std::chrono::steady_clock::now();
         logDebug({{"event", "session_start"}, {"method", "Connect"}, {"cn", commonName}, {"peer", peer}});
@@ -176,7 +227,11 @@ public:
         nix::remote::QueryValidPathsReply * reply) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto const commonName = nixgrpc::clientCommonName(*context);
+            auto const cert = nixgrpc::clientCommonName(*context);
+            auto const commonName = cert.value_or("-");
+            if (auto status = authorize(cert, "QueryValidPaths", nixgrpc::Role::readOnly); !status.ok()) {
+                return status;
+            }
             logDebug(
                 {{"event", "rpc"},
                  {"method", "QueryValidPaths"},
@@ -203,7 +258,11 @@ public:
         nix::remote::AddMultipleReply * /*reply*/) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto const commonName = nixgrpc::clientCommonName(*context);
+            auto const cert = nixgrpc::clientCommonName(*context);
+            auto const commonName = cert.value_or("-");
+            if (auto status = authorize(cert, "AddMultipleToStore", nixgrpc::Role::write); !status.ok()) {
+                return status;
+            }
             auto const peer = context->peer();
             auto const start = std::chrono::steady_clock::now();
             auto localStore = getStore();
@@ -216,6 +275,12 @@ public:
             // The nix-daemon downgrades this to CheckSigs if we are not a
             // trusted user, same as for the tunnelled protocol.
             auto checkSigs = first.check_sigs() ? nix::CheckSigs : nix::NoCheckSigs;
+            if (acl.roleFor(cert) == nixgrpc::Role::write) {
+                // write may only import signed paths, no matter how trusted
+                // the proxy's own uid is.
+                repair = nix::NoRepair;
+                checkSigs = nix::CheckSigs;
+            }
 
             nixgrpc::ZstdReaderSource<AddMultipleReader, nix::remote::AddMultipleChunk> source(
                 *reader, std::move(*first.mutable_data()));
@@ -254,7 +319,11 @@ public:
         nix::remote::QueryPathInfosReply * reply) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto const commonName = nixgrpc::clientCommonName(*context);
+            auto const cert = nixgrpc::clientCommonName(*context);
+            auto const commonName = cert.value_or("-");
+            if (auto status = authorize(cert, "QueryPathInfos", nixgrpc::Role::readOnly); !status.ok()) {
+                return status;
+            }
             logDebug(
                 {{"event", "rpc"},
                  {"method", "QueryPathInfos"},
@@ -308,13 +377,57 @@ public:
         return backend;
     }
 
+    auto QueryMissing(
+        grpc::ServerContext * context,
+        const nix::remote::QueryMissingRequest * request,
+        nix::remote::QueryMissingReply * reply) -> grpc::Status override
+    {
+        return guarded([&]() -> grpc::Status {
+            auto const cert = nixgrpc::clientCommonName(*context);
+            auto const commonName = cert.value_or("-");
+            if (auto status = authorize(cert, "QueryMissing", nixgrpc::Role::readOnly); !status.ok()) {
+                return status;
+            }
+            logDebug(
+                {{"event", "rpc"},
+                 {"method", "QueryMissing"},
+                 {"cn", commonName},
+                 {"peer", context->peer()},
+                 {"targets", std::to_string(request->targets_size())}});
+            metrics.countRpc("QueryMissing", commonName);
+            auto localStore = getStore();
+            std::vector<nix::DerivedPath> targets;
+            targets.reserve(request->targets_size());
+            for (const auto & target : request->targets()) {
+                targets.push_back(nix::DerivedPath::parse(*localStore, target));
+            }
+            auto missing = localStore->queryMissing(targets);
+            for (const auto & path : missing.willBuild) {
+                reply->add_will_build(std::string(path.to_string()));
+            }
+            for (const auto & path : missing.willSubstitute) {
+                reply->add_will_substitute(std::string(path.to_string()));
+            }
+            for (const auto & path : missing.unknown) {
+                reply->add_unknown(std::string(path.to_string()));
+            }
+            reply->set_download_size(missing.downloadSize);
+            reply->set_nar_size(missing.narSize);
+            return grpc::Status::OK;
+        });
+    }
+
     auto StoreInfo(
         grpc::ServerContext * context,
         const nix::remote::StoreInfoRequest * /*request*/,
         nix::remote::StoreInfoReply * reply) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto const commonName = nixgrpc::clientCommonName(*context);
+            auto const cert = nixgrpc::clientCommonName(*context);
+            auto const commonName = cert.value_or("-");
+            if (auto status = authorize(cert, "StoreInfo", nixgrpc::Role::readOnly); !status.ok()) {
+                return status;
+            }
             logDebug({{"event", "rpc"}, {"method", "StoreInfo"}, {"cn", commonName}, {"peer", context->peer()}});
             metrics.countRpc("StoreInfo", commonName);
             auto backend = connectBackend(*getStore());
@@ -327,6 +440,18 @@ public:
 
     // Consumes the worker-protocol stderr stream up to STDERR_LAST,
     // forwarding plain build log lines.
+    static void appendOutputInfo(nix::Store & store, nix::remote::PathInfo * out, const nix::StorePath & outPath)
+    {
+        auto info = store.queryPathInfo(outPath);
+        out->set_path(std::string(info->path.to_string()));
+        nix::StringSink sink;
+        nix::WorkerProto::Serialise<nix::UnkeyedValidPathInfo>::write(
+            store,
+            nix::WorkerProto::WriteConn{.to = sink, .version = nixcompat::infoProtocolVersion()},
+            static_cast<const nix::UnkeyedValidPathInfo &>(*info));
+        *out->mutable_info() = std::move(sink.s);
+    }
+
     static void relayBuildLog(nix::Source & source, const std::function<void(std::string)> & sendLogLine)
     {
         auto readLogFields = [&]() -> std::vector<std::string> {
@@ -378,7 +503,12 @@ public:
         BuildWriter * writer) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto const commonName = nixgrpc::clientCommonName(*context);
+            auto const cert = nixgrpc::clientCommonName(*context);
+            auto const commonName = cert.value_or("-");
+            if (auto status = authorizeBuild(cert, "BuildDerivation", request->build_mode());
+                !status.ok()) {
+                return status;
+            }
             auto const start = std::chrono::steady_clock::now();
             metrics.countRpc("BuildDerivation", commonName);
 
@@ -430,15 +560,7 @@ public:
             }
             uint64_t outputs = 0;
             nixcompat::forBuiltOutputs(res, [&](const nix::StorePath & outPath) -> void {
-                auto info = localStore->queryPathInfo(outPath);
-                auto * out = done->add_outputs();
-                out->set_path(std::string(info->path.to_string()));
-                nix::StringSink sink;
-                nix::WorkerProto::Serialise<nix::UnkeyedValidPathInfo>::write(
-                    *localStore,
-                    nix::WorkerProto::WriteConn{.to = sink, .version = nixcompat::infoProtocolVersion()},
-                    static_cast<const nix::UnkeyedValidPathInfo &>(*info));
-                *out->mutable_info() = std::move(sink.s);
+                appendOutputInfo(*localStore, done->add_outputs(), outPath);
                 ++outputs;
             });
             writer->Write(chunk);
@@ -456,10 +578,103 @@ public:
         });
     }
 
+    // Builds run entirely server-side under the proxy user, so the write
+    // role suffices where the raw worker-protocol tunnel would not.
+    auto BuildPaths(
+        grpc::ServerContext * context,
+        const nix::remote::BuildPathsRequest * request,
+        BuildPathsWriter * writer) -> grpc::Status override
+    {
+        return guarded([&]() -> grpc::Status {
+            auto const cert = nixgrpc::clientCommonName(*context);
+            auto const commonName = cert.value_or("-");
+            if (auto status = authorizeBuild(cert, "BuildPaths", request->build_mode());
+                !status.ok()) {
+                return status;
+            }
+            auto const start = std::chrono::steady_clock::now();
+            metrics.countRpc("BuildPaths", commonName);
+
+            auto const protocol = nixcompat::buildProtocolVersion();
+            if (request->protocol() != nixcompat::kBuildProtocolWire
+                || request->build_mode() > static_cast<uint32_t>(nix::bmCheck)) {
+                return {grpc::StatusCode::INVALID_ARGUMENT, "unsupported build protocol or mode"};
+            }
+            auto localStore = getStore();
+
+            std::vector<nix::DerivedPath> targets;
+            targets.reserve(request->targets_size());
+            for (const auto & target : request->targets()) {
+                targets.push_back(nix::DerivedPath::parse(*localStore, target));
+            }
+
+            auto backend = connectBackend(*localStore);
+            auto & conn = backend->conn;
+            if (nixcompat::protocolWire(conn.protoVersion) != nixcompat::kBuildProtocolWire) {
+                return {grpc::StatusCode::FAILED_PRECONDITION, "backend daemon is too old"};
+            }
+            auto sendLogLine = [&](std::string line) -> void {
+                nix::remote::BuildPathsChunk chunk;
+                *chunk.mutable_log_line() = std::move(line);
+                writer->Write(chunk);
+            };
+            // The daemon opens every connection with a stderr work block.
+            relayBuildLog(conn.from, sendLogLine);
+
+            conn.to << nix::WorkerProto::Op::BuildPathsWithResults;
+            nix::WorkerProto::write(
+                *localStore,
+                nix::WorkerProto::WriteConn{.to = conn.to, .version = conn.protoVersion},
+                targets);
+            conn.to << request->build_mode();
+            conn.to.flush();
+
+            relayBuildLog(conn.from, sendLogLine);
+
+            auto results = nix::WorkerProto::Serialise<std::vector<nix::KeyedBuildResult>>::read(
+                *localStore, nix::WorkerProto::ReadConn{.from = conn.from, .version = protocol});
+
+            nix::remote::BuildPathsChunk chunk;
+            auto * done = chunk.mutable_done();
+            {
+                nix::StringSink sink;
+                nix::WorkerProto::Serialise<std::vector<nix::KeyedBuildResult>>::write(
+                    *localStore,
+                    nix::WorkerProto::WriteConn{.to = sink, .version = protocol},
+                    results);
+                *done->mutable_results() = std::move(sink.s);
+            }
+            nix::StorePathSet outputPaths;
+            for (auto & res : results) {
+                nixcompat::forBuiltOutputs(
+                    res, [&](const nix::StorePath & outPath) -> void { outputPaths.insert(outPath); });
+            }
+            for (const auto & outPath : outputPaths) {
+                appendOutputInfo(*localStore, done->add_outputs(), outPath);
+            }
+            writer->Write(chunk);
+
+            nixgrpc::logLine(
+                nixgrpc::LogLevel::info,
+                {{"event", "rpc"},
+                 {"method", "BuildPaths"},
+                 {"cn", commonName},
+                 {"peer", context->peer()},
+                 {"duration_s", secondsSince(start)},
+                 {"targets", std::to_string(targets.size())},
+                 {"outputs", std::to_string(outputPaths.size())}});
+            return grpc::Status::OK;
+        });
+    }
+
     auto NarsFromPaths(grpc::ServerContext * context, NarsStream * stream) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto const commonName = nixgrpc::clientCommonName(*context);
+            auto const cert = nixgrpc::clientCommonName(*context);
+            auto const commonName = cert.value_or("-");
+            if (auto status = authorize(cert, "NarsFromPaths", nixgrpc::Role::readOnly); !status.ok()) {
+                return status;
+            }
             auto const start = std::chrono::steady_clock::now();
             auto localStore = getStore();
             nixgrpc::ZstdWriterSink<NarsStream, nix::remote::NarChunk> sink(*stream);
@@ -508,6 +723,7 @@ struct Options
     std::string clientCA;
     std::string metricsListen;
     nixgrpc::LogLevel logLevel = nixgrpc::LogLevel::info;
+    nixgrpc::Acl acl;
 };
 
 auto parseOptions(const std::vector<std::string_view> & args) -> Options
@@ -533,6 +749,10 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.tlsKey = next();
         } else if (arg == "--client-ca") {
             options.clientCA = next();
+        } else if (arg == "--allow") {
+            options.acl.addRule(next());
+        } else if (arg == "--allow-anonymous") {
+            options.acl.allowAnonymous(nixgrpc::parseRole(next()));
         } else if (arg == "--metrics-listen") {
             options.metricsListen = next();
         } else if (arg == "--log-level") {
@@ -546,6 +766,10 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             throw nix::Error("unknown flag '%s'", arg);
         }
     }
+    if ((options.acl.active() || options.acl.anonymousRole()) && options.clientCA.empty()) {
+        // Without mTLS every client's CN is "-".
+        throw nix::Error("--allow/--allow-anonymous requires --client-ca");
+    }
     return options;
 }
 
@@ -558,10 +782,15 @@ auto makeServerCredentials(const Options & options) -> std::shared_ptr<grpc::Ser
         return grpc::InsecureServerCredentials();
     }
     // With --client-ca the server requires and verifies a client certificate
-    // (mTLS); without it, plain server-auth TLS.
-    grpc::SslServerCredentialsOptions ssl(
-        options.clientCA.empty() ? GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE
-                                 : GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY);
+    // (mTLS); --allow-anonymous downgrades "require" to "verify if
+    // presented" and the ACL sees cert-less clients as CN "-".
+    auto clientCertRequest = GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE;
+    if (!options.clientCA.empty()) {
+        clientCertRequest = options.acl.anonymousRole()
+                                ? GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY
+                                : GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
+    }
+    grpc::SslServerCredentialsOptions ssl(clientCertRequest);
     ssl.pem_key_cert_pairs.push_back(
         {.private_key = nix::readFile(options.tlsKey), .cert_chain = nix::readFile(options.tlsCert)});
     if (!options.clientCA.empty()) {
@@ -589,7 +818,7 @@ try {
     if (options.storeUri.empty()) {
         options.storeUri = "unix://" + options.socketPath;
     }
-    NixRemoteService service(options.socketPath, options.storeUri, metrics, options.logLevel);
+    NixRemoteService service(options.socketPath, options.storeUri, metrics, options.logLevel, options.acl);
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;

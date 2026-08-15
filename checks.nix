@@ -58,6 +58,13 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     dontFixup = true;
   });
 
+  # Exercises the README ACME/step-ca substituter example.
+  acme-vm = import ./tests/acme-substituter-test.nix {
+    inherit pkgs;
+    nixPkgs = nixPackages;
+    module = nixosModule;
+  };
+
   vm = import ./tests/nixos-test.nix {
     inherit pkgs;
     nixPkgs = nixPackages;

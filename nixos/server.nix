@@ -85,6 +85,68 @@ in
       };
     };
 
+    accessRules = lib.mkOption {
+      type = lib.types.listOf (
+        lib.types.submodule {
+          options = {
+            cn = lib.mkOption {
+              type = lib.types.str;
+              example = "ci-*";
+              description = "Glob pattern matched against the client certificate CN.";
+            };
+            role = lib.mkOption {
+              type = lib.types.enum [
+                "read-only"
+                "write"
+                "trusted"
+              ];
+              description = ''
+                `read-only` allows path queries and NAR downloads.
+                `write` additionally allows signed imports (signature
+                checking is enforced) and server-side builds. `trusted`
+                allows everything, including the raw worker-protocol
+                tunnel and unsigned imports (the latter also needs
+                {option}`trustClients`).
+              '';
+            };
+          };
+        }
+      );
+      default = [ ];
+      example = lib.literalExpression ''
+        [
+          { cn = "ci-*"; role = "trusted"; }
+          { cn = "cache-mirror"; role = "read-only"; }
+          { cn = "*"; role = "write"; }
+        ]
+      '';
+      description = ''
+        Ordered access-control rules mapping client certificate CNs to
+        roles; the first matching rule wins and clients matching no rule
+        are denied. Requires {option}`tls.clientCaFile`. When empty, every
+        authenticated client has full access.
+      '';
+    };
+
+    anonymousRole = lib.mkOption {
+      type = lib.types.nullOr (
+        lib.types.enum [
+          "read-only"
+          "write"
+          "trusted"
+        ]
+      );
+      default = null;
+      example = "read-only";
+      description = ''
+        Role for clients that present no certificate. When set, a client
+        certificate is no longer required (but still verified when
+        presented). `read-only` turns the daemon into a public binary
+        cache while certificate holders keep their {option}`accessRules`
+        roles. Requires {option}`tls.clientCaFile`.
+      '';
+    };
+
     extraFlags = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -101,6 +163,10 @@ in
       {
         assertion = (cfg.tls.certFile == null) == (cfg.tls.keyFile == null);
         message = "services.nix-grpc-daemon.tls.certFile and tls.keyFile must be set together";
+      }
+      {
+        assertion = (cfg.accessRules == [ ] && cfg.anonymousRole == null) || cfg.tls.clientCaFile != null;
+        message = "services.nix-grpc-daemon.accessRules/anonymousRole requires tls.clientCaFile (mTLS)";
       }
     ];
 
@@ -147,6 +213,14 @@ in
           ++ lib.optionals (cfg.tls.clientCaFile != null) [
             "--client-ca"
             cfg.tls.clientCaFile
+          ]
+          ++ lib.concatMap (rule: [
+            "--allow"
+            "${rule.cn}=${rule.role}"
+          ]) cfg.accessRules
+          ++ lib.optionals (cfg.anonymousRole != null) [
+            "--allow-anonymous"
+            cfg.anonymousRole
           ]
           ++ lib.optionals (cfg.metricsListen != null) [
             "--metrics-listen"

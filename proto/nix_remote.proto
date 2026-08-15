@@ -72,6 +72,41 @@ message BuildDerivationChunk {
   }
 }
 
+message BuildPathsRequest {
+  // DerivedPaths in nix's string notation.
+  repeated string targets = 1;
+  uint32 build_mode = 2;
+  uint32 protocol = 3;
+}
+
+// `results` is the worker-protocol vector<KeyedBuildResult> serialisation at
+// the request's `protocol`. Output path infos ride along so the client needs
+// no follow-up queries.
+message BuildPathsDone {
+  bytes results = 1;
+  repeated PathInfo outputs = 2;
+}
+
+message BuildPathsChunk {
+  oneof event {
+    string log_line = 1;
+    BuildPathsDone done = 2;
+  }
+}
+
+message QueryMissingRequest {
+  // DerivedPaths in nix's string notation.
+  repeated string targets = 1;
+}
+
+message QueryMissingReply {
+  repeated string will_build = 1;
+  repeated string will_substitute = 2;
+  repeated string unknown = 3;
+  uint64 download_size = 4;
+  uint64 nar_size = 5;
+}
+
 message StoreInfoRequest {}
 
 message StoreInfoReply {
@@ -103,5 +138,7 @@ service NixRemote {
   rpc QueryPathInfos(QueryPathInfosRequest) returns (QueryPathInfosReply);
   rpc NarsFromPaths(stream NarRequest) returns (stream NarChunk);
   rpc BuildDerivation(BuildDerivationRequest) returns (stream BuildDerivationChunk);
+  rpc BuildPaths(BuildPathsRequest) returns (stream BuildPathsChunk);
+  rpc QueryMissing(QueryMissingRequest) returns (QueryMissingReply);
   rpc StoreInfo(StoreInfoRequest) returns (StoreInfoReply);
 }

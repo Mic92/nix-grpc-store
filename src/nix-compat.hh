@@ -110,6 +110,36 @@ inline void forBuiltOutputs(R &res, const F &fun) {
   }
 }
 
+// Same variant split as forBuiltOutputs.
+// Non-const because BuildResult::success() is non-const before Nix 2.32.
+template <typename R>
+inline auto buildFailureMsg(R &res) -> std::optional<std::string> {
+  if constexpr (requires { res.tryGetFailure(); }) {
+    if (const auto *failure = res.tryGetFailure()) {
+      if constexpr (requires { failure->errorMsg; }) {
+        return failure->errorMsg;
+      } else {
+        return std::string(failure->what());
+      }
+    }
+    return std::nullopt;
+  } else {
+    if (res.success()) {
+      return std::nullopt;
+    }
+    return res.errorMsg;
+  }
+}
+
+// Same variant split as forBuiltOutputs.
+template <typename R> inline void setAlreadyValid(R &res) {
+  if constexpr (requires { res.tryGetSuccess(); }) {
+    res.inner = typename R::Success{.status = R::Success::AlreadyValid};
+  } else {
+    res.status = R::AlreadyValid;
+  }
+}
+
 inline auto buildProtocolVersion() -> nix::WorkerProto::Version {
   constexpr unsigned int major = 1;
   constexpr uint8_t minor = 37;

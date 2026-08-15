@@ -13,6 +13,11 @@ let
   # Certs live under /run so they are freshly generated on every test run
   # (a store path would be cached and eventually expire).
   certDir = "/run/nix-grpc-certs";
+  # Static throwaway signing key: the ACL subtest needs the daemon's
+  # nix-daemon to trust a key at eval time (trusted-public-keys is static
+  # nix.conf), so it cannot be generated at runtime like the TLS certs.
+  signingSecretKey = "nix-grpc-test-1:1/icU6Hlts+rG2LxnM8NoIMcrLWAzdCgJEOLjewE8DxGQKUPC9+LF07Ci6sEjhQP2G50TfF9TkQFBwwVRW5FXw==";
+  signingPublicKey = "nix-grpc-test-1:RkClDwvfixdOwourBI4UD9hudE3xfU5EBQcMFUVuRV8=";
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-store";
@@ -32,6 +37,7 @@ pkgs.testers.runNixOSTest {
         experimental-features = [ "nix-command" ];
         # Keep the benchmark deterministic and offline.
         substituters = [ ];
+        trusted-public-keys = [ signingPublicKey ];
       };
 
       programs.nix-grpc-store.enable = true;
@@ -98,14 +104,20 @@ pkgs.testers.runNixOSTest {
           cd ${certDir}
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
             -keyout ca.key -out ca.pem -subj /CN=nix-grpc-ca
-          for n in server client; do
+          issue() {
             openssl req -newkey rsa:2048 -nodes \
-              -keyout $n.key -out $n.csr -subj /CN=localhost
-            openssl x509 -req -in $n.csr -days 1 \
+              -keyout $1.key -out $1.csr -subj /CN=$2
+            openssl x509 -req -in $1.csr -days 1 \
               -CA ca.pem -CAkey ca.key -set_serial 0x$RANDOM \
               -extfile <(printf 'subjectAltName=DNS:localhost') \
-              -out $n.pem
-          done
+              -out $1.pem
+          }
+          issue server localhost
+          issue client localhost
+          # Distinct CNs for the ACL subtest.
+          issue ro ro-client
+          issue rw rw-client
+          issue stranger stranger
           chmod a+r ${certDir}/*
         '';
       };
@@ -123,6 +135,10 @@ pkgs.testers.runNixOSTest {
             --proxy-socket /nix/var/nix/daemon-socket/socket \
             --tls-cert ${certDir}/server.pem --tls-key ${certDir}/server.key \
             --client-ca ${certDir}/ca.pem \
+            --allow localhost=trusted \
+            --allow ro-client=read-only \
+            --allow rw-client=write \
+            --allow-anonymous read-only \
             --metrics-listen 127.0.0.1:9464
         '';
       };
@@ -172,10 +188,16 @@ pkgs.testers.runNixOSTest {
     with subtest("mTLS"):
         machine.wait_for_unit("nix-grpc-daemon-mtls.service")
         machine.wait_for_open_port(50052)
-        # Without a client cert the handshake must fail.
-        machine.fail(
-            "nix store info --store "
-            "'grpc://localhost:50052?ca-cert=${certDir}/ca.pem'"
+        # Cert-less clients are anonymous: reads work (--allow-anonymous
+        # read-only), mutations are denied.
+        store_anon = "grpc://localhost:50052?ca-cert=${certDir}/ca.pem"
+        machine.succeed(f"nix path-info --store '{store_anon}' '{p}'")
+        # Fresh content: an already-valid path would no-op without a write.
+        machine.succeed("head -c 64 /dev/urandom | base64 > /root/denyfile")
+        machine.fail(f"nix store add --store '{store_anon}' /root/denyfile")
+        machine.succeed(
+            "journalctl -u nix-grpc-daemon-mtls.service | "
+            "grep -q 'event=denied method=Connect cn=- role=read-only'"
         )
         # With a client cert it succeeds and can round-trip a build.
         machine.succeed(f"nix store info --json --store '{store_mtls}'")
@@ -190,12 +212,117 @@ pkgs.testers.runNixOSTest {
             "install -m 0644 ${certDir}/client.pem /var/lib/nix-grpc-store/client.crt",
             "install -m 0600 ${certDir}/client.key /var/lib/nix-grpc-store/client.key",
         )
-        # No client-cert/client-key URI params: falls back to /var/lib.
+        # No client-cert/client-key URI params: falls back to /var/lib. A
+        # mutation proves the trusted cert is picked up, since reads would
+        # succeed anonymously too.
         machine.succeed(
-            "nix store info --json --store "
-            "'grpc://localhost:50052?ca-cert=${certDir}/ca.pem'"
+            "nix store add --store "
+            "'grpc://localhost:50052?ca-cert=${certDir}/ca.pem' /etc/hello.nix"
         )
         machine.succeed("rm -r /var/lib/nix-grpc-store")
+
+    with subtest("certificate ACL: read-only role"):
+        def cert_store(name: str) -> str:
+            return (
+                "grpc://localhost:50052"
+                "?ca-cert=${certDir}/ca.pem"
+                f"&client-cert=${certDir}/{name}.pem"
+                f"&client-key=${certDir}/{name}.key"
+            )
+
+        store_ro = cert_store("ro")
+        # Queries and downloads work. (`nix store info` would tunnel for the
+        # daemon version, so probe with a native path query instead.)
+        machine.succeed(f"nix path-info --store '{store_ro}' '{p}'")
+        machine.succeed(
+            f"nix copy --no-check-sigs --from '{store_ro}' --to /root/ro-dst '{p}'"
+        )
+        # Mutations are denied: store add and gc need the tunnel, build needs
+        # the build permission.
+        machine.fail(f"nix store add --store '{store_ro}' /root/denyfile")
+        machine.fail(
+            f"nix build --store '{store_ro}' --impure -f /etc/hello.nix --no-link"
+        )
+        machine.succeed(
+            "journalctl -u nix-grpc-daemon-mtls.service | "
+            "grep -q 'event=denied method=Connect cn=ro-client role=read-only'"
+        )
+
+    with subtest("certificate ACL: write role enforces signatures"):
+        store_rw = cert_store("rw")
+        # Input-addressed output: a CA path (nix store add) would pass
+        # CheckSigs without a signature.
+        machine.succeed(
+            "printf 'derivation { name = \"acl-blob\"; "
+            "system = builtins.currentSystem; builder = \"/bin/sh\"; "
+            "args = [ \"-c\" \"echo acl-payload > $out\" ]; }' > /root/acl.nix"
+        )
+        up = machine.succeed(
+            "nix build --store /root/aclsrc --impure -f /root/acl.nix "
+            "--no-link --print-out-paths"
+        ).strip()
+        # The client asks to skip signature checks, but the server forces
+        # CheckSigs for the write role, so the unsigned path is rejected.
+        machine.fail(
+            f"nix copy --no-check-sigs --from /root/aclsrc --to '{store_rw}' '{up}'"
+        )
+        # After signing with a key the daemon trusts, the same copy succeeds.
+        machine.succeed(
+            "install -m 0600 /dev/null /root/cache-key && "
+            "echo '${signingSecretKey}' > /root/cache-key"
+        )
+        machine.succeed(f"nix store sign -k /root/cache-key --store /root/aclsrc '{up}'")
+        machine.succeed(
+            f"nix copy --no-check-sigs --from /root/aclsrc --to '{store_rw}' '{up}'"
+        )
+        machine.succeed(f"test -e '{up}'")
+        # The opaque worker-protocol tunnel stays off limits.
+        machine.fail(f"nix store add --store '{store_rw}' /root/denyfile")
+
+    with subtest("certificate ACL: write role builds via the native BuildPaths RPC"):
+        # Evaluation stays local; the drv closure is imported
+        # (content-addressed, passes CheckSigs) and built server-side, so no
+        # trusted role or worker-protocol tunnel is needed.
+        machine.succeed(
+            "printf 'derivation { name = \"bp-blob\"; "
+            "system = builtins.currentSystem; builder = \"/bin/sh\"; "
+            "args = [ \"-c\" \"echo bp-payload > $out\" ]; }' > /root/bp.nix"
+        )
+        out = machine.succeed(
+            f"nix build --store '{store_rw}' --eval-store auto --impure "
+            "-f /root/bp.nix --no-link --print-out-paths"
+        ).strip()
+        machine.succeed(f"grep -q bp-payload '{out}'")
+        machine.succeed(
+            "journalctl -u nix-grpc-daemon-mtls.service | "
+            "grep -q 'event=rpc method=BuildPaths cn=rw-client'"
+        )
+        # A failing build reports the error without the tunnel.
+        machine.succeed(
+            "printf 'derivation { name = \"bp-fail\"; "
+            "system = builtins.currentSystem; builder = \"/bin/sh\"; "
+            "args = [ \"-c\" \"exit 1\" ]; }' > /root/bp-fail.nix"
+        )
+        machine.fail(
+            f"nix build --store '{store_rw}' --eval-store auto --impure "
+            "-f /root/bp-fail.nix --no-link"
+        )
+        # Repair rewrites existing store paths and stays trusted-only.
+        machine.fail(
+            f"nix build --store '{store_rw}' --eval-store auto --impure "
+            "-f /root/bp.nix --no-link --repair"
+        )
+        machine.succeed(
+            "journalctl -u nix-grpc-daemon-mtls.service | "
+            "grep -q 'event=denied method=BuildPaths(repair) cn=rw-client'"
+        )
+
+    with subtest("certificate ACL: unmatched CN is denied"):
+        machine.fail(f"nix store info --store '{cert_store('stranger')}'")
+        machine.succeed(
+            "journalctl -u nix-grpc-daemon-mtls.service | "
+            "grep -q 'event=denied method=.* cn=stranger role=none'"
+        )
 
     with subtest("access log attributes clients by certificate CN"):
         machine.succeed(
