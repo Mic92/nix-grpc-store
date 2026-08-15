@@ -290,8 +290,9 @@ public:
             nix::remote::NarRequest request;
             while (stream->Read(&request)) {
                 localStore->narFromPath(nix::StorePath(request.path()), counting);
-                // The client blocks on this NAR before sending the next
-                // request, so it must not linger in the encoder.
+                // The client blocks on this NAR (requests may be pipelined,
+                // but NARs are consumed in request order), so it must not
+                // linger in the encoder.
                 sink.flush();
                 ++paths;
             }
