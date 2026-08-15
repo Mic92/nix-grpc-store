@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot bench-transports.py results.
+"""Plot bench-transports.py or bench-builds.py results.
 
 Usage:
   nix shell nixpkgs#python3Packages.matplotlib -c \\
@@ -61,12 +61,17 @@ def main() -> None:
     )
     axis.set_ylim(0, tallest * 1.35)
 
+    builds = "length" in history[0]
     labels = []
     for record in history:
         means = [statistics.mean(record["runs"][store]) for store in stores]
+        what = (
+            f"{record['length']} derivations"
+            if builds
+            else f"{record['paths']} paths, {record['bytes'] / 1e6:.0f} MB"
+        )
         labels.append(
-            f"{record['date'][:10]}, {record['paths']} paths, "
-            f"{record['bytes'] / 1e6:.0f} MB\n"
+            f"{record['date'][:10]}, {what}\n"
             f"fastest is {max(means) / min(means):.1f}x faster"
         )
     axis.set_xticks(
@@ -74,8 +79,9 @@ def main() -> None:
         labels,
         fontsize=8,
     )
-    axis.set_ylabel("nix copy wall time (s)")
-    axis.set_title("nix copy transport comparison", fontsize=11)
+    verb = "remote build" if builds else "nix copy"
+    axis.set_ylabel(f"{verb} wall time (s)")
+    axis.set_title(f"{verb} transport comparison", fontsize=11)
     axis.legend(fontsize=8, frameon=False, loc="upper right")
     fig.tight_layout()
     fig.savefig(args.output)

@@ -31,6 +31,15 @@ Why gRPC instead of `ssh-ng://`?
 
 Reproduce with `./scripts/bench-transports.py`.*
 
+Remote builds skip the tunnelled worker protocol too: one streaming RPC
+submits the derivation and returns the result with its output path
+infos, so a chain of tiny builds over a ~50 ms WAN link runs 2.6x
+faster than `ssh-ng://`:
+
+![remote build transport comparison](docs/bench-builds.png)
+
+Reproduce with `./scripts/bench-builds.py`.*
+
 Everything that works over `ssh-ng://` works here: remote builds,
 `nix copy`, path queries, GC. The gRPC layer is a thin tunnel to the
 `nix-daemon` on the other side, with dedicated RPCs for the `nix copy` hot
