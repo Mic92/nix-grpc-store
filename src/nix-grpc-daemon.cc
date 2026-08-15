@@ -360,6 +360,46 @@ public:
         return backend;
     }
 
+    auto QueryMissing(
+        grpc::ServerContext * context,
+        const nix::remote::QueryMissingRequest * request,
+        nix::remote::QueryMissingReply * reply) -> grpc::Status override
+    {
+        return guarded([&]() -> grpc::Status {
+            auto const cert = nixgrpc::clientCommonName(*context);
+            auto const commonName = cert.value_or("-");
+            if (auto status = authorize(cert, "QueryMissing", nixgrpc::Role::readOnly); !status.ok()) {
+                return status;
+            }
+            logDebug(
+                {{"event", "rpc"},
+                 {"method", "QueryMissing"},
+                 {"cn", commonName},
+                 {"peer", context->peer()},
+                 {"targets", std::to_string(request->targets_size())}});
+            metrics.countRpc("QueryMissing", commonName);
+            auto localStore = getStore();
+            std::vector<nix::DerivedPath> targets;
+            targets.reserve(request->targets_size());
+            for (const auto & target : request->targets()) {
+                targets.push_back(nix::DerivedPath::parse(*localStore, target));
+            }
+            auto missing = localStore->queryMissing(targets);
+            for (const auto & path : missing.willBuild) {
+                reply->add_will_build(std::string(path.to_string()));
+            }
+            for (const auto & path : missing.willSubstitute) {
+                reply->add_will_substitute(std::string(path.to_string()));
+            }
+            for (const auto & path : missing.unknown) {
+                reply->add_unknown(std::string(path.to_string()));
+            }
+            reply->set_download_size(missing.downloadSize);
+            reply->set_nar_size(missing.narSize);
+            return grpc::Status::OK;
+        });
+    }
+
     auto StoreInfo(
         grpc::ServerContext * context,
         const nix::remote::StoreInfoRequest * /*request*/,

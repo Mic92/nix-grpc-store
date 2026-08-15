@@ -72,6 +72,19 @@ message BuildDerivationChunk {
   }
 }
 
+message QueryMissingRequest {
+  // DerivedPaths in nix's string notation.
+  repeated string targets = 1;
+}
+
+message QueryMissingReply {
+  repeated string will_build = 1;
+  repeated string will_substitute = 2;
+  repeated string unknown = 3;
+  uint64 download_size = 4;
+  uint64 nar_size = 5;
+}
+
 message StoreInfoRequest {}
 
 message StoreInfoReply {
@@ -103,5 +116,6 @@ service NixRemote {
   rpc QueryPathInfos(QueryPathInfosRequest) returns (QueryPathInfosReply);
   rpc NarsFromPaths(stream NarRequest) returns (stream NarChunk);
   rpc BuildDerivation(BuildDerivationRequest) returns (stream BuildDerivationChunk);
+  rpc QueryMissing(QueryMissingRequest) returns (QueryMissingReply);
   rpc StoreInfo(StoreInfoRequest) returns (StoreInfoReply);
 }

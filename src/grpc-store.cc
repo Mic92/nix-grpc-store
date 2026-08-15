@@ -271,6 +271,39 @@ public:
       return res;
     }
 
+    // RemoteStore would tunnel this. One RPC, with a fallback to the
+    // client-side walk for servers without QueryMissing.
+    auto queryMissing(const std::vector<DerivedPath> & targets)
+        -> MissingPaths override {
+      grpc::ClientContext ctx;
+      remote::QueryMissingRequest request;
+      for (const auto & target : targets) {
+        request.add_targets(target.to_string(*this));
+      }
+      remote::QueryMissingReply reply;
+      auto status = stub->QueryMissing(&ctx, request, &reply);
+      if (status.error_code() == grpc::StatusCode::UNIMPLEMENTED) {
+        // Deliberate: RemoteStore::queryMissing would tunnel, the generic
+        // Store walk works with native path queries.
+        // NOLINTNEXTLINE(bugprone-parent-virtual-call)
+        return Store::queryMissing(targets);
+      }
+      checkStatus(status, "QueryMissing");
+      MissingPaths res;
+      for (const auto & path : reply.will_build()) {
+        res.willBuild.insert(StorePath(path));
+      }
+      for (const auto & path : reply.will_substitute()) {
+        res.willSubstitute.insert(StorePath(path));
+      }
+      for (const auto & path : reply.unknown()) {
+        res.unknown.insert(StorePath(path));
+      }
+      res.downloadSize = reply.download_size();
+      res.narSize = reply.nar_size();
+      return res;
+    }
+
     // Same: keep read-only clients off the tunnel.
     auto isValidPathUncached(const StorePath & path) -> bool override {
       return queryValidPaths({path}, NoSubstitute).contains(path);
