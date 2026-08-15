@@ -37,6 +37,15 @@ path (path info queries, bulk import, NAR download).
 
 ![nix copy transport comparison](docs/bench.png)
 
+`nix copy` of a 101-path, 411 MB closure from the same server over a
+wired link with ~47 ms RTT, 6 interleaved runs each:
+
+| Transport                     | Wall time      | Throughput |
+| ----------------------------- | -------------- | ---------- |
+| `grpc://`                     | 5.3 s ± 0.14   | 77 MB/s    |
+| `https://` (harmonia)         | 7.2 s ± 0.37   | 57 MB/s    |
+| `ssh-ng://`                   | 19.7 s ± 0.46  | 21 MB/s    |
+
 Reproduce with `./scripts/bench-transports.py`.*
 
 Remote builds skip the tunnelled worker protocol too: one streaming RPC
