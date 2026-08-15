@@ -271,6 +271,23 @@ public:
       return res;
     }
 
+    // The build hook probes reachability at store open. One StoreInfo RPC
+    // answers it and caches the trust flag, no tunnel needed.
+    void connect() override { isTrustedClient(); }
+
+    auto isTrustedClient() -> std::optional<TrustedFlag> override {
+      std::call_once(trustedOnce, [&]() -> void {
+        grpc::ClientContext ctx;
+        remote::StoreInfoRequest const request;
+        remote::StoreInfoReply reply;
+        checkStatus(stub->StoreInfo(&ctx, request, &reply), "StoreInfo");
+        if (reply.has_trusted()) {
+          trusted = reply.trusted() ? Trusted : NotTrusted;
+        }
+      });
+      return trusted;
+    }
+
 #if NIX_COMPAT_HAS_BUILDER
     auto getBuilder(std::shared_ptr<Store> evalStore) -> ref<Builder> override {
       class GrpcBuilder : public Builder {
@@ -369,6 +386,9 @@ private:
       return {path, std::make_shared<ValidPathInfo>(StorePath(path),
                                                     std::move(info))};
     }
+
+    std::once_flag trustedOnce;
+    std::optional<TrustedFlag> trusted;
 
     /* Path infos fetched in bulk by topoSortPaths(), consumed by
        queryPathInfoUncached() so `nix copy` needs one QueryPathInfos RPC

@@ -72,6 +72,12 @@ message BuildDerivationChunk {
   }
 }
 
+message StoreInfoRequest {}
+
+message StoreInfoReply {
+  optional bool trusted = 1;
+}
+
 message NarRequest {
   string path = 1;
 }
@@ -97,4 +103,5 @@ service NixRemote {
   rpc QueryPathInfos(QueryPathInfosRequest) returns (QueryPathInfosReply);
   rpc NarsFromPaths(stream NarRequest) returns (stream NarChunk);
   rpc BuildDerivation(BuildDerivationRequest) returns (stream BuildDerivationChunk);
+  rpc StoreInfo(StoreInfoRequest) returns (StoreInfoReply);
 }

@@ -286,6 +286,45 @@ public:
     // Relays the raw worker-protocol stderr stream of one build to the
     // client, which replays it through its own protocol code. Output path
     // infos ride on the final message.
+    struct Backend
+    {
+        struct Conn : nix::WorkerProto::BasicClientConnection
+        {
+            void closeWrite() override {}
+        };
+        nix::AutoCloseFD sock;
+        Conn conn;
+        nix::WorkerProto::ClientHandshakeInfo info;
+    };
+
+    auto connectBackend(nix::Store & store) -> std::unique_ptr<Backend>
+    {
+        auto backend = std::make_unique<Backend>();
+        backend->sock = nix::connect(std::filesystem::path{socketPath});
+        backend->conn.to = nix::FdSink(backend->sock.get());
+        backend->conn.from = nix::FdSource(backend->sock.get());
+        backend->conn.protoVersion = nixcompat::handshakeCompat(backend->conn, nixcompat::buildProtocolVersion());
+        backend->info = backend->conn.postHandshake(store);
+        return backend;
+    }
+
+    auto StoreInfo(
+        grpc::ServerContext * context,
+        const nix::remote::StoreInfoRequest * /*request*/,
+        nix::remote::StoreInfoReply * reply) -> grpc::Status override
+    {
+        return guarded([&]() -> grpc::Status {
+            auto const commonName = nixgrpc::clientCommonName(*context);
+            logDebug({{"event", "rpc"}, {"method", "StoreInfo"}, {"cn", commonName}, {"peer", context->peer()}});
+            metrics.countRpc("StoreInfo", commonName);
+            auto backend = connectBackend(*getStore());
+            if (backend->info.remoteTrustsUs) {
+                reply->set_trusted(*backend->info.remoteTrustsUs == nix::Trusted);
+            }
+            return grpc::Status::OK;
+        });
+    }
+
     // Consumes the worker-protocol stderr stream up to STDERR_LAST,
     // forwarding plain build log lines.
     static void relayBuildLog(nix::Source & source, const std::function<void(std::string)> & sendLogLine)
@@ -350,19 +389,11 @@ public:
             }
             auto localStore = getStore();
 
-            struct Conn : nix::WorkerProto::BasicClientConnection
-            {
-                void closeWrite() override {}
-            };
-            auto sock = nix::connect(std::filesystem::path{socketPath});
-            Conn conn;
-            conn.to = nix::FdSink(sock.get());
-            conn.from = nix::FdSource(sock.get());
-            conn.protoVersion = nixcompat::handshakeCompat(conn, protocol);
+            auto backend = connectBackend(*localStore);
+            auto & conn = backend->conn;
             if (nixcompat::protocolWire(conn.protoVersion) != nixcompat::kBuildProtocolWire) {
                 return {grpc::StatusCode::FAILED_PRECONDITION, "backend daemon is too old"};
             }
-            conn.postHandshake(*localStore);
             auto sendLogLine = [&](std::string line) -> void {
                 nix::remote::BuildDerivationChunk chunk;
                 *chunk.mutable_log_line() = std::move(line);
