@@ -37,7 +37,8 @@
         }
         // scope.versionPlugins
         // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
-          # Benchmark, intentionally not in `checks` so CI skips it.
+          # Benchmarks, intentionally not in `checks` so CI skips them.
+          bench-closure = nixpkgs.legacyPackages.${system}.callPackage ./tests/bench-closure.nix { };
           bench-latency = import ./tests/latency-test.nix {
             pkgs = nixpkgs.legacyPackages.${system};
             nixPkgs = nix.packages.${system};
