@@ -227,8 +227,10 @@ public:
       args.SetMaxReceiveMessageSize(-1);
       args.SetMaxSendMessageSize(-1);
 
-      stub = remote::NixRemote::NewStub(grpc::CreateCustomChannel(
-          config->authority.to_string(), creds, args));
+      auto channel = grpc::CreateCustomChannel(config->authority.to_string(), creds, args);
+      // Start TCP+TLS setup now instead of stalling the first RPC.
+      channel->GetState(true);
+      stub = remote::NixRemote::NewStub(std::move(channel));
     }
 
     GrpcStore(const GrpcStore &) = delete;
