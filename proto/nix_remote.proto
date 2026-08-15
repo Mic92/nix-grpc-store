@@ -113,17 +113,22 @@ message StoreInfoReply {
   optional bool trusted = 1;
 }
 
-message NarRequest {
-  string path = 1;
+message FetchNarsRequest {
+  // Store paths to send, streamed back in this order.
+  repeated string paths = 1;
 }
 
-// One message of a NAR download. The concatenation of all `data` fields in
-// one NarsFromPaths call is a single zstd stream containing the raw NARs of
-// the requested paths, in request order, so the compression window is shared
-// across paths. NARs are self-delimiting; the stream is flushed after each so
-// the client never blocks on a NAR that is still buffered in the encoder.
-message NarChunk {
-  bytes data = 1;
+// One frame of a NAR download. The concatenation of all `data` fields in one
+// FetchNars call is a single zstd stream, so the compression window is
+// shared across paths. The stream is flushed at every frame boundary, so
+// each frame decodes in isolation and its decompressed bytes belong to
+// `paths[path_index]`. `eof` marks the last frame of that path's NAR; the
+// client can restore the path as soon as its frames arrive, while later
+// paths are still in flight.
+message NarFrame {
+  uint32 path_index = 1;
+  bytes data = 2;
+  bool eof = 3;
 }
 
 // Bidirectional tunnel that carries the same byte stream `nix-daemon --stdio`
@@ -136,7 +141,7 @@ service NixRemote {
   rpc QueryValidPaths(QueryValidPathsRequest) returns (QueryValidPathsReply);
   rpc AddMultipleToStore(stream AddMultipleChunk) returns (AddMultipleReply);
   rpc QueryPathInfos(QueryPathInfosRequest) returns (QueryPathInfosReply);
-  rpc NarsFromPaths(stream NarRequest) returns (stream NarChunk);
+  rpc FetchNars(FetchNarsRequest) returns (stream NarFrame);
   rpc BuildDerivation(BuildDerivationRequest) returns (stream BuildDerivationChunk);
   rpc BuildPaths(BuildPathsRequest) returns (stream BuildPathsChunk);
   rpc QueryMissing(QueryMissingRequest) returns (QueryMissingReply);

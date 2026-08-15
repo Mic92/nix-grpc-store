@@ -53,7 +53,6 @@
 // Generic definitions for the std::vector serialiser wrappers, which
 // libnixstore does not instantiate explicitly.
 #include <nix/store/worker-protocol-impl.hh> // IWYU pragma: keep
-#include <nix/util/archive.hh>
 #include <nix/util/callback.hh>
 #include <nix/util/file-descriptor.hh>
 #include <nix/util/url.hh>
@@ -773,9 +772,7 @@ public:
     // NOLINTNEXTLINE(misc-override-with-different-visibility): Store and RemoteStore already disagree
     void narFromPath(const StorePath & path, Sink & sink) override
     {
-      auto spoolFd = narFetcher.fetch(path);
-      FdSource spooled(spoolFd.get());
-      copyNAR(spooled, sink);
+      narFetcher.fetchInto(path, sink);
     }
 
     ~GrpcStore() override {

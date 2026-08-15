@@ -67,7 +67,7 @@
 
 using GrpcStream = grpc::ServerReaderWriter<nix::remote::Chunk, nix::remote::Chunk>;
 using AddMultipleReader = grpc::ServerReader<nix::remote::AddMultipleChunk>;
-using NarsStream = grpc::ServerReaderWriter<nix::remote::NarChunk, nix::remote::NarRequest>;
+using NarFrameWriter = grpc::ServerWriter<nix::remote::NarFrame>;
 using BuildWriter = grpc::ServerWriter<nix::remote::BuildDerivationChunk>;
 using BuildPathsWriter = grpc::ServerWriter<nix::remote::BuildPathsChunk>;
 
@@ -667,17 +667,45 @@ public:
         });
     }
 
-    auto NarsFromPaths(grpc::ServerContext * context, NarsStream * stream) -> grpc::Status override
+    auto FetchNars(
+        grpc::ServerContext * context,
+        const nix::remote::FetchNarsRequest * request,
+        NarFrameWriter * writer) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
             auto const cert = nixgrpc::clientCommonName(*context);
             auto const commonName = cert.value_or("-");
-            if (auto status = authorize(cert, "NarsFromPaths", nixgrpc::Role::readOnly); !status.ok()) {
+            if (auto status = authorize(cert, "FetchNars", nixgrpc::Role::readOnly); !status.ok()) {
                 return status;
             }
             auto const start = std::chrono::steady_clock::now();
             auto localStore = getStore();
-            nixgrpc::ZstdWriterSink<NarsStream, nix::remote::NarChunk> sink(*stream);
+
+            class TaggingWriter
+            {
+                NarFrameWriter * writer;
+                uint32_t pathIndex = 0;
+
+            public:
+                explicit TaggingWriter(NarFrameWriter * writer)
+                    : writer(writer)
+                {
+                }
+
+                void setPathIndex(uint32_t index)
+                {
+                    pathIndex = index;
+                }
+
+                auto Write(nix::remote::NarFrame & frame) -> bool
+                {
+                    frame.set_path_index(pathIndex);
+                    return writer->Write(frame);
+                }
+            };
+
+            TaggingWriter tagged(writer);
+            nixgrpc::ZstdWriterSink<TaggingWriter, nix::remote::NarFrame> sink(tagged);
 
             uint64_t narBytes = 0;
             nix::LambdaSink counting([&](std::string_view data) -> void {
@@ -685,27 +713,27 @@ public:
                 narBytes += data.size();
             });
 
-            uint64_t paths = 0;
-            nix::remote::NarRequest request;
-            while (stream->Read(&request)) {
-                localStore->narFromPath(nix::StorePath(request.path()), counting);
-                // The client blocks on this NAR (requests may be pipelined,
-                // but NARs are consumed in request order), so it must not
-                // linger in the encoder.
+            for (int idx = 0; idx < request->paths_size(); ++idx) {
+                tagged.setPathIndex(static_cast<uint32_t>(idx));
+                localStore->narFromPath(nix::StorePath(request->paths(idx)), counting);
                 sink.flush();
-                ++paths;
+                nix::remote::NarFrame eofFrame;
+                eofFrame.set_path_index(static_cast<uint32_t>(idx));
+                eofFrame.set_eof(true);
+                if (!writer->Write(eofFrame)) {
+                    throw nix::Error("gRPC stream closed by peer");
+                }
             }
-            sink.finish();
             nixgrpc::logLine(
                 nixgrpc::LogLevel::info,
                 {{"event", "rpc"},
-                 {"method", "NarsFromPaths"},
+                 {"method", "FetchNars"},
                  {"cn", commonName},
                  {"peer", context->peer()},
                  {"duration_s", secondsSince(start)},
-                 {"paths", std::to_string(paths)},
+                 {"paths", std::to_string(request->paths_size())},
                  {"nar_bytes_out", std::to_string(narBytes)}});
-            metrics.countRpc("NarsFromPaths", commonName);
+            metrics.countRpc("FetchNars", commonName);
             metrics.countNarBytes("out", commonName, narBytes);
             return grpc::Status::OK;
         });

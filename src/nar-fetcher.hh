@@ -1,32 +1,21 @@
 #pragma once
-// Sharded NAR download client for the grpc store plugin.
+// NAR download client for the grpc store plugin.
 //
-// Downloads are sharded over N NarsFromPaths streams, each on its own TCP
-// connection, because one connection cannot fill a high
-// bandwidth-delay-product link. Paths go to the least-loaded stream and
-// are pipelined in the order recorded via recordOrder(), so many small
-// paths cost ~1 round trip. Each stream has one reader thread that spools
-// every NAR to an unlinked temp file and fulfills a promise. fetch()
-// waits on the future, so restores run concurrently in the caller's
-// thread pool. The path and byte caps bound spool size and the bytes
-// wasted on an aborted copy.
-//
-// Two structural properties carry the safety argument: the futures map
-// is the single "already requested" marker and entries never revert to
-// absent while a request can be in flight, so a path cannot be requested
-// twice; and each promise travels inside its session's queue entry, so
-// the reader can never see a request without its promise.
+// The paths recorded via recordOrder() are partitioned across N FetchNars
+// streams (one TCP connection each, since a single connection cannot fill
+// a high bandwidth-delay-product link), largest paths first so their
+// restores start early. Each stream's reader thread decompresses tagged
+// frames into per-path spool files; fetchInto() streams a path's bytes to
+// the caller while later frames are still arriving, so restores overlap
+// the download.
 
 #include <algorithm>
-#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <deque>
 #include <exception>
 #include <functional>
-#include <future>
 #include <grpcpp/channel.h>
 #include <grpcpp/client_context.h>
 #include <grpcpp/support/status.h>
@@ -35,17 +24,17 @@
 #include <memory>
 #include <mutex>
 #include <nix/store/path.hh>
-#include <nix/util/archive.hh>
 #include <nix/util/error.hh>
 #include <nix/util/file-descriptor.hh>
 #include <nix/util/serialise.hh>
 #include <nix/util/util.hh>
-#include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
 #include <utility>
 #include <vector>
+#include <zstd.h>
 
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
@@ -71,85 +60,140 @@ public:
     auto operator=(const NarFetcher &) -> NarFetcher & = delete;
     auto operator=(NarFetcher &&) -> NarFetcher & = delete;
 
-    // Predicted fetch() call order with narSizes, used for pipelining.
     void recordOrder(std::vector<nix::StorePath> order, std::map<nix::StorePath, uint64_t> sizes)
     {
         std::scoped_lock const lock(narMutex);
-        expectedOrder = std::move(order);
-        narSizes = std::move(sizes);
-        cursor = 0;
+        for (auto & path : order) {
+            if (!buffers.contains(path)) {
+                pending.push_back(std::move(path));
+            }
+        }
+        narSizes.merge(sizes);
     }
 
-    // Returns the NAR for `path` as an unlinked spool file, rewound.
-    auto fetch(const nix::StorePath & path) -> nix::AutoCloseFD
+    void fetchInto(const nix::StorePath & path, nix::Sink & sink)
     {
-        std::future<nix::AutoCloseFD> pending;
+        std::shared_ptr<SpoolBuffer> buffer;
         {
             std::scoped_lock const lock(narMutex);
-            if (sessions.empty()) {
-                for (unsigned i = 0; i < connections; ++i) {
-                    sessions.push_back(std::unique_ptr<Session>(new Session(*this)));
-                }
+            auto found = buffers.find(path);
+            if (found == buffers.end()) {
+                startPending();
+                found = buffers.find(path);
             }
-            auto requested = futures.find(path);
-            // A present but invalid entry is a consumed request. Only then
-            // is a fresh request safe: nothing for the path is in flight.
-            if (requested == futures.end() || !requested->second.valid()) {
-                requested = futures.insert_or_assign(path, requestPath(path)).first;
+            if (found == buffers.end()) {
+                startSession({path});
+                found = buffers.find(path);
             }
-            pending = std::move(requested->second);
-            topUpPipeline();
+            buffer = found->second;
         }
-
-        auto spoolFd = pending.get();
-        if (::lseek(spoolFd.get(), 0, SEEK_SET) == -1) {
-            throw nix::SysError("seeking NAR spool file");
+        buffer->readInto(sink);
+        {
+            std::scoped_lock const lock(narMutex);
+            auto found = buffers.find(path);
+            if (found != buffers.end() && found->second == buffer) {
+                buffers.erase(found);
+            }
         }
-        return spoolFd;
     }
 
     ~NarFetcher()
     {
         for (const auto & session : sessions) {
-            bool idle = false;
-            {
-                std::scoped_lock const lock(session->mutex);
-                session->closing = true;
-                idle = session->queue.empty() && !session->spoolingActive;
+            session->ctx.TryCancel();
+            if (session->thread.joinable()) {
+                session->thread.join();
             }
-            session->wakeup.notify_all();
-            // With NARs still in flight (aborted copy), draining would
-            // download them all just to close the stream. Cancel instead.
-            if (!idle) {
-                session->ctx.TryCancel();
-            }
-            if (session->reader.joinable()) {
-                session->reader.join();
-            }
-            if (session->broken) {
-                continue;
-            }
-            // Let the server end its NarsFromPaths handler cleanly.
-            session->stream->WritesDone();
-            nix::remote::NarChunk chunk;
-            while (session->stream->Read(&chunk)) {
-                ;
-            }
-            (void)session->stream->Finish();
         }
     }
 
 private:
-    static constexpr size_t kPipelineWindow = 64;
-    static constexpr uint64_t kPipelineWindowBytes = 128ULL * 1024 * 1024;
-
-    using NarStream = grpc::ClientReaderWriter<nix::remote::NarRequest, nix::remote::NarChunk>;
-
-    // A requested NAR: the promise travels with the queue entry.
-    struct Item
+    class SpoolBuffer
     {
-        uint64_t size;
-        std::promise<nix::AutoCloseFD> promise;
+        nix::AutoCloseFD fd;
+        std::mutex mutex;
+        std::condition_variable grown;
+        uint64_t written = 0;
+        bool eof = false;
+        std::exception_ptr failure;
+
+    public:
+        SpoolBuffer()
+        {
+            auto [tmpFd, tmpPath] = nix::createTempFile("nix-grpc-nar");
+            ::unlink(tmpPath.c_str());
+            fd = std::move(tmpFd);
+        }
+
+        void append(std::string_view data)
+        {
+            auto const size = data.size();
+            uint64_t off = written;
+            while (!data.empty()) {
+                auto count = ::pwrite(fd.get(), data.data(), data.size(), static_cast<off_t>(off));
+                if (count < 0) {
+                    throw nix::SysError("writing NAR spool file");
+                }
+                data.remove_prefix(static_cast<size_t>(count));
+                off += static_cast<uint64_t>(count);
+            }
+            {
+                std::scoped_lock const lock(mutex);
+                written += size;
+            }
+            grown.notify_all();
+        }
+
+        void finish()
+        {
+            {
+                std::scoped_lock const lock(mutex);
+                eof = true;
+            }
+            grown.notify_all();
+        }
+
+        void fail(const std::exception_ptr & cause)
+        {
+            {
+                std::scoped_lock const lock(mutex);
+                if (eof || failure) {
+                    return;
+                }
+                failure = cause;
+            }
+            grown.notify_all();
+        }
+
+        void readInto(nix::Sink & sink)
+        {
+            uint64_t pos = 0;
+            std::vector<char> buf(kChunkSize);
+            while (true) {
+                uint64_t avail = 0;
+                {
+                    std::unique_lock lock(mutex);
+                    grown.wait(lock, [&] -> bool { return written > pos || eof || failure; });
+                    if (failure) {
+                        std::rethrow_exception(failure);
+                    }
+                    avail = written;
+                    if (avail == pos && eof) {
+                        fd.close();
+                        return;
+                    }
+                }
+                while (pos < avail) {
+                    auto want = std::min<uint64_t>(buf.size(), avail - pos);
+                    auto count = ::pread(fd.get(), buf.data(), want, static_cast<off_t>(pos));
+                    if (count <= 0) {
+                        throw nix::SysError("reading NAR spool file");
+                    }
+                    sink({buf.data(), static_cast<size_t>(count)});
+                    pos += static_cast<uint64_t>(count);
+                }
+            }
+        }
     };
 
     class Session
@@ -158,138 +202,45 @@ private:
 
         std::unique_ptr<nix::remote::NixRemote::Stub> stub;
         grpc::ClientContext ctx;
-        std::unique_ptr<NarStream> stream;
-        ZstdReaderSource<NarStream, nix::remote::NarChunk> source;
-
-        std::mutex mutex;
-        std::condition_variable wakeup;
-        // Guarded by mutex.
-        std::deque<Item> queue;
-        bool spoolingActive = false;
-        bool closing = false;
-
-        // Guarded by the fetcher's narMutex.
-        uint64_t loadBytes = 0;
-
-        // Set before the reader finishes the stream. Refuses new requests.
-        std::atomic<bool> broken = false;
-
-        NarFetcher & fetcher;
-        std::thread reader;
-
-        explicit Session(NarFetcher & owner)
-            : stub(nix::remote::NixRemote::NewStub(owner.channelFactory()))
-            , stream(requireStream(stub->NarsFromPaths(&ctx), owner.authority))
-            , source(*stream, std::string{})
-            , fetcher(owner)
-            , reader([this] -> void { run(); })
-        {
-        }
-
-    public:
-        Session(const Session &) = delete;
-        Session(Session &&) = delete;
-        auto operator=(const Session &) -> Session & = delete;
-        auto operator=(Session &&) -> Session & = delete;
-        ~Session() = default;
-
-    private:
-        static auto requireStream(std::unique_ptr<NarStream> stream, const std::string & authority)
-            -> std::unique_ptr<NarStream>
-        {
-            if (!stream) {
-                throw nix::Error("failed to open gRPC NarsFromPaths stream to '%s'", authority);
-            }
-            return stream;
-        }
-
-        // Caller holds narMutex.
-        auto request(const nix::StorePath & path, uint64_t narSize) -> std::future<nix::AutoCloseFD>
-        {
-            nix::remote::NarRequest req;
-            req.set_path(std::string(path.to_string()));
-            if (broken || !stream->Write(req)) {
-                throw nix::Error("gRPC stream closed by peer");
-            }
-            Item item{.size = narSize, .promise = {}};
-            auto result = item.promise.get_future();
-            {
-                std::scoped_lock const lock(mutex);
-                queue.push_back(std::move(item));
-            }
-            loadBytes += narSize;
-            wakeup.notify_one();
-            return result;
-        }
+        std::unique_ptr<grpc::ClientReader<nix::remote::NarFrame>> reader;
+        std::vector<std::shared_ptr<SpoolBuffer>> targets;
+        std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx{ZSTD_createDCtx(), ZSTD_freeDCtx};
+        std::thread thread;
 
         void run()
         {
-            while (true) {
-                std::optional<Item> item;
-                {
-                    std::unique_lock lock(mutex);
-                    wakeup.wait(lock, [&] -> bool { return closing || !queue.empty(); });
-                    if (queue.empty()) {
-                        return;
+            try {
+                std::string out(ZSTD_DStreamOutSize(), '\0');
+                nix::remote::NarFrame frame;
+                while (reader->Read(&frame)) {
+                    auto & target = targets.at(frame.path_index());
+                    ZSTD_inBuffer zin{.src = frame.data().data(), .size = frame.data().size(), .pos = 0};
+                    while (true) {
+                        ZSTD_outBuffer zout{.dst = out.data(), .size = out.size(), .pos = 0};
+                        zstdCheck(ZSTD_decompressStream(dctx.get(), &zout, &zin), "decompress");
+                        if (zout.pos != 0) {
+                            target->append({out.data(), zout.pos});
+                        }
+                        if (zin.pos == zin.size && zout.pos < zout.size) {
+                            break;
+                        }
                     }
-                    item = std::move(queue.front());
-                    queue.pop_front();
-                    spoolingActive = true;
+                    if (frame.eof()) {
+                        target->finish();
+                    }
                 }
-                try {
-                    auto spoolFd = spoolOne(source);
-                    {
-                        std::scoped_lock const lock(fetcher.narMutex);
-                        fetcher.settle(*this, item->size);
-                    }
-                    {
-                        std::scoped_lock const lock(mutex);
-                        spoolingActive = false;
-                    }
-                    item->promise.set_value(std::move(spoolFd));
-                } catch (...) {
-                    fail(std::current_exception(), std::move(*item));
-                    return;
+                auto status = reader->Finish();
+                auto cause = std::make_exception_ptr(
+                    status.ok() ? nix::Error("gRPC FetchNars stream ended early")
+                                : nix::Error("gRPC FetchNars failed: %s", status.error_message()));
+                for (const auto & target : targets) {
+                    target->fail(cause);
                 }
-            }
-        }
-
-        void fail(const std::exception_ptr & cause, Item current)
-        {
-            broken = true;
-            ctx.TryCancel();
-            grpc::Status status;
-            std::deque<Item> abandoned;
-            {
-                // narMutex keeps Finish() from racing concurrent Write()s.
-                std::scoped_lock const narLock(fetcher.narMutex);
-                status = stream->Finish();
-                std::scoped_lock const lock(mutex);
-                abandoned.swap(queue);
-                spoolingActive = false;
-                fetcher.settle(*this, current.size);
-                for (const auto & item : abandoned) {
-                    fetcher.settle(*this, item.size);
+            } catch (...) {
+                for (const auto & target : targets) {
+                    target->fail(std::current_exception());
                 }
             }
-            auto failure = !status.ok() && status.error_code() != grpc::StatusCode::CANCELLED
-                               ? std::make_exception_ptr(nix::Error(
-                                     "gRPC NarsFromPaths failed: %s", status.error_message()))
-                               : cause;
-            current.promise.set_exception(failure);
-            for (auto & item : abandoned) {
-                item.promise.set_exception(failure);
-            }
-        }
-
-        static auto spoolOne(nix::Source & source) -> nix::AutoCloseFD
-        {
-            auto [tmpFd, tmpPath] = nix::createTempFile("nix-grpc-nar");
-            ::unlink(tmpPath.c_str());
-            nix::FdSink tmpSink(tmpFd.get());
-            copyNAR(source, tmpSink);
-            tmpSink.flush();
-            return std::move(tmpFd);
         }
     };
 
@@ -299,15 +250,9 @@ private:
 
     std::mutex narMutex;
     std::vector<std::unique_ptr<Session>> sessions;
-
-    // Guarded by narMutex. A futures entry means the path was requested;
-    // fetch() moves the future out but leaves the key in place.
-    std::map<nix::StorePath, std::future<nix::AutoCloseFD>> futures;
-    std::vector<nix::StorePath> expectedOrder;
+    std::map<nix::StorePath, std::shared_ptr<SpoolBuffer>> buffers;
+    std::vector<nix::StorePath> pending;
     std::map<nix::StorePath, uint64_t> narSizes;
-    size_t cursor = 0;
-    size_t flyingPaths = 0;
-    uint64_t flyingBytes = 0;
 
     [[nodiscard]] auto narSizeOf(const nix::StorePath & path) const -> uint64_t
     {
@@ -315,49 +260,51 @@ private:
         return found == narSizes.end() ? 0 : found->second;
     }
 
-    // Callers of settle/requestPath/topUpPipeline hold narMutex.
-    void settle(Session & session, uint64_t size)
+    // Caller holds narMutex.
+    void startPending()
     {
-        session.loadBytes -= size;
-        flyingBytes -= size;
-        --flyingPaths;
+        if (pending.empty()) {
+            return;
+        }
+        // Largest-first LPT partition, so every stream starts with its
+        // biggest NAR and restores of large paths begin immediately.
+        std::ranges::stable_sort(pending, [&](const auto & lhs, const auto & rhs) -> bool {
+            return narSizeOf(lhs) > narSizeOf(rhs);
+        });
+        std::vector<std::vector<nix::StorePath>> groups(connections);
+        std::vector<uint64_t> load(connections, 0);
+        for (auto & path : pending) {
+            auto smallest = static_cast<size_t>(
+                std::ranges::min_element(load) - load.begin());
+            groups.at(smallest).push_back(std::move(path));
+            load.at(smallest) += narSizeOf(groups.at(smallest).back());
+        }
+        pending.clear();
+        for (auto & group : groups) {
+            if (!group.empty()) {
+                startSession(group);
+            }
+        }
     }
 
-    auto requestPath(const nix::StorePath & path) -> std::future<nix::AutoCloseFD>
+    // Caller holds narMutex.
+    void startSession(const std::vector<nix::StorePath> & paths)
     {
-        Session * session = nullptr;
-        for (const auto & candidate : sessions) {
-            if (candidate->broken) {
-                continue;
-            }
-            if (session == nullptr || candidate->loadBytes < session->loadBytes) {
-                session = candidate.get();
-            }
+        auto session = std::make_unique<Session>();
+        session->stub = nix::remote::NixRemote::NewStub(channelFactory());
+        nix::remote::FetchNarsRequest request;
+        for (const auto & path : paths) {
+            request.add_paths(std::string(path.to_string()));
+            auto buffer = std::make_shared<SpoolBuffer>();
+            session->targets.push_back(buffer);
+            buffers.emplace(path, std::move(buffer));
         }
-        if (session == nullptr) {
-            throw nix::Error("all gRPC NarsFromPaths streams failed");
+        session->reader = session->stub->FetchNars(&session->ctx, request);
+        if (!session->reader) {
+            throw nix::Error("failed to open gRPC FetchNars stream to '%s'", authority);
         }
-        auto size = narSizeOf(path);
-        auto result = session->request(path, size);
-        flyingBytes += size;
-        ++flyingPaths;
-        return result;
-    }
-
-    void topUpPipeline()
-    {
-        while (cursor < expectedOrder.size()) {
-            const auto & candidate = expectedOrder.at(cursor);
-            if (futures.contains(candidate)) {
-                ++cursor;
-                continue;
-            }
-            if (flyingPaths >= kPipelineWindow || flyingBytes >= kPipelineWindowBytes) {
-                break;
-            }
-            futures.emplace(candidate, requestPath(candidate));
-            ++cursor;
-        }
+        session->thread = std::thread([raw = session.get()] -> void { raw->run(); });
+        sessions.push_back(std::move(session));
     }
 };
 
