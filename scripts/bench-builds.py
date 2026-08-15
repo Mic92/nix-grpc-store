@@ -39,52 +39,64 @@ in builtins.head (go length [ ])
 
 
 def bench_once(
-    builder: str, chain: Path, store: Path, salt: str, length: int, system: str
+    target: str, chain: Path, store: Path, salt: str, length: int, system: str
 ) -> float:
+    mode, url = target.split(":", 1)
     if store.exists():
         subprocess.run(["chmod", "-R", "u+w", store], check=True)
         shutil.rmtree(store)
-    t0 = time.monotonic()
-    proc = subprocess.run(
-        [
-            "nix",
-            "build",
-            "-f",
-            str(chain),
-            "--argstr",
-            "salt",
-            salt,
-            "--arg",
-            "length",
-            str(length),
-            "--argstr",
-            "system",
-            system,
+    cmd = [
+        "nix",
+        "build",
+        "-f",
+        str(chain),
+        "--argstr",
+        "salt",
+        salt,
+        "--arg",
+        "length",
+        str(length),
+        "--argstr",
+        "system",
+        system,
+        "--no-link",
+        "--substituters",
+        "",
+        "--option",
+        "substitute",
+        "false",
+    ]
+    if mode == "hook":
+        cmd += [
             "--store",
             str(store),
-            "--no-link",
             "--max-jobs",
             "0",
-            "--substituters",
-            "",
-            "--option",
-            "substitute",
-            "false",
             "--builders",
-            f"{builder} {system} - 1 1",
-        ],
+            f"{url} {system} - 1 1",
+        ]
+    else:
+        cmd += ["--store", url]
+    t0 = time.monotonic()
+    proc = subprocess.run(
+        cmd,
         check=False,
         capture_output=True,
         text=True,
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"nix build via {builder} failed:\n{proc.stderr}")
+        raise RuntimeError(f"nix build via {target} failed:\n{proc.stderr}")
     return time.monotonic() - t0
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--builder", action="append", required=True, help="repeatable")
+    parser.add_argument(
+        "--builder", action="append", default=[], help="build-hook builder, repeatable"
+    )
+    parser.add_argument(
+        "--direct", action="append", default=[], help="remote store url, repeatable"
+    )
     parser.add_argument("--length", type=int, default=15, help="chain length")
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=1)
@@ -104,13 +116,15 @@ def main() -> None:
     def describe(dt: float) -> str:
         return f"{dt / args.length * 1000:5.0f} ms/drv"
 
-    def once(builder: str, i: int) -> float:
-        salt = f"{stamp}r{i}t{args.builder.index(builder)}"
-        return bench_once(builder, chain, store, salt, args.length, args.system)
+    targets = [f"hook:{b}" for b in args.builder] + [f"direct:{s}" for s in args.direct]
+    if not targets:
+        parser.error("need at least one --builder or --direct")
 
-    results = benchlib.interleaved_runs(
-        args.builder, once, args.runs, args.warmup, describe
-    )
+    def once(target: str, i: int) -> float:
+        salt = f"{stamp}r{i}t{targets.index(target)}"
+        return bench_once(target, chain, store, salt, args.length, args.system)
+
+    results = benchlib.interleaved_runs(targets, once, args.runs, args.warmup, describe)
     benchlib.print_summary(results, describe)
     benchlib.append_history(args.output, {"length": args.length, "runs": results})
 
