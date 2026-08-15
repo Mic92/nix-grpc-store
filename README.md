@@ -3,7 +3,8 @@
 **Status: Beta.** Safe to use but interfaces may change, so you will need to keep server/client in sync.
 
 Remote Nix store access over gRPC instead of SSH. `nix copy` over a WAN
-link is **3.5x faster than `ssh-ng://`** because round trips are hidden:
+link is **3.7x faster than `ssh-ng://`** (and 1.4x faster than an HTTP
+binary cache served from the same machine) because round trips are hidden:
 path-info queries are batched and NAR downloads are pipelined, so wall time
 is bandwidth-bound instead of latency-bound.
 
