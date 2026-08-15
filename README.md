@@ -3,7 +3,7 @@
 **Status: Beta.** Safe to use but interfaces may change, so you will need to keep server/client in sync.
 
 Remote Nix store access over gRPC instead of SSH. `nix copy` over a WAN
-link is **4.2x faster than `ssh-ng://`** because round trips are hidden:
+link is **4.3x faster than `ssh-ng://`** because round trips are hidden:
 path-info queries are batched and NAR downloads are pipelined, so wall time
 is bandwidth-bound instead of latency-bound.
 
@@ -37,19 +37,13 @@ path (path info queries, bulk import, NAR download).
 ![nix copy transport comparison](docs/bench.png)
 
 `nix copy` of a 101-path, 411 MB closure from the same server over a
-wired link with ~47 ms RTT, 6 interleaved runs each:
-
-| Transport                     | Wall time      | Throughput |
-| ----------------------------- | -------------- | ---------- |
-| `https://` (harmonia)         | 3.1 s ± 0.20   | 132 MB/s   |
-| `grpc://`                     | 4.5 s ± 0.12   | 92 MB/s    |
-| `ssh-ng://`                   | 19.0 s ± 0.42  | 22 MB/s    |
+wired link with ~47 ms RTT, 10 interleaved runs each.
 
 A static HTTP binary cache stays ahead for pure downloads, but it is
 download-only. The gRPC store keeps close while also handling uploads,
 remote builds, GC and mTLS through the same endpoint.
 
-Reproduce with `./scripts/bench-transports.py`.*
+Reproduce with `./scripts/bench-transports.py`.
 
 Remote builds skip the tunnelled worker protocol too: one streaming RPC
 submits the derivation and returns the result with its output path
@@ -58,7 +52,7 @@ faster than `ssh-ng://`:
 
 ![remote build transport comparison](docs/bench-builds.png)
 
-Reproduce with `./scripts/bench-builds.py`.*
+Reproduce with `./scripts/bench-builds.py`.
 
 
 ## Install
