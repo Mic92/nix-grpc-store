@@ -238,12 +238,6 @@ public:
     }
 
 private:
-    /* Whether the server implements the native (non-tunnelled) RPCs. Probed
-       once with an empty QueryValidPaths so bulk operations can decide
-       between the native path and the tunnel before consuming any data. */
-    std::optional<bool> nativeOps;
-    std::mutex nativeOpsMutex;
-
     static void checkStatus(const grpc::Status & status, const char * opName)
     {
       if (!status.ok()) {
@@ -251,30 +245,10 @@ private:
       }
     }
 
-    auto hasNativeOps() -> bool {
-      std::scoped_lock const lock(nativeOpsMutex);
-      if (!nativeOps) {
-        grpc::ClientContext ctx;
-        remote::QueryValidPathsRequest const request;
-        remote::QueryValidPathsReply reply;
-        auto status = stub->QueryValidPaths(&ctx, request, &reply);
-        nativeOps = status.ok();
-        if (!status.ok()) {
-          debug("gRPC store '%s' lacks native ops, using tunnel: %s",
-                config->authority.to_string(), status.error_message());
-        }
-      }
-      return *nativeOps;
-    }
-
 public:
     auto queryValidPaths(const StorePathSet &paths,
                          SubstituteFlag maybeSubstitute)
         -> StorePathSet override {
-      if (!hasNativeOps()) {
-        return RemoteStore::queryValidPaths(paths, maybeSubstitute);
-      }
-
       grpc::ClientContext ctx;
       remote::QueryValidPathsRequest request;
       request.set_substitute(maybeSubstitute == Substitute);
@@ -331,7 +305,7 @@ public:
       // copyPaths() hands the source store the full set of paths to copy
       // here, right before querying their info one by one; prefetch them in
       // a single RPC.
-      if (hasNativeOps() && !paths.empty()) {
+      if (!paths.empty()) {
         auto infos = queryPathInfosNative(paths);
         std::scoped_lock const lock(prefetchMutex);
         prefetchedInfos.merge(infos);
@@ -344,11 +318,6 @@ public:
         const StorePath & path, Callback<std::shared_ptr<const ValidPathInfo>> callback) noexcept override
     {
         try {
-          if (!hasNativeOps()) {
-            RemoteStore::queryPathInfoUncached(path, std::move(callback));
-            return;
-          }
-
             {
               std::scoped_lock const lock(prefetchMutex);
               if (auto found = prefetchedInfos.find(path);
@@ -410,11 +379,6 @@ public:
     // NOLINTNEXTLINE(misc-override-with-different-visibility): Store and RemoteStore already disagree
     void narFromPath(const StorePath & path, Sink & sink) override
     {
-      if (!hasNativeOps()) {
-        RemoteStore::narFromPath(path, sink);
-        return;
-      }
-
       std::scoped_lock const lock(narMutex);
 
       if (!narSession) {
@@ -458,11 +422,6 @@ public:
     void addMultipleToStore(
         PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs) override
     {
-      if (!hasNativeOps()) {
-        RemoteStore::addMultipleToStore(std::move(pathsToCopy), act, repair, checkSigs);
-        return;
-      }
-
         uint64_t bytesExpected = 0;
         for (auto &[pathInfo, pathSource] : pathsToCopy) {
           bytesExpected += pathInfo.narSize;
