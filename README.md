@@ -100,51 +100,6 @@ the daemon as an unprivileged `nix-grpc-daemon` user and adds it to
 `extra-allowed-users` so it can reach the local `nix-daemon` even when
 `allowed-users` is restricted.
 
-## Trust model
-
-gRPC clients act as the `nix-grpc-daemon` user, which is not trusted by
-default. That is enough for `nix build --store 'grpc://…'`, `nix copy`,
-path queries and GC: sources and derivations are content-addressed, signed
-cache paths are accepted, and the server builds everything itself.
-
-This makes an untrusting server usable as a builder without any special
-setup:
-
-    nix build nixpkgs#hello --store 'grpc://builder:50051' --eval-store auto
-
-Evaluation runs locally (`--eval-store auto` keeps the eval artifacts in
-the local store instead of round-tripping them to the server), the
-derivation closure is imported — sources and `.drv` files are
-content-addressed, so they pass signature checks — and all builds happen
-server-side. Nothing unsigned crosses the trust boundary, so
-`trustClients` can stay off.
-
-Using the server as a remote builder (`builders = grpc://…`) is different:
-there the *client* schedules builds and uploads input paths it built
-locally, which are unsigned — something only trusted users may do. Set
-`services.nix-grpc-daemon.trustClients = true` for that. Every
-authenticated client then has trusted-user privileges, so require client
-certs (`tls.clientCaFile`).
-
-## Remote builder
-
-    nix.buildMachines = [{
-      hostName = "grpc://builder:50051";
-      protocol = null;
-      systems = [ "x86_64-linux" "aarch64-linux" ];
-      maxJobs = 64;
-    }];
-
-TLS uses the system CA bundle and the client key pair from
-`/run/nix-grpc-store` or `/var/lib/nix-grpc-store` by default (see below).
-
-With access control enabled, remote builders need the `trusted` role.
-The builder protocol imports unsigned outputs built on the client, which
-also requires `trustClients` (see above). Clients that only build *on*
-the server (`nix build --store 'grpc://…'`) submit builds through a
-dedicated RPC and get by with `write`. `nix copy --to` needs `write` as
-well, and substituter/`nix copy --from` access only needs `read-only`.
-
 ## Quick start (manual)
 
 On the builder:
@@ -179,6 +134,32 @@ Client:
 
 Without `--client-ca` any TLS client can connect. With it, only clients
 presenting a certificate signed by that CA are accepted.
+
+## Trust model
+
+gRPC clients act as the `nix-grpc-daemon` user, which is not trusted by
+default. That is enough for `nix build --store 'grpc://…'`, `nix copy`,
+path queries and GC: sources and derivations are content-addressed, signed
+cache paths are accepted, and the server builds everything itself.
+
+This makes an untrusting server usable as a builder without any special
+setup:
+
+    nix build nixpkgs#hello --store 'grpc://builder:50051' --eval-store auto
+
+Evaluation runs locally (`--eval-store auto` keeps the eval artifacts in
+the local store instead of round-tripping them to the server), the
+derivation closure is imported — sources and `.drv` files are
+content-addressed, so they pass signature checks — and all builds happen
+server-side. Nothing unsigned crosses the trust boundary, so
+`trustClients` can stay off.
+
+Using the server as a remote builder (`builders = grpc://…`) is different:
+there the *client* schedules builds and uploads input paths it built
+locally, which are unsigned — something only trusted users may do. Set
+`services.nix-grpc-daemon.trustClients = true` for that. Every
+authenticated client then has trusted-user privileges, so require client
+certs (`tls.clientCaFile`).
 
 ## Access control
 
@@ -237,6 +218,25 @@ host's domain name in the CN, e.g. a
 read-only` grants it substituter access. See
 [`tests/acme-substituter-test.nix`](tests/acme-substituter-test.nix)
 for a complete, tested NixOS setup (built as the `acme-vm` check).
+
+## Remote builder
+
+    nix.buildMachines = [{
+      hostName = "grpc://builder:50051";
+      protocol = null;
+      systems = [ "x86_64-linux" "aarch64-linux" ];
+      maxJobs = 64;
+    }];
+
+TLS uses the system CA bundle and the client key pair from
+`/run/nix-grpc-store` or `/var/lib/nix-grpc-store` by default (see below).
+
+With access control enabled, remote builders need the `trusted` role.
+The builder protocol imports unsigned outputs built on the client, which
+also requires `trustClients` (see above). Clients that only build *on*
+the server (`nix build --store 'grpc://…'`) submit builds through a
+dedicated RPC and get by with `write`. `nix copy --to` needs `write` as
+well, and substituter/`nix copy --from` access only needs `read-only`.
 
 ## URI parameters
 
