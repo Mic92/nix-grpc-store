@@ -110,7 +110,7 @@ server-side. Nothing unsigned crosses the trust boundary, so
 Using the server as a remote builder (`builders = grpc://…`) is different:
 there the *client* schedules builds and uploads input paths it built
 locally, which are unsigned — something only trusted users may do. Set
-`services.nix-grpc-daemon.trustClients = true` for that; every
+`services.nix-grpc-daemon.trustClients = true` for that. Every
 authenticated client then has trusted-user privileges, so require client
 certs (`tls.clientCaFile`).
 
@@ -126,13 +126,12 @@ certs (`tls.clientCaFile`).
 TLS uses the system CA bundle and the client key pair from
 `/run/nix-grpc-store` or `/var/lib/nix-grpc-store` by default (see below).
 
-With access control enabled, remote builders need the `trusted` role:
-the builder protocol tunnels the raw worker protocol and imports
-unsigned outputs built on the client (which also requires
-`trustClients`, see above). Clients that only build *on* the server
-(`nix build --store 'grpc://…'`) also use the worker-protocol tunnel and
-therefore need `trusted` too; `nix copy --to` needs `write`, and
-substituter/`nix copy --from` access only needs `read-only`.
+With access control enabled, remote builders need the `trusted` role.
+The builder protocol imports unsigned outputs built on the client, which
+also requires `trustClients` (see above). Clients that only build *on*
+the server (`nix build --store 'grpc://…'`) submit builds through a
+dedicated RPC and get by with `write`. `nix copy --to` needs `write` as
+well, and substituter/`nix copy --from` access only needs `read-only`.
 
 ## Quick start (manual)
 
@@ -166,13 +165,13 @@ Client:
     nix build --store \
       'grpc://builder:50051?ca-cert=ca.pem&client-cert=me.pem&client-key=me.key' ...
 
-Without `--client-ca` any TLS client can connect; with it, only clients
+Without `--client-ca` any TLS client can connect. With it, only clients
 presenting a certificate signed by that CA are accepted.
 
 ## Access control
 
 With mTLS, `--allow 'cn-pattern=role'` maps client certificate CNs to
-roles via glob patterns; the first match wins and unmatched clients are
+roles via glob patterns. The first match wins and unmatched clients are
 denied. Without any rules every authenticated client keeps full access.
 
     nix-grpc-daemon ... --client-ca ca.pem \
@@ -183,10 +182,11 @@ denied. Without any rules every authenticated client keeps full access.
 
   * `read-only` — path queries and NAR downloads (`nix copy --from`)
   * `write` — additionally imports (signature checking is enforced
-    regardless of `--no-check-sigs`) and builds via the native RPC
+    regardless of `--no-check-sigs`) and server-side builds
+    (`nix build --store 'grpc://…'`)
   * `trusted` — everything, including the raw worker-protocol tunnel
-    (GC, `nix build --store`) and unsigned imports (still subject to the
-    nix-daemon's trust in the proxy user, see above)
+    (GC, `nix store add`, repair) and unsigned imports (still subject to
+    the nix-daemon's trust in the proxy user, see above)
 
 `--allow-anonymous ROLE` relaxes the client-certificate requirement:
 cert-less clients connect with that role (e.g. a public read-only
@@ -204,17 +204,18 @@ NixOS:
 
 Role needed per use case:
 
-| Use case                                   | Role        |
-| ------------------------------------------ | ----------- |
-| Substituter, `nix copy --from`             | `read-only` |
-| `nix copy --to` (signed paths)             | `write`     |
-| Native build RPC                           | `write`     |
-| Remote builder (`nix.buildMachines`)       | `trusted`   |
-| `nix build --store 'grpc://…'`, GC, repair | `trusted`   |
+| Use case                                         | Role        |
+| ------------------------------------------------ | ----------- |
+| Substituter, `nix copy --from`                   | `read-only` |
+| `nix copy --to` (signed paths)                   | `write`     |
+| `nix build --store 'grpc://…' --eval-store auto` | `write`     |
+| Remote builder (`nix.buildMachines`)             | `trusted`   |
+| GC, `--repair`, `nix store add`                  | `trusted`   |
 
-Note that `nix build --store 'grpc://…' --eval-store auto` needs the
-`trusted` role: the build itself is harmless (see the trust model above),
-but the CLI drives it through the raw worker-protocol tunnel.
+Builds are submitted through a dedicated RPC and run entirely
+server-side, so the `write` role suffices. Only operations that tunnel
+the raw worker protocol need `trusted`, and repair builds are treated
+like the rest of the repair surface.
 
 For host-based access, pair this with a CA that issues certs with the
 host's domain name in the CN, e.g. a
@@ -228,9 +229,9 @@ for a complete, tested NixOS setup (built as the `acme-vm` check).
 ## URI parameters
 
   * `insecure` — plaintext, no TLS (testing only)
-  * `ca-cert` — PEM CA to verify the server; defaults to `$NIX_SSL_CERT_FILE`,
+  * `ca-cert` — PEM CA to verify the server. Defaults to `$NIX_SSL_CERT_FILE`,
     `$SSL_CERT_FILE` or the system CA bundle
-  * `client-cert`, `client-key` — PEM pair to present for mTLS; default to
+  * `client-cert`, `client-key` — PEM pair to present for mTLS. Default to
     `$NIX_GRPC_CLIENT_CERT`/`$NIX_GRPC_CLIENT_KEY`, then `client.crt`/`client.key`
     in `$XDG_DATA_HOME/nix-grpc-store`, then `/run/nix-grpc-store`, then
     `/var/lib/nix-grpc-store` (unreadable candidates are skipped)
@@ -241,7 +242,7 @@ for a complete, tested NixOS setup (built as the `acme-vm` check).
   * `--proxy-socket PATH` — nix-daemon socket, default `/nix/var/nix/daemon-socket/socket`
   * `--tls-cert`, `--tls-key`, `--client-ca` — see above
   * `--allow 'cn-pattern=role'`, `--allow-anonymous ROLE` — see access control
-  * `--metrics-listen ADDR` — serve Prometheus metrics; disabled if unset
+  * `--metrics-listen ADDR` — serve Prometheus metrics, disabled if unset
   * `--log-level info|debug` — access log verbosity, default `info`
 
 ## Monitoring

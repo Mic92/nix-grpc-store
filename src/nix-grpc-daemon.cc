@@ -45,6 +45,9 @@
 #include <nix/store/store-api.hh>
 #include <nix/store/store-open.hh>
 #include <nix/store/worker-protocol.hh>
+// Generic definitions for the std::vector serialiser wrappers used by
+// BuildPaths, which libnixstore does not instantiate explicitly.
+#include <nix/store/worker-protocol-impl.hh> // IWYU pragma: keep
 #include <nix/util/error.hh>
 #include <nix/util/file-descriptor.hh>
 #include <nix/util/file-system.hh>
@@ -66,6 +69,7 @@ using GrpcStream = grpc::ServerReaderWriter<nix::remote::Chunk, nix::remote::Chu
 using AddMultipleReader = grpc::ServerReader<nix::remote::AddMultipleChunk>;
 using NarsStream = grpc::ServerReaderWriter<nix::remote::NarChunk, nix::remote::NarRequest>;
 using BuildWriter = grpc::ServerWriter<nix::remote::BuildDerivationChunk>;
+using BuildPathsWriter = grpc::ServerWriter<nix::remote::BuildPathsChunk>;
 
 namespace {
 
@@ -115,6 +119,19 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     {
         auto const elapsed = std::chrono::steady_clock::now() - start;
         return std::to_string(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
+    }
+
+    // Builds need write, except repair, which rewrites existing store paths.
+    auto authorizeBuild(const std::optional<std::string> & cert, std::string_view method, uint32_t buildMode)
+        -> grpc::Status
+    {
+        if (auto status = authorize(cert, method, nixgrpc::Role::write); !status.ok()) {
+            return status;
+        }
+        if (buildMode == static_cast<uint32_t>(nix::bmRepair)) {
+            return authorize(cert, std::string(method) + "(repair)", nixgrpc::Role::trusted);
+        }
+        return grpc::Status::OK;
     }
 
     auto authorize(const std::optional<std::string> & cert, std::string_view method, nixgrpc::Role minRole)
@@ -423,6 +440,18 @@ public:
 
     // Consumes the worker-protocol stderr stream up to STDERR_LAST,
     // forwarding plain build log lines.
+    static void appendOutputInfo(nix::Store & store, nix::remote::PathInfo * out, const nix::StorePath & outPath)
+    {
+        auto info = store.queryPathInfo(outPath);
+        out->set_path(std::string(info->path.to_string()));
+        nix::StringSink sink;
+        nix::WorkerProto::Serialise<nix::UnkeyedValidPathInfo>::write(
+            store,
+            nix::WorkerProto::WriteConn{.to = sink, .version = nixcompat::infoProtocolVersion()},
+            static_cast<const nix::UnkeyedValidPathInfo &>(*info));
+        *out->mutable_info() = std::move(sink.s);
+    }
+
     static void relayBuildLog(nix::Source & source, const std::function<void(std::string)> & sendLogLine)
     {
         auto readLogFields = [&]() -> std::vector<std::string> {
@@ -476,7 +505,8 @@ public:
         return guarded([&]() -> grpc::Status {
             auto const cert = nixgrpc::clientCommonName(*context);
             auto const commonName = cert.value_or("-");
-            if (auto status = authorize(cert, "BuildDerivation", nixgrpc::Role::write); !status.ok()) {
+            if (auto status = authorizeBuild(cert, "BuildDerivation", request->build_mode());
+                !status.ok()) {
                 return status;
             }
             auto const start = std::chrono::steady_clock::now();
@@ -530,15 +560,7 @@ public:
             }
             uint64_t outputs = 0;
             nixcompat::forBuiltOutputs(res, [&](const nix::StorePath & outPath) -> void {
-                auto info = localStore->queryPathInfo(outPath);
-                auto * out = done->add_outputs();
-                out->set_path(std::string(info->path.to_string()));
-                nix::StringSink sink;
-                nix::WorkerProto::Serialise<nix::UnkeyedValidPathInfo>::write(
-                    *localStore,
-                    nix::WorkerProto::WriteConn{.to = sink, .version = nixcompat::infoProtocolVersion()},
-                    static_cast<const nix::UnkeyedValidPathInfo &>(*info));
-                *out->mutable_info() = std::move(sink.s);
+                appendOutputInfo(*localStore, done->add_outputs(), outPath);
                 ++outputs;
             });
             writer->Write(chunk);
@@ -552,6 +574,95 @@ public:
                  {"duration_s", secondsSince(start)},
                  {"drv", std::string(drvPath.to_string())},
                  {"outputs", std::to_string(outputs)}});
+            return grpc::Status::OK;
+        });
+    }
+
+    // Builds run entirely server-side under the proxy user, so the write
+    // role suffices where the raw worker-protocol tunnel would not.
+    auto BuildPaths(
+        grpc::ServerContext * context,
+        const nix::remote::BuildPathsRequest * request,
+        BuildPathsWriter * writer) -> grpc::Status override
+    {
+        return guarded([&]() -> grpc::Status {
+            auto const cert = nixgrpc::clientCommonName(*context);
+            auto const commonName = cert.value_or("-");
+            if (auto status = authorizeBuild(cert, "BuildPaths", request->build_mode());
+                !status.ok()) {
+                return status;
+            }
+            auto const start = std::chrono::steady_clock::now();
+            metrics.countRpc("BuildPaths", commonName);
+
+            auto const protocol = nixcompat::buildProtocolVersion();
+            if (request->protocol() != nixcompat::kBuildProtocolWire
+                || request->build_mode() > static_cast<uint32_t>(nix::bmCheck)) {
+                return {grpc::StatusCode::INVALID_ARGUMENT, "unsupported build protocol or mode"};
+            }
+            auto localStore = getStore();
+
+            std::vector<nix::DerivedPath> targets;
+            targets.reserve(request->targets_size());
+            for (const auto & target : request->targets()) {
+                targets.push_back(nix::DerivedPath::parse(*localStore, target));
+            }
+
+            auto backend = connectBackend(*localStore);
+            auto & conn = backend->conn;
+            if (nixcompat::protocolWire(conn.protoVersion) != nixcompat::kBuildProtocolWire) {
+                return {grpc::StatusCode::FAILED_PRECONDITION, "backend daemon is too old"};
+            }
+            auto sendLogLine = [&](std::string line) -> void {
+                nix::remote::BuildPathsChunk chunk;
+                *chunk.mutable_log_line() = std::move(line);
+                writer->Write(chunk);
+            };
+            // The daemon opens every connection with a stderr work block.
+            relayBuildLog(conn.from, sendLogLine);
+
+            conn.to << nix::WorkerProto::Op::BuildPathsWithResults;
+            nix::WorkerProto::write(
+                *localStore,
+                nix::WorkerProto::WriteConn{.to = conn.to, .version = conn.protoVersion},
+                targets);
+            conn.to << request->build_mode();
+            conn.to.flush();
+
+            relayBuildLog(conn.from, sendLogLine);
+
+            auto results = nix::WorkerProto::Serialise<std::vector<nix::KeyedBuildResult>>::read(
+                *localStore, nix::WorkerProto::ReadConn{.from = conn.from, .version = protocol});
+
+            nix::remote::BuildPathsChunk chunk;
+            auto * done = chunk.mutable_done();
+            {
+                nix::StringSink sink;
+                nix::WorkerProto::Serialise<std::vector<nix::KeyedBuildResult>>::write(
+                    *localStore,
+                    nix::WorkerProto::WriteConn{.to = sink, .version = protocol},
+                    results);
+                *done->mutable_results() = std::move(sink.s);
+            }
+            nix::StorePathSet outputPaths;
+            for (auto & res : results) {
+                nixcompat::forBuiltOutputs(
+                    res, [&](const nix::StorePath & outPath) -> void { outputPaths.insert(outPath); });
+            }
+            for (const auto & outPath : outputPaths) {
+                appendOutputInfo(*localStore, done->add_outputs(), outPath);
+            }
+            writer->Write(chunk);
+
+            nixgrpc::logLine(
+                nixgrpc::LogLevel::info,
+                {{"event", "rpc"},
+                 {"method", "BuildPaths"},
+                 {"cn", commonName},
+                 {"peer", context->peer()},
+                 {"duration_s", secondsSince(start)},
+                 {"targets", std::to_string(targets.size())},
+                 {"outputs", std::to_string(outputPaths.size())}});
             return grpc::Status::OK;
         });
     }

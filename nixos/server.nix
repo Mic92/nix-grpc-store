@@ -101,11 +101,11 @@ in
                 "trusted"
               ];
               description = ''
-                `read-only` allows path queries and NAR downloads;
+                `read-only` allows path queries and NAR downloads.
                 `write` additionally allows signed imports (signature
-                checking is enforced) and builds; `trusted` allows
-                everything, including the raw worker-protocol tunnel and
-                unsigned imports (the latter also needs
+                checking is enforced) and server-side builds. `trusted`
+                allows everything, including the raw worker-protocol
+                tunnel and unsigned imports (the latter also needs
                 {option}`trustClients`).
               '';
             };

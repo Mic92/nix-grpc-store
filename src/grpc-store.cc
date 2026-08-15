@@ -40,6 +40,7 @@
 #include <string_view>
 #include <thread>
 #include <unistd.h>
+#include <variant>
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
@@ -49,6 +50,9 @@
 #include <nix/store/remote-store.hh>
 #include <nix/store/store-registration.hh>
 #include <nix/store/worker-protocol.hh>
+// Generic definitions for the std::vector serialiser wrappers, which
+// libnixstore does not instantiate explicitly.
+#include <nix/store/worker-protocol-impl.hh> // IWYU pragma: keep
 #include <nix/util/archive.hh>
 #include <nix/util/callback.hh>
 #include <nix/util/file-descriptor.hh>
@@ -355,14 +359,22 @@ public:
     auto getBuilder(std::shared_ptr<Store> evalStore) -> ref<Builder> override {
       class GrpcBuilder : public Builder {
         GrpcStore * store;
+        std::shared_ptr<Store> evalStore;
         ref<Builder> inner;
 
       public:
-        GrpcBuilder(GrpcStore * store, ref<Builder> inner)
-            : store(store), inner(std::move(inner)) {}
+        GrpcBuilder(GrpcStore * store, std::shared_ptr<Store> evalStore,
+                    ref<Builder> inner)
+            : store(store), evalStore(std::move(evalStore)),
+              inner(std::move(inner)) {}
         void buildPaths(const std::vector<DerivedPath> & reqs,
                         BuildMode buildMode) override {
           if (buildMode == bmNormal && store->alreadyValidResults(reqs)) {
+            return;
+          }
+          store->copyDrvsFromEvalStore(reqs, evalStore);
+          if (auto results = store->buildPathsWithResultsNative(reqs, buildMode)) {
+            store->throwOnFailedBuilds(*results);
             return;
           }
           inner->buildPaths(reqs, buildMode);
@@ -374,6 +386,10 @@ public:
             if (auto results = store->alreadyValidResults(reqs)) {
               return std::move(*results);
             }
+          }
+          store->copyDrvsFromEvalStore(reqs, evalStore);
+          if (auto results = store->buildPathsWithResultsNative(reqs, buildMode)) {
+            return std::move(*results);
           }
           return inner->buildPathsWithResults(reqs, buildMode);
         }
@@ -389,13 +405,18 @@ public:
           inner->repairPath(path);
         }
       };
-      return make_ref<GrpcBuilder>(this,
-                                   RemoteStore::getBuilder(std::move(evalStore)));
+      return make_ref<GrpcBuilder>(this, evalStore,
+                                   RemoteStore::getBuilder(evalStore));
     }
 #else
     void buildPaths(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
                     std::shared_ptr<Store> evalStore) override {
       if (buildMode == bmNormal && alreadyValidResults(reqs)) {
+        return;
+      }
+      copyDrvsFromEvalStore(reqs, evalStore);
+      if (auto results = buildPathsWithResultsNative(reqs, buildMode)) {
+        throwOnFailedBuilds(*results);
         return;
       }
       RemoteStore::buildPaths(reqs, buildMode, std::move(evalStore));
@@ -408,6 +429,10 @@ public:
         if (auto results = alreadyValidResults(reqs)) {
           return std::move(*results);
         }
+      }
+      copyDrvsFromEvalStore(reqs, evalStore);
+      if (auto results = buildPathsWithResultsNative(reqs, buildMode)) {
+        return std::move(*results);
       }
       return RemoteStore::buildPathsWithResults(reqs, buildMode,
                                                 std::move(evalStore));
@@ -461,6 +486,79 @@ public:
         prefetchedInfos.merge(infos);
       }
       return std::move(*res);
+    }
+
+    // Builds run server-side under the proxy user, so the write role
+    // suffices where the raw worker-protocol tunnel would not. Returns
+    // nullopt for servers without the RPC.
+    [[nodiscard]] auto buildPathsWithResultsNative(
+        const std::vector<DerivedPath> & reqs, BuildMode buildMode)
+        -> std::optional<std::vector<KeyedBuildResult>> {
+      remote::BuildPathsRequest request;
+      for (const auto & req : reqs) {
+        request.add_targets(req.to_string(*this));
+      }
+      request.set_build_mode(static_cast<uint32_t>(buildMode));
+      request.set_protocol(nixcompat::kBuildProtocolWire);
+
+      grpc::ClientContext ctx;
+      auto reader = stub->BuildPaths(&ctx, request);
+
+      std::optional<std::vector<KeyedBuildResult>> results;
+      PathInfoMap infos;
+      remote::BuildPathsChunk msg;
+      while (reader->Read(&msg)) {
+        if (msg.has_log_line()) {
+          printError(msg.log_line());
+        } else if (msg.has_done()) {
+          StringSource source(msg.done().results());
+          results = WorkerProto::Serialise<std::vector<KeyedBuildResult>>::read(
+              *this, WorkerProto::ReadConn{.from = source,
+                                           .version = nixcompat::buildProtocolVersion()});
+          for (const auto & entry : msg.done().outputs()) {
+            infos.insert(parseInfoEntry(entry));
+          }
+        }
+      }
+      auto status = reader->Finish();
+      if (status.error_code() == grpc::StatusCode::UNIMPLEMENTED) {
+        return std::nullopt;
+      }
+      checkStatus(status, "BuildPaths");
+      if (!results) {
+        throw Error("gRPC BuildPaths stream ended without a result");
+      }
+      if (!infos.empty()) {
+        std::scoped_lock const lock(prefetchMutex);
+        prefetchedInfos.merge(infos);
+      }
+      return results;
+    }
+
+    // The server cannot reach the client's eval store, so the .drvs are
+    // imported first (content-addressed, passes signature checks).
+    void copyDrvsFromEvalStore(const std::vector<DerivedPath> & paths,
+                               const std::shared_ptr<Store> & evalStore) {
+      if (evalStore && evalStore.get() != this) {
+        StorePathSet drvPaths;
+        for (const auto & req : paths) {
+          if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
+            drvPaths.insert(built->drvPath->getBaseStorePath());
+          }
+        }
+        if (!drvPaths.empty()) {
+          copyClosure(*evalStore, *this, drvPaths);
+        }
+      }
+    }
+
+    void throwOnFailedBuilds(std::vector<KeyedBuildResult> & results) {
+      for (auto & res : results) {
+        if (auto errorMsg = nixcompat::buildFailureMsg(res)) {
+          throw Error("build of '%s' failed: %s", res.path.to_string(*this),
+                      *errorMsg);
+        }
+      }
     }
 
 private:
