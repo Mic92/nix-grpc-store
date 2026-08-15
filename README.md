@@ -173,11 +173,11 @@ user's activity is a grep away:
 With `--metrics-listen 127.0.0.1:9464` (NixOS:
 `services.nix-grpc-daemon.metricsListen`) the daemon serves `/metrics`:
 
-  * `nix_grpc_rpcs_total{method,cn}` — RPCs handled
-  * `nix_grpc_tunnel_bytes_total{direction,cn}` — uncompressed bytes through
-    the `Connect` tunnel
-  * `nix_grpc_nar_bytes_total{direction,cn}` — uncompressed NAR bytes
-    imported (`in`) / exported (`out`)
+| metric | labels | counts |
+|---|---|---|
+| `nix_grpc_rpcs_total` | method, cn | RPCs handled |
+| `nix_grpc_tunnel_bytes_total` | direction, cn | uncompressed tunnel bytes |
+| `nix_grpc_nar_bytes_total` | direction, cn | uncompressed NAR bytes imported/exported |
 
 Only CA-issued CNs appear as labels, so cardinality stays bounded.
 
