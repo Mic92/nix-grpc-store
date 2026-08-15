@@ -148,6 +148,39 @@ Client:
 Without `--client-ca` any TLS client can connect; with it, only clients
 presenting a certificate signed by that CA are accepted.
 
+## Access control
+
+With mTLS, `--allow 'cn-pattern=role'` maps client certificate CNs to
+roles via glob patterns; the first match wins and unmatched clients are
+denied. Without any rules every authenticated client keeps full access.
+
+    nix-grpc-daemon ... --client-ca ca.pem \
+        --allow 'ci-*=trusted' \
+        --allow 'cache-mirror=read-only' \
+        --allow '*=write' \
+        --allow-anonymous read-only    # optional: cert-less clients
+
+  * `read-only` — path queries and NAR downloads (`nix copy --from`)
+  * `write` — additionally imports (signature checking is enforced
+    regardless of `--no-check-sigs`) and builds via the native RPC
+  * `trusted` — everything, including the raw worker-protocol tunnel
+    (GC, `nix build --store`) and unsigned imports (still subject to the
+    nix-daemon's trust in the proxy user, see above)
+
+`--allow-anonymous ROLE` relaxes the client-certificate requirement:
+cert-less clients connect with that role (e.g. a public read-only
+cache), certificate holders keep their `--allow` roles. Naming policies
+pair well with a CA like [step-ca](https://smallstep.com/docs/step-ca/),
+where provisioners constrain which CNs each token may request.
+
+NixOS:
+
+    services.nix-grpc-daemon.accessRules = [
+      { cn = "ci-*"; role = "trusted"; }
+      { cn = "*"; role = "read-only"; }
+    ];
+    services.nix-grpc-daemon.anonymousRole = "read-only"; # optional
+
 ## URI parameters
 
   * `insecure` — plaintext, no TLS (testing only)
@@ -163,6 +196,7 @@ presenting a certificate signed by that CA are accepted.
   * `--listen ADDR` — default `0.0.0.0:50051`
   * `--proxy-socket PATH` — nix-daemon socket, default `/nix/var/nix/daemon-socket/socket`
   * `--tls-cert`, `--tls-key`, `--client-ca` — see above
+  * `--allow 'cn-pattern=role'`, `--allow-anonymous ROLE` — see access control
   * `--metrics-listen ADDR` — serve Prometheus metrics; disabled if unset
   * `--log-level info|debug` — access log verbosity, default `info`
 

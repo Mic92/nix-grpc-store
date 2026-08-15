@@ -4,6 +4,7 @@
 
 #include <array>
 #include <chrono>
+#include <optional>
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
@@ -73,18 +74,20 @@ inline void logLine(LogLevel level, std::initializer_list<std::pair<std::string_
     static_cast<void>(std::fputs(line.c_str(), stderr));
 }
 
-// TLS client identity (x509 CN) or "-" when the client did not present a
-// certificate (no --client-ca configured).
-inline auto clientCommonName(const grpc::ServerContext & context) -> std::string
+// TLS client identity (x509 CN), or nullopt when the client did not present
+// a certificate. Kept optional rather than a "-" sentinel so a certificate
+// whose CN is literally "-" (or absent, SAN-only) cannot pose as anonymous.
+inline auto clientCommonName(const grpc::ServerContext & context) -> std::optional<std::string>
 {
     auto auth = context.auth_context();
-    if (auth) {
-        auto values = auth->FindPropertyValues(GRPC_X509_CN_PROPERTY_NAME);
-        if (!values.empty()) {
-            return {values.front().data(), values.front().size()};
-        }
+    if (!auth || auth->FindPropertyValues(GRPC_X509_PEM_CERT_PROPERTY_NAME).empty()) {
+        return std::nullopt;
     }
-    return "-";
+    auto values = auth->FindPropertyValues(GRPC_X509_CN_PROPERTY_NAME);
+    if (values.empty()) {
+        return "";
+    }
+    return std::string{values.front().data(), values.front().size()};
 }
 
 } // namespace nixgrpc
