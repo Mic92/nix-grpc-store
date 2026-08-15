@@ -189,7 +189,7 @@ pkgs.testers.runNixOSTest {
         # Path queries only show up at --log-level debug.
         machine.succeed(
             "journalctl -u nix-grpc-daemon.service | "
-            "grep -q 'level=debug event=rpc method=QueryValidPaths'"
+            "grep -q 'level=debug event=rpc method=QueryPathInfos'"
         )
         machine.fail(
             "journalctl -u nix-grpc-daemon-mtls.service | grep -q level=debug"

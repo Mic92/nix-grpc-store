@@ -36,6 +36,14 @@
           inherit (scope) default plugin-dispatcher;
         }
         // scope.versionPlugins
+        // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
+          # Benchmark, intentionally not in `checks` so CI skips it.
+          bench-latency = import ./tests/latency-test.nix {
+            pkgs = nixpkgs.legacyPackages.${system};
+            nixPkgs = nix.packages.${system};
+            module = self.nixosModules.default;
+          };
+        }
       );
 
       nixosModules = {

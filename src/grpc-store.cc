@@ -12,11 +12,14 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <grpcpp/security/credentials.h>
 #include <grpcpp/support/channel_arguments.h>
 #include <grpcpp/support/status.h>
+#include <deque>
 #include <map>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <nix/store/globals.hh>
 #include <nix/store/path.hh>
@@ -24,6 +27,7 @@
 #include <nix/store/store-reference.hh>
 #include <nix/util/configuration.hh>
 #include <nix/util/environment-variables.hh>
+#include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
 #include <nix/util/logging.hh>
 #include <nix/util/ref.hh>
@@ -305,17 +309,72 @@ public:
       // copyPaths() hands the source store the full set of paths to copy
       // here, right before querying their info one by one; prefetch them in
       // a single RPC.
+      std::map<StorePath, uint64_t> sizes;
       if (!paths.empty()) {
         auto infos = queryPathInfosNative(paths);
+        for (const auto & [infoPath, info] : infos) {
+          sizes.emplace(infoPath, info->narSize);
+        }
         std::scoped_lock const lock(prefetchMutex);
         prefetchedInfos.merge(infos);
       }
-      return Store::topoSortPaths(paths);
+      // copyPaths() consumes the sources in reverse topological order.
+      // Record it so narFromPath() can pipeline its NAR requests.
+      auto sorted = Store::topoSortPaths(paths);
+      {
+        std::scoped_lock const lock(narMutex);
+        narExpectedOrder.assign(sorted.rbegin(), sorted.rend());
+        narCursor = 0;
+        narSizes = std::move(sizes);
+      }
+      return sorted;
     }
 #endif
 
-    void queryPathInfoUncached(
-        const StorePath & path, Callback<std::shared_ptr<const ValidPathInfo>> callback) noexcept override
+private:
+    /* Batches concurrent queryPathInfoUncached() calls into one
+       QueryPathInfos RPC. Closure computation awaits many paths at once.
+       Queries piling up during an in-flight RPC form the next batch, so a
+       BFS level costs one round trip instead of one per path. */
+    using InfoCallback = Callback<std::shared_ptr<const ValidPathInfo>>;
+    std::mutex infoBatchMutex;
+    std::condition_variable infoBatchWakeup;
+    std::vector<std::pair<StorePath, InfoCallback>> infoBatch;
+    std::thread infoBatchWorker;
+    bool infoBatchStop = false;
+
+    void runInfoBatches()
+    {
+        while (true) {
+            std::vector<std::pair<StorePath, InfoCallback>> batch;
+            {
+                std::unique_lock lock(infoBatchMutex);
+                infoBatchWakeup.wait(lock, [&] -> bool { return infoBatchStop || !infoBatch.empty(); });
+                if (infoBatchStop) {
+                    return;
+                }
+                batch.swap(infoBatch);
+            }
+            try {
+                StorePathSet paths;
+                for (const auto & [path, callback] : batch) {
+                    paths.insert(path);
+                }
+                auto infos = queryPathInfosNative(paths);
+                for (auto & [path, callback] : batch) {
+                    auto found = infos.find(path);
+                    callback(found == infos.end() ? nullptr : found->second);
+                }
+            } catch (...) {
+                for (auto & [path, callback] : batch) {
+                    callback.rethrow();
+                }
+            }
+        }
+    }
+
+public:
+    void queryPathInfoUncached(const StorePath & path, InfoCallback callback) noexcept override
     {
         try {
             {
@@ -329,9 +388,14 @@ public:
               }
             }
 
-            auto infos = queryPathInfosNative({path});
-            auto found = infos.find(path);
-            callback(found == infos.end() ? nullptr : std::move(found->second));
+            {
+              std::scoped_lock const lock(infoBatchMutex);
+              infoBatch.emplace_back(path, std::move(callback));
+              if (!infoBatchWorker.joinable()) {
+                infoBatchWorker = std::thread([this] -> void { runInfoBatches(); });
+              }
+            }
+            infoBatchWakeup.notify_one();
         } catch (...) {
             callback.rethrow();
         }
@@ -340,8 +404,19 @@ public:
     /* One long-lived NarsFromPaths stream shared by all narFromPath() calls:
        the server compresses all NARs into a single zstd stream, so many small
        paths share the compression window and there is no per-path RPC setup.
-       Serialised by narMutex; NARs are self-delimiting (copyNAR), so no
-       length framing is needed. */
+       Serialised by narMutex. NARs are self-delimiting (copyNAR), so no
+       length framing is needed.
+
+       Requests are pipelined in the order recorded by topoSortPaths(), so
+       copying many small paths costs ~1 round trip instead of one per path.
+       The server answers in request order. NARs arriving before their
+       narFromPath() call are spooled to unlinked temp files. The path and
+       byte caps sit well above the bandwidth-delay product of a fast WAN
+       link (~19 MB), so they only bound spool size and the bytes wasted on
+       an aborted copy. */
+    static constexpr size_t kNarPipelineWindow = 64;
+    static constexpr uint64_t kNarPipelineWindowBytes = 128ULL * 1024 * 1024;
+
     using NarStream = grpc::ClientReaderWriter<remote::NarRequest, remote::NarChunk>;
 
 private:
@@ -353,6 +428,25 @@ private:
         grpc::ClientContext ctx;
         std::unique_ptr<NarStream> stream;
         nixgrpc::ZstdReaderSource<NarStream, remote::NarChunk> source;
+
+        // Requested paths whose NAR has not been consumed yet, with their
+        // narSize (0 if unknown).
+        std::deque<std::pair<StorePath, uint64_t>> inflight;
+        uint64_t inflightBytes = 0;
+        StorePathSet requested;
+        std::map<StorePath, AutoCloseFD> spool;
+
+        void request(const StorePath & path, uint64_t narSize)
+        {
+            remote::NarRequest req;
+            req.set_path(std::string(path.to_string()));
+            if (!stream->Write(req)) {
+                throw Error("gRPC stream closed by peer");
+            }
+            inflight.emplace_back(path, narSize);
+            inflightBytes += narSize;
+            requested.insert(path);
+        }
 
         static auto requireStream(std::unique_ptr<NarStream> stream, const GrpcStoreConfig & config)
             -> std::unique_ptr<NarStream>
@@ -375,6 +469,16 @@ private:
     std::mutex narMutex;
     std::unique_ptr<NarSession> narSession;
 
+    // Predicted narFromPath() call order. Guarded by narMutex.
+    std::vector<StorePath> narExpectedOrder;
+    std::map<StorePath, uint64_t> narSizes;
+    size_t narCursor = 0;
+
+    auto narSizeOf(const StorePath & path) const -> uint64_t {
+      auto found = narSizes.find(path);
+      return found == narSizes.end() ? 0 : found->second;
+    }
+
 public:
     // NOLINTNEXTLINE(misc-override-with-different-visibility): Store and RemoteStore already disagree
     void narFromPath(const StorePath & path, Sink & sink) override
@@ -386,12 +490,54 @@ public:
       }
 
         try {
-            remote::NarRequest request;
-            request.set_path(std::string(path.to_string()));
-            if (!narSession->stream->Write(request)) {
-              throw Error("gRPC stream closed by peer");
+            if (auto found = narSession->spool.find(path); found != narSession->spool.end()) {
+              auto spoolFd = std::move(found->second);
+              narSession->spool.erase(found);
+              if (::lseek(spoolFd.get(), 0, SEEK_SET) == -1) {
+                throw SysError("seeking NAR spool file");
+              }
+              FdSource spooled(spoolFd.get());
+              copyNAR(spooled, sink);
+              return;
             }
-            copyNAR(narSession->source, sink);
+
+            if (!narSession->requested.contains(path)) {
+              narSession->request(path, narSizeOf(path));
+            }
+
+            // Top up the pipeline. Mispredicted consumption order lands in
+            // the spool instead of stalling the pipeline.
+            while (narSession->inflight.size() < kNarPipelineWindow && narCursor < narExpectedOrder.size()) {
+              const auto & candidate = narExpectedOrder.at(narCursor);
+              if (narSession->requested.contains(candidate)) {
+                ++narCursor;
+                continue;
+              }
+              // Allow one overshoot so a NAR larger than the whole budget
+              // cannot wedge the pipeline.
+              if (narSession->inflightBytes >= kNarPipelineWindowBytes) {
+                break;
+              }
+              narSession->request(candidate, narSizeOf(candidate));
+              ++narCursor;
+            }
+
+            // Spool everything queued ahead of the path we need.
+            while (true) {
+              auto [current, size] = narSession->inflight.front();
+              narSession->inflight.pop_front();
+              narSession->inflightBytes -= size;
+              if (current == path) {
+                copyNAR(narSession->source, sink);
+                return;
+              }
+              auto [tmpFd, tmpPath] = createTempFile("nix-grpc-nar");
+              ::unlink(tmpPath.c_str());
+              FdSink tmpSink(tmpFd.get());
+              copyNAR(narSession->source, tmpSink);
+              tmpSink.flush();
+              narSession->spool.emplace(std::move(current), std::move(tmpFd));
+            }
         } catch (...) {
             // The session is unusable after an error (the stream position is
             // unknown); surface the server-side status if there is one.
@@ -408,20 +554,38 @@ public:
     }
 
     ~GrpcStore() override {
-      // Let the server end its NarsFromPaths handler cleanly.
-      if (narSession) {
-        narSession->stream->WritesDone();
-        remote::NarChunk chunk;
-        while (narSession->stream->Read(&chunk)) {
-          ;
-        }
-        (void)narSession->stream->Finish();
+      {
+        std::scoped_lock const lock(infoBatchMutex);
+        infoBatchStop = true;
       }
+      infoBatchWakeup.notify_one();
+      if (infoBatchWorker.joinable()) {
+        infoBatchWorker.join();
+      }
+
+      if (!narSession) {
+        return;
+      }
+      // With NARs still in flight (aborted copy), draining would download
+      // them all just to close the stream. Cancel instead.
+      if (!narSession->inflight.empty()) {
+        narSession->ctx.TryCancel();
+        (void)narSession->stream->Finish();
+        return;
+      }
+      // Let the server end its NarsFromPaths handler cleanly.
+      narSession->stream->WritesDone();
+      remote::NarChunk chunk;
+      while (narSession->stream->Read(&chunk)) {
+        ;
+      }
+      (void)narSession->stream->Finish();
     }
 
     void addMultipleToStore(
-        PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs) override
+        PathsSource && pathsToCopy_, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs) override
     {
+        auto pathsToCopy = std::move(pathsToCopy_);
         uint64_t bytesExpected = 0;
         for (auto &[pathInfo, pathSource] : pathsToCopy) {
           bytesExpected += pathInfo.narSize;
