@@ -9,10 +9,11 @@ is bandwidth-bound instead of latency-bound.
 
 Why gRPC instead of `ssh-ng://`?
 
-  * **Latency-tolerant `nix copy`.** Dedicated streaming RPCs batch path
-    queries and keep up to 64 NAR requests in flight. Copying 200 small
-    paths at 50 ms RTT takes 1.3 s instead of the 11.8 s a
-    round-trip-per-path client needs.
+  * **Latency-tolerant `nix copy`.** One RPC batches the path queries
+    for a whole closure and one request per connection downloads all
+    NARs as a server-driven stream. Copying 200 small paths at 50 ms
+    RTT takes 1.3 s instead of the 11.8 s a round-trip-per-path client
+    needs.
   * **Faster handshakes.** A TLS handshake is much cheaper than an SSH
     connection setup (no subprocess, no shell, no SSH key exchange and
     session negotiation), and connections are multiplexed over HTTP/2, so
@@ -36,6 +37,8 @@ operation costs as sequence diagrams.
 
 ## Benchmark
 
+### `nix copy`
+
 ![nix copy transport comparison](docs/bench.png)
 
 `nix copy` of a 101-path, 411 MB closure from the same server over a
@@ -46,6 +49,8 @@ download-only. The gRPC store keeps close while also handling uploads,
 remote builds, GC and mTLS through the same endpoint.
 
 Reproduce with `./scripts/bench-transports.py`.
+
+### Remote builds
 
 There are two ways to build on a remote machine:
 
@@ -68,7 +73,6 @@ build either way:
 ![remote build transport comparison](docs/bench-builds.png)
 
 Reproduce with `./scripts/bench-builds.py`.
-
 
 ## Install
 
@@ -232,11 +236,8 @@ TLS uses the system CA bundle and the client key pair from
 `/run/nix-grpc-store` or `/var/lib/nix-grpc-store` by default (see below).
 
 With access control enabled, remote builders need the `trusted` role.
-The builder protocol imports unsigned outputs built on the client, which
-also requires `trustClients` (see above). Clients that only build *on*
-the server (`nix build --store 'grpc://…'`) submit builds through a
-dedicated RPC and get by with `write`. `nix copy --to` needs `write` as
-well, and substituter/`nix copy --from` access only needs `read-only`.
+The builder protocol imports unsigned outputs built on the client,
+which also requires `trustClients` (see above).
 
 ## URI parameters
 
@@ -304,5 +305,6 @@ coalescing and flushable zstd.
     nix build .#bench-latency -L
 
 VM benchmark measuring `nix copy` of 200 small paths at an emulated 50 ms
-RTT. `scripts/bench-transports.py` benchmarks real hosts across transports
-and `scripts/bench-plot.py` renders the chart above.
+RTT. `scripts/bench-transports.py` and `scripts/bench-builds.py`
+benchmark real hosts and `scripts/bench-plot.py` renders the charts
+above.
