@@ -308,6 +308,7 @@ public:
     auto isValidPathUncached(const StorePath & path) -> bool override {
       return queryValidPaths({path}, NoSubstitute).contains(path);
     }
+
     // The build hook probes reachability at store open. One StoreInfo RPC
     // answers it and caches the trust flag, no tunnel needed.
     void connect() override { isTrustedClient(); }
