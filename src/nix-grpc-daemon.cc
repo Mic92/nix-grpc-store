@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -33,7 +34,11 @@
 #include <grpcpp/support/status.h>
 #include <grpcpp/support/sync_stream.h>
 
+#include <nix/store/build-result.hh>
+#include <nix/store/derivations.hh>
 #include <nix/store/globals.hh>
+#include <nix/util/logging.hh>
+#include <nix/store/worker-protocol-connection.hh>
 #include <nix/store/path-info.hh>
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
@@ -58,6 +63,7 @@
 using GrpcStream = grpc::ServerReaderWriter<nix::remote::Chunk, nix::remote::Chunk>;
 using AddMultipleReader = grpc::ServerReader<nix::remote::AddMultipleChunk>;
 using NarsStream = grpc::ServerReaderWriter<nix::remote::NarChunk, nix::remote::NarRequest>;
+using BuildWriter = grpc::ServerWriter<nix::remote::BuildDerivationChunk>;
 
 namespace {
 
@@ -273,6 +279,148 @@ public:
                     static_cast<const nix::UnkeyedValidPathInfo &>(*info));
                 *out->mutable_info() = std::move(sink.s);
             }
+            return grpc::Status::OK;
+        });
+    }
+
+    // Relays the raw worker-protocol stderr stream of one build to the
+    // client, which replays it through its own protocol code. Output path
+    // infos ride on the final message.
+    // Consumes the worker-protocol stderr stream up to STDERR_LAST,
+    // forwarding plain build log lines.
+    static void relayBuildLog(nix::Source & source, const std::function<void(std::string)> & sendLogLine)
+    {
+        auto readLogFields = [&]() -> std::vector<std::string> {
+            std::vector<std::string> fields;
+            auto count = nix::readNum<uint64_t>(source);
+            for (uint64_t idx = 0; idx < count; ++idx) {
+                if (nix::readNum<uint64_t>(source) == 0) {
+                    nix::readNum<uint64_t>(source);
+                    fields.emplace_back();
+                } else {
+                    fields.push_back(nix::readString(source));
+                }
+            }
+            return fields;
+        };
+        while (true) {
+            auto msg = nix::readNum<uint64_t>(source);
+            if (msg == STDERR_NEXT) {
+                sendLogLine(nix::chomp(nix::readString(source)));
+            } else if (msg == STDERR_START_ACTIVITY) {
+                nix::readNum<uint64_t>(source);
+                nix::readNum<uint64_t>(source);
+                nix::readNum<uint64_t>(source);
+                nix::readString(source);
+                readLogFields();
+                nix::readNum<uint64_t>(source);
+            } else if (msg == STDERR_STOP_ACTIVITY) {
+                nix::readNum<uint64_t>(source);
+            } else if (msg == STDERR_RESULT) {
+                nix::readNum<uint64_t>(source);
+                auto type = nix::readNum<uint64_t>(source);
+                auto fields = readLogFields();
+                if (type == nix::resBuildLogLine && !fields.empty()) {
+                    sendLogLine(std::move(fields.front()));
+                }
+            } else if (msg == STDERR_ERROR) {
+                throw nix::readError(source);
+            } else if (msg == STDERR_LAST) {
+                break;
+            } else {
+                throw nix::Error("unexpected worker protocol message from backend");
+            }
+        }
+    }
+
+    auto BuildDerivation(
+        grpc::ServerContext * context,
+        const nix::remote::BuildDerivationRequest * request,
+        BuildWriter * writer) -> grpc::Status override
+    {
+        return guarded([&]() -> grpc::Status {
+            auto const commonName = nixgrpc::clientCommonName(*context);
+            auto const start = std::chrono::steady_clock::now();
+            metrics.countRpc("BuildDerivation", commonName);
+
+            auto const protocol = nixcompat::buildProtocolVersion();
+            if (request->protocol() != nixcompat::kBuildProtocolWire
+                || request->build_mode() > static_cast<uint32_t>(nix::bmCheck)) {
+                return {grpc::StatusCode::INVALID_ARGUMENT, "unsupported build protocol or mode"};
+            }
+            auto localStore = getStore();
+
+            struct Conn : nix::WorkerProto::BasicClientConnection
+            {
+                void closeWrite() override {}
+            };
+            auto sock = nix::connect(std::filesystem::path{socketPath});
+            Conn conn;
+            conn.to = nix::FdSink(sock.get());
+            conn.from = nix::FdSource(sock.get());
+            conn.protoVersion = nixcompat::handshakeCompat(conn, protocol);
+            if (nixcompat::protocolWire(conn.protoVersion) != nixcompat::kBuildProtocolWire) {
+                return {grpc::StatusCode::FAILED_PRECONDITION, "backend daemon is too old"};
+            }
+            conn.postHandshake(*localStore);
+            auto sendLogLine = [&](std::string line) -> void {
+                nix::remote::BuildDerivationChunk chunk;
+                *chunk.mutable_log_line() = std::move(line);
+                writer->Write(chunk);
+            };
+            // The daemon opens every connection with a stderr work block.
+            relayBuildLog(conn.from, sendLogLine);
+
+            nix::StorePath const drvPath(request->drv_path());
+            nix::StringSource drvSource(request->drv());
+            nix::BasicDerivation drv;
+            nixcompat::readDrv(drvSource, *localStore, drv, nix::Derivation::nameFromPath(drvPath));
+            bool daemonException = false;
+            conn.putBuildDerivationRequest(
+                *localStore,
+                &daemonException,
+                drvPath,
+                drv,
+                static_cast<nix::BuildMode>(request->build_mode()));
+            conn.to.flush();
+
+            relayBuildLog(conn.from, sendLogLine);
+
+            auto res = nix::WorkerProto::Serialise<nix::BuildResult>::read(
+                *localStore, nix::WorkerProto::ReadConn{.from = conn.from, .version = protocol});
+
+            nix::remote::BuildDerivationChunk chunk;
+            auto * done = chunk.mutable_done();
+            {
+                nix::StringSink sink;
+                nix::WorkerProto::Serialise<nix::BuildResult>::write(
+                    *localStore, nix::WorkerProto::WriteConn{.to = sink, .version = protocol}, res);
+                *done->mutable_result() = std::move(sink.s);
+            }
+            uint64_t outputs = 0;
+            nixcompat::forBuiltOutputs(res, [&](const nix::StorePath & outPath) -> void {
+                auto info = localStore->queryPathInfo(outPath);
+                auto * out = done->add_outputs();
+                out->set_path(std::string(info->path.to_string()));
+                nix::StringSink sink;
+                nix::WorkerProto::Serialise<nix::UnkeyedValidPathInfo>::write(
+                    *localStore,
+                    nix::WorkerProto::WriteConn{.to = sink, .version = nixcompat::infoProtocolVersion()},
+                    static_cast<const nix::UnkeyedValidPathInfo &>(*info));
+                *out->mutable_info() = std::move(sink.s);
+                ++outputs;
+            });
+            writer->Write(chunk);
+
+            nixgrpc::logLine(
+                nixgrpc::LogLevel::info,
+                {{"event", "rpc"},
+                 {"method", "BuildDerivation"},
+                 {"cn", commonName},
+                 {"peer", context->peer()},
+                 {"duration_s", secondsSince(start)},
+                 {"drv", std::string(drvPath.to_string())},
+                 {"outputs", std::to_string(outputs)}});
             return grpc::Status::OK;
         });
     }

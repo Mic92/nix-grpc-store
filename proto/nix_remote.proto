@@ -48,6 +48,30 @@ message QueryPathInfosReply {
   repeated PathInfo infos = 1;
 }
 
+// `drv` is the worker-protocol BasicDerivation serialisation. `protocol`
+// (major << 8 | minor) pins the BuildResult serialisation in the reply.
+message BuildDerivationRequest {
+  string drv_path = 1;
+  bytes drv = 2;
+  uint32 build_mode = 3;
+  uint32 protocol = 4;
+}
+
+// `result` is the worker-protocol BuildResult serialisation at the request's
+// `protocol`. Output path infos ride along so the client needs no follow-up
+// queries.
+message BuildDerivationDone {
+  bytes result = 1;
+  repeated PathInfo outputs = 2;
+}
+
+message BuildDerivationChunk {
+  oneof event {
+    string log_line = 1;
+    BuildDerivationDone done = 2;
+  }
+}
+
 message NarRequest {
   string path = 1;
 }
@@ -72,4 +96,5 @@ service NixRemote {
   rpc AddMultipleToStore(stream AddMultipleChunk) returns (AddMultipleReply);
   rpc QueryPathInfos(QueryPathInfosRequest) returns (QueryPathInfosReply);
   rpc NarsFromPaths(stream NarRequest) returns (stream NarChunk);
+  rpc BuildDerivation(BuildDerivationRequest) returns (stream BuildDerivationChunk);
 }

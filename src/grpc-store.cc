@@ -271,8 +271,104 @@ public:
       return res;
     }
 
+#if NIX_COMPAT_HAS_BUILDER
+    auto getBuilder(std::shared_ptr<Store> evalStore) -> ref<Builder> override {
+      class GrpcBuilder : public Builder {
+        GrpcStore * store;
+        ref<Builder> inner;
+
+      public:
+        GrpcBuilder(GrpcStore * store, ref<Builder> inner)
+            : store(store), inner(std::move(inner)) {}
+        void buildPaths(const std::vector<DerivedPath> & reqs,
+                        BuildMode buildMode) override {
+          inner->buildPaths(reqs, buildMode);
+        }
+        auto buildPathsWithResults(const std::vector<DerivedPath> & reqs,
+                                   BuildMode buildMode)
+            -> std::vector<KeyedBuildResult> override {
+          return inner->buildPathsWithResults(reqs, buildMode);
+        }
+        auto buildDerivation(const StorePath & drvPath,
+                             const BasicDerivation & drv, BuildMode buildMode)
+            -> BuildResult override {
+          return store->buildDerivationNative(drvPath, drv, buildMode);
+        }
+        void ensurePath(const StorePath & path) override {
+          inner->ensurePath(path);
+        }
+        void repairPath(const StorePath & path) override {
+          inner->repairPath(path);
+        }
+      };
+      return make_ref<GrpcBuilder>(this,
+                                   RemoteStore::getBuilder(std::move(evalStore)));
+    }
+#else
+    auto buildDerivation(const StorePath & drvPath, const BasicDerivation & drv,
+                         BuildMode buildMode) -> BuildResult override {
+      return buildDerivationNative(drvPath, drv, buildMode);
+    }
+#endif
+
+    // One RPC per build: log lines stream during the build, the result
+    // arrives with the output path infos so no follow-up queries are needed.
+    auto buildDerivationNative(const StorePath & drvPath,
+                               const BasicDerivation & drv,
+                               BuildMode buildMode) -> BuildResult {
+      remote::BuildDerivationRequest request;
+      request.set_drv_path(std::string(drvPath.to_string()));
+      request.set_build_mode(static_cast<uint32_t>(buildMode));
+      request.set_protocol(nixcompat::kBuildProtocolWire);
+      {
+        StringSink sink;
+        nixcompat::writeDrv(sink, *this, drv);
+        *request.mutable_drv() = std::move(sink.s);
+      }
+
+      grpc::ClientContext ctx;
+      auto reader = stub->BuildDerivation(&ctx, request);
+
+      std::optional<BuildResult> res;
+      PathInfoMap infos;
+      remote::BuildDerivationChunk msg;
+      while (reader->Read(&msg)) {
+        if (msg.has_log_line()) {
+          printError(msg.log_line());
+        } else if (msg.has_done()) {
+          StringSource source(msg.done().result());
+          res = WorkerProto::Serialise<BuildResult>::read(
+              *this, WorkerProto::ReadConn{.from = source,
+                                           .version = nixcompat::buildProtocolVersion()});
+          for (const auto & entry : msg.done().outputs()) {
+            infos.insert(parseInfoEntry(entry));
+          }
+        }
+      }
+      checkStatus(reader->Finish(), "BuildDerivation");
+      if (!res) {
+        throw Error("gRPC BuildDerivation stream ended without a result");
+      }
+      if (!infos.empty()) {
+        std::scoped_lock const lock(prefetchMutex);
+        prefetchedInfos.merge(infos);
+      }
+      return std::move(*res);
+    }
+
 private:
     using PathInfoMap = std::map<StorePath, std::shared_ptr<const ValidPathInfo>>;
+
+    auto parseInfoEntry(const remote::PathInfo & entry)
+        -> std::pair<StorePath, std::shared_ptr<const ValidPathInfo>> {
+      StorePath const path(entry.path());
+      StringSource source(entry.info());
+      auto info = WorkerProto::Serialise<UnkeyedValidPathInfo>::read(
+          *this, WorkerProto::ReadConn{.from = source,
+                                       .version = nixcompat::infoProtocolVersion()});
+      return {path, std::make_shared<ValidPathInfo>(StorePath(path),
+                                                    std::move(info))};
+    }
 
     /* Path infos fetched in bulk by topoSortPaths(), consumed by
        queryPathInfoUncached() so `nix copy` needs one QueryPathInfos RPC
@@ -292,13 +388,7 @@ private:
 
       PathInfoMap res;
       for (const auto &entry : reply.infos()) {
-        StorePath const path(entry.path());
-        StringSource source(entry.info());
-        auto info = WorkerProto::Serialise<UnkeyedValidPathInfo>::read(
-            *this, WorkerProto::ReadConn{.from = source,
-                                         .version = nixcompat::infoProtocolVersion()});
-        res.insert_or_assign(path, std::make_shared<ValidPathInfo>(
-                                       StorePath(path), std::move(info)));
+        res.insert(parseInfoEntry(entry));
       }
       return res;
     }
