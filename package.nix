@@ -18,7 +18,17 @@
 stdenv.mkDerivation {
   pname = "nix-grpc-store";
   version = "0.1.0";
-  src = ./.;
+  src = lib.fileset.toSource {
+    root = ./.;
+    fileset = lib.fileset.unions [
+      ./.clang-tidy
+      ./meson.build
+      ./meson.options
+      ./proto
+      ./src
+      ./fuzz
+    ];
+  };
 
   nativeBuildInputs = [
     meson
