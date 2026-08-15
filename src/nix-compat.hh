@@ -110,6 +110,15 @@ inline void forBuiltOutputs(R &res, const F &fun) {
   }
 }
 
+// Same variant split as forBuiltOutputs.
+template <typename R> inline void setAlreadyValid(R &res) {
+  if constexpr (requires { res.tryGetSuccess(); }) {
+    res.inner = typename R::Success{.status = R::Success::AlreadyValid};
+  } else {
+    res.status = R::AlreadyValid;
+  }
+}
+
 inline auto buildProtocolVersion() -> nix::WorkerProto::Version {
   constexpr unsigned int major = 1;
   constexpr uint8_t minor = 37;

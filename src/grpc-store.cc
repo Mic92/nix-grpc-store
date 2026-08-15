@@ -271,6 +271,10 @@ public:
       return res;
     }
 
+    // Same: keep read-only clients off the tunnel.
+    auto isValidPathUncached(const StorePath & path) -> bool override {
+      return queryValidPaths({path}, NoSubstitute).contains(path);
+    }
     // The build hook probes reachability at store open. One StoreInfo RPC
     // answers it and caches the trust flag, no tunnel needed.
     void connect() override { isTrustedClient(); }
@@ -288,6 +292,31 @@ public:
       return trusted;
     }
 
+    // nix copy "builds" opaque paths; answering already-valid ones here
+    // avoids the tunnel, which read-only clients may not open.
+    auto alreadyValidResults(const std::vector<DerivedPath> & reqs)
+        -> std::optional<std::vector<KeyedBuildResult>> {
+      StorePathSet paths;
+      for (const auto & req : reqs) {
+        const auto * opaque = std::get_if<DerivedPath::Opaque>(&req.raw());
+        if (opaque == nullptr) {
+          return std::nullopt;
+        }
+        paths.insert(opaque->path);
+      }
+      if (queryValidPaths(paths, NoSubstitute).size() != paths.size()) {
+        return std::nullopt;
+      }
+      std::vector<KeyedBuildResult> results;
+      results.reserve(reqs.size());
+      for (const auto & req : reqs) {
+        KeyedBuildResult res{{}, req};
+        nixcompat::setAlreadyValid(res);
+        results.push_back(std::move(res));
+      }
+      return results;
+    }
+
 #if NIX_COMPAT_HAS_BUILDER
     auto getBuilder(std::shared_ptr<Store> evalStore) -> ref<Builder> override {
       class GrpcBuilder : public Builder {
@@ -299,11 +328,19 @@ public:
             : store(store), inner(std::move(inner)) {}
         void buildPaths(const std::vector<DerivedPath> & reqs,
                         BuildMode buildMode) override {
+          if (buildMode == bmNormal && store->alreadyValidResults(reqs)) {
+            return;
+          }
           inner->buildPaths(reqs, buildMode);
         }
         auto buildPathsWithResults(const std::vector<DerivedPath> & reqs,
                                    BuildMode buildMode)
             -> std::vector<KeyedBuildResult> override {
+          if (buildMode == bmNormal) {
+            if (auto results = store->alreadyValidResults(reqs)) {
+              return std::move(*results);
+            }
+          }
           return inner->buildPathsWithResults(reqs, buildMode);
         }
         auto buildDerivation(const StorePath & drvPath,
@@ -322,6 +359,25 @@ public:
                                    RemoteStore::getBuilder(std::move(evalStore)));
     }
 #else
+    void buildPaths(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
+                    std::shared_ptr<Store> evalStore) override {
+      if (buildMode == bmNormal && alreadyValidResults(reqs)) {
+        return;
+      }
+      RemoteStore::buildPaths(reqs, buildMode, std::move(evalStore));
+    }
+    auto buildPathsWithResults(const std::vector<DerivedPath> & reqs,
+                               BuildMode buildMode,
+                               std::shared_ptr<Store> evalStore)
+        -> std::vector<KeyedBuildResult> override {
+      if (buildMode == bmNormal) {
+        if (auto results = alreadyValidResults(reqs)) {
+          return std::move(*results);
+        }
+      }
+      return RemoteStore::buildPathsWithResults(reqs, buildMode,
+                                                std::move(evalStore));
+    }
     auto buildDerivation(const StorePath & drvPath, const BasicDerivation & drv,
                          BuildMode buildMode) -> BuildResult override {
       return buildDerivationNative(drvPath, drv, buildMode);
@@ -578,6 +634,57 @@ private:
         }
     };
 
+    struct Connection : RemoteStore::Connection
+    {
+    private:
+        friend struct GrpcStore;
+
+        // RemoteStore::Connection speaks through FdSink/FdSource, so bridge the
+        // gRPC stream to a pair of pipes with pump threads. This keeps the
+        // blocking, ordered semantics the worker protocol relies on without
+        // reimplementing Source/Sink on top of gRPC.
+        grpc::ClientContext ctx;
+        std::unique_ptr<GrpcStream> stream;
+
+        Pipe toRemote;   // plugin writes → reader thread sends over gRPC
+        Pipe fromRemote; // writer thread receives from gRPC → plugin reads
+
+        std::thread reader;
+        std::thread writer;
+
+    public:
+        Connection() = default;
+        Connection(const Connection &) = delete;
+        Connection(Connection &&) = delete;
+        auto operator=(const Connection &) -> Connection & = delete;
+        auto operator=(Connection &&) -> Connection & = delete;
+
+        void closeWrite() override
+        {
+            // Closing the write side of the pipe makes the reader thread hit
+            // EOF, which then calls WritesDone() on the stream.
+            toRemote.writeSide.close();
+        }
+
+        ~Connection() override {
+          // Unblock the reader pump (poll() on toRemote.readSide sees EOF)
+          // and the writer pump (stream->Read() returns false), then join.
+          // The pipe ends drained by the pump threads are owned by those
+          // threads; touching them here would race with their own close().
+          toRemote.writeSide.close();
+          ctx.TryCancel();
+          if (reader.joinable()) {
+            reader.join();
+          }
+          if (writer.joinable()) {
+            writer.join();
+          }
+          if (stream) {
+            (void)stream->Finish();
+          }
+        }
+    };
+
     std::mutex narMutex;
     std::unique_ptr<NarSession> narSession;
 
@@ -750,57 +857,6 @@ public:
     void setOptions(RemoteStore::Connection & /*conn*/) override {
       // As with SSHStore, do not forward local settings automatically.
     }
-
-    struct Connection : RemoteStore::Connection
-    {
-    private:
-        friend struct GrpcStore;
-
-        // RemoteStore::Connection speaks through FdSink/FdSource, so bridge the
-        // gRPC stream to a pair of pipes with pump threads. This keeps the
-        // blocking, ordered semantics the worker protocol relies on without
-        // reimplementing Source/Sink on top of gRPC.
-        grpc::ClientContext ctx;
-        std::unique_ptr<GrpcStream> stream;
-
-        Pipe toRemote;   // plugin writes → reader thread sends over gRPC
-        Pipe fromRemote; // writer thread receives from gRPC → plugin reads
-
-        std::thread reader;
-        std::thread writer;
-
-    public:
-        Connection() = default;
-        Connection(const Connection &) = delete;
-        Connection(Connection &&) = delete;
-        auto operator=(const Connection &) -> Connection & = delete;
-        auto operator=(Connection &&) -> Connection & = delete;
-
-        void closeWrite() override
-        {
-            // Closing the write side of the pipe makes the reader thread hit
-            // EOF, which then calls WritesDone() on the stream.
-            toRemote.writeSide.close();
-        }
-
-        ~Connection() override {
-          // Unblock the reader pump (poll() on toRemote.readSide sees EOF)
-          // and the writer pump (stream->Read() returns false), then join.
-          // The pipe ends drained by the pump threads are owned by those
-          // threads; touching them here would race with their own close().
-          toRemote.writeSide.close();
-          ctx.TryCancel();
-          if (reader.joinable()) {
-            reader.join();
-          }
-          if (writer.joinable()) {
-            writer.join();
-          }
-          if (stream) {
-            (void)stream->Finish();
-          }
-        }
-    };
 
     // NOLINTNEXTLINE(misc-override-with-different-visibility): see narFromPath
     auto openConnection() -> ref<RemoteStore::Connection> override;
