@@ -64,6 +64,7 @@ namespace {
 class NixRemoteService final : public nix::remote::NixRemote::Service
 {
     std::string socketPath;
+    std::string storeUri;
     nixgrpc::Metrics & metrics;
     nixgrpc::LogLevel logLevel;
 
@@ -76,7 +77,7 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     {
         std::scoped_lock const lock(storeMutex);
         if (!store) {
-            store = nix::openStore("unix://" + socketPath).get_ptr();
+            store = nix::openStore(storeUri).get_ptr();
         }
         return nix::ref<nix::Store>(store);
     }
@@ -88,6 +89,8 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         try {
             return std::forward<F>(func)();
         } catch (std::exception & err) {
+            nixgrpc::logLine(
+                nixgrpc::LogLevel::info, {{"event", "handler_error"}, {"error", std::string(err.what())}});
             return {grpc::StatusCode::INTERNAL, err.what()};
         }
     }
@@ -106,8 +109,10 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     }
 
 public:
-    NixRemoteService(std::string socketPath, nixgrpc::Metrics & metrics, nixgrpc::LogLevel logLevel)
+    NixRemoteService(
+        std::string socketPath, std::string storeUri, nixgrpc::Metrics & metrics, nixgrpc::LogLevel logLevel)
         : socketPath(std::move(socketPath))
+        , storeUri(std::move(storeUri))
         , metrics(metrics)
         , logLevel(logLevel)
     {
@@ -317,6 +322,8 @@ struct Options
 {
     std::string listen = "0.0.0.0:50051";
     std::string socketPath = "/nix/var/nix/daemon-socket/socket";
+    // Store URI for the native bulk RPCs. Defaults to the proxy socket.
+    std::string storeUri;
     std::string tlsCert;
     std::string tlsKey;
     std::string clientCA;
@@ -339,6 +346,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.listen = next();
         } else if (arg == "--proxy-socket") {
             options.socketPath = next();
+        } else if (arg == "--proxy-store") {
+            options.storeUri = next();
         } else if (arg == "--tls-cert") {
             options.tlsCert = next();
         } else if (arg == "--tls-key") {
@@ -398,7 +407,10 @@ try {
     auto options = parseOptions({args.begin(), args.end()});
 
     nixgrpc::Metrics metrics(options.metricsListen);
-    NixRemoteService service(options.socketPath, metrics, options.logLevel);
+    if (options.storeUri.empty()) {
+        options.storeUri = "unix://" + options.socketPath;
+    }
+    NixRemoteService service(options.socketPath, options.storeUri, metrics, options.logLevel);
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
