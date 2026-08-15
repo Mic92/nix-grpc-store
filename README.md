@@ -29,7 +29,6 @@ Why gRPC instead of `ssh-ng://`?
 
 ![nix copy transport comparison](docs/bench.png)
 
-*101 paths / 411 MB closure over a 46 ms RTT WAN link, 5 runs each.
 Reproduce with `./scripts/bench-transports.py`.*
 
 Everything that works over `ssh-ng://` works here: remote builds,
