@@ -2,10 +2,17 @@
 
 **Status: Beta.** Interfaces may change.
 
-Remote Nix store access over gRPC instead of SSH.
+Remote Nix store access over gRPC instead of SSH. `nix copy` over a WAN
+link is **3.5x faster than `ssh-ng://`** because round trips are hidden:
+path-info queries are batched and NAR downloads are pipelined, so wall time
+is bandwidth-bound instead of latency-bound.
 
 Why gRPC instead of `ssh-ng://`?
 
+  * **Latency-tolerant `nix copy`.** Dedicated streaming RPCs batch path
+    queries and keep up to 64 NAR requests in flight. Copying 200 small
+    paths at 50 ms RTT takes 1.3 s instead of the 11.8 s a
+    round-trip-per-path client needs.
   * **Faster handshakes.** A TLS handshake is much cheaper than an SSH
     connection setup (no subprocess, no shell, no SSH key exchange and
     session negotiation), and connections are multiplexed over HTTP/2, so
@@ -15,10 +22,15 @@ Why gRPC instead of `ssh-ng://`?
     [step-ca](https://smallstep.com/docs/step-ca/) issuing short-lived client
     and server certs — and reuse load balancers, service meshes and mTLS
     policies that already speak HTTP/2.
-  * **Compression.** All traffic is zstd-compressed. The `nix copy` hot
-    path uses dedicated streaming RPCs where a whole batch of paths shares a
-    single zstd stream (one compression window across all NARs), so copying
-    many small paths needs one round trip instead of one per path.
+  * **Compression.** All traffic is zstd-compressed. A whole batch of
+    paths shares a single zstd stream (one compression window across all
+    NARs), unlike ssh's optional zlib, which made the benchmark below
+    slower instead of faster.
+
+![nix copy transport comparison](docs/bench.png)
+
+*101 paths / 411 MB closure over a 46 ms RTT WAN link, 5 runs each.
+Reproduce with `./scripts/bench-transports.py`.*
 
 Everything that works over `ssh-ng://` works here: remote builds,
 `nix copy`, path queries, GC. The gRPC layer is a thin tunnel to the
@@ -176,3 +188,9 @@ Only CA-issued CNs appear as labels, so cardinality stays bounded.
 End-to-end NixOS VM test plus a 256 MiB throughput benchmark against the unix
 socket and `perf` counters. See `src/pump.hh` for design notes on chunk
 coalescing and flushable zstd.
+
+    nix build .#bench-latency -L
+
+VM benchmark measuring `nix copy` of 200 small paths at an emulated 50 ms
+RTT. `scripts/bench-transports.py` benchmarks real hosts across transports
+and `scripts/bench-plot.py` renders the chart above.
