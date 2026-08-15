@@ -1,12 +1,8 @@
 #pragma once
-// NAR download client for the grpc store plugin.
-//
-// The paths recorded via recordOrder() are partitioned across N FetchNars
-// streams (one TCP connection each, since a single connection cannot fill
-// a high bandwidth-delay-product link), largest paths first so their
-// restores start early. Each stream's reader thread decompresses tagged
-// frames into per-path spool files; fetchInto() streams a path's bytes to
-// the caller while later frames are still arriving, so restores overlap
+// NAR download client for the grpc store plugin. Recorded paths are
+// partitioned largest-first across N FetchNars streams, one TCP
+// connection each. Reader threads decompress tagged frames into per-path
+// spool files while fetchInto() streams them out, so restores overlap
 // the download.
 
 #include <algorithm>
@@ -266,8 +262,6 @@ private:
         if (pending.empty()) {
             return;
         }
-        // Largest-first LPT partition, so every stream starts with its
-        // biggest NAR and restores of large paths begin immediately.
         std::ranges::stable_sort(pending, [&](const auto & lhs, const auto & rhs) -> bool {
             return narSizeOf(lhs) > narSizeOf(rhs);
         });
