@@ -49,9 +49,9 @@ Remote builds skip the tunnelled worker protocol too: one streaming RPC
 submits the derivation and returns the result with its output path
 infos, so a chain of tiny builds over a ~50 ms WAN link runs 1.4x
 faster than `ssh-ng://` through the build hook (`builders =`). Using
-the remote store directly (`nix build --store 'grpc://…'`) avoids the
-per-derivation hook process and its two fresh TLS connections, which is
-worth another 1.5x — 2.1x over an ssh-ng hook setup:
+the remote store directly (`nix build --store 'grpc://…'`) also avoids
+the per-derivation hook process and its two fresh TLS connections,
+which is worth another 1.5x — 2.1x over an ssh-ng hook setup:
 
 ![remote build transport comparison](docs/bench-builds.png)
 
