@@ -45,13 +45,24 @@ remote builds, GC and mTLS through the same endpoint.
 
 Reproduce with `./scripts/bench-transports.py`.
 
-Remote builds skip the tunnelled worker protocol too: one streaming RPC
-submits the derivation and returns the result with its output path
-infos, so a chain of tiny builds over a ~50 ms WAN link runs 1.4x
-faster than `ssh-ng://` through the build hook (`builders =`). Using
-the remote store directly (`nix build --store 'grpc://…'`) also avoids
-the per-derivation hook process and its two fresh TLS connections,
-which is worth another 1.5x — 2.1x over an ssh-ng hook setup:
+Remote builds benefit too. There are two ways to build on a remote
+machine:
+
+- **hook**: the machine is listed in `builders =`. For every
+  derivation Nix spawns a fresh `build-remote` helper process that
+  opens its own connections, uploads the inputs, runs the build and
+  downloads the outputs.
+- **direct**: the remote store is the target of the build
+  (`nix build --store 'grpc://…'`). One client process drives the
+  whole build graph over a single long-lived connection and outputs
+  stay on the remote store.
+
+On a chain of tiny builds over a ~50 ms WAN link, grpc is 1.4x faster
+than `ssh-ng://` in hook mode: one streaming RPC submits a derivation
+and returns the result with its output path infos, where ssh-ng pays
+per-derivation ssh session setup. In direct mode the transports are
+comparable, since a single long-lived connection serves the whole
+build either way:
 
 ![remote build transport comparison](docs/bench-builds.png)
 
