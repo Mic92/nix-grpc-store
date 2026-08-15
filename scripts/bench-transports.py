@@ -11,13 +11,12 @@ Example:
 """
 
 import argparse
-import datetime
-import json
 import shutil
-import statistics
 import subprocess
 import time
 from pathlib import Path
+
+import benchlib
 
 
 def nix(*args: str) -> str:
@@ -55,33 +54,23 @@ def main() -> None:
     n_paths, n_bytes = len(info), int(info[-1].split()[-1])
     print(f"closure: {n_paths} paths, {n_bytes / 1e6:.0f} MB")
 
-    results: dict[str, list[float]] = {store: [] for store in args.store}
     dest = Path("/tmp/nix-bench-dst")
-    for i in range(args.warmup + args.runs):
-        for store in args.store:
-            dt = bench_once(store, path, dest)
-            print(f"  {store:45s} run {i} {dt:7.2f}s", flush=True)
-            if i >= args.warmup:
-                results[store].append(dt)
 
-    for store, times in results.items():
-        mean = statistics.mean(times)
-        stdev = statistics.stdev(times) if len(times) > 1 else 0.0
-        print(
-            f"{store:45s} {mean:7.2f}s ±{stdev:5.2f}  {n_bytes / mean / 1e6:6.1f} MB/s"
-        )
+    def describe(dt: float) -> str:
+        return f"{n_bytes / dt / 1e6:6.1f} MB/s"
 
-    history = json.loads(args.output.read_text()) if args.output.exists() else []
-    history.append(
-        {
-            "date": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
-            "path": path,
-            "paths": n_paths,
-            "bytes": n_bytes,
-            "runs": results,
-        }
+    results = benchlib.interleaved_runs(
+        args.store,
+        lambda store, _i: bench_once(store, path, dest),
+        args.runs,
+        args.warmup,
+        describe,
     )
-    args.output.write_text(json.dumps(history, indent=2) + "\n")
+    benchlib.print_summary(results, describe)
+    benchlib.append_history(
+        args.output,
+        {"path": path, "paths": n_paths, "bytes": n_bytes, "runs": results},
+    )
 
 
 if __name__ == "__main__":

@@ -14,14 +14,14 @@ Example:
 
 import argparse
 import datetime
-import json
 import platform
 import shutil
-import statistics
 import subprocess
 import tempfile
 import time
 from pathlib import Path
+
+import benchlib
 
 CHAIN_NIX = """
 { salt, length, system }:
@@ -99,37 +99,20 @@ def main() -> None:
     chain.write_text(CHAIN_NIX)
     store = tmp / "store"
 
-    results: dict[str, list[float]] = {builder: [] for builder in args.builder}
     stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d%H%M%S")
-    for i in range(args.warmup + args.runs):
-        for builder in args.builder:
-            salt = f"{stamp}r{i}t{args.builder.index(builder)}"
-            dt = bench_once(builder, chain, store, salt, args.length, args.system)
-            print(
-                f"  {builder:45s} run {i} {dt:7.2f}s"
-                f" ({dt / args.length * 1000:5.0f} ms/drv)",
-                flush=True,
-            )
-            if i >= args.warmup:
-                results[builder].append(dt)
 
-    for builder, times in results.items():
-        mean = statistics.mean(times)
-        stdev = statistics.stdev(times) if len(times) > 1 else 0.0
-        print(
-            f"{builder:45s} {mean:7.2f}s ±{stdev:5.2f}"
-            f"  {mean / args.length * 1000:6.0f} ms/drv"
-        )
+    def describe(dt: float) -> str:
+        return f"{dt / args.length * 1000:5.0f} ms/drv"
 
-    history = json.loads(args.output.read_text()) if args.output.exists() else []
-    history.append(
-        {
-            "date": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
-            "length": args.length,
-            "runs": results,
-        }
+    def once(builder: str, i: int) -> float:
+        salt = f"{stamp}r{i}t{args.builder.index(builder)}"
+        return bench_once(builder, chain, store, salt, args.length, args.system)
+
+    results = benchlib.interleaved_runs(
+        args.builder, once, args.runs, args.warmup, describe
     )
-    args.output.write_text(json.dumps(history, indent=2) + "\n")
+    benchlib.print_summary(results, describe)
+    benchlib.append_history(args.output, {"length": args.length, "runs": results})
 
 
 if __name__ == "__main__":

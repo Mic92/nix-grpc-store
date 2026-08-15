@@ -14,7 +14,7 @@ from pathlib import Path
 import matplotlib  # type: ignore[import-not-found]
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # type: ignore[import-not-found]  # noqa: E402
+import matplotlib.pyplot as plt  # type: ignore[import-not-found]
 
 COLORS = ["#4c72b0", "#55a868", "#c44e52", "#8172b3", "#ccb974"]
 
