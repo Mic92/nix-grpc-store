@@ -95,11 +95,24 @@ default. That is enough for `nix build --store 'grpc://…'`, `nix copy`,
 path queries and GC: sources and derivations are content-addressed, signed
 cache paths are accepted, and the server builds everything itself.
 
-Using the server as a remote builder (`builders = grpc://…`) also imports
-unsigned outputs built on the client, which only trusted users may do. Set
-`services.nix-grpc-daemon.trustClients = true` for that; every authenticated
-client then has trusted-user privileges, so require client certs
-(`tls.clientCaFile`).
+This makes an untrusting server usable as a builder without any special
+setup:
+
+    nix build nixpkgs#hello --store 'grpc://builder:50051' --eval-store auto
+
+Evaluation runs locally (`--eval-store auto` keeps the eval artifacts in
+the local store instead of round-tripping them to the server), the
+derivation closure is imported — sources and `.drv` files are
+content-addressed, so they pass signature checks — and all builds happen
+server-side. Nothing unsigned crosses the trust boundary, so
+`trustClients` can stay off.
+
+Using the server as a remote builder (`builders = grpc://…`) is different:
+there the *client* schedules builds and uploads input paths it built
+locally, which are unsigned — something only trusted users may do. Set
+`services.nix-grpc-daemon.trustClients = true` for that; every
+authenticated client then has trusted-user privileges, so require client
+certs (`tls.clientCaFile`).
 
 ## Remote builder
 
@@ -112,6 +125,14 @@ client then has trusted-user privileges, so require client certs
 
 TLS uses the system CA bundle and the client key pair from
 `/run/nix-grpc-store` or `/var/lib/nix-grpc-store` by default (see below).
+
+With access control enabled, remote builders need the `trusted` role:
+the builder protocol tunnels the raw worker protocol and imports
+unsigned outputs built on the client (which also requires
+`trustClients`, see above). Clients that only build *on* the server
+(`nix build --store 'grpc://…'`) also use the worker-protocol tunnel and
+therefore need `trusted` too; `nix copy --to` needs `write`, and
+substituter/`nix copy --from` access only needs `read-only`.
 
 ## Quick start (manual)
 
@@ -180,6 +201,29 @@ NixOS:
       { cn = "*"; role = "read-only"; }
     ];
     services.nix-grpc-daemon.anonymousRole = "read-only"; # optional
+
+Role needed per use case:
+
+| Use case                                   | Role        |
+| ------------------------------------------ | ----------- |
+| Substituter, `nix copy --from`             | `read-only` |
+| `nix copy --to` (signed paths)             | `write`     |
+| Native build RPC                           | `write`     |
+| Remote builder (`nix.buildMachines`)       | `trusted`   |
+| `nix build --store 'grpc://…'`, GC, repair | `trusted`   |
+
+Note that `nix build --store 'grpc://…' --eval-store auto` needs the
+`trusted` role: the build itself is harmless (see the trust model above),
+but the CLI drives it through the raw worker-protocol tunnel.
+
+For host-based access, pair this with a CA that issues certs with the
+host's domain name in the CN, e.g. a
+[step-ca](https://smallstep.com/docs/step-ca/) ACME provisioner with
+`forceCN = true`: each host obtains its certificate via ordinary ACME
+(`security.acme`) and an `accessRules` glob like `*.example.com =
+read-only` grants it substituter access. See
+[`tests/acme-substituter-test.nix`](tests/acme-substituter-test.nix)
+for a complete, tested NixOS setup (built as the `acme-vm` check).
 
 ## URI parameters
 
