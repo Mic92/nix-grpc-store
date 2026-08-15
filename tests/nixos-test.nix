@@ -64,6 +64,26 @@ pkgs.testers.runNixOSTest {
         }
       '';
 
+      # Bench corpora as input-addressed outputs: CA paths from `nix store
+      # add` are re-hashed on import (RewritingSink), skewing the benchmark.
+      environment.etc."blob.nix".text = ''
+        let
+          mk = name: cmd:
+            derivation {
+              inherit name;
+              system = builtins.currentSystem;
+              builder = "/bin/sh";
+              args = [ "-c" cmd ];
+              PATH = builtins.storePath "${pkgs.coreutils}" + "/bin";
+            };
+        in
+        {
+          rand = mk "blob-rand" "dd if=/dev/urandom of=$out bs=1M count=256 status=none";
+          text = mk "blob-text" "base64 /dev/zero | head -c $((256*1024*1024)) > $out";
+        }
+      '';
+      system.extraDependencies = [ pkgs.coreutils ];
+
       # Self-signed CA plus server/client leaf certs for the mTLS subtest.
       systemd.services.nix-grpc-certs = {
         wantedBy = [ "multi-user.target" ];
@@ -270,18 +290,11 @@ pkgs.testers.runNixOSTest {
             print(f"[bench] {label:16s} {dt:6.2f}s  {256 / dt:6.1f} MiB/s")
             return dt
 
-        # Two corpora: incompressible (urandom) and highly compressible
-        # (base64 of zeros) so zstd's effect is visible in both directions.
-        corpora = {
-            # `head` closing the pipe makes base64 exit non-zero under
-            # pipefail; that is the expected way to bound the output.
-            "text": "set +o pipefail; "
-            "base64 /dev/zero | head -c $((256*1024*1024)) > /root/blob",
-            "rand": "dd if=/dev/urandom of=/root/blob bs=1M count=256 status=none",
-        }
-        for tag, gen in corpora.items():
-            machine.succeed(gen)
-            blob = machine.succeed("nix store add --mode flat /root/blob").strip()
+        for tag in ("text", "rand"):
+            blob = machine.succeed(
+                f"nix build --impure -f /etc/blob.nix {tag} "
+                "--no-link --print-out-paths"
+            ).strip()
 
             bench(f"{tag}/warmup", "daemon", blob)
             t_unix = bench(f"{tag}/unix", "daemon", blob)
