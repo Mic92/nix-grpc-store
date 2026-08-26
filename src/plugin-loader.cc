@@ -12,6 +12,10 @@
 #include <string>
 #include <string_view>
 
+#ifdef NIX_GRPC_BLOCKING_SHUTDOWN
+#include <grpc/grpc.h>
+#endif
+
 namespace nix {
 // Resolved from the host `nix` process at dlopen() time.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
@@ -19,6 +23,20 @@ extern std::string nixVersion;
 } // namespace nix
 
 namespace {
+
+#ifdef NIX_GRPC_BLOCKING_SHUTDOWN
+class GrpcRuntimeGuard
+{
+public:
+    GrpcRuntimeGuard() { grpc_init(); }
+    ~GrpcRuntimeGuard() { grpc_shutdown_blocking(); }
+
+    GrpcRuntimeGuard(const GrpcRuntimeGuard &) = delete;
+    GrpcRuntimeGuard(GrpcRuntimeGuard &&) = delete;
+    auto operator=(const GrpcRuntimeGuard &) -> GrpcRuntimeGuard & = delete;
+    auto operator=(GrpcRuntimeGuard &&) -> GrpcRuntimeGuard & = delete;
+};
+#endif
 
 // "2.31.5" / "2.35pre20260619_f8bb823a" -> "2.31" / "2.35"
 auto majorMinor(std::string_view version) -> std::string_view {
@@ -63,6 +81,12 @@ extern "C" void nix_plugin_entry() {
     warn("no plugin build for Nix " + nix::nixVersion);
     return;
   }
+
+#ifdef NIX_GRPC_BLOCKING_SHUTDOWN
+  // gRPC shutdown is asynchronous by default. Keep one process-wide reference
+  // so its final shutdown can block before OpenSSL's process-exit cleanup.
+  static const GrpcRuntimeGuard grpcRuntime;
+#endif
 
   // Leaked on purpose: the plugin stays registered for the process lifetime.
   void *handle = dlopen(plugin.c_str(), RTLD_NOW | RTLD_LOCAL);
