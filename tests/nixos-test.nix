@@ -142,6 +142,22 @@ pkgs.testers.runNixOSTest {
             --metrics-listen 127.0.0.1:9464
         '';
       };
+
+      systemd.services.nix-grpc-daemon-strict = {
+        wantedBy = [ "multi-user.target" ];
+        after = [
+          "nix-daemon.socket"
+          "nix-grpc-certs.service"
+        ];
+        requires = [ "nix-grpc-certs.service" ];
+        serviceConfig.ExecStart = ''
+          ${lib.getExe config.services.nix-grpc-daemon.package} --listen 127.0.0.1:50053 \
+            --proxy-socket /nix/var/nix/daemon-socket/socket \
+            --tls-cert ${certDir}/server.pem --tls-key ${certDir}/server.key \
+            --client-ca ${certDir}/ca.pem \
+            --allow localhost=trusted
+        '';
+      };
     };
 
   testScript = ''
@@ -204,6 +220,18 @@ pkgs.testers.runNixOSTest {
         machine.succeed(
             f"nix build --store '{store_mtls}' --impure -f /etc/hello.nix "
             "--no-link --print-out-paths"
+        )
+
+    with subtest("missing client cert yields a readable error"):
+        machine.wait_for_unit("nix-grpc-daemon-strict.service")
+        machine.wait_for_open_port(50053)
+        store_strict = "grpc://localhost:50053?ca-cert=${certDir}/ca.pem"
+        err = machine.fail(f"nix path-info --store '{store_strict}' '{p}' 2>&1")
+        print(err)
+        assert "requires a TLS client certificate" in err, err
+        machine.succeed(
+            f"nix path-info --store '{store_strict}&client-cert=${certDir}/client.pem"
+            f"&client-key=${certDir}/client.key' '{p}'"
         )
 
     with subtest("default client cert lookup in /var/lib/nix-grpc-store"):

@@ -59,6 +59,7 @@ class Acl
     std::vector<Rule> rules;
     // Separate from the glob rules so '*' cannot grant anonymous access.
     std::optional<Role> anonRole;
+    bool certRequired = false;
 
 public:
     [[nodiscard]] auto active() const -> bool
@@ -85,6 +86,11 @@ public:
         return anonRole;
     }
 
+    void requireCertificate()
+    {
+        certRequired = true;
+    }
+
     // nullopt means access denied.
     [[nodiscard]] auto roleFor(const std::optional<std::string> & commonName) const -> std::optional<Role>
     {
@@ -92,7 +98,7 @@ public:
             if (anonRole) {
                 return anonRole;
             }
-            return rules.empty() ? std::optional(Role::trusted) : std::nullopt;
+            return (certRequired || !rules.empty()) ? std::nullopt : std::optional(Role::trusted);
         }
         if (rules.empty()) {
             return Role::trusted;

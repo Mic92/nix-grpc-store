@@ -148,11 +148,15 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
              {"method", std::string(method)},
              {"cn", commonName},
              {"role", role ? std::string(nixgrpc::roleName(*role)) : "none"}});
-        auto const detail = role
-                                ? "role '" + std::string(nixgrpc::roleName(*role)) + "' may not call "
-                                      + std::string(method)
-                                : "no access rule matches certificate CN '" + commonName + "'";
-        return {grpc::StatusCode::PERMISSION_DENIED, detail};
+        if (role) {
+            return {
+                grpc::StatusCode::PERMISSION_DENIED,
+                "role '" + std::string(nixgrpc::roleName(*role)) + "' may not call " + std::string(method)};
+        }
+        if (!cert) {
+            return {grpc::StatusCode::UNAUTHENTICATED, "server requires a TLS client certificate"};
+        }
+        return {grpc::StatusCode::PERMISSION_DENIED, "no access rule matches certificate CN '" + commonName + "'"};
     }
 
 public:
@@ -798,6 +802,9 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
         // Without mTLS every client's CN is "-".
         throw nix::Error("--allow/--allow-anonymous requires --client-ca");
     }
+    if (!options.clientCA.empty() && !options.acl.anonymousRole()) {
+        options.acl.requireCertificate();
+    }
     return options;
 }
 
@@ -809,15 +816,10 @@ auto makeServerCredentials(const Options & options) -> std::shared_ptr<grpc::Ser
         }
         return grpc::InsecureServerCredentials();
     }
-    // With --client-ca the server requires and verifies a client certificate
-    // (mTLS); --allow-anonymous downgrades "require" to "verify if
-    // presented" and the ACL sees cert-less clients as CN "-".
-    auto clientCertRequest = GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE;
-    if (!options.clientCA.empty()) {
-        clientCertRequest = options.acl.anonymousRole()
-                                ? GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY
-                                : GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
-    }
+    // Cert-less clients pass the handshake and are denied by the ACL with a
+    // readable UNAUTHENTICATED instead of an opaque "Socket closed".
+    auto const clientCertRequest = options.clientCA.empty() ? GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE
+                                                             : GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY;
     grpc::SslServerCredentialsOptions ssl(clientCertRequest);
     ssl.pem_key_cert_pairs.push_back(
         {.private_key = nix::readFile(options.tlsKey), .cert_chain = nix::readFile(options.tlsCert)});
