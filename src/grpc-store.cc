@@ -35,6 +35,10 @@
 #include <nix/util/serialise.hh>
 #include <nix/util/types.hh>
 #include <nix/util/util.hh>
+#include <openssl/bio.h>
+#include <openssl/pem.h>
+#include <openssl/types.h>
+#include <openssl/x509.h>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -77,6 +81,26 @@ auto firstReadable(const std::vector<std::string> &candidates) -> std::string {
     }
   }
   return "";
+}
+
+// The server rejects an expired client cert during the TLS handshake, which
+// gRPC reports only as "Socket closed", so check up front.
+auto readValidCert(const std::string &path) -> std::string {
+  auto pem = nix::readFile(path);
+  std::unique_ptr<BIO, decltype(&BIO_free)> const bio{
+      BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size())), BIO_free};
+  std::unique_ptr<X509, decltype(&X509_free)> const cert{
+      PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr), X509_free};
+  if (!cert) {
+    throw nix::Error("client certificate '%s' is not a valid PEM certificate", path);
+  }
+  if (X509_cmp_current_time(X509_get0_notAfter(cert.get())) < 0) {
+    throw nix::Error("client certificate '%s' has expired", path);
+  }
+  if (X509_cmp_current_time(X509_get0_notBefore(cert.get())) > 0) {
+    throw nix::Error("client certificate '%s' is not yet valid", path);
+  }
+  return pem;
 }
 
 // Same lookup order as Nix's ssl-cert-file setting.
@@ -253,7 +277,7 @@ public:
           clientKey = defaultClientCred("NIX_GRPC_CLIENT_KEY", "client.key");
         }
         if (!clientCert.empty() && !clientKey.empty()) {
-          ssl.pem_cert_chain = readFile(clientCert);
+          ssl.pem_cert_chain = readValidCert(clientCert);
           ssl.pem_private_key = readFile(clientKey);
           haveClientCert = true;
         }

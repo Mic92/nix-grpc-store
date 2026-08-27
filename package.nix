@@ -6,6 +6,7 @@
   pkg-config,
   protobuf,
   grpc,
+  openssl,
   prometheus-cpp,
   zstd,
   # Nix component libraries. When building the client plugin these must be
@@ -40,6 +41,7 @@ stdenv.mkDerivation {
 
   buildInputs = [
     grpc
+    openssl
     protobuf
     prometheus-cpp
     zstd

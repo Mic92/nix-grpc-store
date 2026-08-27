@@ -118,6 +118,10 @@ pkgs.testers.runNixOSTest {
           issue ro ro-client
           issue rw rw-client
           issue stranger stranger
+          openssl req -newkey rsa:2048 -nodes \
+            -keyout expired.key -out expired.csr -subj /CN=localhost
+          openssl x509 -req -in expired.csr -not_before 20200101000000Z -not_after 20200102000000Z \
+            -CA ca.pem -CAkey ca.key -set_serial 0x$RANDOM -out expired.pem
           chmod a+r ${certDir}/*
         '';
       };
@@ -230,6 +234,11 @@ pkgs.testers.runNixOSTest {
         print(err)
         assert "requires a TLS client certificate" in err, err
         assert "no client certificate was presented" in err, err
+        err = machine.fail(
+            f"nix path-info --store '{store_strict}&client-cert=${certDir}/expired.pem"
+            f"&client-key=${certDir}/expired.key' '{p}' 2>&1"
+        )
+        assert "has expired" in err, err
         machine.succeed(
             f"nix path-info --store '{store_strict}&client-cert=${certDir}/client.pem"
             f"&client-key=${certDir}/client.key' '{p}'"
