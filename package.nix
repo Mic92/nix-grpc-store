@@ -6,6 +6,7 @@
   pkg-config,
   protobuf,
   grpc,
+  openssl,
   prometheus-cpp,
   zstd,
   # Nix component libraries. When building the client plugin these must be
@@ -18,7 +19,17 @@
 stdenv.mkDerivation {
   pname = "nix-grpc-store";
   version = "0.1.0";
-  src = ./.;
+  src = lib.fileset.toSource {
+    root = ./.;
+    fileset = lib.fileset.unions [
+      ./.clang-tidy
+      ./meson.build
+      ./meson.options
+      ./proto
+      ./src
+      ./fuzz
+    ];
+  };
 
   nativeBuildInputs = [
     meson
@@ -30,6 +41,7 @@ stdenv.mkDerivation {
 
   buildInputs = [
     grpc
+    openssl
     protobuf
     prometheus-cpp
     zstd

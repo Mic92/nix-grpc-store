@@ -9,6 +9,7 @@ grpc_dep     = dependency('grpc++')
 protobuf_dep = dependency('protobuf')
 zstd_dep     = dependency('libzstd')
 threads_dep  = dependency('threads')
+openssl_dep  = dependency('libcrypto')
 
 prometheus_dep = [dependency('prometheus-cpp-core'), dependency('prometheus-cpp-pull')]
 
@@ -77,7 +78,7 @@ shared_module('nix-grpc-store',
   # nix_plugin_entry() skips registering the store when the running Nix
   # version differs from the one the plugin was built against.
   cpp_args : nix_compat_args + ['-DNIX_GRPC_BUILT_AGAINST_NIX="' + nix_store_dep.version() + '"'],
-  dependencies : common_deps + nix_header_deps,
+  dependencies : common_deps + nix_header_deps + [openssl_dep],
   link_args : plugin_link_args,
   name_prefix : '',
   install : true,

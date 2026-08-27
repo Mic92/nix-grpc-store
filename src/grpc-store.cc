@@ -35,6 +35,10 @@
 #include <nix/util/serialise.hh>
 #include <nix/util/types.hh>
 #include <nix/util/util.hh>
+#include <openssl/bio.h>
+#include <openssl/pem.h>
+#include <openssl/types.h>
+#include <openssl/x509.h>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -77,6 +81,26 @@ auto firstReadable(const std::vector<std::string> &candidates) -> std::string {
     }
   }
   return "";
+}
+
+// The server rejects an expired client cert during the TLS handshake, which
+// gRPC reports only as "Socket closed", so check up front.
+auto readValidCert(const std::string &path) -> std::string {
+  auto pem = nix::readFile(path);
+  std::unique_ptr<BIO, decltype(&BIO_free)> const bio{
+      BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size())), BIO_free};
+  std::unique_ptr<X509, decltype(&X509_free)> const cert{
+      PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr), X509_free};
+  if (!cert) {
+    throw nix::Error("client certificate '%s' is not a valid PEM certificate", path);
+  }
+  if (X509_cmp_current_time(X509_get0_notAfter(cert.get())) < 0) {
+    throw nix::Error("client certificate '%s' has expired", path);
+  }
+  if (X509_cmp_current_time(X509_get0_notBefore(cert.get())) > 0) {
+    throw nix::Error("client certificate '%s' is not yet valid", path);
+  }
+  return pem;
 }
 
 // Same lookup order as Nix's ssl-cert-file setting.
@@ -204,6 +228,7 @@ private:
     ref<const Config> config;
 
     std::shared_ptr<grpc::ChannelCredentials> creds;
+    bool haveClientCert = false;
 
     /* One channel is shared by all connections in the pool; gRPC multiplexes
        streams over it internally. The stub keeps the channel alive. */
@@ -243,13 +268,18 @@ public:
         }
         auto clientCert = config->clientCert.get();
         auto clientKey = config->clientKey.get();
-        if (clientCert.empty() && clientKey.empty()) {
+        if (clientCert.empty() != clientKey.empty()) {
+          throw Error("gRPC store '%s': client-cert and client-key must be set together",
+                      config->authority.to_string());
+        }
+        if (clientCert.empty()) {
           clientCert = defaultClientCred("NIX_GRPC_CLIENT_CERT", "client.crt");
           clientKey = defaultClientCred("NIX_GRPC_CLIENT_KEY", "client.key");
         }
         if (!clientCert.empty() && !clientKey.empty()) {
-          ssl.pem_cert_chain = readFile(clientCert);
+          ssl.pem_cert_chain = readValidCert(clientCert);
           ssl.pem_private_key = readFile(clientKey);
+          haveClientCert = true;
         }
         creds = grpc::SslCredentials(ssl);
       }
@@ -268,10 +298,30 @@ public:
     }
 
 private:
-    static void checkStatus(const grpc::Status & status, const char * opName)
+    auto statusError(const grpc::Status & status, const char * opName) const -> Error
+    {
+      std::string hint;
+      auto code = status.error_code();
+      // UNAVAILABLE: a TLS-level rejection shows up only as "Socket closed".
+      if (!config->insecure &&
+          (code == grpc::StatusCode::UNAUTHENTICATED || code == grpc::StatusCode::UNAVAILABLE)) {
+        hint = haveClientCert
+                   ? "\nhint: the server may have rejected the client certificate "
+                     "(untrusted CA or revoked)."
+                   : "\nhint: no client certificate was presented. If the server requires "
+                     "mTLS, set the 'client-cert'/'client-key' store parameters or install "
+                     "client.crt/client.key in $XDG_DATA_HOME/nix-grpc-store or "
+                     "/var/lib/nix-grpc-store.";
+      }
+      // NOLINTNEXTLINE(modernize-return-braced-init-list): Error ctor is explicit
+      return Error("gRPC %s on '%s' failed: %s%s", opName, config->authority.to_string(),
+                   status.error_message(), hint);
+    }
+
+    void checkStatus(const grpc::Status & status, const char * opName) const
     {
       if (!status.ok()) {
-        throw Error("gRPC %s failed: %s", opName, status.error_message());
+        throw statusError(status, opName);
       }
     }
 
@@ -734,6 +784,7 @@ private:
 
         std::thread reader;
         std::thread writer;
+        bool finished = false;
 
     public:
         Connection() = default;
@@ -762,7 +813,7 @@ private:
           if (writer.joinable()) {
             writer.join();
           }
-          if (stream) {
+          if (stream && !finished) {
             (void)stream->Finish();
           }
         }
@@ -874,11 +925,17 @@ auto GrpcStore::openConnection() -> ref<RemoteStore::Connection> {
     connPtr->toRemote.readSide.close();
   });
 
-  conn->writer = std::thread([connPtr = &*conn] -> void {
+  conn->writer = std::thread([this, connPtr = &*conn] -> void {
     try {
       nixgrpc::pumpStreamToFd(*connPtr->stream, connPtr->fromRemote.writeSide.get());
     } catch (...) {
       ignoreExceptionInDestructor();
+    }
+    // RemoteStore only sees EOF on the pipe, so surface the real status here.
+    auto status = connPtr->stream->Finish();
+    connPtr->finished = true;
+    if (!status.ok() && status.error_code() != grpc::StatusCode::CANCELLED) {
+      logError(statusError(status, "Connect").info());
     }
     // Propagate EOF / error to the worker-protocol reader.
     connPtr->fromRemote.writeSide.close();
