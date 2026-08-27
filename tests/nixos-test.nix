@@ -229,6 +229,7 @@ pkgs.testers.runNixOSTest {
         err = machine.fail(f"nix path-info --store '{store_strict}' '{p}' 2>&1")
         print(err)
         assert "requires a TLS client certificate" in err, err
+        assert "no client certificate was presented" in err, err
         machine.succeed(
             f"nix path-info --store '{store_strict}&client-cert=${certDir}/client.pem"
             f"&client-key=${certDir}/client.key' '{p}'"
