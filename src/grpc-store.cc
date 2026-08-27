@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <grpc/grpc.h>
 #include <grpc/impl/channel_arg_names.h>
 #include <grpcpp/security/credentials.h>
 #include <grpcpp/support/channel_arguments.h>
@@ -36,6 +37,7 @@
 #include <nix/util/types.hh>
 #include <nix/util/util.hh>
 #include <openssl/bio.h>
+#include <openssl/crypto.h>
 #include <openssl/pem.h>
 #include <openssl/types.h>
 #include <openssl/x509.h>
@@ -130,6 +132,28 @@ auto defaultClientCred(const char *envVar, const std::string &fileName) -> std::
   candidates.push_back("/run/nix-grpc-store/" + fileName);
   candidates.push_back("/var/lib/nix-grpc-store/" + fileName);
   return firstReadable(candidates);
+}
+
+// grpc_shutdown() is asynchronous, so gRPC worker threads can still touch
+// OpenSSL while its atexit cleanup frees global state (SIGSEGV on Darwin
+// with short-lived clients). Hold one reference for the process lifetime and
+// release it with the blocking variant. Initialising OpenSSL first orders its
+// atexit handler before ours. Taken on first store use rather than at plugin
+// load: nix-daemon loads plugins too and its forked workers must not run
+// gRPC shutdown at exit.
+void retainGrpcRuntime() {
+  struct GrpcRuntime {
+    GrpcRuntime() {
+      OPENSSL_init_crypto(0, nullptr);
+      grpc_init();
+    }
+    ~GrpcRuntime() { grpc_shutdown_blocking(); }
+    GrpcRuntime(const GrpcRuntime &) = delete;
+    GrpcRuntime(GrpcRuntime &&) = delete;
+    auto operator=(const GrpcRuntime &) -> GrpcRuntime & = delete;
+    auto operator=(GrpcRuntime &&) -> GrpcRuntime & = delete;
+  };
+  static const GrpcRuntime grpcRuntime;
 }
 
 } // namespace
@@ -947,6 +971,7 @@ auto GrpcStore::openConnection() -> ref<RemoteStore::Connection> {
 }
 
 auto GrpcStoreConfig::openStore() const -> ref<Store> {
+  retainGrpcRuntime();
   return make_ref<GrpcStore>(ref{shared_from_this()});
 }
 

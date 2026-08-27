@@ -90,17 +90,11 @@ shared_module('nix-grpc-store',
 # Loaded via nix.conf `plugin-files`. It dlopen()s the build matching the
 # running Nix from the versions directory above, so merged installs of
 # several builds support all of their Nix versions.
-loader_deps = [dependency('dl')]
-loader_cpp_args = ['-DNIX_GRPC_MODULE_SUFFIX="' + module_suffix + '"']
-if host_machine.system() == 'darwin'
-  loader_deps += [grpc_dep]
-  loader_cpp_args += ['-DNIX_GRPC_BLOCKING_SHUTDOWN']
-endif
 
 shared_module('nix-grpc-store-loader',
   sources : ['src/plugin-loader.cc'],
-  cpp_args : loader_cpp_args,
-  dependencies : loader_deps,
+  cpp_args : ['-DNIX_GRPC_MODULE_SUFFIX="' + module_suffix + '"'],
+  dependencies : dependency('dl'),
   link_args : plugin_link_args,
   name_prefix : '',
   install : true,
