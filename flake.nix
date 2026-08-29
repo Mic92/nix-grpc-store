@@ -3,22 +3,24 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nix.url = "github:Mic92/nix-1";
-    nix.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
     {
       self,
       nixpkgs,
-      nix,
     }:
     let
       lib = nixpkgs.lib;
+      # The default build and the VM tests track nixpkgs' git snapshot of Nix.
+      nixPackagesFor = pkgs: {
+        inherit (pkgs.nixVersions.git.libs) nix-store nix-util;
+        nix-everything = pkgs.nixVersions.git;
+      };
       packageSetFor =
         pkgs:
         pkgs.callPackage ./packages.nix {
-          nixPackages = nix.packages.${pkgs.stdenv.hostPlatform.system};
+          nixPackages = nixPackagesFor pkgs;
         };
       forAllSystems = lib.genAttrs [
         "x86_64-linux"
@@ -41,7 +43,7 @@
           bench-closure = nixpkgs.legacyPackages.${system}.callPackage ./tests/bench-closure.nix { };
           bench-latency = import ./tests/latency-test.nix {
             pkgs = nixpkgs.legacyPackages.${system};
-            nixPkgs = nix.packages.${system};
+            nixPkgs = nixPackagesFor nixpkgs.legacyPackages.${system};
             module = self.nixosModules.default;
           };
         }
@@ -68,7 +70,7 @@
         import ./checks.nix {
           pkgs = nixpkgs.legacyPackages.${system};
           packages = self.packages.${system};
-          nixPackages = nix.packages.${system};
+          nixPackages = nixPackagesFor nixpkgs.legacyPackages.${system};
           nixosModule = self.nixosModules.default;
         }
       );
