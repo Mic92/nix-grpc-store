@@ -71,9 +71,9 @@ auto versionsDir() -> std::filesystem::path {
 }
 
 auto pluginForRunningNix() -> std::filesystem::path {
-  std::error_code ec;
+  std::error_code ignored;
   for (const auto &entry :
-       std::filesystem::directory_iterator(versionsDir(), ec)) {
+       std::filesystem::directory_iterator(versionsDir(), ignored)) {
     if (hostHas(nixStoreSoname(entry.path().filename().string()))) {
       return entry.path() / ("nix-grpc-store." NIX_GRPC_MODULE_SUFFIX);
     }
