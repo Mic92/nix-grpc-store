@@ -19,7 +19,9 @@ nix_util_dep  = dependency('nix-util')
 # Pre-release versions look like "2.35pre20260619_f8bb823a".
 nix_ver = nix_store_dep.version().split('.')
 nix_ver_minor = nix_ver[1].split('pre')[0]
-nix_ver_major_minor = nix_ver[0] + '.' + nix_ver_minor
+# Same rule Nix uses for its SONAME, so the loader can check whether the
+# host already has exactly these libraries mapped.
+nix_soversion = nix_store_dep.version().split('+')[0].split('pre')[0]
 
 # Version macros for src/nix-compat.hh.
 nix_compat_args = [
@@ -82,7 +84,7 @@ shared_module('nix-grpc-store',
   link_args : plugin_link_args,
   name_prefix : '',
   install : true,
-  install_dir : get_option('libdir') / 'nix' / 'nix-grpc-store-versions' / nix_ver_major_minor,
+  install_dir : get_option('libdir') / 'nix' / 'nix-grpc-store-versions' / nix_soversion,
 )
 
 # Loaded via nix.conf `plugin-files`. It dlopen()s the build matching the
