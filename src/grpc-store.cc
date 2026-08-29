@@ -442,7 +442,7 @@ public:
           if (buildMode == bmNormal && store->alreadyValidResults(reqs)) {
             return;
           }
-          store->copyDrvsFromEvalStore(reqs, evalStore);
+          store->importDrvsFromEvalStore(reqs, evalStore);
           if (auto results = store->buildPathsWithResultsNative(reqs, buildMode)) {
             store->throwOnFailedBuilds(*results);
             return;
@@ -457,7 +457,7 @@ public:
               return std::move(*results);
             }
           }
-          store->copyDrvsFromEvalStore(reqs, evalStore);
+          store->importDrvsFromEvalStore(reqs, evalStore);
           if (auto results = store->buildPathsWithResultsNative(reqs, buildMode)) {
             return std::move(*results);
           }
@@ -484,7 +484,7 @@ public:
       if (buildMode == bmNormal && alreadyValidResults(reqs)) {
         return;
       }
-      copyDrvsFromEvalStore(reqs, evalStore);
+      importDrvsFromEvalStore(reqs, evalStore);
       if (auto results = buildPathsWithResultsNative(reqs, buildMode)) {
         throwOnFailedBuilds(*results);
         return;
@@ -500,7 +500,7 @@ public:
           return std::move(*results);
         }
       }
-      copyDrvsFromEvalStore(reqs, evalStore);
+      importDrvsFromEvalStore(reqs, evalStore);
       if (auto results = buildPathsWithResultsNative(reqs, buildMode)) {
         return std::move(*results);
       }
@@ -607,7 +607,7 @@ public:
 
     // The server cannot reach the client's eval store, so the .drvs are
     // imported first (content-addressed, passes signature checks).
-    void copyDrvsFromEvalStore(const std::vector<DerivedPath> & paths,
+    void importDrvsFromEvalStore(const std::vector<DerivedPath> & paths,
                                const std::shared_ptr<Store> & evalStore) {
       if (evalStore && evalStore.get() != this) {
         StorePathSet drvPaths;

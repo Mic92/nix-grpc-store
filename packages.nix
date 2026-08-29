@@ -26,8 +26,7 @@ lib.makeScope newScope (
       inherit (nixPackages) nix-store nix-util;
     };
 
-    # One plugin per supported Nix version.
-    # "git" is only a compile check for the next release.
+    # One plugin per supported Nix release. nixVersions.git is `default`.
     versionPlugins = lib.listToAttrs (
       map (
         version:
@@ -36,7 +35,7 @@ lib.makeScope newScope (
             inherit (nixVersions.${version}.libs) nix-store nix-util;
           }
         )
-      ) (supportedNixVersions ++ [ "git" ])
+      ) supportedNixVersions
     );
 
     # The loader picks the one matching the running Nix, see meson.build.
