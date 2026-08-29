@@ -12,11 +12,33 @@
     }:
     let
       lib = nixpkgs.lib;
-      # The default build and the VM tests track nixpkgs' git snapshot of Nix.
-      nixPackagesFor = pkgs: {
-        inherit (pkgs.nixVersions.git.libs) nix-store nix-util;
-        nix-everything = pkgs.nixVersions.git;
-      };
+      # The default build and the VM tests track NixOS/nix master. nixpkgs'
+      # nixVersions.git lags behind, so pin master in nix-git.json (bumped
+      # weekly by the update-nix-git effect) to see API breakage here first.
+      nixGitPin = lib.importJSON ./nix-git.json;
+      nixGitFor =
+        pkgs:
+        ((pkgs.nixVersions.nixComponents_git.overrideSource (
+          pkgs.fetchFromGitHub {
+            inherit (nixGitPin)
+              owner
+              repo
+              rev
+              hash
+              ;
+          }
+        )).overrideScope
+          (_final: _prev: { inherit (nixGitPin) version; })
+        ).nix-everything;
+      nixPackagesFor =
+        pkgs:
+        let
+          nix-everything = nixGitFor pkgs;
+        in
+        {
+          inherit (nix-everything.libs) nix-store nix-util;
+          inherit nix-everything;
+        };
       packageSetFor =
         pkgs:
         pkgs.callPackage ./packages.nix {
@@ -64,6 +86,8 @@
           self.nixosModules.client
         ];
       };
+
+      herculesCI = import ./effects.nix { inherit nixpkgs; };
 
       checks = forAllSystems (
         system:
