@@ -1,28 +1,41 @@
 // Dispatcher plugin loaded via nix.conf `plugin-files`. It dlopen()s the
-// nix-grpc-store build matching the running Nix version from
-// ../nix-grpc-store-versions/<major.minor>/ next to itself. If no build
+// nix-grpc-store build from ../nix-grpc-store-versions/<soversion>/ whose
+// libnixstore is the one already mapped into this process. If no build
 // matches, it warns and leaves grpc:// stores unregistered.
 //
-// It must not use any Nix API beyond the version string.
+// Loading a build for any other SONAME would pull a second copy of the
+// Nix libraries into the process, which appears to work and then
+// double-frees their globals at exit. It must not use any Nix API.
 
 #include <cstdio>
 #include <cstdlib>
 #include <dlfcn.h>
 #include <filesystem>
 #include <string>
-#include <string_view>
+#include <system_error>
 
 #ifdef NIX_GRPC_BLOCKING_SHUTDOWN
 #include <grpc/grpc.h>
 #endif
 
-namespace nix {
-// Resolved from the host `nix` process at dlopen() time.
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-extern std::string nixVersion;
-} // namespace nix
-
 namespace {
+
+auto nixStoreSoname(const std::string &soversion) -> std::string {
+#ifdef __APPLE__
+  return "libnixstore." + soversion + ".dylib";
+#else
+  return "libnixstore.so." + soversion;
+#endif
+}
+
+auto hostHas(const std::string &soname) -> bool {
+  void *handle = dlopen(soname.c_str(), RTLD_LAZY | RTLD_NOLOAD);
+  if (handle == nullptr) {
+    return false;
+  }
+  dlclose(handle);
+  return true;
+}
 
 #ifdef NIX_GRPC_BLOCKING_SHUTDOWN
 class GrpcRuntimeGuard
@@ -38,13 +51,6 @@ public:
 };
 #endif
 
-// "2.31.5" / "2.35pre20260619_f8bb823a" -> "2.31" / "2.35"
-auto majorMinor(std::string_view version) -> std::string_view {
-  auto firstDot = version.find('.');
-  auto end = version.find_first_not_of("0123456789", firstDot + 1);
-  return version.substr(0, end);
-}
-
 // nix::warn() would drag in more of the Nix ABI, so use plain stderr.
 void warn(const std::string &message) {
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
@@ -53,17 +59,26 @@ void warn(const std::string &message) {
       message.c_str()));
 }
 
-// <this module's directory>/../nix-grpc-store-versions/<major.minor>/nix-grpc-store.<module suffix>
-auto pluginForRunningNix() -> std::filesystem::path {
+auto versionsDir() -> std::filesystem::path {
   Dl_info info{};
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): dladdr needs a data pointer
-  if (dladdr(reinterpret_cast<void *>(&pluginForRunningNix), &info) == 0 ||
+  if (dladdr(reinterpret_cast<void *>(&versionsDir), &info) == 0 ||
       info.dli_fname == nullptr) {
     return {};
   }
   return std::filesystem::path(info.dli_fname).parent_path().parent_path() /
-         "nix-grpc-store-versions" / majorMinor(nix::nixVersion) /
-         ("nix-grpc-store." NIX_GRPC_MODULE_SUFFIX);
+         "nix-grpc-store-versions";
+}
+
+auto pluginForRunningNix() -> std::filesystem::path {
+  std::error_code ignored;
+  for (const auto &entry :
+       std::filesystem::directory_iterator(versionsDir(), ignored)) {
+    if (hostHas(nixStoreSoname(entry.path().filename().string()))) {
+      return entry.path() / ("nix-grpc-store." NIX_GRPC_MODULE_SUFFIX);
+    }
+  }
+  return {};
 }
 
 } // namespace
@@ -78,7 +93,8 @@ extern "C" void nix_plugin_entry() {
   }
 
   if (plugin.empty() || !std::filesystem::exists(plugin)) {
-    warn("no plugin build for Nix " + nix::nixVersion);
+    warn("no plugin build matching the loaded libnixstore in '" +
+         versionsDir().string() + "'");
     return;
   }
 
