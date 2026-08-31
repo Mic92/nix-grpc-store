@@ -1,6 +1,6 @@
 # nix-grpc-store
 
-**Status: Beta.** Safe to use but interfaces may change, so you will need to keep server/client in sync.
+**Status: Stable.**
 
 Remote Nix store access over gRPC instead of SSH. `nix copy` over a WAN
 link is **5.5x faster than `ssh-ng://`** because round trips are hidden:
