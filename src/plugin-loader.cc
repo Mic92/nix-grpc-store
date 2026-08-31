@@ -14,10 +14,6 @@
 #include <string>
 #include <system_error>
 
-#ifdef NIX_GRPC_BLOCKING_SHUTDOWN
-#include <grpc/grpc.h>
-#endif
-
 namespace {
 
 auto nixStoreSoname(const std::string &soversion) -> std::string {
@@ -36,20 +32,6 @@ auto hostHas(const std::string &soname) -> bool {
   dlclose(handle);
   return true;
 }
-
-#ifdef NIX_GRPC_BLOCKING_SHUTDOWN
-class GrpcRuntimeGuard
-{
-public:
-    GrpcRuntimeGuard() { grpc_init(); }
-    ~GrpcRuntimeGuard() { grpc_shutdown_blocking(); }
-
-    GrpcRuntimeGuard(const GrpcRuntimeGuard &) = delete;
-    GrpcRuntimeGuard(GrpcRuntimeGuard &&) = delete;
-    auto operator=(const GrpcRuntimeGuard &) -> GrpcRuntimeGuard & = delete;
-    auto operator=(GrpcRuntimeGuard &&) -> GrpcRuntimeGuard & = delete;
-};
-#endif
 
 // nix::warn() would drag in more of the Nix ABI, so use plain stderr.
 void warn(const std::string &message) {
@@ -97,12 +79,6 @@ extern "C" void nix_plugin_entry() {
          versionsDir().string() + "'");
     return;
   }
-
-#ifdef NIX_GRPC_BLOCKING_SHUTDOWN
-  // gRPC shutdown is asynchronous by default. Keep one process-wide reference
-  // so its final shutdown can block before OpenSSL's process-exit cleanup.
-  static const GrpcRuntimeGuard grpcRuntime;
-#endif
 
   // Leaked on purpose: the plugin stays registered for the process lifetime.
   void *handle = dlopen(plugin.c_str(), RTLD_NOW | RTLD_LOCAL);

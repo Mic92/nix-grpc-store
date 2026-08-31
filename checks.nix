@@ -23,6 +23,11 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     doCheck = false;
     dontFixup = true;
   });
+  exit-stress = import ./tests/exit-stress.nix {
+    inherit pkgs;
+    nix = nixPackages.nix-everything;
+    package = packages.default;
+  };
 }
 // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
   sanitize-smoke = import ./tests/sanitize-smoke.nix {
