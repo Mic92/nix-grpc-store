@@ -44,6 +44,15 @@ lib.makeScope newScope (
       dontFixup = true;
     });
 
+    # Same targets with source coverage, for scripts/fuzz.sh -c.
+    fuzzers-coverage = self.fuzzers.overrideAttrs (old: {
+      pname = "nix-grpc-store-fuzzers-coverage";
+      env = old.env // {
+        NIX_CFLAGS_COMPILE = old.env.NIX_CFLAGS_COMPILE + " -fprofile-instr-generate -fcoverage-mapping";
+        NIX_CFLAGS_LINK = "-fprofile-instr-generate";
+      };
+    });
+
     # One plugin per supported Nix release. nixVersions.git is `default`.
     versionPlugins = lib.listToAttrs (
       map (

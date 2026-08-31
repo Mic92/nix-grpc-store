@@ -63,7 +63,12 @@
           scope = packageSetFor nixpkgs.legacyPackages.${system};
         in
         {
-          inherit (scope) default plugin-dispatcher fuzzers;
+          inherit (scope)
+            default
+            plugin-dispatcher
+            fuzzers
+            fuzzers-coverage
+            ;
         }
         // scope.versionPlugins
         // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
