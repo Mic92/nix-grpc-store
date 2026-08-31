@@ -1,5 +1,5 @@
 project('nix-grpc-store', 'cpp',
-  version : '0.1.0',
+  version : files('.version'),
   default_options : ['cpp_std=c++23'],
 )
 

@@ -18,11 +18,12 @@
 
 stdenv.mkDerivation {
   pname = "nix-grpc-store";
-  version = "0.1.0";
+  version = lib.fileContents ./.version;
   src = lib.fileset.toSource {
     root = ./.;
     fileset = lib.fileset.unions [
       ./.clang-tidy
+      ./.version
       ./meson.build
       ./meson.options
       ./proto
