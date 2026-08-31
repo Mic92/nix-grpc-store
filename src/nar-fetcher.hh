@@ -22,6 +22,7 @@
 #include <nix/store/path.hh>
 #include <nix/util/error.hh>
 #include <nix/util/file-descriptor.hh>
+#include <nix/util/file-system.hh>
 #include <nix/util/serialise.hh>
 #include <nix/util/util.hh>
 #include <string>
@@ -37,6 +38,133 @@
 #include "pump.hh"
 
 namespace nixgrpc {
+
+// Unlinked temp file one reader thread appends to while fetchInto() streams
+// it out, so a large NAR never has to fit in memory.
+class NarSpool
+{
+    nix::AutoCloseFD fd;
+    std::mutex mutex;
+    std::condition_variable grown;
+    uint64_t written = 0;
+    bool eof = false;
+    std::exception_ptr failure;
+
+public:
+    NarSpool()
+    {
+        auto [tmpFd, tmpPath] = nix::createTempFile("nix-grpc-nar");
+        ::unlink(tmpPath.c_str());
+        fd = std::move(tmpFd);
+    }
+
+    void append(std::string_view data)
+    {
+        auto const size = data.size();
+        uint64_t off = written;
+        if (eof) {
+            throw nix::Error("gRPC FetchNars sent data after EOF for a path");
+        }
+        while (!data.empty()) {
+            auto count = ::pwrite(fd.get(), data.data(), data.size(), static_cast<off_t>(off));
+            if (count < 0) {
+                throw nix::SysError("writing NAR spool file");
+            }
+            data.remove_prefix(static_cast<size_t>(count));
+            off += static_cast<uint64_t>(count);
+        }
+        {
+            std::scoped_lock const lock(mutex);
+            written += size;
+        }
+        grown.notify_all();
+    }
+
+    void finish()
+    {
+        {
+            std::scoped_lock const lock(mutex);
+            if (eof) {
+                throw nix::Error("gRPC FetchNars sent duplicate EOF for a path");
+            }
+            eof = true;
+        }
+        grown.notify_all();
+    }
+
+    void fail(const std::exception_ptr & cause)
+    {
+        {
+            std::scoped_lock const lock(mutex);
+            if (eof || failure) {
+                return;
+            }
+            failure = cause;
+        }
+        grown.notify_all();
+    }
+
+    void readInto(nix::Sink & sink)
+    {
+        uint64_t pos = 0;
+        std::vector<char> buf(kChunkSize);
+        while (true) {
+            uint64_t avail = 0;
+            {
+                std::unique_lock lock(mutex);
+                grown.wait(lock, [&] -> bool { return written > pos || eof || failure; });
+                if (failure) {
+                    std::rethrow_exception(failure);
+                }
+                avail = written;
+                if (avail == pos && eof) {
+                    fd.close();
+                    return;
+                }
+            }
+            while (pos < avail) {
+                auto want = std::min<uint64_t>(buf.size(), avail - pos);
+                auto count = ::pread(fd.get(), buf.data(), want, static_cast<off_t>(pos));
+                if (count <= 0) {
+                    throw nix::SysError("reading NAR spool file");
+                }
+                sink({buf.data(), static_cast<size_t>(count)});
+                pos += static_cast<uint64_t>(count);
+            }
+        }
+    }
+};
+
+// Decode one FetchNars stream (server-controlled path_index/data/eof) into
+// the per-path spools. Throws on malformed input; the caller fails all
+// targets.
+template<class Reader>
+inline void demuxNarFrames(Reader & reader, const std::vector<std::shared_ptr<NarSpool>> & targets)
+{
+    std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> const dctx{ZSTD_createDCtx(), ZSTD_freeDCtx};
+    std::string out(ZSTD_DStreamOutSize(), '\0');
+    nix::remote::NarFrame frame;
+    while (reader.Read(&frame)) {
+        if (frame.path_index() >= targets.size()) {
+            throw nix::Error("gRPC FetchNars sent path index %d for %d requested paths", frame.path_index(), targets.size());
+        }
+        const auto & target = targets.at(frame.path_index());
+        ZSTD_inBuffer zin{.src = frame.data().data(), .size = frame.data().size(), .pos = 0};
+        while (true) {
+            ZSTD_outBuffer zout{.dst = out.data(), .size = out.size(), .pos = 0};
+            zstdCheck(ZSTD_decompressStream(dctx.get(), &zout, &zin), "decompress");
+            if (zout.pos != 0) {
+                target->append({out.data(), zout.pos});
+            }
+            if (zin.pos == zin.size && zout.pos < zout.size) {
+                break;
+            }
+        }
+        if (frame.eof()) {
+            target->finish();
+        }
+    }
+}
 
 class NarFetcher
 {
@@ -69,7 +197,7 @@ public:
 
     void fetchInto(const nix::StorePath & path, nix::Sink & sink)
     {
-        std::shared_ptr<SpoolBuffer> buffer;
+        std::shared_ptr<NarSpool> buffer;
         {
             std::scoped_lock const lock(narMutex);
             auto found = buffers.find(path);
@@ -104,94 +232,6 @@ public:
     }
 
 private:
-    class SpoolBuffer
-    {
-        nix::AutoCloseFD fd;
-        std::mutex mutex;
-        std::condition_variable grown;
-        uint64_t written = 0;
-        bool eof = false;
-        std::exception_ptr failure;
-
-    public:
-        SpoolBuffer()
-        {
-            auto [tmpFd, tmpPath] = nix::createTempFile("nix-grpc-nar");
-            ::unlink(tmpPath.c_str());
-            fd = std::move(tmpFd);
-        }
-
-        void append(std::string_view data)
-        {
-            auto const size = data.size();
-            uint64_t off = written;
-            while (!data.empty()) {
-                auto count = ::pwrite(fd.get(), data.data(), data.size(), static_cast<off_t>(off));
-                if (count < 0) {
-                    throw nix::SysError("writing NAR spool file");
-                }
-                data.remove_prefix(static_cast<size_t>(count));
-                off += static_cast<uint64_t>(count);
-            }
-            {
-                std::scoped_lock const lock(mutex);
-                written += size;
-            }
-            grown.notify_all();
-        }
-
-        void finish()
-        {
-            {
-                std::scoped_lock const lock(mutex);
-                eof = true;
-            }
-            grown.notify_all();
-        }
-
-        void fail(const std::exception_ptr & cause)
-        {
-            {
-                std::scoped_lock const lock(mutex);
-                if (eof || failure) {
-                    return;
-                }
-                failure = cause;
-            }
-            grown.notify_all();
-        }
-
-        void readInto(nix::Sink & sink)
-        {
-            uint64_t pos = 0;
-            std::vector<char> buf(kChunkSize);
-            while (true) {
-                uint64_t avail = 0;
-                {
-                    std::unique_lock lock(mutex);
-                    grown.wait(lock, [&] -> bool { return written > pos || eof || failure; });
-                    if (failure) {
-                        std::rethrow_exception(failure);
-                    }
-                    avail = written;
-                    if (avail == pos && eof) {
-                        fd.close();
-                        return;
-                    }
-                }
-                while (pos < avail) {
-                    auto want = std::min<uint64_t>(buf.size(), avail - pos);
-                    auto count = ::pread(fd.get(), buf.data(), want, static_cast<off_t>(pos));
-                    if (count <= 0) {
-                        throw nix::SysError("reading NAR spool file");
-                    }
-                    sink({buf.data(), static_cast<size_t>(count)});
-                    pos += static_cast<uint64_t>(count);
-                }
-            }
-        }
-    };
-
     class Session
     {
         friend class NarFetcher;
@@ -199,32 +239,13 @@ private:
         std::unique_ptr<nix::remote::NixRemote::Stub> stub;
         grpc::ClientContext ctx;
         std::unique_ptr<grpc::ClientReader<nix::remote::NarFrame>> reader;
-        std::vector<std::shared_ptr<SpoolBuffer>> targets;
-        std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx{ZSTD_createDCtx(), ZSTD_freeDCtx};
+        std::vector<std::shared_ptr<NarSpool>> targets;
         std::thread thread;
 
         void run()
         {
             try {
-                std::string out(ZSTD_DStreamOutSize(), '\0');
-                nix::remote::NarFrame frame;
-                while (reader->Read(&frame)) {
-                    auto & target = targets.at(frame.path_index());
-                    ZSTD_inBuffer zin{.src = frame.data().data(), .size = frame.data().size(), .pos = 0};
-                    while (true) {
-                        ZSTD_outBuffer zout{.dst = out.data(), .size = out.size(), .pos = 0};
-                        zstdCheck(ZSTD_decompressStream(dctx.get(), &zout, &zin), "decompress");
-                        if (zout.pos != 0) {
-                            target->append({out.data(), zout.pos});
-                        }
-                        if (zin.pos == zin.size && zout.pos < zout.size) {
-                            break;
-                        }
-                    }
-                    if (frame.eof()) {
-                        target->finish();
-                    }
-                }
+                demuxNarFrames(*reader, targets);
                 auto status = reader->Finish();
                 auto cause = std::make_exception_ptr(
                     status.ok() ? nix::Error("gRPC FetchNars stream ended early")
@@ -246,7 +267,7 @@ private:
 
     std::mutex narMutex;
     std::vector<std::unique_ptr<Session>> sessions;
-    std::map<nix::StorePath, std::shared_ptr<SpoolBuffer>> buffers;
+    std::map<nix::StorePath, std::shared_ptr<NarSpool>> buffers;
     std::vector<nix::StorePath> pending;
     std::map<nix::StorePath, uint64_t> narSizes;
 
@@ -289,7 +310,7 @@ private:
         nix::remote::FetchNarsRequest request;
         for (const auto & path : paths) {
             request.add_paths(std::string(path.to_string()));
-            auto buffer = std::make_shared<SpoolBuffer>();
+            auto buffer = std::make_shared<NarSpool>();
             session->targets.push_back(buffer);
             buffers.emplace(path, std::move(buffer));
         }

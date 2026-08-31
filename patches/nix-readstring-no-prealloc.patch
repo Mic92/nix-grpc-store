@@ -1,0 +1,80 @@
+From e8714b209a443b79028c0a0a5b9e399d495cb66d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?J=C3=B6rg=20Thalheim?= <joerg@thalheim.io>
+Date: Mon, 31 Aug 2026 10:35:28 +0200
+Subject: [PATCH] readString: do not preallocate the announced length
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A bogus 64-bit length prefix made readString() allocate and zero that
+much memory before reading any payload. Grow the buffer as data arrives
+instead.
+
+Signed-off-by: Jörg Thalheim <joerg@thalheim.io>
+---
+ src/libutil-tests/serialise.cc | 25 +++++++++++++++++++++++++
+ src/libutil/serialise.cc       | 12 ++++++++++--
+ 2 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/src/libutil-tests/serialise.cc b/src/libutil-tests/serialise.cc
+index 40424c685..4498fb2aa 100644
+--- a/src/libutil-tests/serialise.cc
++++ b/src/libutil-tests/serialise.cc
+@@ -24,6 +24,31 @@ TEST(readNum, negativeValuesSerialiseWellDefined)
+     EXPECT_EQ(readNum<uint64_t>(*makeNumSource(int16_t(-1))), std::numeric_limits<uint64_t>::max());
+ }
+ 
++TEST(readString, roundTrip)
++{
++    for (auto s : {"", "x", "1234567", "12345678", "123456789"}) {
++        StringSink sink;
++        sink << std::string_view(s);
++        StringSource source(sink.s);
++        EXPECT_EQ(readString(source), s);
++    }
++    std::string big(300'000, 'a');
++    StringSink sink;
++    sink << big;
++    StringSource source(sink.s);
++    EXPECT_EQ(readString(source), big);
++}
++
++TEST(readString, bogusLengthDoesNotPreallocate)
++{
++    // 1 TiB length prefix followed by EOF: must fail on the read, not by
++    // allocating (and zeroing) the announced size up front.
++    StringSink sink;
++    sink << (uint64_t(1) << 40);
++    StringSource source(sink.s);
++    EXPECT_THROW(readString(source), EndOfFile);
++}
++
+ TEST(readPadding, works)
+ {
+     for (unsigned i = 0; i < 8; ++i)
+diff --git a/src/libutil/serialise.cc b/src/libutil/serialise.cc
+index eb1209843..8d5b3e6d5 100644
+--- a/src/libutil/serialise.cc
++++ b/src/libutil/serialise.cc
+@@ -600,8 +600,16 @@ std::string readString(Source & source, size_t max)
+     auto len = readNum<size_t>(source);
+     if (len > max)
+         throw SerialisationError("string is too long");
+-    std::string res(len, 0);
+-    source(res.data(), len);
++    /* Grow with the data actually received rather than trusting `len` for
++       the allocation, so a bogus length prefix costs the peer as many bytes
++       as it costs us. */
++    std::string res;
++    size_t filled = 0;
++    while (filled < len) {
++        if (filled == res.size())
++            res.resize(std::min(len, std::max<size_t>(2 * res.size(), 64 * 1024)));
++        filled += source.read(res.data() + filled, res.size() - filled);
++    }
+     readPadding(len, source);
+     return res;
+ }
+-- 
+2.55.0
+

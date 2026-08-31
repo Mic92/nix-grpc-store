@@ -232,6 +232,8 @@ in
           ]
           ++ cfg.extraFlags
         );
+        # Builds run in nix-daemon; this only bounds the proxy.
+        MemoryMax = lib.mkDefault "2G";
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         ProtectHome = true;
