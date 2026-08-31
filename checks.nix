@@ -43,25 +43,14 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     });
   };
 
-  # Quick libFuzzer run over the zstd chunk decoder (peer-controlled input).
-  fuzz = (packages.default.override { stdenv = pkgs.clangStdenv; }).overrideAttrs (old: {
-    pname = "nix-grpc-store-fuzz";
-    mesonFlags = (old.mesonFlags or [ ]) ++ [
-      "-Dfuzzers=true"
-      "-Db_sanitize=address,undefined"
-      "-Db_lundef=false"
-    ];
-    hardeningDisable = [ "fortify" ];
-    nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.zstd ];
-    installPhase = ''
-      mkdir corpus
-      printf 'seed' | zstd -o corpus/valid.zst
-      ASAN_OPTIONS=detect_leaks=0 ./fuzz-zstd-reader -max_total_time=30 corpus
-      touch $out
-    '';
-    doCheck = false;
-    dontFixup = true;
-  });
+  # Smoke run so the fuzz targets keep compiling and do not crash on an
+  # empty input; real campaigns run locally via scripts/fuzz.sh.
+  fuzz = pkgs.runCommand "nix-grpc-store-fuzz-smoke" { } ''
+    for f in ${packages.fuzzers}/bin/fuzz-*; do
+      "$f" -runs=200 2>&1 | tail -n2
+    done
+    touch $out
+  '';
 
   # Exercises the README ACME/step-ca substituter example.
   acme-vm = import ./tests/acme-substituter-test.nix {

@@ -28,7 +28,13 @@
               ;
           }
         )).overrideScope
-          (_final: _prev: { inherit (nixGitPin) version; })
+          (
+            _final: prev: {
+              inherit (nixGitPin) version;
+              # Pending upstream; drop once merged.
+              patches = prev.patches ++ [ ./patches/nix-readstring-no-prealloc.patch ];
+            }
+          )
         ).nix-everything;
       nixPackagesFor =
         pkgs:
@@ -57,7 +63,12 @@
           scope = packageSetFor nixpkgs.legacyPackages.${system};
         in
         {
-          inherit (scope) default plugin-dispatcher;
+          inherit (scope)
+            default
+            plugin-dispatcher
+            fuzzers
+            fuzzers-coverage
+            ;
         }
         // scope.versionPlugins
         // lib.optionalAttrs (lib.hasSuffix "-linux" system) {

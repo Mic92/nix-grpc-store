@@ -38,7 +38,6 @@
 #include <nix/store/build-result.hh>
 #include <nix/store/derivations.hh>
 #include <nix/store/globals.hh>
-#include <nix/util/logging.hh>
 #include <nix/store/worker-protocol-connection.hh>
 #include <nix/store/path-info.hh>
 #include <nix/store/path.hh>
@@ -58,7 +57,10 @@
 #include <nix/util/util.hh>
 
 #include "acl.hh"
+#include "build-log.hh"
+#include "import-paths.hh"
 #include "logfmt.hh"
+#include "path-info-wire.hh"
 #include "metrics.hh"
 #include "nix-compat.hh"
 #include "nix_remote.grpc.pb.h"
@@ -289,19 +291,10 @@ public:
             nixgrpc::ZstdReaderSource<AddMultipleReader, nix::remote::AddMultipleChunk> source(
                 *reader, std::move(*first.mutable_data()));
 
-            // Same framing as nix::WorkerProto::Op::AddMultipleToStore.
-            auto expected = nix::readNum<uint64_t>(source);
-            uint64_t narBytes = 0;
-            for (uint64_t idx = 0; idx < expected; ++idx) {
-                auto info = nix::WorkerProto::Serialise<nix::ValidPathInfo>::read(
-                    *localStore,
-                    nix::WorkerProto::ReadConn{.from = source, .version = nixcompat::infoProtocolVersion()});
-                info.ultimate = false;
-                nixcompat::EnsureRead wrapper{source, info.narSize};
-                localStore->addToStore(info, wrapper, repair, checkSigs);
-                wrapper.finish();
-                narBytes += info.narSize;
-            }
+            auto stats = nixgrpc::importPaths(
+                *localStore, source, [&](const nix::ValidPathInfo & info, nix::Source & nar) -> void {
+                    localStore->addToStore(info, nar, repair, checkSigs);
+                });
             nixgrpc::logLine(
                 nixgrpc::LogLevel::info,
                 {{"event", "rpc"},
@@ -309,10 +302,10 @@ public:
                  {"cn", commonName},
                  {"peer", peer},
                  {"duration_s", secondsSince(start)},
-                 {"paths", std::to_string(expected)},
-                 {"nar_bytes_in", std::to_string(narBytes)}});
+                 {"paths", std::to_string(stats.paths)},
+                 {"nar_bytes_in", std::to_string(stats.narBytes)}});
             metrics.countRpc("AddMultipleToStore", commonName);
-            metrics.countNarBytes("in", commonName, narBytes);
+            metrics.countNarBytes("in", commonName, stats.narBytes);
             return grpc::Status::OK;
         });
     }
@@ -343,14 +336,7 @@ public:
                 } catch (nix::InvalidPath &) {
                     continue;
                 }
-                auto * out = reply->add_infos();
-                out->set_path(std::string(info->path.to_string()));
-                nix::StringSink sink;
-                nix::WorkerProto::Serialise<nix::UnkeyedValidPathInfo>::write(
-                    *localStore,
-                    nix::WorkerProto::WriteConn{.to = sink, .version = nixcompat::infoProtocolVersion()},
-                    static_cast<const nix::UnkeyedValidPathInfo &>(*info));
-                *out->mutable_info() = std::move(sink.s);
+                nixgrpc::encodePathInfo(*localStore, *info, reply->add_infos());
             }
             return grpc::Status::OK;
         });
@@ -442,63 +428,9 @@ public:
         });
     }
 
-    // Consumes the worker-protocol stderr stream up to STDERR_LAST,
-    // forwarding plain build log lines.
     static void appendOutputInfo(nix::Store & store, nix::remote::PathInfo * out, const nix::StorePath & outPath)
     {
-        auto info = store.queryPathInfo(outPath);
-        out->set_path(std::string(info->path.to_string()));
-        nix::StringSink sink;
-        nix::WorkerProto::Serialise<nix::UnkeyedValidPathInfo>::write(
-            store,
-            nix::WorkerProto::WriteConn{.to = sink, .version = nixcompat::infoProtocolVersion()},
-            static_cast<const nix::UnkeyedValidPathInfo &>(*info));
-        *out->mutable_info() = std::move(sink.s);
-    }
-
-    static void relayBuildLog(nix::Source & source, const std::function<void(std::string)> & sendLogLine)
-    {
-        auto readLogFields = [&]() -> std::vector<std::string> {
-            std::vector<std::string> fields;
-            auto count = nix::readNum<uint64_t>(source);
-            for (uint64_t idx = 0; idx < count; ++idx) {
-                if (nix::readNum<uint64_t>(source) == 0) {
-                    nix::readNum<uint64_t>(source);
-                    fields.emplace_back();
-                } else {
-                    fields.push_back(nix::readString(source));
-                }
-            }
-            return fields;
-        };
-        while (true) {
-            auto msg = nix::readNum<uint64_t>(source);
-            if (msg == STDERR_NEXT) {
-                sendLogLine(nix::chomp(nix::readString(source)));
-            } else if (msg == STDERR_START_ACTIVITY) {
-                nix::readNum<uint64_t>(source);
-                nix::readNum<uint64_t>(source);
-                nix::readNum<uint64_t>(source);
-                nix::readString(source);
-                readLogFields();
-                nix::readNum<uint64_t>(source);
-            } else if (msg == STDERR_STOP_ACTIVITY) {
-                nix::readNum<uint64_t>(source);
-            } else if (msg == STDERR_RESULT) {
-                nix::readNum<uint64_t>(source);
-                auto type = nix::readNum<uint64_t>(source);
-                auto fields = readLogFields();
-                if (type == nix::resBuildLogLine && !fields.empty()) {
-                    sendLogLine(std::move(fields.front()));
-                }
-            } else if (msg == STDERR_ERROR) {
-                throw nix::readError(source);
-            } else if (msg == STDERR_LAST) {
-                break;
-            } else {
-                throw nix::Error("unexpected worker protocol message from backend");
-            }
-        }
+        nixgrpc::encodePathInfo(store, *store.queryPathInfo(outPath), out);
     }
 
     auto BuildDerivation(
@@ -534,7 +466,7 @@ public:
                 writer->Write(chunk);
             };
             // The daemon opens every connection with a stderr work block.
-            relayBuildLog(conn.from, sendLogLine);
+            nixgrpc::relayBuildLog(conn.from, sendLogLine);
 
             nix::StorePath const drvPath(request->drv_path());
             nix::StringSource drvSource(request->drv());
@@ -549,7 +481,7 @@ public:
                 static_cast<nix::BuildMode>(request->build_mode()));
             conn.to.flush();
 
-            relayBuildLog(conn.from, sendLogLine);
+            nixgrpc::relayBuildLog(conn.from, sendLogLine);
 
             auto res = nix::WorkerProto::Serialise<nix::BuildResult>::read(
                 *localStore, nix::WorkerProto::ReadConn{.from = conn.from, .version = protocol});
@@ -623,7 +555,7 @@ public:
                 writer->Write(chunk);
             };
             // The daemon opens every connection with a stderr work block.
-            relayBuildLog(conn.from, sendLogLine);
+            nixgrpc::relayBuildLog(conn.from, sendLogLine);
 
             conn.to << nix::WorkerProto::Op::BuildPathsWithResults;
             nix::WorkerProto::write(
@@ -633,7 +565,7 @@ public:
             conn.to << request->build_mode();
             conn.to.flush();
 
-            relayBuildLog(conn.from, sendLogLine);
+            nixgrpc::relayBuildLog(conn.from, sendLogLine);
 
             auto results = nix::WorkerProto::Serialise<std::vector<nix::KeyedBuildResult>>::read(
                 *localStore, nix::WorkerProto::ReadConn{.from = conn.from, .version = protocol});

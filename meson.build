@@ -115,12 +115,15 @@ executable('nix-grpc-daemon',
 # --- fuzzers ----------------------------------------------------------------
 
 # Built only with -Dfuzzers=true (requires clang for libFuzzer).
+# Run them with scripts/fuzz.sh.
 if get_option('fuzzers')
-  executable('fuzz-zstd-reader',
-    sources : ['fuzz/zstd-reader.cc', gen],
-    include_directories : gen_inc,
-    cpp_args : ['-fsanitize=fuzzer'],
-    link_args : ['-fsanitize=fuzzer'],
-    dependencies : common_deps + [nix_util_dep, nix_store_dep],
-  )
+  foreach name : ['zstd-reader', 'tunnel-pump', 'import-paths', 'build-log', 'nar-frames', 'wire', 'acl']
+    executable('fuzz-' + name,
+      sources : ['fuzz' / name + '.cc', 'fuzz/support.cc', gen],
+      include_directories : gen_inc,
+      cpp_args : nix_compat_args + ['-fsanitize=fuzzer'],
+      link_args : ['-fsanitize=fuzzer'],
+      dependencies : common_deps + [nix_util_dep, nix_store_dep],
+    )
+  endforeach
 endif

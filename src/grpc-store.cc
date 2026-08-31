@@ -66,6 +66,7 @@
 
 #include "nix-compat.hh"
 #include "nar-fetcher.hh"
+#include "path-info-wire.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
 #include "pump.hh"
@@ -567,7 +568,7 @@ public:
               *this, WorkerProto::ReadConn{.from = source,
                                            .version = nixcompat::buildProtocolVersion()});
           for (const auto & entry : msg.done().outputs()) {
-            infos.insert(parseInfoEntry(entry));
+            infos.insert(nixgrpc::decodePathInfo(*this, entry));
           }
         }
       }
@@ -610,7 +611,7 @@ public:
               *this, WorkerProto::ReadConn{.from = source,
                                            .version = nixcompat::buildProtocolVersion()});
           for (const auto & entry : msg.done().outputs()) {
-            infos.insert(parseInfoEntry(entry));
+            infos.insert(nixgrpc::decodePathInfo(*this, entry));
           }
         }
       }
@@ -658,17 +659,6 @@ public:
 private:
     using PathInfoMap = std::map<StorePath, std::shared_ptr<const ValidPathInfo>>;
 
-    auto parseInfoEntry(const remote::PathInfo & entry)
-        -> std::pair<StorePath, std::shared_ptr<const ValidPathInfo>> {
-      StorePath const path(entry.path());
-      StringSource source(entry.info());
-      auto info = WorkerProto::Serialise<UnkeyedValidPathInfo>::read(
-          *this, WorkerProto::ReadConn{.from = source,
-                                       .version = nixcompat::infoProtocolVersion()});
-      return {path, std::make_shared<ValidPathInfo>(StorePath(path),
-                                                    std::move(info))};
-    }
-
     std::once_flag trustedOnce;
     std::optional<TrustedFlag> trusted;
 
@@ -690,7 +680,7 @@ private:
 
       PathInfoMap res;
       for (const auto &entry : reply.infos()) {
-        res.insert(parseInfoEntry(entry));
+        res.insert(nixgrpc::decodePathInfo(*this, entry));
       }
       return res;
     }
