@@ -18,6 +18,7 @@
 #include <grpcpp/security/credentials.h>
 #include <grpcpp/support/channel_arguments.h>
 #include <grpcpp/support/status.h>
+#include <atomic>
 #include <condition_variable>
 #include <map>
 #include <memory>
@@ -44,6 +45,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <stop_token>
 #include <thread>
 #include <unistd.h>
 #include <variant>
@@ -717,19 +719,17 @@ private:
        BFS level costs one round trip instead of one per path. */
     using InfoCallback = Callback<std::shared_ptr<const ValidPathInfo>>;
     std::mutex infoBatchMutex;
-    std::condition_variable infoBatchWakeup;
+    std::condition_variable_any infoBatchWakeup;
     std::vector<std::pair<StorePath, InfoCallback>> infoBatch;
-    std::thread infoBatchWorker;
-    bool infoBatchStop = false;
+    std::jthread infoBatchWorker;
 
-    void runInfoBatches()
+    void runInfoBatches(const std::stop_token & stop)
     {
         while (true) {
             std::vector<std::pair<StorePath, InfoCallback>> batch;
             {
                 std::unique_lock lock(infoBatchMutex);
-                infoBatchWakeup.wait(lock, [&] -> bool { return infoBatchStop || !infoBatch.empty(); });
-                if (infoBatchStop) {
+                if (!infoBatchWakeup.wait(lock, stop, [&] -> bool { return !infoBatch.empty(); })) {
                     return;
                 }
                 batch.swap(infoBatch);
@@ -771,7 +771,7 @@ public:
               std::scoped_lock const lock(infoBatchMutex);
               infoBatch.emplace_back(path, std::move(callback));
               if (!infoBatchWorker.joinable()) {
-                infoBatchWorker = std::thread([this] -> void { runInfoBatches(); });
+                infoBatchWorker = std::jthread([this](const std::stop_token & stop) -> void { runInfoBatches(stop); });
               }
             }
             infoBatchWakeup.notify_one();
@@ -796,9 +796,9 @@ private:
         Pipe toRemote;   // plugin writes → reader thread sends over gRPC
         Pipe fromRemote; // writer thread receives from gRPC → plugin reads
 
-        std::thread reader;
-        std::thread writer;
-        bool finished = false;
+        std::jthread reader;
+        std::jthread writer;
+        std::atomic<bool> finished = false;
 
     public:
         Connection() = default;
@@ -821,12 +821,8 @@ private:
           // threads; touching them here would race with their own close().
           toRemote.writeSide.close();
           ctx.TryCancel();
-          if (reader.joinable()) {
-            reader.join();
-          }
-          if (writer.joinable()) {
-            writer.join();
-          }
+          reader = {};
+          writer = {};
           if (stream && !finished) {
             (void)stream->Finish();
           }
@@ -840,15 +836,10 @@ public:
       narFetcher.fetchInto(path, sink);
     }
 
-    ~GrpcStore() override {
-      {
-        std::scoped_lock const lock(infoBatchMutex);
-        infoBatchStop = true;
-      }
-      infoBatchWakeup.notify_one();
-      if (infoBatchWorker.joinable()) {
-        infoBatchWorker.join();
-      }
+    // The worker uses members declared after it, so stop it before they go.
+    ~GrpcStore() override
+    {
+        infoBatchWorker = {};
     }
 
     void addMultipleToStore(
@@ -926,7 +917,7 @@ auto GrpcStore::openConnection() -> ref<RemoteStore::Connection> {
   nixgrpc::growPipe(conn->toRemote);
   nixgrpc::growPipe(conn->fromRemote);
 
-  conn->reader = std::thread([connPtr = &*conn] -> void {
+  conn->reader = std::jthread([connPtr = &*conn] -> void {
     try {
       nixgrpc::pumpFdToStream(connPtr->toRemote.readSide.get(), *connPtr->stream);
     } catch (...) {
@@ -939,7 +930,7 @@ auto GrpcStore::openConnection() -> ref<RemoteStore::Connection> {
     connPtr->toRemote.readSide.close();
   });
 
-  conn->writer = std::thread([this, connPtr = &*conn] -> void {
+  conn->writer = std::jthread([this, connPtr = &*conn] -> void {
     try {
       nixgrpc::pumpStreamToFd(*connPtr->stream, connPtr->fromRemote.writeSide.get());
     } catch (...) {

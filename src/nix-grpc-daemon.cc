@@ -6,6 +6,7 @@
 // handled natively (via a Store opened on the same socket) so `nix copy`
 // avoids the tunnel's per-batch zstd flushes and per-path round trips.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -61,6 +62,7 @@
 #include "idle.hh"
 #include "import-paths.hh"
 #include "logfmt.hh"
+#include "parse-int.hh"
 #include "path-info-wire.hh"
 #include "metrics.hh"
 #include "nix-compat.hh"
@@ -204,7 +206,7 @@ public:
         }
 
         std::atomic<uint64_t> bytesIn{0};
-        std::thread receiver([&]() -> void {
+        std::jthread receiver([&]() -> void {
             try {
                 bytesIn = nixgrpc::pumpStreamToFd(*stream, sock.get());
             } catch (...) {
@@ -739,7 +741,11 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
         } else if (arg == "--metrics-listen") {
             options.metricsListen = next();
         } else if (arg == "--idle-timeout") {
-            options.idleTimeout = std::chrono::seconds(std::stoul(std::string(next())));
+            auto secs = nixgrpc::parseInt<unsigned>(next());
+            if (!secs) {
+                throw nix::Error("--idle-timeout expects a non-negative integer");
+            }
+            options.idleTimeout = std::chrono::seconds(*secs);
         } else if (arg == "--log-level") {
             options.logLevel = parseLogLevel(next());
         } else {
@@ -779,12 +785,21 @@ auto makeServerCredentials(const Options & options) -> std::shared_ptr<grpc::Ser
 
 } // namespace
 
+namespace {
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): signal handler.
+volatile std::sig_atomic_t stopSignal = 0;
+} // namespace
+
 auto main(int argc, char ** argv) -> int
 try {
     // Pump threads write to a socket whose peer may already be gone; we want
     // EPIPE, not process death.
     // NOLINTNEXTLINE(misc-include-cleaner): SIGPIPE comes from <csignal>.
     static_cast<void>(std::signal(SIGPIPE, SIG_IGN));
+    // Polled by the main loop so in-flight RPCs get the shutdown grace.
+    for (int const sig : {SIGTERM, SIGINT}) {
+        static_cast<void>(std::signal(sig, [](int) -> void { stopSignal = 1; }));
+    }
 
     // Required before nix::openStore() in the native RPC handlers.
     nix::initLibStore();
@@ -830,15 +845,22 @@ try {
     nixgrpc::logLine(
         nixgrpc::LogLevel::info,
         {{"event", "startup"}, {"listen", options.listen}, {"proxy_socket", options.socketPath}});
+    nixgrpc::sdNotify("READY=1");
 
-    if (options.idleTimeout) {
-        while (idle.idleFor() < *options.idleTimeout) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+    auto const watchdog = nixgrpc::sdWatchdogInterval();
+    std::chrono::nanoseconds const tick =
+        watchdog.count() != 0 ? std::min<std::chrono::nanoseconds>(watchdog, std::chrono::seconds(1))
+                              : std::chrono::seconds(1);
+    while (stopSignal == 0 && (!options.idleTimeout || idle.idleFor() < *options.idleTimeout)) {
+        if (watchdog.count() != 0) {
+            nixgrpc::sdNotify("WATCHDOG=1");
         }
-        nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "idle_exit"}});
-        constexpr std::chrono::seconds shutdownGrace{5};
-        server->Shutdown(std::chrono::system_clock::now() + shutdownGrace);
+        std::this_thread::sleep_for(tick);
     }
+    nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", stopSignal != 0 ? "signal_exit" : "idle_exit"}});
+    nixgrpc::sdNotify("STOPPING=1");
+    constexpr std::chrono::seconds shutdownGrace{5};
+    server->Shutdown(std::chrono::system_clock::now() + shutdownGrace);
     server->Wait();
     return 0;
 } catch (const std::exception & err) {

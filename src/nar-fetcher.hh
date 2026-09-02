@@ -225,9 +225,7 @@ public:
     {
         for (const auto & session : sessions) {
             session->ctx.TryCancel();
-            if (session->thread.joinable()) {
-                session->thread.join();
-            }
+            session->thread = {};
         }
     }
 
@@ -240,7 +238,7 @@ private:
         grpc::ClientContext ctx;
         std::unique_ptr<grpc::ClientReader<nix::remote::NarFrame>> reader;
         std::vector<std::shared_ptr<NarSpool>> targets;
-        std::thread thread;
+        std::jthread thread;
 
         void run()
         {
@@ -318,7 +316,7 @@ private:
         if (!session->reader) {
             throw nix::Error("failed to open gRPC FetchNars stream to '%s'", authority);
         }
-        session->thread = std::thread([raw = session.get()] -> void { raw->run(); });
+        session->thread = std::jthread([raw = session.get()] -> void { raw->run(); });
         sessions.push_back(std::move(session));
     }
 };
