@@ -190,7 +190,7 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     start_all()
     server.wait_for_unit("step-ca.service")
-    server.wait_for_unit("nix-grpc-daemon.service")
+    server.wait_for_unit("nix-grpc-daemon.socket")
     server.wait_for_open_port(50051)
 
     with subtest("host1 obtains a certificate via ACME"):

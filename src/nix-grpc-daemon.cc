@@ -58,6 +58,7 @@
 
 #include "acl.hh"
 #include "build-log.hh"
+#include "idle.hh"
 #include "import-paths.hh"
 #include "logfmt.hh"
 #include "path-info-wire.hh"
@@ -66,6 +67,7 @@
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
 #include "pump.hh"
+#include "socket-activation.hh"
 
 using GrpcStream = grpc::ServerReaderWriter<nix::remote::Chunk, nix::remote::Chunk>;
 using AddMultipleReader = grpc::ServerReader<nix::remote::AddMultipleChunk>;
@@ -80,6 +82,7 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     std::string socketPath;
     std::string storeUri;
     nixgrpc::Metrics & metrics;
+    nixgrpc::IdleTracker & idle;
     nixgrpc::LogLevel logLevel;
     nixgrpc::Acl acl;
 
@@ -99,8 +102,9 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
 
     // gRPC aborts the process if a handler lets an exception escape.
     template<typename F>
-    static auto guarded(F && func) -> grpc::Status
+    auto guarded(F && func) -> grpc::Status
     {
+        nixgrpc::IdleTracker::Guard const active(idle);
         try {
             return std::forward<F>(func)();
         } catch (std::exception & err) {
@@ -166,11 +170,13 @@ public:
         std::string socketPath,
         std::string storeUri,
         nixgrpc::Metrics & metrics,
+        nixgrpc::IdleTracker & idle,
         nixgrpc::LogLevel logLevel,
         nixgrpc::Acl acl)
         : socketPath(std::move(socketPath))
         , storeUri(std::move(storeUri))
         , metrics(metrics)
+        , idle(idle)
         , logLevel(logLevel)
         , acl(std::move(acl))
     {
@@ -178,6 +184,7 @@ public:
 
     auto Connect(grpc::ServerContext * context, GrpcStream * stream) -> grpc::Status override
     {
+        nixgrpc::IdleTracker::Guard const active(idle);
         auto const cert = nixgrpc::clientCommonName(*context);
         auto const commonName = cert.value_or("-");
         // The opaque worker protocol cannot be inspected here.
@@ -679,6 +686,7 @@ public:
 struct Options
 {
     std::string listen = "0.0.0.0:50051";
+    std::optional<std::chrono::seconds> idleTimeout;
     std::string socketPath = "/nix/var/nix/daemon-socket/socket";
     // Store URI for the native bulk RPCs. Defaults to the proxy socket.
     std::string storeUri;
@@ -689,6 +697,17 @@ struct Options
     nixgrpc::LogLevel logLevel = nixgrpc::LogLevel::info;
     nixgrpc::Acl acl;
 };
+
+auto parseLogLevel(std::string_view value) -> nixgrpc::LogLevel
+{
+    if (value == "debug") {
+        return nixgrpc::LogLevel::debug;
+    }
+    if (value != "info") {
+        throw nix::Error("--log-level must be 'info' or 'debug'");
+    }
+    return nixgrpc::LogLevel::info;
+}
 
 auto parseOptions(const std::vector<std::string_view> & args) -> Options
 {
@@ -719,13 +738,10 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.acl.allowAnonymous(nixgrpc::parseRole(next()));
         } else if (arg == "--metrics-listen") {
             options.metricsListen = next();
+        } else if (arg == "--idle-timeout") {
+            options.idleTimeout = std::chrono::seconds(std::stoul(std::string(next())));
         } else if (arg == "--log-level") {
-            auto value = next();
-            if (value == "debug") {
-                options.logLevel = nixgrpc::LogLevel::debug;
-            } else if (value != "info") {
-                throw nix::Error("--log-level must be 'info' or 'debug'");
-            }
+            options.logLevel = parseLogLevel(next());
         } else {
             throw nix::Error("unknown flag '%s'", arg);
         }
@@ -775,28 +791,54 @@ try {
 
     const std::span args(argv, static_cast<size_t>(argc));
     auto options = parseOptions({args.begin(), args.end()});
+    auto const listenFds = nixgrpc::systemdListenFds();
+    if (listenFds.empty() && options.idleTimeout) {
+        // Nobody would restart us on the next connection.
+        throw nix::Error("--idle-timeout requires systemd socket activation");
+    }
 
     nixgrpc::Metrics metrics(options.metricsListen);
+    nixgrpc::IdleTracker idle;
     if (options.storeUri.empty()) {
         options.storeUri = "unix://" + options.socketPath;
     }
-    NixRemoteService service(options.socketPath, options.storeUri, metrics, options.logLevel, options.acl);
+    NixRemoteService service(options.socketPath, options.storeUri, metrics, idle, options.logLevel, options.acl);
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
     builder.SetMaxReceiveMessageSize(-1);
     builder.SetMaxSendMessageSize(-1);
-    builder.AddListeningPort(options.listen, makeServerCredentials(options));
+    auto creds = makeServerCredentials(options);
+    std::shared_ptr<grpc::experimental::ExternalConnectionAcceptor> acceptor;
+    if (listenFds.empty()) {
+        builder.AddListeningPort(options.listen, creds);
+    } else {
+        options.listen = "systemd";
+        acceptor = builder.experimental().AddExternalConnectionAcceptor(
+            grpc::ServerBuilder::experimental_type::ExternalConnectionType::FROM_FD, creds);
+    }
     builder.RegisterService(&service);
 
     auto server = builder.BuildAndStart();
     if (!server) {
         throw nix::Error("failed to start gRPC server on '%s'", options.listen);
     }
+    if (acceptor) {
+        nixgrpc::acceptInto(listenFds, acceptor);
+    }
 
     nixgrpc::logLine(
         nixgrpc::LogLevel::info,
         {{"event", "startup"}, {"listen", options.listen}, {"proxy_socket", options.socketPath}});
+
+    if (options.idleTimeout) {
+        while (idle.idleFor() < *options.idleTimeout) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "idle_exit"}});
+        constexpr std::chrono::seconds shutdownGrace{5};
+        server->Shutdown(std::chrono::system_clock::now() + shutdownGrace);
+    }
     server->Wait();
     return 0;
 } catch (const std::exception & err) {

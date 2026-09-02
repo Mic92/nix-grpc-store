@@ -36,7 +36,20 @@ in
     listen = lib.mkOption {
       type = lib.types.str;
       default = "0.0.0.0:50051";
-      description = "Address to listen on, in gRPC `host:port` form.";
+      description = ''
+        Address to listen on, `host:port` or `unix:/path`. Bound by a
+        systemd socket unit. The daemon is started on the first connection.
+      '';
+    };
+
+    idleTimeout = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = 600;
+      description = ''
+        Exit after this many seconds without in-flight RPCs. systemd keeps
+        the socket and restarts the daemon on the next connection. `null`
+        keeps it running.
+      '';
     };
 
     logLevel = lib.mkOption {
@@ -182,13 +195,19 @@ in
     };
     users.groups.nix-grpc-daemon = { };
 
+    systemd.sockets.nix-grpc-daemon = {
+      description = "Nix worker-protocol over gRPC";
+      wantedBy = [ "sockets.target" ];
+      socketConfig.ListenStream = lib.removePrefix "unix:" cfg.listen;
+    };
+
     systemd.services.nix-grpc-daemon = {
       description = "Nix worker-protocol over gRPC";
-      wantedBy = [ "multi-user.target" ];
+      requires = [ "nix-grpc-daemon.socket" ];
       # nix-daemon is socket-activated; ordering after the socket is enough,
       # the first proxied connection will start it.
       after = [
-        "network.target"
+        "nix-grpc-daemon.socket"
         "nix-daemon.socket"
       ];
       wants = [ "nix-daemon.socket" ];
@@ -199,10 +218,12 @@ in
         ExecStart = lib.escapeShellArgs (
           [
             (lib.getExe cfg.package)
-            "--listen"
-            cfg.listen
             "--proxy-socket"
             cfg.proxySocket
+          ]
+          ++ lib.optionals (cfg.idleTimeout != null) [
+            "--idle-timeout"
+            (toString cfg.idleTimeout)
           ]
           ++ lib.optionals (cfg.tls.certFile != null) [
             "--tls-cert"
@@ -232,7 +253,7 @@ in
           ]
           ++ cfg.extraFlags
         );
-        # Builds run in nix-daemon; this only bounds the proxy.
+        # Builds run in nix-daemon. This only bounds the proxy.
         MemoryMax = lib.mkDefault "2G";
         NoNewPrivileges = true;
         ProtectSystem = "strict";
