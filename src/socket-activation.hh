@@ -4,10 +4,8 @@
 // ourselves.
 
 #include <algorithm>
-#include <charconv>
 #include <chrono>
 #include <optional>
-#include <system_error>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -25,18 +23,14 @@
 #include <nix/util/environment-variables.hh>
 #include <nix/util/file-descriptor.hh>
 
+#include "parse-int.hh"
+
 namespace nixgrpc {
 
 template<typename T>
 inline auto envInt(const char * name) -> std::optional<T>
 {
-    auto str = nix::getEnv(name).value_or("");
-    T value{};
-    auto [end, errc] = std::from_chars(str.data(), str.data() + str.size(), value);
-    if (str.empty() || errc != std::errc() || end != str.data() + str.size()) {
-        return std::nullopt;
-    }
-    return value;
+    return parseInt<T>(nix::getEnv(name).value_or(""));
 }
 
 // sd_listen_fds(3) without libsystemd. Call before starting threads.

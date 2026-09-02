@@ -62,6 +62,7 @@
 #include "idle.hh"
 #include "import-paths.hh"
 #include "logfmt.hh"
+#include "parse-int.hh"
 #include "path-info-wire.hh"
 #include "metrics.hh"
 #include "nix-compat.hh"
@@ -740,7 +741,11 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
         } else if (arg == "--metrics-listen") {
             options.metricsListen = next();
         } else if (arg == "--idle-timeout") {
-            options.idleTimeout = std::chrono::seconds(std::stoul(std::string(next())));
+            auto secs = nixgrpc::parseInt<unsigned>(next());
+            if (!secs) {
+                throw nix::Error("--idle-timeout expects a non-negative integer");
+            }
+            options.idleTimeout = std::chrono::seconds(*secs);
         } else if (arg == "--log-level") {
             options.logLevel = parseLogLevel(next());
         } else {
