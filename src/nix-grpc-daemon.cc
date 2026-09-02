@@ -785,12 +785,21 @@ auto makeServerCredentials(const Options & options) -> std::shared_ptr<grpc::Ser
 
 } // namespace
 
+namespace {
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): signal handler.
+volatile std::sig_atomic_t stopSignal = 0;
+} // namespace
+
 auto main(int argc, char ** argv) -> int
 try {
     // Pump threads write to a socket whose peer may already be gone; we want
     // EPIPE, not process death.
     // NOLINTNEXTLINE(misc-include-cleaner): SIGPIPE comes from <csignal>.
     static_cast<void>(std::signal(SIGPIPE, SIG_IGN));
+    // Polled by the main loop so in-flight RPCs get the shutdown grace.
+    for (int const sig : {SIGTERM, SIGINT}) {
+        static_cast<void>(std::signal(sig, [](int) -> void { stopSignal = 1; }));
+    }
 
     // Required before nix::openStore() in the native RPC handlers.
     nix::initLibStore();
@@ -838,18 +847,17 @@ try {
         {{"event", "startup"}, {"listen", options.listen}, {"proxy_socket", options.socketPath}});
     nixgrpc::sdNotify("READY=1");
 
-    // SIGTERM keeps its default action, so this loop is the daemon's lifetime.
     auto const watchdog = nixgrpc::sdWatchdogInterval();
     std::chrono::nanoseconds const tick =
         watchdog.count() != 0 ? std::min<std::chrono::nanoseconds>(watchdog, std::chrono::seconds(1))
                               : std::chrono::seconds(1);
-    while (!options.idleTimeout || idle.idleFor() < *options.idleTimeout) {
+    while (stopSignal == 0 && (!options.idleTimeout || idle.idleFor() < *options.idleTimeout)) {
         if (watchdog.count() != 0) {
             nixgrpc::sdNotify("WATCHDOG=1");
         }
         std::this_thread::sleep_for(tick);
     }
-    nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "idle_exit"}});
+    nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", stopSignal != 0 ? "signal_exit" : "idle_exit"}});
     nixgrpc::sdNotify("STOPPING=1");
     constexpr std::chrono::seconds shutdownGrace{5};
     server->Shutdown(std::chrono::system_clock::now() + shutdownGrace);
