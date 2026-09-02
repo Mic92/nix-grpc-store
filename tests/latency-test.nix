@@ -61,7 +61,7 @@ pkgs.testers.runNixOSTest {
     n_paths = 200
     rtt_s = 0.05
 
-    machine.wait_for_unit("nix-grpc-daemon.service")
+    machine.wait_for_unit("nix-grpc-daemon.socket")
     machine.wait_for_open_port(50051)
     store = "grpc://127.0.0.1:50051?insecure=1"
 
