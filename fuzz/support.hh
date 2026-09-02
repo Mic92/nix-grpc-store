@@ -4,11 +4,15 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
 #include <memory>
 #include <string>
 #include <string_view>
 
 #include <nix/store/globals.hh>
+#include <nix/util/configuration.hh>
 #include <nix/store/store-api.hh>
 #include <nix/store/store-open.hh>
 #include <nix/util/logging.hh>
@@ -67,6 +71,20 @@ inline auto view(const uint8_t * raw, size_t size) -> std::string_view
     return {reinterpret_cast<const char *>(raw), size};
 }
 
+// With NIX_GRPC_FUZZ_STRICT=1 a parse error aborts, so scripts/fuzz.sh can
+// verify that generated seeds are actually well-formed.
+inline void rejected(const std::exception & err)
+{
+    static bool const strict = [] -> bool {
+        const char * env = std::getenv("NIX_GRPC_FUZZ_STRICT");
+        return env != nullptr && *env == '1';
+    }();
+    if (strict) {
+        std::fprintf(stderr, "seed rejected: %s\n", err.what());
+        std::abort();
+    }
+}
+
 // In-memory store for the worker-protocol deserialisers, which need a
 // StoreDirConfig to parse store paths.
 inline auto store() -> nix::Store &
@@ -74,6 +92,7 @@ inline auto store() -> nix::Store &
     static nix::ref<nix::Store> const instance = []() -> nix::ref<nix::Store> {
         nix::initLibStore(false);
         nix::verbosity = nix::lvlError;
+        nix::experimentalFeatureSettings.set("experimental-features", "ca-derivations dynamic-derivations impure-derivations");
         return nix::openStore("dummy://");
     }();
     return *instance;

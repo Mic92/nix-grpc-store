@@ -17,6 +17,15 @@
 
 namespace nixgrpc {
 
+// An error reported by the backend daemon, as opposed to a malformed stream.
+class BackendError final : public nix::CloneableError<BackendError, nix::Error>
+{
+    void anchor() override {}
+
+public:
+    using CloneableError<BackendError, nix::Error>::CloneableError;
+};
+
 // nix::readString() preallocates the announced length.
 constexpr size_t kMaxLogString = 1UL << 20;
 
@@ -43,7 +52,7 @@ inline auto readLogFields(nix::Source & source) -> std::vector<std::string>
 } // namespace detail
 
 // Consumes the stream up to STDERR_LAST, forwarding plain build log lines.
-// Throws the daemon's error on STDERR_ERROR.
+// Throws BackendError on STDERR_ERROR.
 inline void relayBuildLog(nix::Source & source, const std::function<void(std::string)> & sendLogLine)
 {
     while (true) {
@@ -67,7 +76,7 @@ inline void relayBuildLog(nix::Source & source, const std::function<void(std::st
                 sendLogLine(std::move(fields.front()));
             }
         } else if (msg == STDERR_ERROR) {
-            throw nix::readError(source);
+            throw BackendError(nix::readError(source).info());
         } else if (msg == STDERR_LAST) {
             break;
         } else {

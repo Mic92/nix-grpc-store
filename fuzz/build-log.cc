@@ -16,7 +16,9 @@ extern "C" auto LLVMFuzzerTestOneInput(const uint8_t * raw, size_t size) -> int
     nix::StringSource source(nixgrpc::fuzz::view(raw, size));
     try {
         nixgrpc::relayBuildLog(source, [](std::string line) -> void { static_cast<void>(line); });
-    } catch (std::exception &) { // NOLINT(bugprone-empty-catch): mirrors NixRemoteService::guarded()
+    } catch (nixgrpc::BackendError &) {
+    } catch (std::exception & err) { // mirrors NixRemoteService::guarded()
+        nixgrpc::fuzz::rejected(err);
     }
     return 0;
 }

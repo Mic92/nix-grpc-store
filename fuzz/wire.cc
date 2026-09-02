@@ -73,7 +73,8 @@ extern "C" auto LLVMFuzzerTestOneInput(const uint8_t * raw, size_t size) -> int
         default:
             break;
         }
-    } catch (std::exception &) { // NOLINT(bugprone-empty-catch): mirrors NixRemoteService::guarded()
+    } catch (std::exception & err) { // mirrors NixRemoteService::guarded()
+        rejected(err);
     }
     return 0;
 }
