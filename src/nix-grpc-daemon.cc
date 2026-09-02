@@ -6,6 +6,7 @@
 // handled natively (via a Store opened on the same socket) so `nix copy`
 // avoids the tunnel's per-batch zstd flushes and per-path round trips.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -830,15 +831,23 @@ try {
     nixgrpc::logLine(
         nixgrpc::LogLevel::info,
         {{"event", "startup"}, {"listen", options.listen}, {"proxy_socket", options.socketPath}});
+    nixgrpc::sdNotify("READY=1");
 
-    if (options.idleTimeout) {
-        while (idle.idleFor() < *options.idleTimeout) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+    // SIGTERM keeps its default action, so this loop is the daemon's lifetime.
+    auto const watchdog = nixgrpc::sdWatchdogInterval();
+    std::chrono::nanoseconds const tick =
+        watchdog.count() != 0 ? std::min<std::chrono::nanoseconds>(watchdog, std::chrono::seconds(1))
+                              : std::chrono::seconds(1);
+    while (!options.idleTimeout || idle.idleFor() < *options.idleTimeout) {
+        if (watchdog.count() != 0) {
+            nixgrpc::sdNotify("WATCHDOG=1");
         }
-        nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "idle_exit"}});
-        constexpr std::chrono::seconds shutdownGrace{5};
-        server->Shutdown(std::chrono::system_clock::now() + shutdownGrace);
+        std::this_thread::sleep_for(tick);
     }
+    nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "idle_exit"}});
+    nixgrpc::sdNotify("STOPPING=1");
+    constexpr std::chrono::seconds shutdownGrace{5};
+    server->Shutdown(std::chrono::system_clock::now() + shutdownGrace);
     server->Wait();
     return 0;
 } catch (const std::exception & err) {

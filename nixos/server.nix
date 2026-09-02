@@ -212,6 +212,8 @@ in
       ];
       wants = [ "nix-daemon.socket" ];
       serviceConfig = {
+        Type = "notify";
+        WatchdogSec = 30;
         User = "nix-grpc-daemon";
         Group = "nix-grpc-daemon";
         Restart = "on-failure";
