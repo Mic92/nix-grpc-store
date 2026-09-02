@@ -205,7 +205,7 @@ public:
         }
 
         std::atomic<uint64_t> bytesIn{0};
-        std::thread receiver([&]() -> void {
+        std::jthread receiver([&]() -> void {
             try {
                 bytesIn = nixgrpc::pumpStreamToFd(*stream, sock.get());
             } catch (...) {
