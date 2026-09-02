@@ -126,4 +126,10 @@ if get_option('fuzzers')
       dependencies : common_deps + [nix_util_dep, nix_store_dep],
     )
   endforeach
+  executable('fuzz-gen-seeds',
+    sources : ['fuzz/gen-seeds.cc', gen],
+    include_directories : gen_inc,
+    cpp_args : nix_compat_args,
+    dependencies : common_deps + [nix_util_dep, nix_store_dep],
+  )
 endif

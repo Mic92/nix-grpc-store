@@ -31,7 +31,8 @@ extern "C" auto LLVMFuzzerTestOneInput(const uint8_t * raw, size_t size) -> int
         auto eol = rules.find('\n');
         try {
             acl.addRule(rules.substr(0, eol));
-        } catch (nix::Error &) {
+        } catch (nix::Error & err) {
+            nixgrpc::fuzz::rejected(err);
         }
         if (eol == std::string_view::npos) {
             break;

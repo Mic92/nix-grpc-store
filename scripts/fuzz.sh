@@ -28,14 +28,29 @@ bin=$(nix build --no-link --print-out-paths "$root#$attr")/bin
 corpusRoot=${XDG_CACHE_HOME:-$HOME/.cache}/nix-grpc-store/fuzz
 
 if [[ $# -eq 0 ]]; then
-  mapfile -t targets < <(cd "$bin" && printf '%s\n' fuzz-* | sed 's/^fuzz-//')
+  mapfile -t targets < <(cd "$bin" && printf '%s\n' fuzz-* | sed 's/^fuzz-//; /^gen-seeds$/d')
 else
   targets=("$@")
 fi
+seeds=$(mktemp -d)
+trap 'rm -rf "$seeds"' EXIT
+"$bin/fuzz-gen-seeds" "$seeds"
+for target in "${targets[@]}"; do
+  mkdir -p "$corpusRoot/$target"
+  for seed in "$seeds/$target"/*; do
+    [[ -f $seed ]] || continue
+    if ! NIX_GRPC_FUZZ_STRICT=1 "$bin/fuzz-$target" "$seed" >/dev/null 2>"$seeds/log"; then
+      grep -a 'seed rejected' "$seeds/log" >&2
+      echo "generated seed $target/$(basename "$seed") does not parse" >&2
+      exit 1
+    fi
+    cp "$seed" "$corpusRoot/$target/"
+  done
+done
 
 if [[ $coverage -eq 1 ]]; then
-  profdir=$(mktemp -d)
-  trap 'rm -rf "$profdir"' EXIT
+  profdir=$seeds/prof
+  mkdir "$profdir"
   objects=()
   for target in "${targets[@]}"; do
     LLVM_PROFILE_FILE="$profdir/$target.profraw" "$bin/fuzz-$target" -runs=0 "$corpusRoot/$target" >/dev/null 2>&1
@@ -54,7 +69,9 @@ for target in "${targets[@]}"; do
   artifacts=$corpusRoot/$target-artifacts/
   mkdir -p "$corpus" "$artifacts"
   echo "==> fuzz-$target (${seconds}s, corpus: $corpus)"
-  if ! "$bin/fuzz-$target" \
+  dict=()
+  [[ -f $root/fuzz/$target.dict ]] && dict=("-dict=$root/fuzz/$target.dict")
+  if ! "$bin/fuzz-$target" "${dict[@]}" \
       -max_total_time="$seconds" \
       -jobs="$jobs" -workers="$jobs" \
       -rss_limit_mb=4096 -malloc_limit_mb=1000000 \

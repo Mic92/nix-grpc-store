@@ -21,7 +21,8 @@ extern "C" auto LLVMFuzzerTestOneInput(const uint8_t * raw, size_t size) -> int
     reader.data = view(raw, size);
     try {
         nixgrpc::pumpStreamToFd(reader, devNull.get());
-    } catch (nix::Error &) {
+    } catch (nix::Error & err) {
+        rejected(err);
     }
     return 0;
 }

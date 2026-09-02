@@ -31,8 +31,8 @@
           (
             _final: prev: {
               inherit (nixGitPin) version;
-              # Pending upstream; drop once merged.
-              patches = prev.patches ++ [ ./patches/nix-readstring-no-prealloc.patch ];
+              # NixOS/nix#16399, drop once merged.
+              patches = prev.patches ++ [ ./patches/nix-readerror-level.patch ];
             }
           )
         ).nix-everything;

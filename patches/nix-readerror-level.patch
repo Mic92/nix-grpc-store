@@ -1,0 +1,57 @@
+From 0a83da6fc432a7d6689642ad8987c7a1bd0550e5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?J=C3=B6rg=20Thalheim?= <joerg@thalheim.io>
+Date: Mon, 31 Aug 2026 11:36:19 +0200
+Subject: [PATCH] readError: do not trust the peer's verbosity level
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+showErrorInfo() asserts on levels outside the Verbosity enum, so a
+remote daemon could abort the client with a single STDERR_ERROR
+message. Map unknown levels to lvlError.
+
+Signed-off-by: Jörg Thalheim <joerg@thalheim.io>
+---
+ src/libutil-tests/serialise.cc | 11 +++++++++++
+ src/libutil/serialise.cc       |  3 ++-
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/libutil-tests/serialise.cc b/src/libutil-tests/serialise.cc
+index 40424c685..ee64c9189 100644
+--- a/src/libutil-tests/serialise.cc
++++ b/src/libutil-tests/serialise.cc
+@@ -24,6 +24,17 @@ TEST(readNum, negativeValuesSerialiseWellDefined)
+     EXPECT_EQ(readNum<uint64_t>(*makeNumSource(int16_t(-1))), std::numeric_limits<uint64_t>::max());
+ }
+ 
++TEST(readError, bogusLevelDoesNotAbort)
++{
++    StringSink sink;
++    sink << "Error" << uint64_t(1234) << "Error" << "oops" << uint64_t(0) << uint64_t(0);
++    StringSource source(sink.s);
++    auto e = readError(source);
++    // showErrorInfo() asserts on unknown levels.
++    EXPECT_NE(std::string(e.what()).find("oops"), std::string::npos);
++    EXPECT_EQ(e.info().level, lvlError);
++}
++
+ TEST(readPadding, works)
+ {
+     for (unsigned i = 0; i < 8; ++i)
+diff --git a/src/libutil/serialise.cc b/src/libutil/serialise.cc
+index eb1209843..4dcb15d4b 100644
+--- a/src/libutil/serialise.cc
++++ b/src/libutil/serialise.cc
+@@ -630,7 +630,8 @@ Error readError(Source & source)
+     auto type = readString(source);
+     if (type != "Error")
+         throw SerialisationError("unexpected error type '%s'", type);
+-    auto level = (Verbosity) readInt(source);
++    auto rawLevel = readNum<unsigned int>(source);
++    auto level = rawLevel > lvlVomit ? lvlError : (Verbosity) rawLevel;
+     [[maybe_unused]] auto name = readString(source); // removed
+     auto msg = readString(source);
+     ErrorInfo info{
+-- 
+2.55.0
+
