@@ -14,6 +14,11 @@
 #include <string>
 #include <system_error>
 
+#ifdef __APPLE__
+#include <cstdint>
+#include <mach-o/dyld.h>
+#endif
+
 namespace {
 
 auto nixStoreSoname(const std::string &soversion) -> std::string {
@@ -24,13 +29,44 @@ auto nixStoreSoname(const std::string &soversion) -> std::string {
 #endif
 }
 
-auto hostHas(const std::string &soname) -> bool {
+#ifndef __APPLE__
+auto hostHasVersionedLibrary(const std::string &soname) -> bool {
   void *handle = dlopen(soname.c_str(), RTLD_LAZY | RTLD_NOLOAD);
   if (handle == nullptr) {
     return false;
   }
   dlclose(handle);
   return true;
+}
+#else
+auto hostHasDarwinNixStore(const std::string &soversion) -> bool {
+  const auto versionedName = nixStoreSoname(soversion);
+  const auto outputSuffix = "-nix-store-" + soversion;
+  for (uint32_t index = 0; index < _dyld_image_count(); ++index) {
+    const char *imageName = _dyld_get_image_name(index);
+    if (imageName == nullptr) {
+      continue;
+    }
+    const std::filesystem::path imagePath(imageName);
+    if (imagePath.filename() == versionedName ||
+        (imagePath.filename() == "libnixstore.dylib" &&
+         imagePath.parent_path().parent_path().filename().string().ends_with(
+             outputSuffix))) {
+      return true;
+    }
+  }
+  return false;
+}
+#endif
+
+// Darwin's dyld records full install paths, so RTLD_NOLOAD with only a basename
+// cannot reliably find either versioned or nixpkgs modular Nix libraries.
+auto hostHasNixStore(const std::string &soversion) -> bool {
+#ifdef __APPLE__
+  return hostHasDarwinNixStore(soversion);
+#else
+  return hostHasVersionedLibrary(nixStoreSoname(soversion));
+#endif
 }
 
 // nix::warn() would drag in more of the Nix ABI, so use plain stderr.
@@ -56,7 +92,7 @@ auto pluginForRunningNix() -> std::filesystem::path {
   std::error_code ignored;
   for (const auto &entry :
        std::filesystem::directory_iterator(versionsDir(), ignored)) {
-    if (hostHas(nixStoreSoname(entry.path().filename().string()))) {
+    if (hostHasNixStore(entry.path().filename().string())) {
       return entry.path() / ("nix-grpc-store." NIX_GRPC_MODULE_SUFFIX);
     }
   }
