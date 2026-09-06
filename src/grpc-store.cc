@@ -19,7 +19,12 @@
 #include <grpcpp/support/channel_arguments.h>
 #include <grpcpp/support/status.h>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cassert>
+#include <deque>
+#include <exception>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -31,6 +36,7 @@
 #include <nix/util/environment-variables.hh>
 #include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
+#include <nix/util/fmt.hh>
 #include <nix/util/logging.hh>
 #include <nix/util/ref.hh>
 #include <nix/util/repair-flag.hh>
@@ -56,7 +62,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include <nix/store/path-info.hh>
-#include <nix/store/derivation-options.hh>
+#include <nix/store/build-result.hh>
 #include <nix/store/remote-store-connection.hh>
 #include <nix/store/remote-store.hh>
 #include <nix/store/store-registration.hh>
@@ -198,6 +204,13 @@ private:
         "client-key",
         "Path to the PEM private key for `client-cert`. Defaults to "
         "`$NIX_GRPC_CLIENT_KEY`, then `client.key` next to the default `client-cert`."};
+
+    static constexpr unsigned defaultMaxBuilds = 64;
+    Setting<unsigned> maxBuilds{
+        this,
+        defaultMaxBuilds,
+        "max-builds",
+        "Number of concurrent BuildDerivation calls when talking to a build farm."};
 
     Setting<unsigned> narConnections{
         this,
@@ -489,6 +502,11 @@ public:
               inner(std::move(inner)) {}
         void buildPaths(const std::vector<DerivedPath> & reqs,
                         BuildMode buildMode) override {
+          if (store->isFarm()) {
+            auto results = store->farmBuildPaths(reqs, buildMode, evalStore.get());
+            store->throwOnFailedBuilds(results);
+            return;
+          }
           if (buildMode == bmNormal && store->alreadyValidResults(reqs)) {
             return;
           }
@@ -502,6 +520,9 @@ public:
         auto buildPathsWithResults(const std::vector<DerivedPath> & reqs,
                                    BuildMode buildMode)
             -> std::vector<KeyedBuildResult> override {
+          if (store->isFarm()) {
+            return store->farmBuildPaths(reqs, buildMode, evalStore.get());
+          }
           if (buildMode == bmNormal) {
             if (auto results = store->alreadyValidResults(reqs)) {
               return std::move(*results);
@@ -531,6 +552,11 @@ public:
 #else
     void buildPaths(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
                     std::shared_ptr<Store> evalStore) override {
+      if (isFarm()) {
+        auto results = farmBuildPaths(reqs, buildMode, evalStore.get());
+        throwOnFailedBuilds(results);
+        return;
+      }
       if (buildMode == bmNormal && alreadyValidResults(reqs)) {
         return;
       }
@@ -545,6 +571,9 @@ public:
                                BuildMode buildMode,
                                std::shared_ptr<Store> evalStore)
         -> std::vector<KeyedBuildResult> override {
+      if (isFarm()) {
+        return farmBuildPaths(reqs, buildMode, evalStore.get());
+      }
       if (buildMode == bmNormal) {
         if (auto results = alreadyValidResults(reqs)) {
           return std::move(*results);
@@ -563,14 +592,13 @@ public:
     }
 #endif
 
+    static constexpr unsigned unavailableRetries = 5;
+
     // Farm workers are picked by the load balancer from these headers.
     auto routingFor(const StorePath & drvPath, const BasicDerivation & drv) -> Metadata {
-      auto options = derivationOptionsFromStructuredAttrs(
-          *this, drv.env, drv.structuredAttrs ? &*drv.structuredAttrs : nullptr,
-          /*shouldWarn=*/false);
       return {{"x-nix-drv", std::string(drvPath.hashPart())},
               {"x-nix-system", drv.platform},
-              {"x-nix-features", concatStringsSep(",", options.getRequiredSystemFeatures(drv))}};
+              {"x-nix-features", concatStringsSep(",", nixcompat::requiredSystemFeatures(*this, drv))}};
     }
 
     static void addHeaders(grpc::ClientContext & ctx, const Metadata & headers) {
@@ -579,8 +607,7 @@ public:
       }
     }
 
-    // The worker that answered NOT_FOUND gets the drv closure it lacks. Same
-    // headers on every RPC so the balancer keeps us on that worker.
+    // Same headers on every RPC so the balancer keeps us on that worker.
     void uploadDrvClosure(Store & evalStore, const StorePath & drvPath, const Metadata & headers) {
       StorePathSet closure;
       evalStore.computeFSClosure(drvPath, closure);
@@ -639,8 +666,7 @@ public:
       return status;
     }
 
-    // A farm worker answers NOT_FOUND when it lacks the drv closure. Upload
-    // it from the eval store and ask again.
+    // NOT_FOUND: the worker lacks the drv closure, upload it and ask again.
     auto buildDerivationNative(const StorePath & drvPath,
                                const BasicDerivation & drv,
                                BuildMode buildMode,
@@ -666,11 +692,189 @@ public:
         uploadDrvClosure(*evalStore, drvPath, headers);
         status = tryBuildDerivation(request, headers, res);
       }
+      // Worker drained or lost its claim. The balancer picks another.
+      for (unsigned attempt = 1; attempt <= unavailableRetries
+                                 && status.error_code() == grpc::StatusCode::UNAVAILABLE;
+           attempt++) {
+        printError("%s, retrying", status.error_message());
+        std::this_thread::sleep_for(std::chrono::seconds(attempt));
+        status = tryBuildDerivation(request, headers, res);
+      }
       checkStatus(status, "BuildDerivation");
       if (!res) {
         throw Error("gRPC BuildDerivation stream ended without a result");
       }
       return std::move(*res);
+    }
+
+    // A farm refuses BuildPaths. An empty request is the cheapest probe.
+    auto isFarm() -> bool {
+      std::call_once(farmOnce, [&]() -> void {
+        grpc::ClientContext ctx;
+        remote::BuildPathsRequest request;
+        request.set_protocol(nixcompat::kBuildProtocolWire);
+        auto reader = stub->BuildPaths(&ctx, request);
+        remote::BuildPathsChunk msg;
+        while (reader->Read(&msg)) {
+        }
+        farm = reader->Finish().error_code() == grpc::StatusCode::UNIMPLEMENTED;
+      });
+      return farm;
+    }
+
+    struct FarmJob {
+      StorePath drvPath;
+      BasicDerivation drv;
+      std::vector<FarmJob *> dependants;
+      size_t waiting = 0;
+      std::optional<StorePath> failedInput;
+      std::optional<BuildResult> result;
+    };
+
+    struct FarmRun {
+      std::mutex mutex;
+      std::condition_variable cv;
+      std::deque<FarmJob *> ready;
+      size_t remaining;
+
+      auto next() -> FarmJob * {
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&]() -> bool { return !ready.empty() || remaining == 0; });
+        if (ready.empty()) {
+          return nullptr;
+        }
+        auto * job = ready.front();
+        ready.pop_front();
+        return job;
+      }
+
+      void finish(FarmJob & job, BuildResult res) {
+        std::scoped_lock const lock(mutex);
+        bool const succeeded = nixcompat::succeeded(res);
+        job.result = std::move(res);
+        assert(remaining > 0);
+        remaining--;
+        for (auto * dep : job.dependants) {
+          if (!succeeded) {
+            dep->failedInput = job.drvPath;
+          }
+          assert(dep->waiting > 0);
+          if (--dep->waiting == 0) {
+            ready.push_back(dep);
+          }
+        }
+        cv.notify_all();
+      }
+    };
+
+    // Runs on a fan-out thread: nothing may escape, or the process terminates.
+    auto runFarmJob(FarmJob & job, BuildMode buildMode, Store & evalStore) -> BuildResult {
+      using nixcompat::FailureStatus;
+      if (job.failedInput) {
+        return nixcompat::failed(FailureStatus::DependencyFailed,
+                                 fmt("dependency '%s' failed", job.failedInput->to_string()));
+      }
+      try {
+        return buildDerivationNative(job.drvPath, job.drv, buildMode, &evalStore);
+      } catch (Error & err) {
+        return nixcompat::failed(FailureStatus::MiscFailure, err.msg());
+      } catch (std::exception & err) {
+        return nixcompat::failed(FailureStatus::MiscFailure, err.what());
+      } catch (...) {
+        return nixcompat::failed(FailureStatus::MiscFailure, "unknown exception");
+      }
+    }
+
+    // The farm builds one derivation per RPC, so walk the DAG here and send
+    // every ready derivation at once. Cached ones come back AlreadyValid.
+    auto farmBuildPaths(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
+                        Store * evalStore) -> std::vector<KeyedBuildResult> {
+      if (evalStore == nullptr || evalStore == this) {
+        throw Error("'%s' is a build farm\nhint: pass --eval-store auto", config->authority.to_string());
+      }
+      std::map<StorePath, FarmJob> jobs;
+      loadFarmJobs(reqs, *evalStore, jobs);
+
+      FarmRun run{.remaining = jobs.size()};
+      for (auto & [drvPath, job] : jobs) {
+        if (job.waiting == 0) {
+          run.ready.push_back(&job);
+        }
+      }
+      auto worker = [&]() -> void {
+        while (auto * job = run.next()) {
+          run.finish(*job, runFarmJob(*job, buildMode, *evalStore));
+        }
+      };
+      {
+        std::vector<std::jthread> threads(std::min<size_t>(config->maxBuilds, jobs.size()));
+        for (auto & thread : threads) {
+          thread = std::jthread(worker);
+        }
+      }
+
+      std::vector<KeyedBuildResult> results;
+      results.reserve(reqs.size());
+      for (const auto & req : reqs) {
+        KeyedBuildResult res{{}, req};
+        if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
+          auto & job = jobs.at(built->drvPath->getBaseStorePath());
+          if (job.result) {
+            static_cast<BuildResult &>(res) = std::move(*job.result);
+          }
+        } else {
+          nixcompat::setAlreadyValid(res);
+        }
+        results.push_back(std::move(res));
+      }
+      return results;
+    }
+
+    auto basicForFarm(Store & evalStore, const StorePath & drvPath, const Derivation & full)
+        -> BasicDerivation {
+      auto basic = nixcompat::toBasicDrv(full, [&](const StorePath & dep, const std::string & output) -> StorePath {
+        auto path = evalStore.queryStaticPartialDerivationOutputMap(dep)[output];
+        if (!path) {
+          throw Error("'%s': input '%s!%s' has no statically known path (floating content-addressed?)",
+                      printStorePath(drvPath), printStorePath(dep), output);
+        }
+        return *path;
+      });
+      if (!basic || std::ranges::any_of(basic->outputs, [&](const auto & out) -> bool {
+            return !out.second.path(*this, basic->name, out.first);
+          })) {
+        throw Error("'%s': the build farm needs statically known input and output paths "
+                    "(no floating content-addressed or dynamic derivations)",
+                    printStorePath(drvPath));
+      }
+      return std::move(*basic);
+    }
+
+    void loadFarmJobs(const std::vector<DerivedPath> & reqs, Store & evalStore,
+                      std::map<StorePath, FarmJob> & jobs) {
+      std::function<FarmJob &(const StorePath &)> load = [&](const StorePath & drvPath) -> FarmJob & {
+        if (auto found = jobs.find(drvPath); found != jobs.end()) {
+          return found->second;
+        }
+        auto full = evalStore.readDerivation(drvPath);
+        auto & job = jobs.emplace(drvPath, FarmJob{.drvPath = drvPath,
+                                                   .drv = basicForFarm(evalStore, drvPath, full)})
+                         .first->second;
+        nixcompat::forInputDrvs(full, [&](const StorePath & input) -> void {
+          load(input).dependants.push_back(&job);
+          job.waiting++;
+        });
+        return job;
+      };
+      for (const auto & req : reqs) {
+        if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
+          if (const auto * opaque = std::get_if<SingleDerivedPath::Opaque>(&built->drvPath->raw())) {
+            load(opaque->path);
+          } else {
+            throw Error("'%s': dynamic derivations are not supported by the build farm", req.to_string(*this));
+          }
+        }
+      }
     }
 
     // Builds run server-side under the proxy user, so the write role
@@ -751,6 +955,8 @@ private:
 
     std::once_flag trustedOnce;
     std::optional<TrustedFlag> trusted;
+    std::once_flag farmOnce;
+    bool farm = false;
 
     /* Path infos fetched in bulk by topoSortPaths(), consumed by
        queryPathInfoUncached() so `nix copy` needs one QueryPathInfos RPC
@@ -835,8 +1041,7 @@ private:
                 }
                 continue;
             }
-            // Each callback fires exactly once. One that throws must not
-            // take the worker down or re-fire the others.
+            // Each callback fires exactly once, even if one throws.
             for (auto & [path, callback] : batch) {
                 auto found = infos.find(path);
                 try {
