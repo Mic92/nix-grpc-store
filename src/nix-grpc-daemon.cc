@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <signal.h> // NOLINT(modernize-deprecated-headers): sigaction is POSIX, not in <csignal>
 #include <cstddef>
 #include <initializer_list>
 #include <cstdint>
@@ -794,12 +795,16 @@ auto main(int argc, char ** argv) -> int
 try {
     // Pump threads write to a socket whose peer may already be gone; we want
     // EPIPE, not process death.
-    // NOLINTNEXTLINE(misc-include-cleaner): SIGPIPE comes from <csignal>.
-    static_cast<void>(std::signal(SIGPIPE, SIG_IGN));
+    // NOLINTBEGIN(misc-include-cleaner): darwin's <signal.h> forwards these.
+    struct sigaction act{};
+    act.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &act, nullptr);
     // Polled by the main loop so in-flight RPCs get the shutdown grace.
+    act.sa_handler = [](int) -> void { stopSignal = 1; };
     for (int const sig : {SIGTERM, SIGINT}) {
-        static_cast<void>(std::signal(sig, [](int) -> void { stopSignal = 1; }));
+        sigaction(sig, &act, nullptr);
     }
+    // NOLINTEND(misc-include-cleaner)
 
     // Required before nix::openStore() in the native RPC handlers.
     nix::initLibStore();
