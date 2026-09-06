@@ -93,6 +93,7 @@
 
       nixosModules = {
         server = ./nixos/server.nix;
+        lb = ./nixos/lb.nix;
         # Reuse the flake's package set so hosts get the same derivations as
         # `nix build` instead of rebuilding the plugins per machine.
         client =
@@ -104,6 +105,7 @@
         default.imports = [
           self.nixosModules.server
           self.nixosModules.client
+          self.nixosModules.lb
         ];
       };
 
