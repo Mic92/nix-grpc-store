@@ -1,5 +1,6 @@
-# PLAN.md end to end: niks3 + S3, two farm workers, one client with
-# --eval-store. No load balancer yet, the client talks to worker1.
+# Farm end to end: niks3 + S3, two farm workers behind two load
+# balancers at opposite ends: envoy (L7, MAGLEV on x-nix-drv, gRPC health)
+# and nginx stream (L4, knows nothing). Both must yield correct builds.
 {
   pkgs,
   nixPkgs,
@@ -31,7 +32,7 @@ let
       ];
       services.nix-grpc-daemon = {
         enable = true;
-        listen = "0.0.0.0:50051";
+        listen = "[::]:50051";
         logLevel = "debug";
         idleTimeout = null;
         package = config.programs.nix-grpc-store.package;
@@ -128,6 +129,40 @@ pkgs.testers.runNixOSTest {
     worker1 = worker;
     worker2 = worker;
 
+    lb =
+      { ... }:
+      {
+        imports = [
+          common
+          module
+        ];
+        services.nix-grpc-farm-lb = {
+          enable = true;
+          workers.${pkgs.stdenv.hostPlatform.system} = [
+            "worker1:50051"
+            "worker2:50051"
+          ];
+        };
+        services.nginx = {
+          enable = true;
+          streamConfig = ''
+            upstream farm {
+              server worker1:50051;
+              server worker2:50051;
+            }
+            server {
+              listen 50052;
+              proxy_pass farm;
+            }
+          '';
+        };
+        networking.firewall.allowedTCPPorts = [
+          50051
+          50052
+        ];
+        environment.systemPackages = [ pkgs.grpc-health-probe ];
+      };
+
     client =
       { ... }:
       {
@@ -146,23 +181,40 @@ pkgs.testers.runNixOSTest {
     cache.wait_for_open_port(5751)
     for w in [worker1, worker2]:
         w.wait_for_unit("nix-grpc-daemon.socket")
+    lb.wait_for_unit("envoy.service")
+    lb.wait_for_open_port(50051)
+    lb.wait_for_open_port(50052)
+    # Envoy only routes to endpoints that passed a gRPC health check.
+    for w in ["worker1", "worker2"]:
+        lb.wait_until_succeeds(f"grpc-health-probe -addr {w}:50051", timeout=180)
+    lb.wait_until_succeeds("grpc-health-probe -addr localhost:50051", timeout=60)
 
-    farm = "grpc://worker1:50051?insecure=1"
+    envoy = "grpc://lb:50051?insecure=1"
+    l4 = "grpc://lb:50052?insecure=1"
+
+    def build(store: str, tag: str) -> str:
+        client.succeed(f"nix build -L --store '{store}' --eval-store auto -f ${jobExpr} --argstr tag {tag} >&2")
+        return client.succeed(f"nix eval --raw -f ${jobExpr} --argstr tag {tag} outPath").strip()
+
+    def holders(path: str) -> int:
+        return sum(w.execute(f"test -e {path}")[0] == 0 for w in [worker1, worker2])
 
     with subtest("without --eval-store the farm refuses and hints"):
-        out = client.fail(f"nix build --store '{farm}' -f ${jobExpr} --argstr tag t0 2>&1")
+        out = client.fail(f"nix build --store '{envoy}' -f ${jobExpr} --argstr tag t0 2>&1")
         assert "--eval-store" in out, out
 
-    with subtest("fan-out build lands in the cache"):
-        client.succeed(f"nix build -L --store '{farm}' --eval-store auto -f ${jobExpr} --argstr tag t1 >&2")
-        top = client.succeed("nix eval --raw -f ${jobExpr} --argstr tag t1 outPath").strip()
-        # The client store has nothing. The cache does.
-        client.fail(f"test -e {top}")
-        client.succeed(f"nix copy --from ${niks3Url} --no-check-sigs {top} && grep farm-top-t1 {top}")
+    for name, store in [("envoy", envoy), ("l4", l4)]:
+        with subtest(f"{name}: fan-out build lands in the cache"):
+            top = build(store, name)
+            assert holders(top) == 1, "exactly one worker built it"
+            # The client store has nothing. The cache does.
+            client.fail(f"test -e {top}")
+            client.succeed(f"nix copy --from ${niks3Url} --no-check-sigs {top} && grep farm-top-{name} {top}")
 
-    with subtest("second worker answers from the claim without building"):
-        client.succeed("nix build -L --store 'grpc://worker2:50051?insecure=1' --eval-store auto -f ${jobExpr} --argstr tag t1 >&2")
-        worker2.fail(f"test -e {top}")
-        worker2.fail("journalctl -u nix-daemon | grep -q 'building.*farm-top'")
+        with subtest(f"{name}: repeat is answered from the claim without building"):
+            for w in [worker1, worker2]:
+                w.succeed(f"nix-store --delete {top}")
+            build(store, name)
+            assert holders(top) == 0, "no worker rebuilt it"
   '';
 }

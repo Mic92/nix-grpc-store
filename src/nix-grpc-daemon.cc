@@ -1109,6 +1109,10 @@ try {
     grpc::ServerBuilder builder;
     builder.SetMaxReceiveMessageSize(-1);
     builder.SetMaxSendMessageSize(-1);
+    // A balancer keeps idle upstream connections alive with pings.
+    builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+    constexpr int minPingIntervalMs = 10'000;
+    builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, minPingIntervalMs);
     auto creds = makeServerCredentials(options);
     std::shared_ptr<grpc::experimental::ExternalConnectionAcceptor> acceptor;
     if (listenFds.empty()) {
