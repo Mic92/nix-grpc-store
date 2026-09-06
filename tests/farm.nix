@@ -65,6 +65,15 @@ let
     in
     mk "farm-top" [ a b ]
   '';
+  slowExpr = pkgs.writeText "slow.nix" ''
+    { tag }:
+    derivation {
+      name = "slow-''${tag}";
+      system = builtins.currentSystem;
+      builder = "/bin/sh";
+      args = [ "-c" "read -t 60 x < /dev/zero; echo > $out" ];
+    }
+  '';
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-farm";
@@ -217,6 +226,18 @@ pkgs.testers.runNixOSTest {
                 w.succeed(f"nix-store --delete {top}")
             build(store, name)
             assert holders(top) == 0, "no worker rebuilt it"
+
+    with subtest("interrupting the client stops the build on the worker"):
+        # [6] keeps the probe from matching its own command line.
+        builder = "pgrep -f 'read -t [6]0 x'"
+
+        def building() -> bool:
+            return any(w.execute(builder)[0] == 0 for w in [worker1, worker2])
+
+        client.succeed(f"systemd-run --unit intr nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag intr")
+        retry(lambda _: building(), timeout_seconds=60)
+        client.succeed("systemctl kill -s INT intr")
+        retry(lambda _: not building(), timeout_seconds=20)
 
     with subtest("low disk drains a worker and builds go to the other"):
         # Leave less than minFree on worker1.
