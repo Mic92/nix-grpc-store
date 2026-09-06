@@ -243,17 +243,21 @@ inline auto alreadyValid(const nix::StorePath &drvPath,
 }
 
 // Failure kinds worth telling other workers' waiters about.
-inline auto deterministicFailureKind(nix::BuildResult &res) -> std::string {
-  std::optional<FailureStatus> status;
+inline auto failureStatus(nix::BuildResult &res) -> std::optional<FailureStatus> {
 #if NIX_COMPAT_AT_LEAST(2, 32)
   if (const auto *failure = res.tryGetFailure()) {
-    status = failure->status;
+    return failure->status;
   }
 #else
   if (!succeeded(res)) {
-    status = res.status;
+    return res.status;
   }
 #endif
+  return std::nullopt;
+}
+
+inline auto deterministicFailureKind(nix::BuildResult &res) -> std::string {
+  auto status = failureStatus(res);
   if (!status) {
     return "";
   }
