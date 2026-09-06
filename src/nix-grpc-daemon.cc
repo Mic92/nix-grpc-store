@@ -33,6 +33,7 @@
 #include <vector>
 
 #include <sys/socket.h>
+#include <sys/statvfs.h>
 
 #include <grpc/grpc_security_constants.h>
 #include <grpcpp/grpcpp.h>
@@ -62,6 +63,7 @@
 #include <nix/util/repair-flag.hh>
 #include <nix/util/serialise.hh>
 #include <nix/util/unix-domain-socket.hh>
+#include <nix/util/environment-variables.hh>
 #include <nix/util/strings.hh>
 #include <nix/util/util.hh>
 
@@ -94,6 +96,8 @@ struct FarmConfig
     std::string niks3TokenFile;
     nixgrpc::PushProcess::Argv pushArgv;
     unsigned maxJobs = 1;
+    uint64_t minFree = 0;
+    std::string storeDir = nix::getEnv("NIX_STORE_DIR").value_or("/nix/store");
 };
 
 struct Farm
@@ -101,12 +105,33 @@ struct Farm
     nixgrpc::Niks3 niks3;
     nixgrpc::PushProcess push;
     std::counting_semaphore<> slots;
+    uint64_t minFree;
+    std::string storeDir;
+    // Low disk: new builds bounce with UNAVAILABLE and gRPC health says
+    // NOT_SERVING so the balancer routes elsewhere.
+    std::atomic<bool> healthy{true};
 
     explicit Farm(const FarmConfig & cfg)
         : niks3(cfg.niks3Url, nix::chomp(nix::readFile(cfg.niks3TokenFile)))
         , push(cfg.pushArgv)
         , slots(static_cast<std::ptrdiff_t>(cfg.maxJobs))
+        , minFree(cfg.minFree)
+        , storeDir(cfg.storeDir)
     {
+    }
+
+    void updateHealth(grpc::Server & server)
+    {
+        struct statvfs vfs{};
+        if (minFree == 0 || statvfs(storeDir.c_str(), &vfs) != 0) {
+            return;
+        }
+        bool const now = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize >= minFree;
+        if (healthy.exchange(now) == now) {
+            return;
+        }
+        server.GetHealthCheckService()->SetServingStatus(now);
+        nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", now ? "healthy" : "unhealthy"}, {"reason", "min_free"}});
     }
 };
 
@@ -632,6 +657,9 @@ public:
         if (outPaths.size() != drv.outputs.size()) {
             return {grpc::StatusCode::UNIMPLEMENTED, "farm builds need statically known output paths"};
         }
+        if (!frm.healthy) {
+            return {grpc::StatusCode::UNAVAILABLE, "worker low on disk space"};
+        }
         std::unique_ptr<SlotGuard> slot = std::make_unique<SlotGuard>(frm.slots);
         auto claim = frm.niks3.claim(narinfoKeys(outPaths | std::views::values), narinfoKeys(nixcompat::drvInputs(drv)));
         if (claim->first() == nixgrpc::Claim::Status::wait) {
@@ -677,6 +705,11 @@ public:
                 claim->fail(nixcompat::deterministicFailureKind(res));
             } catch (nix::Error & err) {
                 log(std::string("reporting failure to niks3: ") + err.what());
+            }
+            // nix reports ENOSPC and the like as TransientFailure. Not the
+            // build's fault, so let the client retry on another worker.
+            if (nixcompat::failureStatus(res) == nixcompat::FailureStatus::TransientFailure) {
+                return {grpc::StatusCode::UNAVAILABLE, nixcompat::buildFailureMsg(res).value_or("transient failure")};
             }
             return grpc::Status::OK;
         }
@@ -1008,6 +1041,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
                 throw nix::Error("--max-jobs expects a positive integer");
             }
             farm(options).maxJobs = *jobs;
+        } else if (arg == "--min-free") {
+            farm(options).minFree = nix::string2IntWithUnitPrefix<uint64_t>(next());
         } else {
             throw nix::Error("unknown flag '%s'", arg);
         }
@@ -1140,6 +1175,9 @@ try {
     while (stopSignal == 0 && (!options.idleTimeout || idle.idleFor() < *options.idleTimeout)) {
         if (watchdog.count() != 0) {
             nixgrpc::sdNotify("WATCHDOG=1");
+        }
+        if (farm) {
+            farm->updateHealth(*server);
         }
         std::this_thread::sleep_for(tick);
     }
