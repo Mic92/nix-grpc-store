@@ -28,6 +28,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <stop_token>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -463,6 +464,24 @@ public:
         nix::AutoCloseFD sock;
         Conn conn;
         nix::WorkerProto::ClientHandshakeInfo info;
+        // Declared last so it joins before sock closes.
+        std::jthread canceller;
+
+        // A silent build sends nothing for us to notice a cancelled RPC on,
+        // so watch for it and drop the connection. nix-daemon then kills
+        // the build and our blocked read throws.
+        void cancelWith(grpc::ServerContext & context)
+        {
+            canceller = std::jthread([&context, this](const std::stop_token & stop) -> void {
+                constexpr std::chrono::milliseconds poll{200};
+                while (!stop.stop_requested() && !context.IsCancelled()) {
+                    std::this_thread::sleep_for(poll);
+                }
+                if (context.IsCancelled()) {
+                    ::shutdown(sock.get(), SHUT_RDWR);
+                }
+            });
+        }
     };
 
     auto connectBackend(nix::Store & store) -> std::unique_ptr<Backend>
@@ -569,7 +588,9 @@ public:
     }
 
     
+    
     auto runBuild(
+        grpc::ServerContext & context,
         nix::Store & localStore,
         const nix::StorePath & drvPath,
         const nix::BasicDerivation * drv,
@@ -577,6 +598,7 @@ public:
         const LogSink & sendLogLine) -> nix::BuildResult
     {
         auto backend = connectBackend(localStore);
+        backend->cancelWith(context);
         auto & conn = backend->conn;
         if (nixcompat::protocolWire(conn.protoVersion) != nixcompat::kBuildProtocolWire) {
             throw nix::Error("backend daemon is too old");
@@ -646,6 +668,7 @@ public:
     // gRPC errors mean "retry this RPC". Build
     // outcomes travel as BuildResult.
     auto farmBuild(
+        grpc::ServerContext & context,
         Farm & frm,
         nix::Store & localStore,
         const nix::StorePath & drvPath,
@@ -693,7 +716,7 @@ public:
             return {grpc::StatusCode::FAILED_PRECONDITION, std::string("input not substitutable: ") + err.what()};
         }
 
-        res = runBuild(localStore, drvPath, nullptr, nix::bmNormal, log);
+        res = runBuild(context, localStore, drvPath, nullptr, nix::bmNormal, log);
 
         if (claim->lost()) {
             return {grpc::StatusCode::UNAVAILABLE, "lost niks3 claim during build"};
@@ -765,11 +788,11 @@ public:
                 if (mode != nix::bmNormal) {
                     return {grpc::StatusCode::INVALID_ARGUMENT, "farm endpoint only does normal builds"};
                 }
-                if (auto status = farmBuild(*farm, *localStore, drvPath, drv, sendLogLine, res); !status.ok()) {
+                if (auto status = farmBuild(*context, *farm, *localStore, drvPath, drv, sendLogLine, res); !status.ok()) {
                     return status;
                 }
             } else {
-                res = runBuild(*localStore, drvPath, &drv, mode, sendLogLine);
+                res = runBuild(*context, *localStore, drvPath, &drv, mode, sendLogLine);
             }
 
             nix::remote::BuildDerivationChunk chunk;
@@ -823,6 +846,7 @@ public:
             }
 
             auto backend = connectBackend(*localStore);
+            backend->cancelWith(*context);
             auto & conn = backend->conn;
             if (nixcompat::protocolWire(conn.protoVersion) != nixcompat::kBuildProtocolWire) {
                 return {grpc::StatusCode::FAILED_PRECONDITION, "backend daemon is too old"};
