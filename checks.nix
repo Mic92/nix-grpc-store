@@ -3,6 +3,7 @@
   packages,
   nixPackages,
   nixosModule,
+  niks3,
 }:
 let
   inherit (pkgs) lib;
@@ -61,6 +62,12 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
 
   vm = import ./tests/nixos-test.nix {
     inherit pkgs;
+    nixPkgs = nixPackages;
+    module = nixosModule;
+  };
+
+  farm = import ./tests/farm.nix {
+    inherit pkgs niks3;
     nixPkgs = nixPackages;
     module = nixosModule;
   };
