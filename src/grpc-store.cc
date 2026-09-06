@@ -594,6 +594,10 @@ public:
 
     static constexpr unsigned unavailableRetries = 5;
 
+    static auto firstLine(const std::string & msg) -> std::string {
+      return msg.substr(0, msg.find('\n'));
+    }
+
     // Farm workers are picked by the load balancer from these headers.
     auto routingFor(const StorePath & drvPath, const BasicDerivation & drv) -> Metadata {
       return {{"x-nix-drv", std::string(drvPath.hashPart())},
@@ -683,22 +687,25 @@ public:
 
       auto headers = routingFor(drvPath, drv);
       std::optional<BuildResult> res;
-      auto status = tryBuildDerivation(request, headers, res);
-      if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
-        if (evalStore == nullptr) {
-          throw Error("farm worker lacks '%s'\nhint: pass --eval-store auto",
-                      printStorePath(drvPath));
+      grpc::Status status;
+      for (unsigned attempt = 0;; attempt++) {
+        status = tryBuildDerivation(request, headers, res);
+        if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
+          if (evalStore == nullptr) {
+            throw Error("farm worker lacks '%s'\nhint: pass --eval-store auto",
+                        printStorePath(drvPath));
+          }
+          uploadDrvClosure(*evalStore, drvPath, headers);
+          status = tryBuildDerivation(request, headers, res);
         }
-        uploadDrvClosure(*evalStore, drvPath, headers);
-        status = tryBuildDerivation(request, headers, res);
-      }
-      // Worker drained or lost its claim. The balancer picks another.
-      for (unsigned attempt = 1; attempt <= unavailableRetries
-                                 && status.error_code() == grpc::StatusCode::UNAVAILABLE;
-           attempt++) {
-        printError("%s, retrying", status.error_message());
-        std::this_thread::sleep_for(std::chrono::seconds(attempt));
-        status = tryBuildDerivation(request, headers, res);
+        // Salt the hash header so a consistent-hashing balancer picks another worker.
+        if (status.error_code() != grpc::StatusCode::UNAVAILABLE
+            || attempt == unavailableRetries) {
+          break;
+        }
+        printError("%s, retrying elsewhere", firstLine(status.error_message()));
+        std::this_thread::sleep_for(std::chrono::seconds(attempt + 1));
+        headers.front().second = std::string(drvPath.hashPart()) + "-" + std::to_string(attempt + 1);
       }
       checkStatus(status, "BuildDerivation");
       if (!res) {

@@ -43,6 +43,7 @@ let
           tokenFile = toString tokenFile;
           cacheUrl = niks3Url;
           publicKeys = [ signingPublicKey ];
+          minFree = "200M";
         };
       };
       programs.nix-grpc-store.enable = true;
@@ -216,5 +217,14 @@ pkgs.testers.runNixOSTest {
                 w.succeed(f"nix-store --delete {top}")
             build(store, name)
             assert holders(top) == 0, "no worker rebuilt it"
+
+    with subtest("low disk drains a worker and builds go to the other"):
+        # Leave less than minFree on worker1.
+        worker1.succeed("fallocate -l $(( $(df --output=avail -B1 /nix/store | tail -1) - 100*1024*1024 )) /nix/.rw-store/fill")
+        lb.wait_until_succeeds("curl -sf localhost:9901/clusters | grep -q failed_active_hc", timeout=60)
+        top = build(envoy, "drain")
+        worker1.fail(f"test -e {top}")
+        worker1.succeed("rm /nix/.rw-store/fill")
+        lb.wait_until_fails("curl -sf localhost:9901/clusters | grep -q failed_active_hc", timeout=60)
   '';
 }

@@ -201,6 +201,15 @@ in
         default = 1;
         description = "Concurrent builds on this worker.";
       };
+      minFree = lib.mkOption {
+        type = lib.types.str;
+        default = "10G";
+        description = ''
+          Below this much free space under /nix the worker reports
+          NOT_SERVING to the balancer and bounces builds with UNAVAILABLE so
+          they run elsewhere. `0` disables.
+        '';
+      };
       pushFlags = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ ];
@@ -315,6 +324,8 @@ in
             (lib.escapeShellArgs ([ (lib.getExe cfg.farm.niks3Package) "push" ] ++ cfg.farm.pushFlags))
             "--max-jobs"
             (toString cfg.farm.maxJobs)
+            "--min-free"
+            cfg.farm.minFree
           ]
           ++ cfg.extraFlags
         );
