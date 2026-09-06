@@ -165,6 +165,49 @@ in
       default = [ ];
       description = "Additional command-line flags.";
     };
+
+    farm = {
+      enable = lib.mkEnableOption ''
+        build farm worker mode. `BuildDerivation` claims outputs at niks3,
+        substitutes inputs from the cache and publishes results through a
+        long-lived `niks3 push --stdin`
+      '';
+      niks3Package = lib.mkOption {
+        type = lib.types.package;
+        example = lib.literalExpression "inputs.niks3.packages.\${system}.niks3";
+        description = "Package providing the `niks3` client.";
+      };
+      niks3Url = lib.mkOption {
+        type = lib.types.str;
+        example = "https://niks3.example.org";
+        description = "niks3 server URL.";
+      };
+      tokenFile = lib.mkOption {
+        type = lib.types.path;
+        example = "/run/secrets/niks3-token";
+        description = "File with the niks3 API bearer token.";
+      };
+      cacheUrl = lib.mkOption {
+        type = lib.types.str;
+        example = "https://cache.example.org";
+        description = "Binary cache the farm publishes to. Workers substitute inputs from it.";
+      };
+      publicKeys = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        description = "Signing keys of {option}`cacheUrl`.";
+      };
+      maxJobs = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 1;
+        description = "Concurrent builds on this worker.";
+      };
+      pushFlags = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "--max-concurrent-uploads" "8" ];
+        description = "Extra flags for `niks3 push --stdin`.";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -187,6 +230,14 @@ in
     nix.settings.extra-allowed-users = [ "nix-grpc-daemon" ];
     nix.settings.extra-trusted-users = lib.mkIf cfg.trustClients [ "nix-grpc-daemon" ];
 
+    # The cache is the share between workers. A path another
+    # worker just pushed must not be negatively cached here.
+    nix.settings.substituters = lib.mkIf cfg.farm.enable [ cfg.farm.cacheUrl ];
+    nix.settings.trusted-public-keys = lib.mkIf cfg.farm.enable cfg.farm.publicKeys;
+    nix.settings.narinfo-cache-negative-ttl = lib.mkIf cfg.farm.enable 0;
+    nix.settings.max-jobs = lib.mkIf cfg.farm.enable (lib.mkDefault cfg.farm.maxJobs);
+    nix.settings.keep-build-log = lib.mkIf cfg.farm.enable true;
+
     # gRPC clients inherit the store privileges of this uid via the proxied
     # nix-daemon connection, so default to a dedicated unprivileged user.
     users.users.nix-grpc-daemon = {
@@ -203,6 +254,8 @@ in
 
     systemd.services.nix-grpc-daemon = {
       description = "Nix worker-protocol over gRPC";
+      # niks3 push shells out to `nix path-info`.
+      path = lib.optional cfg.farm.enable config.nix.package;
       requires = [ "nix-grpc-daemon.socket" ];
       # nix-daemon is socket-activated; ordering after the socket is enough,
       # the first proxied connection will start it.
@@ -253,10 +306,22 @@ in
             "--log-level"
             cfg.logLevel
           ]
+          ++ lib.optionals cfg.farm.enable [
+            "--niks3"
+            cfg.farm.niks3Url
+            "--niks3-token-file"
+            cfg.farm.tokenFile
+            "--niks3-push"
+            (lib.escapeShellArgs ([ (lib.getExe cfg.farm.niks3Package) "push" ] ++ cfg.farm.pushFlags))
+            "--max-jobs"
+            (toString cfg.farm.maxJobs)
+          ]
           ++ cfg.extraFlags
         );
         # Builds run in nix-daemon. This only bounds the proxy.
         MemoryMax = lib.mkDefault "2G";
+        # A farm worker holds claims for running builds.
+        TimeoutStopSec = lib.mkIf cfg.farm.enable "infinity";
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         ProtectHome = true;
