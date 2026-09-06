@@ -35,6 +35,7 @@
 #include <nix/util/ref.hh>
 #include <nix/util/repair-flag.hh>
 #include <nix/util/serialise.hh>
+#include <nix/util/strings.hh>
 #include <nix/util/types.hh>
 #include <nix/util/util.hh>
 #include <openssl/bio.h>
@@ -43,6 +44,7 @@
 #include <openssl/types.h>
 #include <openssl/x509.h>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <stop_token>
@@ -54,6 +56,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include <nix/store/path-info.hh>
+#include <nix/store/derivation-options.hh>
 #include <nix/store/remote-store-connection.hh>
 #include <nix/store/remote-store.hh>
 #include <nix/store/store-registration.hh>
@@ -340,6 +343,9 @@ private:
                      "client.crt/client.key in $XDG_DATA_HOME/nix-grpc-store or "
                      "/var/lib/nix-grpc-store.";
       }
+      if (code == grpc::StatusCode::UNIMPLEMENTED && std::string_view(opName) == "Connect") {
+        hint = "\nhint: this is a build farm endpoint. Pass --eval-store auto.";
+      }
       // NOLINTNEXTLINE(modernize-return-braced-init-list): Error ctor is explicit
       return Error("gRPC %s on '%s' failed: %s%s", opName, config->authority.to_string(),
                    status.error_message(), hint);
@@ -352,11 +358,12 @@ private:
       }
     }
 
-public:
-    auto queryValidPaths(const StorePathSet &paths,
-                         SubstituteFlag maybeSubstitute)
-        -> StorePathSet override {
+    using Metadata = std::vector<std::pair<std::string, std::string>>;
+
+    auto queryValidPathsRouted(const StorePathSet & paths, SubstituteFlag maybeSubstitute,
+                               const Metadata & headers) -> StorePathSet {
       grpc::ClientContext ctx;
+      addHeaders(ctx, headers);
       remote::QueryValidPathsRequest request;
       request.set_substitute(maybeSubstitute == Substitute);
       for (const auto &path : paths) {
@@ -370,6 +377,12 @@ public:
         res.insert(StorePath(path));
       }
       return res;
+    }
+
+public:
+    auto queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute)
+        -> StorePathSet override {
+      return queryValidPathsRouted(paths, maybeSubstitute, {});
     }
 
     // RemoteStore would tunnel this. One RPC, with a fallback to the
@@ -406,6 +419,16 @@ public:
     }
 
     // Same: keep read-only clients off the tunnel.
+    // RemoteStore asks the daemon even with an eval store, which needs
+    // Connect. Static outputs suffice as floating CA is unsupported here.
+    auto queryPartialDerivationOutputMap(const StorePath & path, Store * evalStore)
+        -> std::map<std::string, std::optional<StorePath>> override {
+      if (evalStore != nullptr && evalStore != this) {
+        return evalStore->queryStaticPartialDerivationOutputMap(path);
+      }
+      return RemoteStore::queryPartialDerivationOutputMap(path, nullptr);
+    }
+
     auto isValidPathUncached(const StorePath & path) -> bool override {
       return queryValidPaths({path}, NoSubstitute).contains(path);
     }
@@ -493,7 +516,7 @@ public:
         auto buildDerivation(const StorePath & drvPath,
                              const BasicDerivation & drv, BuildMode buildMode)
             -> BuildResult override {
-          return store->buildDerivationNative(drvPath, drv, buildMode);
+          return store->buildDerivationNative(drvPath, drv, buildMode, evalStore.get());
         }
         void ensurePath(const StorePath & path) override {
           inner->ensurePath(path);
@@ -540,25 +563,59 @@ public:
     }
 #endif
 
+    // Farm workers are picked by the load balancer from these headers.
+    auto routingFor(const StorePath & drvPath, const BasicDerivation & drv) -> Metadata {
+      auto options = derivationOptionsFromStructuredAttrs(
+          *this, drv.env, drv.structuredAttrs ? &*drv.structuredAttrs : nullptr,
+          /*shouldWarn=*/false);
+      return {{"x-nix-drv", std::string(drvPath.hashPart())},
+              {"x-nix-system", drv.platform},
+              {"x-nix-features", concatStringsSep(",", options.getRequiredSystemFeatures(drv))}};
+    }
+
+    static void addHeaders(grpc::ClientContext & ctx, const Metadata & headers) {
+      for (const auto & [key, value] : headers) {
+        ctx.AddMetadata(key, value);
+      }
+    }
+
+    // The worker that answered NOT_FOUND gets the drv closure it lacks. Same
+    // headers on every RPC so the balancer keeps us on that worker.
+    void uploadDrvClosure(Store & evalStore, const StorePath & drvPath, const Metadata & headers) {
+      StorePathSet closure;
+      evalStore.computeFSClosure(drvPath, closure);
+      auto present = queryValidPathsRouted(closure, NoSubstitute, headers);
+      StorePathSet missing;
+      for (const auto & path : closure) {
+        if (!present.contains(path)) {
+          missing.insert(path);
+        }
+      }
+      if (missing.empty()) {
+        return;
+      }
+      PathsSource sources;
+      // addMultipleToStore wants references before referrers.
+      for (const auto & path : evalStore.topoSortPaths(missing) | std::views::reverse) {
+        auto info = evalStore.queryPathInfo(path);
+        // NOLINTNEXTLINE(bugprone-exception-escape): libc++ coroutine frames trip this.
+        sources.emplace_back(*info, sinkToSource([&evalStore, path](Sink & sink) -> void {
+          evalStore.narFromPath(path, sink);
+        }));
+      }
+      Activity act(*logger, lvlInfo, actCopyPaths,
+                   fmt("copying %d paths to '%s'", sources.size(), config->authority.to_string()));
+      addMultipleToStoreRouted(std::move(sources), act, NoRepair, CheckSigs, headers);
+    }
+
     // One RPC per build: log lines stream during the build, the result
     // arrives with the output path infos so no follow-up queries are needed.
-    auto buildDerivationNative(const StorePath & drvPath,
-                               const BasicDerivation & drv,
-                               BuildMode buildMode) -> BuildResult {
-      remote::BuildDerivationRequest request;
-      request.set_drv_path(std::string(drvPath.to_string()));
-      request.set_build_mode(static_cast<uint32_t>(buildMode));
-      request.set_protocol(nixcompat::kBuildProtocolWire);
-      {
-        StringSink sink;
-        nixcompat::writeDrv(sink, *this, drv);
-        *request.mutable_drv() = std::move(sink.s);
-      }
-
+    auto tryBuildDerivation(const remote::BuildDerivationRequest & request, const Metadata & headers,
+                            std::optional<BuildResult> & res) -> grpc::Status {
       grpc::ClientContext ctx;
+      addHeaders(ctx, headers);
       auto reader = stub->BuildDerivation(&ctx, request);
 
-      std::optional<BuildResult> res;
       PathInfoMap infos;
       remote::BuildDerivationChunk msg;
       while (reader->Read(&msg)) {
@@ -574,13 +631,44 @@ public:
           }
         }
       }
-      checkStatus(reader->Finish(), "BuildDerivation");
-      if (!res) {
-        throw Error("gRPC BuildDerivation stream ended without a result");
-      }
-      if (!infos.empty()) {
+      auto status = reader->Finish();
+      if (status.ok() && !infos.empty()) {
         std::scoped_lock const lock(prefetchMutex);
         prefetchedInfos.merge(infos);
+      }
+      return status;
+    }
+
+    // A farm worker answers NOT_FOUND when it lacks the drv closure. Upload
+    // it from the eval store and ask again.
+    auto buildDerivationNative(const StorePath & drvPath,
+                               const BasicDerivation & drv,
+                               BuildMode buildMode,
+                               Store * evalStore = nullptr) -> BuildResult {
+      remote::BuildDerivationRequest request;
+      request.set_drv_path(std::string(drvPath.to_string()));
+      request.set_build_mode(static_cast<uint32_t>(buildMode));
+      request.set_protocol(nixcompat::kBuildProtocolWire);
+      {
+        StringSink sink;
+        nixcompat::writeDrv(sink, *this, drv);
+        *request.mutable_drv() = std::move(sink.s);
+      }
+
+      auto headers = routingFor(drvPath, drv);
+      std::optional<BuildResult> res;
+      auto status = tryBuildDerivation(request, headers, res);
+      if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
+        if (evalStore == nullptr) {
+          throw Error("farm worker lacks '%s'\nhint: pass --eval-store auto",
+                      printStorePath(drvPath));
+        }
+        uploadDrvClosure(*evalStore, drvPath, headers);
+        status = tryBuildDerivation(request, headers, res);
+      }
+      checkStatus(status, "BuildDerivation");
+      if (!res) {
+        throw Error("gRPC BuildDerivation stream ended without a result");
       }
       return std::move(*res);
     }
@@ -851,9 +939,15 @@ public:
     }
 
     void addMultipleToStore(
-        PathsSource && pathsToCopy_, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs) override
+        PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs) override
     {
-        auto pathsToCopy = std::move(pathsToCopy_);
+        addMultipleToStoreRouted(std::move(pathsToCopy), act, repair, checkSigs, {});
+    }
+
+private:
+    void addMultipleToStoreRouted(
+        PathsSource pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs, const Metadata & headers)
+    {
         uint64_t bytesExpected = 0;
         for (auto &[pathInfo, pathSource] : pathsToCopy) {
           bytesExpected += pathInfo.narSize;
@@ -861,6 +955,7 @@ public:
         act.setExpected(actCopyPath, bytesExpected);
 
         grpc::ClientContext ctx;
+        addHeaders(ctx, headers);
         remote::AddMultipleReply reply;
         auto writer = stub->AddMultipleToStore(&ctx, &reply);
 
@@ -902,6 +997,7 @@ public:
         checkStatus(writer->Finish(), "AddMultipleToStore");
     }
 
+public:
     // NOLINTNEXTLINE(misc-override-with-different-visibility): see narFromPath
     void setOptions(RemoteStore::Connection & /*conn*/) override {
       // As with SSHStore, do not forward local settings automatically.
