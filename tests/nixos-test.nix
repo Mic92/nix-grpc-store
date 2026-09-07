@@ -71,6 +71,17 @@ pkgs.testers.runNixOSTest {
         }
       '';
 
+      # Builders write arbitrary bytes to stderr; the log stream must carry
+      # them.
+      environment.etc."rawlog.nix".text = ''
+        derivation {
+          name = "rawlog-grpc";
+          system = builtins.currentSystem;
+          builder = "/bin/sh";
+          args = [ "-c" "printf 'not utf-8: \\377\\n' >&2; echo rawlog-over-grpc > $out" ];
+        }
+      '';
+
       # Bench corpora as input-addressed outputs: CA paths from `nix store
       # add` are re-hashed on import (RewritingSink), skewing the benchmark.
       environment.etc."blob.nix".text = ''
@@ -202,6 +213,13 @@ pkgs.testers.runNixOSTest {
             "--no-link --print-out-paths"
         ).strip()
         machine.succeed(f"grep -q hello-over-grpc '{p}'")
+
+    with subtest("build whose log is not UTF-8"):
+        p = machine.succeed(
+            f"nix build --store '{store}' --impure -f /etc/rawlog.nix "
+            "--no-link --print-out-paths"
+        ).strip()
+        machine.succeed(f"grep -q rawlog-over-grpc '{p}'")
 
     with subtest("copy from gRPC store to a local scratch store"):
         machine.succeed(
