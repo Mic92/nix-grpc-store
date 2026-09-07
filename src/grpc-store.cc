@@ -433,8 +433,7 @@ public:
     }
 
     // Same: keep read-only clients off the tunnel.
-    // RemoteStore asks the daemon even with an eval store, which needs
-    // Connect. Static outputs suffice as floating CA is unsupported here.
+    // RemoteStore would tunnel this even with an eval store at hand.
     auto queryPartialDerivationOutputMap(const StorePath & path, Store * evalStore)
         -> std::map<std::string, std::optional<StorePath>> override {
       if (evalStore != nullptr && evalStore != this) {
@@ -599,7 +598,7 @@ public:
       return msg.substr(0, msg.find('\n'));
     }
 
-    // Farm workers are picked by the load balancer from these headers.
+    // What the load balancer routes on.
     auto routingFor(const StorePath & drvPath, const BasicDerivation & drv) -> Metadata {
       return {{"x-nix-drv", std::string(drvPath.hashPart())},
               {"x-nix-system", drv.platform},
@@ -640,8 +639,7 @@ public:
       addMultipleToStoreRouted(std::move(sources), act, NoRepair, CheckSigs, headers);
     }
 
-    // One RPC per build: log lines stream during the build, the result
-    // arrives with the output path infos so no follow-up queries are needed.
+    // Log lines stream, the result carries the output path infos.
     auto tryBuildDerivation(const remote::BuildDerivationRequest & request, const Metadata & headers,
                             std::optional<BuildResult> & res) -> grpc::Status {
       grpc::ClientContext ctx;
@@ -777,7 +775,7 @@ public:
       }
     };
 
-    // Runs on a fan-out thread: nothing may escape, or the process terminates.
+    // Runs on a fan-out thread, nothing may escape.
     auto runFarmJob(FarmJob & job, BuildMode buildMode, Store & evalStore) -> BuildResult {
       using nixcompat::FailureStatus;
       if (job.failedInput) {
