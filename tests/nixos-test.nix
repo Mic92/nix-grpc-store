@@ -423,6 +423,10 @@ pkgs.testers.runNixOSTest {
         )
         machine.succeed(f"test -e '{up}'")
 
+    with subtest("uploaded paths are not pinned by the proxy after the RPC returns"):
+        machine.succeed(f"nix-store --delete '{up}'")
+        machine.fail(f"test -e '{up}'")
+
     with subtest("many small paths round-trip (native AddMultipleToStore / NarsFromPaths)"):
         import time
 
