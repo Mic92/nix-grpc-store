@@ -24,7 +24,6 @@ namespace {
 using Status = nixgrpc::Claim::Status;
 
 // Mock heartbeat is 200 ms.
-constexpr std::chrono::milliseconds heartbeat{200};
 constexpr std::chrono::milliseconds settle{300};
 constexpr std::chrono::milliseconds reclaimWindow{800};
 constexpr std::chrono::milliseconds lostAfter{2500};
@@ -92,10 +91,15 @@ void testClaims(Suite & tst, const nixgrpc::Niks3 & niks3)
         tst.check(holder->await() == Status::build, "b: holder");
         auto waiter = niks3.claim({"b.narinfo"}, {});
         tst.check(waiter->first() == Status::wait, "b: waiter");
-        auto start = std::chrono::steady_clock::now();
+        auto tok = holder->token();
         holder.reset();
         tst.check(waiter->await() == Status::build, "waiter promoted when holder releases");
-        tst.check(std::chrono::steady_clock::now() - start < 2 * heartbeat, "closing the stream releases before expiry");
+        tst.check(
+            tst.countLog([&](const nlohmann::json & entry) -> bool {
+                return entry.value("ev", "") == "fail" && entry.value("token", int64_t{0}) == tok
+                    && entry.value("kind", "-").empty();
+            }) == 1,
+            "dropping a held claim releases it explicitly");
     }
     {
         auto holder = niks3.claim({"c.narinfo"}, {});
