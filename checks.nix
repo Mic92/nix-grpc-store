@@ -24,6 +24,15 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     doCheck = false;
     dontFixup = true;
   });
+  # Model of the worker/niks3 claim protocol, see spec/claims.qnt.
+  claims-spec = pkgs.runCommand "nix-grpc-store-claims-spec" { nativeBuildInputs = [ pkgs.quint ]; } ''
+    cd ${./spec}
+    export HOME=$TMPDIR
+    quint typecheck claims.qnt
+    quint run claims.qnt --invariant=safety --max-steps=30 --max-samples=20000
+    quint run claims.qnt --step=stepBlips --invariant=oneBuilder --max-steps=30 --max-samples=20000
+    touch $out
+  '';
   exit-stress = import ./tests/exit-stress.nix {
     inherit pkgs;
     nix = nixPackages.nix-everything;
