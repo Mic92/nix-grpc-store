@@ -7,6 +7,7 @@
 // avoids the tunnel's per-batch zstd flushes and per-path round trips.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -35,6 +36,7 @@
 
 #include <sys/socket.h>
 #include <sys/statvfs.h>
+#include <unistd.h>
 
 #include <grpc/grpc_security_constants.h>
 #include <grpcpp/grpcpp.h>
@@ -108,9 +110,7 @@ struct Farm
     std::counting_semaphore<> slots;
     uint64_t minFree;
     std::string storeDir;
-    // Low disk: new builds bounce with UNAVAILABLE and gRPC health says
-    // NOT_SERVING so the balancer routes elsewhere.
-    std::atomic<bool> healthy{true};
+    std::atomic<bool> healthy{true}; // enough disk, mirrored to gRPC health
 
     explicit Farm(const FarmConfig & cfg)
         : niks3(cfg.niks3Url, nix::chomp(nix::readFile(cfg.niks3TokenFile)))
@@ -136,25 +136,17 @@ struct Farm
     }
 };
 
+// One of the worker's max-jobs.
 class SlotGuard
 {
     std::counting_semaphore<> & sem;
 
-public:
     explicit SlotGuard(std::counting_semaphore<> & sem)
         : sem(sem)
     {
-        sem.acquire();
     }
 
-    static auto tryAcquire(std::counting_semaphore<> & sem) -> std::unique_ptr<SlotGuard>
-    {
-        if (!sem.try_acquire()) {
-            return nullptr;
-        }
-        return std::unique_ptr<SlotGuard>(new SlotGuard(sem, Adopt{}));
-    }
-
+public:
     SlotGuard(const SlotGuard &) = delete;
     SlotGuard(SlotGuard &&) = delete;
     auto operator=(const SlotGuard &) -> SlotGuard & = delete;
@@ -165,20 +157,33 @@ public:
         sem.release();
     }
 
-private:
-    struct Adopt
-    {};
-
-    SlotGuard(std::counting_semaphore<> & sem, Adopt /*unused*/)
-        : sem(sem)
+    static auto acquire(std::counting_semaphore<> & sem) -> std::unique_ptr<SlotGuard>
     {
+        sem.acquire();
+        return std::unique_ptr<SlotGuard>(new SlotGuard(sem));
+    }
+
+    static auto tryAcquire(std::counting_semaphore<> & sem) -> std::unique_ptr<SlotGuard>
+    {
+        return sem.try_acquire() ? std::unique_ptr<SlotGuard>(new SlotGuard(sem)) : nullptr;
     }
 };
+
+auto localHostName() -> std::string
+{
+    constexpr size_t maxLen = 256;
+    std::array<char, maxLen> buf{};
+    if (::gethostname(buf.data(), buf.size() - 1) != 0) {
+        return "?";
+    }
+    return buf.data();
+}
 
 class NixRemoteService final : public nix::remote::NixRemote::Service
 {
     std::string socketPath;
     std::string storeUri;
+    std::string hostName = localHostName();
     nixgrpc::Metrics & metrics;
     nixgrpc::IdleTracker & idle;
     nixgrpc::LogLevel logLevel;
@@ -484,9 +489,8 @@ public:
         // Declared last so it joins before sock closes.
         std::jthread canceller;
 
-        // A silent build sends nothing for us to notice a cancelled RPC on,
-        // so watch for it and drop the connection. nix-daemon then kills
-        // the build and our blocked read throws.
+        // A silent build sends nothing to notice a cancelled RPC on, so poll
+        // and drop the connection, which makes nix-daemon kill the build.
         void cancelWith(grpc::ServerContext & context)
         {
             canceller = std::jthread([&context, this](const std::stop_token & stop) -> void {
@@ -580,12 +584,7 @@ public:
 
     using LogSink = std::function<void(std::string)>;
 
-    // With `drv`, sends the inline BasicDerivation (needs a trusted user
-    // for input-addressed outputs). Without, builds the stored .drv:
-    // nix-daemon recomputes output paths from the closure, so a forged
-    // inline drv cannot claim foreign paths. Farm mode uses the latter.
-    // A farm worker builds itself: no build hook (its failures would look
-    // transient and it defeats claim accounting), one job per connection.
+    // No build hook on a farm worker: it would bypass slots and claims.
     static void buildLocally(Backend::Conn & conn)
     {
         constexpr uint64_t off = 0;
@@ -604,40 +603,54 @@ public:
         }
     }
 
-    
-    
-    auto runBuild(
-        grpc::ServerContext & context,
-        nix::Store & localStore,
-        const nix::StorePath & drvPath,
-        const nix::BasicDerivation * drv,
-        nix::BuildMode mode,
-        const LogSink & sendLogLine) -> nix::BuildResult
+    auto buildBackend(grpc::ServerContext & context, nix::Store & localStore) -> std::unique_ptr<Backend>
     {
         auto backend = connectBackend(localStore);
         backend->cancelWith(context);
-        auto & conn = backend->conn;
-        if (nixcompat::protocolWire(conn.protoVersion) != nixcompat::kBuildProtocolWire) {
+        if (nixcompat::protocolWire(backend->conn.protoVersion) != nixcompat::kBuildProtocolWire) {
             throw nix::Error("backend daemon is too old");
         }
-        if (drv == nullptr) {
-            buildLocally(conn);
-        }
+        return backend;
+    }
+
+    auto proxyBuild(
+        grpc::ServerContext & context,
+        nix::Store & localStore,
+        const nix::StorePath & drvPath,
+        const nix::BasicDerivation & drv,
+        nix::BuildMode mode,
+        const LogSink & sendLogLine) -> nix::BuildResult
+    {
+        auto backend = buildBackend(context, localStore);
+        auto & conn = backend->conn;
+        nixgrpc::relayBuildLog(conn.from, sendLogLine);
+        bool daemonException = false;
+        conn.putBuildDerivationRequest(localStore, &daemonException, drvPath, drv, mode);
+        conn.to.flush();
+        nixgrpc::relayBuildLog(conn.from, sendLogLine);
+        return nix::WorkerProto::Serialise<nix::BuildResult>::read(
+            localStore, nix::WorkerProto::ReadConn{.from = conn.from, .version = nixcompat::buildProtocolVersion()});
+    }
+
+    // By path, not inline: nix-daemon recomputes output paths from the stored
+    // closure, so a forged drv cannot claim foreign paths.
+    auto storedBuild(
+        grpc::ServerContext & context,
+        nix::Store & localStore,
+        const nix::StorePath & drvPath,
+        const LogSink & sendLogLine) -> nix::BuildResult
+    {
+        auto backend = buildBackend(context, localStore);
+        auto & conn = backend->conn;
+        buildLocally(conn);
         nix::WorkerProto::ReadConn const from{.from = conn.from, .version = nixcompat::buildProtocolVersion()};
         nixgrpc::relayBuildLog(conn.from, sendLogLine);
-        if (drv != nullptr) {
-            bool daemonException = false;
-            conn.putBuildDerivationRequest(localStore, &daemonException, drvPath, *drv, mode);
-            conn.to.flush();
-            nixgrpc::relayBuildLog(conn.from, sendLogLine);
-            return nix::WorkerProto::Serialise<nix::BuildResult>::read(localStore, from);
-        }
         std::vector<nix::DerivedPath> const targets{nix::DerivedPath::Built{
             .drvPath = nix::makeConstantStorePathRef(drvPath), .outputs = nix::OutputsSpec::All{}}};
         conn.to << nix::WorkerProto::Op::BuildPathsWithResults;
         nix::WorkerProto::write(
             localStore, nix::WorkerProto::WriteConn{.to = conn.to, .version = conn.protoVersion}, targets);
-        conn.to << static_cast<uint32_t>(mode);
+        conn.to << static_cast<uint32_t>(nix::bmNormal);
         conn.to.flush();
         nixgrpc::relayBuildLog(conn.from, sendLogLine);
         auto results = nix::WorkerProto::Serialise<std::vector<nix::KeyedBuildResult>>::read(localStore, from);
@@ -682,8 +695,7 @@ public:
         return res;
     }
 
-    // gRPC errors mean "retry this RPC". Build
-    // outcomes travel as BuildResult.
+    // gRPC errors mean "retry this RPC", build outcomes travel as BuildResult.
     auto farmBuild(
         grpc::ServerContext & context,
         Farm & frm,
@@ -700,11 +712,11 @@ public:
         if (!frm.healthy) {
             return {grpc::StatusCode::UNAVAILABLE, "worker low on disk space"};
         }
-        std::unique_ptr<SlotGuard> slot = std::make_unique<SlotGuard>(frm.slots);
+        auto slot = SlotGuard::acquire(frm.slots);
         auto claim = frm.niks3.claim(narinfoKeys(outPaths | std::views::values), narinfoKeys(nixcompat::drvInputs(drv)));
         if (claim->first() == nixgrpc::Claim::Status::wait) {
             slot.reset();
-            log("waiting for another worker building " + std::string(drvPath.to_string()));
+            log(hostName + ": waiting for another worker building " + std::string(drvPath.to_string()));
         }
         switch (claim->await()) {
         case nixgrpc::Claim::Status::built:
@@ -717,8 +729,7 @@ public:
         default:
             break;
         }
-        // Blocking here would keep the claim heartbeating while every other
-        // worker waits on us. Give it back and let the client re-route.
+        // Blocking would keep the claim alive while every other worker waits on us.
         if (!slot) {
             slot = SlotGuard::tryAcquire(frm.slots);
         }
@@ -729,7 +740,7 @@ public:
         if (!localStore.isValidPath(drvPath)) {
             return {grpc::StatusCode::NOT_FOUND, "missing: " + localStore.printStorePath(drvPath)};
         }
-        // Temp roots on this connection live exactly until publish is done.
+        // Roots inputs and outputs until publish is done.
         auto roots = openScopedStore();
         try {
             for (const auto & input : nixcompat::drvInputs(drv)) {
@@ -743,21 +754,20 @@ public:
             roots->addTempRoot(path);
         }
 
-        res = runBuild(context, localStore, drvPath, nullptr, nix::bmNormal, log);
+        log(hostName + ": building " + std::string(drvPath.to_string()));
+        res = storedBuild(context, localStore, drvPath, log);
 
         if (claim->lost()) {
             return {grpc::StatusCode::UNAVAILABLE, "lost niks3 claim during build"};
         }
         if (!nixcompat::succeeded(res)) {
-            // The client must see the build log and result even if niks3 is
-            // down. Waiters then learn it by expiry instead of at once.
+            // The client gets the result even if niks3 is down.
             try {
                 claim->fail(nixcompat::deterministicFailureKind(res));
             } catch (nix::Error & err) {
                 log(std::string("reporting failure to niks3: ") + err.what());
             }
-            // nix reports ENOSPC and the like as TransientFailure. Not the
-            // build's fault, so let the client retry on another worker.
+            // ENOSPC and the like: not the build's fault, retry elsewhere.
             if (nixcompat::failureStatus(res) == nixcompat::FailureStatus::TransientFailure) {
                 return {grpc::StatusCode::UNAVAILABLE, nixcompat::buildFailureMsg(res).value_or("transient failure")};
             }
@@ -818,10 +828,10 @@ public:
                     return {grpc::StatusCode::INVALID_ARGUMENT, "farm endpoint only does normal builds"};
                 }
                 if (auto status = farmBuild(*context, *farm, *localStore, drvPath, drv, sendLogLine, res); !status.ok()) {
-                    return status;
+                    return {status.error_code(), hostName + ": " + status.error_message()};
                 }
             } else {
-                res = runBuild(*context, *localStore, drvPath, &drv, mode, sendLogLine);
+                res = proxyBuild(*context, *localStore, drvPath, drv, mode, sendLogLine);
             }
 
             nix::remote::BuildDerivationChunk chunk;
@@ -1020,7 +1030,7 @@ struct Options
     std::string metricsListen;
     nixgrpc::LogLevel logLevel = nixgrpc::LogLevel::info;
     nixgrpc::Acl acl;
-    std::optional<FarmConfig> farm;
+    FarmConfig farm; // active when niks3Url is set
 };
 
 auto parseLogLevel(std::string_view value) -> nixgrpc::LogLevel
@@ -1032,14 +1042,6 @@ auto parseLogLevel(std::string_view value) -> nixgrpc::LogLevel
         throw nix::Error("--log-level must be 'info' or 'debug'");
     }
     return nixgrpc::LogLevel::info;
-}
-
-auto farm(Options & options) -> FarmConfig &
-{
-    if (!options.farm) {
-        options.farm.emplace();
-    }
-    return *options.farm;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity): flat flag list.
@@ -1081,36 +1083,36 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
         } else if (arg == "--log-level") {
             options.logLevel = parseLogLevel(next());
         } else if (arg == "--niks3") {
-            farm(options).niks3Url = next();
+            options.farm.niks3Url = next();
         } else if (arg == "--niks3-token-file") {
-            farm(options).niks3TokenFile = next();
+            options.farm.niks3TokenFile = next();
         } else if (arg == "--niks3-push") {
             // The program plus extra flags, e.g. "niks3 push --max-concurrent-uploads 8".
             auto words = nix::shellSplitString(next());
-            farm(options).pushArgv = {words.begin(), words.end()};
+            options.farm.pushArgv = {words.begin(), words.end()};
         } else if (arg == "--max-jobs") {
             auto jobs = nixgrpc::parseInt<unsigned>(next());
             if (!jobs || *jobs == 0) {
                 throw nix::Error("--max-jobs expects a positive integer");
             }
-            farm(options).maxJobs = *jobs;
+            options.farm.maxJobs = *jobs;
         } else if (arg == "--min-free") {
-            farm(options).minFree = nix::string2IntWithUnitPrefix<uint64_t>(next());
+            options.farm.minFree = nix::string2IntWithUnitPrefix<uint64_t>(next());
         } else {
             throw nix::Error("unknown flag '%s'", arg);
         }
     }
-    if (options.farm) {
-        if (options.farm->niks3Url.empty() || options.farm->niks3TokenFile.empty()) {
-            throw nix::Error("farm mode needs --niks3 and --niks3-token-file");
+    if (!options.farm.niks3Url.empty()) {
+        if (options.farm.niks3TokenFile.empty()) {
+            throw nix::Error("--niks3 needs --niks3-token-file");
         }
-        auto & argv = options.farm->pushArgv;
+        auto & argv = options.farm.pushArgv;
         if (argv.empty()) {
             argv = {"niks3", "push"};
         }
         argv.insert(
             argv.end(),
-            {"--stdin", "--server-url", options.farm->niks3Url, "--auth-token-path", options.farm->niks3TokenFile});
+            {"--stdin", "--server-url", options.farm.niks3Url, "--auth-token-path", options.farm.niks3TokenFile});
     }
     if ((options.acl.active() || options.acl.anonymousRole()) && options.clientCA.empty()) {
         // Without mTLS every client's CN is "-".
@@ -1182,13 +1184,11 @@ try {
         options.storeUri = "unix://" + options.socketPath;
     }
     std::optional<Farm> farm;
-    if (options.farm) {
-        farm.emplace(*options.farm);
+    if (!options.farm.niks3Url.empty()) {
+        farm.emplace(options.farm);
         nixgrpc::logLine(
             nixgrpc::LogLevel::info,
-            {{"event", "farm_mode"},
-             {"niks3", options.farm->niks3Url},
-             {"max_jobs", std::to_string(options.farm->maxJobs)}});
+            {{"event", "farm_mode"}, {"niks3", options.farm.niks3Url}, {"max_jobs", std::to_string(options.farm.maxJobs)}});
     }
     NixRemoteService service(
         options.socketPath, options.storeUri, metrics, idle, options.logLevel, options.acl, farm);
