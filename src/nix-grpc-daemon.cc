@@ -103,6 +103,12 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         return nix::ref<nix::Store>(store);
     }
 
+    // nix-daemon keeps temp roots per connection, so writes get their own.
+    auto openScopedStore() -> nix::ref<nix::Store>
+    {
+        return nix::openStore(storeUri);
+    }
+
     // gRPC aborts the process if a handler lets an exception escape.
     template<typename F>
     auto guarded(F && func) -> grpc::Status
@@ -281,7 +287,7 @@ public:
             }
             auto const peer = context->peer();
             auto const start = std::chrono::steady_clock::now();
-            auto localStore = getStore();
+            auto localStore = openScopedStore();
 
             nix::remote::AddMultipleChunk first;
             if (!reader->Read(&first)) {
