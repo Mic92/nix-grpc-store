@@ -147,6 +147,14 @@ public:
         sem.acquire();
     }
 
+    static auto tryAcquire(std::counting_semaphore<> & sem) -> std::unique_ptr<SlotGuard>
+    {
+        if (!sem.try_acquire()) {
+            return nullptr;
+        }
+        return std::unique_ptr<SlotGuard>(new SlotGuard(sem, Adopt{}));
+    }
+
     SlotGuard(const SlotGuard &) = delete;
     SlotGuard(SlotGuard &&) = delete;
     auto operator=(const SlotGuard &) -> SlotGuard & = delete;
@@ -155,6 +163,15 @@ public:
     ~SlotGuard()
     {
         sem.release();
+    }
+
+private:
+    struct Adopt
+    {};
+
+    SlotGuard(std::counting_semaphore<> & sem, Adopt /*unused*/)
+        : sem(sem)
+    {
     }
 };
 
@@ -700,20 +717,30 @@ public:
         default:
             break;
         }
+        // Blocking here would keep the claim heartbeating while every other
+        // worker waits on us. Give it back and let the client re-route.
         if (!slot) {
-            slot = std::make_unique<SlotGuard>(frm.slots);
+            slot = SlotGuard::tryAcquire(frm.slots);
+        }
+        if (!slot) {
+            return {grpc::StatusCode::UNAVAILABLE, "promoted to build but no free slot"};
         }
 
         if (!localStore.isValidPath(drvPath)) {
             return {grpc::StatusCode::NOT_FOUND, "missing: " + localStore.printStorePath(drvPath)};
         }
+        // Temp roots on this connection live exactly until publish is done.
+        auto roots = openScopedStore();
         try {
             for (const auto & input : nixcompat::drvInputs(drv)) {
-                localStore.addTempRoot(input);
+                roots->addTempRoot(input);
                 nixcompat::ensurePath(localStore, input);
             }
         } catch (nix::Error & err) {
             return {grpc::StatusCode::FAILED_PRECONDITION, std::string("input not substitutable: ") + err.what()};
+        }
+        for (const auto & [name, path] : outPaths) {
+            roots->addTempRoot(path);
         }
 
         res = runBuild(context, localStore, drvPath, nullptr, nix::bmNormal, log);
@@ -744,10 +771,12 @@ public:
         try {
             frm.push.pushWait(built, claim->token());
         } catch (nixgrpc::StaleClaim &) {
-            log("another worker published " + std::string(drvPath.to_string()) + " first");
+            claim->published();
+            return {grpc::StatusCode::UNAVAILABLE, "lost niks3 claim before publishing"};
         } catch (nix::Error & err) {
             return {grpc::StatusCode::UNAVAILABLE, std::string("publish failed: ") + err.what()};
         }
+        claim->published();
         return grpc::Status::OK;
     }
 

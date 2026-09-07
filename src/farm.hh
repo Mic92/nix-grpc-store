@@ -347,6 +347,7 @@ private:
         Clock::time_point lastSeen = Clock::now();
         std::chrono::seconds retryAfter{};
         bool stop = false;
+        bool released = false;
 
         [[nodiscard]] auto decided() const -> bool
         {
@@ -507,10 +508,21 @@ public:
     auto operator=(const Claim &) -> Claim & = delete;
     auto operator=(Claim &&) -> Claim & = delete;
 
-    // Closing the stream is enough: niks3 releases a held claim when the
-    // holder's connection drops, so early returns need no explicit fail().
+    // niks3 keeps the row when the stream drops, so a holder hands it back.
     ~Claim()
     {
+        bool held = false;
+        {
+            auto state(state_.lock());
+            held = state->status == Status::build && !state->released;
+        }
+        if (held) {
+            try {
+                fail("");
+            } catch (...) {
+                nix::ignoreExceptionInDestructor();
+            }
+        }
         halt();
         if (streamThread.joinable()) {
             streamThread.join();
@@ -546,9 +558,15 @@ public:
         return state->status == Status::build && state->stop;
     }
 
+    void published()
+    {
+        state_.lock()->released = true;
+    }
+
     // Empty kind = transient. False on stale token.
     auto fail(const std::string & kind) -> bool
     {
+        state_.lock()->released = true;
         http::Call call(baseUrl + "/api/builds/fail", bearer, nlohmann::json{{"claim_token", token()}, {"kind", kind}});
         auto status = call.perform();
         halt();
