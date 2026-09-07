@@ -67,7 +67,8 @@ message BuildDerivationDone {
 
 message BuildDerivationChunk {
   oneof event {
-    string log_line = 1;
+    // Raw builder stderr, which need not be valid UTF-8.
+    bytes log_line = 1;
     BuildDerivationDone done = 2;
   }
 }
@@ -89,7 +90,8 @@ message BuildPathsDone {
 
 message BuildPathsChunk {
   oneof event {
-    string log_line = 1;
+    // Raw builder stderr, which need not be valid UTF-8.
+    bytes log_line = 1;
     BuildPathsDone done = 2;
   }
 }
