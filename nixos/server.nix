@@ -160,6 +160,36 @@ in
       '';
     };
 
+    oidc = lib.mkOption {
+      type = lib.types.nullOr (pkgs.formats.json { }).type;
+      default = null;
+      example = lib.literalExpression ''
+        {
+          providers.github = {
+            issuer = "https://token.actions.githubusercontent.com";
+            audience = "grpc://cache.example.com";
+            rules = [
+              { bound_claims.repository_owner = [ "myorg" ]; scopes = [ "write" ]; }
+              { bound_claims.ref = [ "refs/heads/main" ]; scopes = [ "admin" ]; }
+            ];
+          };
+          providers.k8s = {
+            audience = "grpc://cache.example.com";
+            ca_file = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+            bearer_token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+            bound_claims."kubernetes.io.namespace" = [ "ci" ];
+          };
+        }
+      '';
+      description = ''
+        Accept OIDC bearer tokens (`authorization: Bearer …`) besides client
+        certificates. Same schema as niks3's `--oidc-config`, so one attrset
+        can serve both. Scopes map to roles: `read` → read-only, `write` →
+        write, `admin` → trusted. A client certificate, when presented,
+        takes precedence. Clients set `token-file` or `$NIX_GRPC_TOKEN_FILE`.
+      '';
+    };
+
     extraFlags = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -230,8 +260,13 @@ in
         message = "services.nix-grpc-daemon.tls.certFile and tls.keyFile must be set together";
       }
       {
-        assertion = (cfg.accessRules == [ ] && cfg.anonymousRole == null) || cfg.tls.clientCaFile != null;
-        message = "services.nix-grpc-daemon.accessRules/anonymousRole requires tls.clientCaFile (mTLS)";
+        assertion =
+          (cfg.accessRules == [ ] && cfg.anonymousRole == null) || cfg.tls.clientCaFile != null || cfg.oidc != null;
+        message = "services.nix-grpc-daemon.accessRules/anonymousRole requires tls.clientCaFile or oidc";
+      }
+      {
+        assertion = cfg.oidc == null || cfg.tls.certFile != null || (cfg.oidc.allow_insecure or false);
+        message = "services.nix-grpc-daemon.oidc sends bearer tokens, enable tls.certFile";
       }
     ];
 
@@ -306,6 +341,10 @@ in
           ++ lib.optionals (cfg.anonymousRole != null) [
             "--allow-anonymous"
             cfg.anonymousRole
+          ]
+          ++ lib.optionals (cfg.oidc != null) [
+            "--oidc-config"
+            ((pkgs.formats.json { }).generate "nix-grpc-daemon-oidc.json" cfg.oidc)
           ]
           ++ lib.optionals (cfg.metricsListen != null) [
             "--metrics-listen"

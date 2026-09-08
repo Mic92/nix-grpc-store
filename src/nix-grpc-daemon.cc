@@ -76,6 +76,7 @@
 #include "idle.hh"
 #include "import-paths.hh"
 #include "logfmt.hh"
+#include "oidc.hh"
 #include "parse-int.hh"
 #include "path-info-wire.hh"
 #include "metrics.hh"
@@ -188,6 +189,7 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     nixgrpc::IdleTracker & idle;
     nixgrpc::LogLevel logLevel;
     nixgrpc::Acl acl;
+    std::optional<nixgrpc::oidc::Verifier> & oidc;
     std::optional<Farm> & farm;
 
     std::mutex storeMutex;
@@ -237,24 +239,50 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         return std::to_string(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
     }
 
-    // Builds need write, except repair, which rewrites existing store paths.
-    auto authorizeBuild(const std::optional<std::string> & cert, std::string_view method, uint32_t buildMode)
-        -> grpc::Status
+    struct Caller
     {
-        if (auto status = authorize(cert, method, nixgrpc::Role::write); !status.ok()) {
+        enum class Kind : std::uint8_t { anonymous, named, badToken };
+        std::string name = "-"; // cert CN or oidc:<provider>:<sub>, for logs and metrics
+        std::optional<nixgrpc::Role> role;
+        Kind kind = Kind::anonymous;
+    };
+
+    // Client certificate first, then bearer token, then anonymous.
+    auto identify(const grpc::ServerContext & context) -> Caller
+    {
+        auto cert = nixgrpc::clientCommonName(context);
+        auto token = cert || !oidc ? std::nullopt : nixgrpc::oidc::bearerToken(context);
+        if (!token) {
+            return {
+                .name = cert.value_or("-"),
+                .role = acl.roleFor(cert),
+                .kind = cert ? Caller::Kind::named : Caller::Kind::anonymous};
+        }
+        auto res = oidc->verify(*token);
+        if (!res.identity) {
+            // Details stay in our log. The client learns nothing about providers or keys.
+            nixgrpc::logLine(
+                nixgrpc::LogLevel::info, {{"event", "oidc_rejected"}, {"error", res.error}, {"peer", context.peer()}});
+            return {.kind = Caller::Kind::badToken};
+        }
+        return {.name = res.identity->subject, .role = res.identity->role, .kind = Caller::Kind::named};
+    }
+
+    // Builds need write, except repair, which rewrites existing store paths.
+    static auto authorizeBuild(const Caller & caller, std::string_view method, uint32_t buildMode) -> grpc::Status
+    {
+        if (auto status = authorize(caller, method, nixgrpc::Role::write); !status.ok()) {
             return status;
         }
         if (buildMode == static_cast<uint32_t>(nix::bmRepair)) {
-            return authorize(cert, std::string(method) + "(repair)", nixgrpc::Role::trusted);
+            return authorize(caller, std::string(method) + "(repair)", nixgrpc::Role::trusted);
         }
         return grpc::Status::OK;
     }
 
-    auto authorize(const std::optional<std::string> & cert, std::string_view method, nixgrpc::Role minRole)
-        -> grpc::Status
+    static auto authorize(const Caller & caller, std::string_view method, nixgrpc::Role minRole) -> grpc::Status
     {
-        auto const commonName = cert.value_or("-");
-        auto const role = acl.roleFor(cert);
+        auto const & role = caller.role;
         if (role && *role >= minRole) {
             return grpc::Status::OK;
         }
@@ -262,17 +290,22 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
             nixgrpc::LogLevel::info,
             {{"event", "denied"},
              {"method", std::string(method)},
-             {"cn", commonName},
+             {"cn", caller.name},
              {"role", role ? std::string(nixgrpc::roleName(*role)) : "none"}});
         if (role) {
             return {
                 grpc::StatusCode::PERMISSION_DENIED,
                 "role '" + std::string(nixgrpc::roleName(*role)) + "' may not call " + std::string(method)};
         }
-        if (!cert) {
-            return {grpc::StatusCode::UNAUTHENTICATED, "server requires a TLS client certificate"};
+        switch (caller.kind) {
+        case Caller::Kind::anonymous:
+            return {grpc::StatusCode::UNAUTHENTICATED, "server requires a TLS client certificate or bearer token"};
+        case Caller::Kind::badToken:
+            return {grpc::StatusCode::UNAUTHENTICATED, "bearer token rejected"};
+        case Caller::Kind::named:
+            break;
         }
-        return {grpc::StatusCode::PERMISSION_DENIED, "no access rule matches certificate CN '" + commonName + "'"};
+        return {grpc::StatusCode::PERMISSION_DENIED, "no access rule matches '" + caller.name + "'"};
     }
 
 public:
@@ -283,6 +316,7 @@ public:
         nixgrpc::IdleTracker & idle,
         nixgrpc::LogLevel logLevel,
         nixgrpc::Acl acl,
+        std::optional<nixgrpc::oidc::Verifier> & oidc,
         std::optional<Farm> & farm)
         : socketPath(std::move(socketPath))
         , storeUri(std::move(storeUri))
@@ -290,6 +324,7 @@ public:
         , idle(idle)
         , logLevel(logLevel)
         , acl(std::move(acl))
+        , oidc(oidc)
         , farm(farm)
     {
     }
@@ -300,10 +335,10 @@ public:
             return {grpc::StatusCode::UNIMPLEMENTED, "farm endpoint: pass --eval-store auto and build via BuildDerivation"};
         }
         nixgrpc::IdleTracker::Guard const active(idle);
-        auto const cert = nixgrpc::clientCommonName(*context);
-        auto const commonName = cert.value_or("-");
+        auto const caller = identify(*context);
+        auto const & commonName = caller.name;
         // The opaque worker protocol cannot be inspected here.
-        if (auto status = authorize(cert, "Connect", nixgrpc::Role::trusted); !status.ok()) {
+        if (auto status = authorize(caller, "Connect", nixgrpc::Role::trusted); !status.ok()) {
             return status;
         }
         auto const peer = context->peer();
@@ -355,9 +390,9 @@ public:
         nix::remote::QueryValidPathsReply * reply) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto const cert = nixgrpc::clientCommonName(*context);
-            auto const commonName = cert.value_or("-");
-            if (auto status = authorize(cert, "QueryValidPaths", nixgrpc::Role::readOnly); !status.ok()) {
+            auto const caller = identify(*context);
+            auto const & commonName = caller.name;
+            if (auto status = authorize(caller, "QueryValidPaths", nixgrpc::Role::readOnly); !status.ok()) {
                 return status;
             }
             logDebug(
@@ -386,9 +421,9 @@ public:
         nix::remote::AddMultipleReply * /*reply*/) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto const cert = nixgrpc::clientCommonName(*context);
-            auto const commonName = cert.value_or("-");
-            if (auto status = authorize(cert, "AddMultipleToStore", nixgrpc::Role::write); !status.ok()) {
+            auto const caller = identify(*context);
+            auto const & commonName = caller.name;
+            if (auto status = authorize(caller, "AddMultipleToStore", nixgrpc::Role::write); !status.ok()) {
                 return status;
             }
             auto const peer = context->peer();
@@ -403,7 +438,7 @@ public:
             // The nix-daemon downgrades this to CheckSigs if we are not a
             // trusted user, same as for the tunnelled protocol.
             auto checkSigs = first.check_sigs() ? nix::CheckSigs : nix::NoCheckSigs;
-            if (acl.roleFor(cert) == nixgrpc::Role::write) {
+            if (caller.role == nixgrpc::Role::write) {
                 // write may only import signed paths, no matter how trusted
                 // the proxy's own uid is.
                 repair = nix::NoRepair;
@@ -448,9 +483,9 @@ public:
         nix::remote::QueryPathInfosReply * reply) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto const cert = nixgrpc::clientCommonName(*context);
-            auto const commonName = cert.value_or("-");
-            if (auto status = authorize(cert, "QueryPathInfos", nixgrpc::Role::readOnly); !status.ok()) {
+            auto const caller = identify(*context);
+            auto const & commonName = caller.name;
+            if (auto status = authorize(caller, "QueryPathInfos", nixgrpc::Role::readOnly); !status.ok()) {
                 return status;
             }
             logDebug(
@@ -522,9 +557,9 @@ public:
         nix::remote::QueryMissingReply * reply) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto const cert = nixgrpc::clientCommonName(*context);
-            auto const commonName = cert.value_or("-");
-            if (auto status = authorize(cert, "QueryMissing", nixgrpc::Role::readOnly); !status.ok()) {
+            auto const caller = identify(*context);
+            auto const & commonName = caller.name;
+            if (auto status = authorize(caller, "QueryMissing", nixgrpc::Role::readOnly); !status.ok()) {
                 return status;
             }
             logDebug(
@@ -562,9 +597,9 @@ public:
         nix::remote::StoreInfoReply * reply) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto const cert = nixgrpc::clientCommonName(*context);
-            auto const commonName = cert.value_or("-");
-            if (auto status = authorize(cert, "StoreInfo", nixgrpc::Role::readOnly); !status.ok()) {
+            auto const caller = identify(*context);
+            auto const & commonName = caller.name;
+            if (auto status = authorize(caller, "StoreInfo", nixgrpc::Role::readOnly); !status.ok()) {
                 return status;
             }
             logDebug({{"event", "rpc"}, {"method", "StoreInfo"}, {"cn", commonName}, {"peer", context->peer()}});
@@ -796,9 +831,9 @@ public:
         BuildWriter * writer) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto const cert = nixgrpc::clientCommonName(*context);
-            auto const commonName = cert.value_or("-");
-            if (auto status = authorizeBuild(cert, "BuildDerivation", request->build_mode());
+            auto const caller = identify(*context);
+            auto const & commonName = caller.name;
+            if (auto status = authorizeBuild(caller, "BuildDerivation", request->build_mode());
                 !status.ok()) {
                 return status;
             }
@@ -862,9 +897,9 @@ public:
             if (farm) {
                 return {grpc::StatusCode::UNIMPLEMENTED, "farm endpoint: build per derivation"};
             }
-            auto const cert = nixgrpc::clientCommonName(*context);
-            auto const commonName = cert.value_or("-");
-            if (auto status = authorizeBuild(cert, "BuildPaths", request->build_mode());
+            auto const caller = identify(*context);
+            auto const & commonName = caller.name;
+            if (auto status = authorizeBuild(caller, "BuildPaths", request->build_mode());
                 !status.ok()) {
                 return status;
             }
@@ -950,9 +985,9 @@ public:
         NarFrameWriter * writer) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto const cert = nixgrpc::clientCommonName(*context);
-            auto const commonName = cert.value_or("-");
-            if (auto status = authorize(cert, "FetchNars", nixgrpc::Role::readOnly); !status.ok()) {
+            auto const caller = identify(*context);
+            auto const & commonName = caller.name;
+            if (auto status = authorize(caller, "FetchNars", nixgrpc::Role::readOnly); !status.ok()) {
                 return status;
             }
             auto const start = std::chrono::steady_clock::now();
@@ -1030,6 +1065,7 @@ struct Options
     std::string metricsListen;
     nixgrpc::LogLevel logLevel = nixgrpc::LogLevel::info;
     nixgrpc::Acl acl;
+    std::string oidcConfig;
     FarmConfig farm; // active when niks3Url is set
 };
 
@@ -1082,6 +1118,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.idleTimeout = std::chrono::seconds(*secs);
         } else if (arg == "--log-level") {
             options.logLevel = parseLogLevel(next());
+        } else if (arg == "--oidc-config") {
+            options.oidcConfig = next();
         } else if (arg == "--niks3") {
             options.farm.niks3Url = next();
         } else if (arg == "--niks3-token-file") {
@@ -1114,9 +1152,12 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             argv.end(),
             {"--stdin", "--server-url", options.farm.niks3Url, "--auth-token-path", options.farm.niks3TokenFile});
     }
-    if ((options.acl.active() || options.acl.anonymousRole()) && options.clientCA.empty()) {
-        // Without mTLS every client's CN is "-".
-        throw nix::Error("--allow/--allow-anonymous requires --client-ca");
+    if ((options.acl.active() || options.acl.anonymousRole()) && options.clientCA.empty() && options.oidcConfig.empty()) {
+        throw nix::Error("--allow/--allow-anonymous requires --client-ca or --oidc-config");
+    }
+    if (!options.oidcConfig.empty() && options.tlsCert.empty()) {
+        // Bearer tokens in clear text are replayable by anyone on the path.
+        nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "warning"}, {"msg", "--oidc-config without --tls-cert sends bearer tokens in clear"}});
     }
     if (!options.clientCA.empty() && !options.acl.anonymousRole()) {
         options.acl.requireCertificate();
@@ -1183,6 +1224,16 @@ try {
     if (options.storeUri.empty()) {
         options.storeUri = "unix://" + options.socketPath;
     }
+    std::optional<nixgrpc::oidc::Verifier> oidc;
+    if (!options.oidcConfig.empty()) {
+        auto cfg = nixgrpc::oidc::loadConfig(options.oidcConfig);
+        for (const auto & provider : cfg.providers) {
+            nixgrpc::logLine(
+                nixgrpc::LogLevel::info,
+                {{"event", "oidc_provider"}, {"name", provider.name}, {"issuer", provider.issuer}});
+        }
+        oidc.emplace(std::move(cfg));
+    }
     std::optional<Farm> farm;
     if (!options.farm.niks3Url.empty()) {
         farm.emplace(options.farm);
@@ -1191,7 +1242,7 @@ try {
             {{"event", "farm_mode"}, {"niks3", options.farm.niks3Url}, {"max_jobs", std::to_string(options.farm.maxJobs)}});
     }
     NixRemoteService service(
-        options.socketPath, options.storeUri, metrics, idle, options.logLevel, options.acl, farm);
+        options.socketPath, options.storeUri, metrics, idle, options.logLevel, options.acl, oidc, farm);
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
