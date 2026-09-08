@@ -214,6 +214,49 @@ server-side, so the `write` role suffices. Only operations that tunnel
 the raw worker protocol need `trusted`, and repair builds are treated
 like the rest of the repair surface.
 
+### OIDC bearer tokens
+
+Instead of (or next to) client certificates the daemon accepts
+`authorization: Bearer <jwt>` and maps token claims to the same roles.
+`--oidc-config FILE` takes the JSON schema of
+[niks3](https://github.com/Mic92/niks3)'s `--oidc-config`, so one file
+can serve the cache and the daemon. Scopes map to roles: `read` →
+`read-only`, `write` → `write`, `admin` → `trusted`.
+
+    {
+      "providers": {
+        "github": {
+          "issuer": "https://token.actions.githubusercontent.com",
+          "audience": "grpc://cache.example.com",
+          "rules": [
+            { "bound_subject": ["repo:myorg/*"], "scopes": ["write"] },
+            { "bound_claims": { "ref": ["refs/heads/main"] }, "scopes": ["admin"] }
+          ]
+        },
+        "k8s": {
+          "audience": "grpc://cache.example.com",
+          "ca_file": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+          "bearer_token_file": "/var/run/secrets/kubernetes.io/serviceaccount/token",
+          "bound_claims": { "kubernetes.io.namespace": ["ci"] }
+        }
+      }
+    }
+
+Without `issuer`, it is taken from `bearer_token_file` (Kubernetes
+workload identity). `jwks_url` skips discovery. Signing keys are
+fetched on first use and cached for an hour, so the daemon starts while
+the issuer is down and refuses tokens until it comes back. A presented
+client certificate takes precedence over a token. A verified token that
+matches no rule is denied, it does not fall back to `--allow-anonymous`.
+In logs and metrics the caller shows as `oidc:<provider>:<sub>`.
+
+Clients pass the token with the `token-file` URI parameter or
+`$NIX_GRPC_TOKEN_FILE` (default: `token` next to the default
+`client-cert`). The file is re-read for every call, so rotating it in
+place works. TLS is required.
+
+NixOS: `services.nix-grpc-daemon.oidc = { providers.github = { … }; };`
+
 For host-based access, pair this with a CA that issues certs with the
 host's domain name in the CN, e.g. a
 [step-ca](https://smallstep.com/docs/step-ca/) ACME provisioner with
@@ -248,6 +291,8 @@ which also requires `trustClients` (see above).
     `$NIX_GRPC_CLIENT_CERT`/`$NIX_GRPC_CLIENT_KEY`, then `client.crt`/`client.key`
     in `$XDG_DATA_HOME/nix-grpc-store`, then `/run/nix-grpc-store`, then
     `/var/lib/nix-grpc-store` (unreadable candidates are skipped)
+  * `token-file` — OIDC bearer token, re-read per call. Defaults to
+    `$NIX_GRPC_TOKEN_FILE`, then `token` in the directories above
 
 ## Server flags
 
@@ -255,6 +300,7 @@ which also requires `trustClients` (see above).
   * `--proxy-socket PATH` — nix-daemon socket, default `/nix/var/nix/daemon-socket/socket`
   * `--tls-cert`, `--tls-key`, `--client-ca` — see above
   * `--allow 'cn-pattern=role'`, `--allow-anonymous ROLE` — see access control
+  * `--oidc-config FILE` — accept OIDC bearer tokens, see access control
   * `--metrics-listen ADDR` — serve Prometheus metrics, disabled if unset
   * `--log-level info|debug` — access log verbosity, default `info`
 

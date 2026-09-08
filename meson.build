@@ -111,7 +111,7 @@ executable('nix-grpc-daemon',
   include_directories : gen_inc,
   cpp_args : nix_compat_args,
   # nix-store: native QueryValidPaths / AddMultipleToStore handlers.
-  dependencies : common_deps + prometheus_dep + [nix_util_dep, nix_store_dep, curl_dep, json_dep],
+  dependencies : common_deps + prometheus_dep + [nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep],
   install : true,
 )
 
@@ -126,6 +126,13 @@ test('farm-client', find_program('tests/farm-client-test.sh'),
   args : [farm_client_test, files('tests/farm-mock.py')],
   timeout : 60,
 )
+
+oidc_test = executable('oidc-test',
+  sources : ['tests/oidc-test.cc'],
+  include_directories : include_directories('src'),
+  dependencies : [nix_util_dep, curl_dep, json_dep, openssl_dep, grpc_dep, threads_dep],
+)
+test('oidc', find_program('tests/oidc-test.sh'), args : [oidc_test], timeout : 60)
 
 # --- fuzzers ----------------------------------------------------------------
 
