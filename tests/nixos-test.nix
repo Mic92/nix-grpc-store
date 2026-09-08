@@ -7,9 +7,33 @@
   pkgs,
   nixPkgs,
   module,
+  mockOidc,
 }:
 
 let
+  oidcAudience = "grpc://localhost:50052";
+  # mockoidc serves discovery under /oidc on :8080, tokens are minted on :8081/issue.
+  oidcConfig = (pkgs.formats.json { }).generate "oidc.json" {
+    allow_insecure = true;
+    providers.mock = {
+      issuer = "http://127.0.0.1:8080/oidc";
+      audience = oidcAudience;
+      rules = [
+        {
+          bound_subject = [ "repo:myorg/*" ];
+          scopes = [ "write" ];
+        }
+        {
+          bound_claims.repository_owner = [ "admins" ];
+          scopes = [ "admin" ];
+        }
+        {
+          bound_claims.groups = [ "readers" ];
+          scopes = [ "read" ];
+        }
+      ];
+    };
+  };
   # Certs live under /run so they are freshly generated on every test run
   # (a store path would be cached and eventually expire).
   certDir = "/run/nix-grpc-certs";
@@ -138,7 +162,13 @@ pkgs.testers.runNixOSTest {
         '';
       };
 
-      # Second instance with mTLS enabled (module covers only one; hand-roll).
+      systemd.services.mock-oidc = {
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig.ExecStart = "${lib.getExe mockOidc} -addr 127.0.0.1:8080";
+      };
+
+      # Second instance with mTLS and OIDC (module covers only one; hand-roll).
+      # Not ordered after mock-oidc on purpose: the issuer may be down at boot.
       systemd.services.nix-grpc-daemon-mtls = {
         wantedBy = [ "multi-user.target" ];
         after = [
@@ -151,6 +181,7 @@ pkgs.testers.runNixOSTest {
             --proxy-socket /nix/var/nix/daemon-socket/socket \
             --tls-cert ${certDir}/server.pem --tls-key ${certDir}/server.key \
             --client-ca ${certDir}/ca.pem \
+            --oidc-config ${oidcConfig} \
             --allow localhost=trusted \
             --allow ro-client=read-only \
             --allow rw-client=write \
@@ -383,6 +414,57 @@ pkgs.testers.runNixOSTest {
         machine.succeed(
             "journalctl -u nix-grpc-daemon-mtls.service | "
             "grep -q 'event=denied method=.* cn=stranger role=none'"
+        )
+
+    with subtest("OIDC bearer tokens"):
+        machine.wait_for_unit("mock-oidc.service")
+        machine.wait_for_open_port(8081)
+
+        def token_store(name: str, query: str) -> str:
+            machine.succeed(
+                f"curl -sfG 'http://127.0.0.1:8081/issue' --data-urlencode 'aud=${oidcAudience}' {query} > /root/{name}.jwt",
+                f"test -s /root/{name}.jwt",
+            )
+            return f"grpc://localhost:50052?ca-cert=${certDir}/ca.pem&token-file=/root/{name}.jwt"
+
+        writer = token_store("writer", "--data-urlencode 'sub=repo:myorg/x:ref:refs/heads/dev'")
+        admin = token_store("admin", "--data-urlencode sub=someone --data-urlencode repository_owner=admins")
+        reader = token_store("reader", "--data-urlencode sub=someone --data-urlencode 'claims={\"groups\":[\"readers\"]}'")
+        nobody = token_store("nobody", "--data-urlencode 'sub=repo:other/x:y'")
+        machine.succeed(
+            "curl -sfG 'http://127.0.0.1:8081/issue' --data-urlencode aud=elsewhere "
+            "--data-urlencode 'sub=repo:myorg/x:y' > /root/wrongaud.jwt"
+        )
+        wrongaud = "grpc://localhost:50052?ca-cert=${certDir}/ca.pem&token-file=/root/wrongaud.jwt"
+
+        # read scope: query yes, build no
+        machine.succeed(f"nix path-info --store '{reader}' '{p}'")
+        machine.fail(f"nix build --store '{reader}' --impure -f /etc/hello.nix --no-link")
+        # write scope: native build works, the tunnel (trusted) does not
+        machine.succeed(
+            "printf 'derivation { name = \"oidc-blob\"; system = builtins.currentSystem; "
+            "builder = \"/bin/sh\"; args = [ \"-c\" \"echo oidc > $out\" ]; }' > /root/oidc.nix"
+        )
+        machine.succeed(f"nix build --store '{writer}' --eval-store auto --impure -f /root/oidc.nix --no-link")
+        machine.fail(f"nix store add --store '{writer}' /root/denyfile")
+        # admin scope: tunnel works
+        machine.succeed(f"nix store add --store '{admin}' /etc/hello.nix")
+        # verified but no rule: a named nobody is denied even where anonymous may read
+        err = machine.fail(f"nix path-info --store '{nobody}' '{p}' 2>&1")
+        assert "no access rule matches 'oidc:mock:repo:other/x:y'" in err, err
+        # bad audience: rejected without detail to the client, detail in our log
+        err = machine.fail(f"nix path-info --store '{wrongaud}' '{p}' 2>&1")
+        assert "bearer token rejected" in err, err
+        machine.succeed("journalctl -u nix-grpc-daemon-mtls.service | grep -q 'event=oidc_rejected.*audience'")
+        machine.succeed("echo garbage > /root/garbage.jwt")
+        machine.fail(
+            f"nix path-info --store 'grpc://localhost:50052?ca-cert=${certDir}/ca.pem&token-file=/root/garbage.jwt' '{p}'"
+        )
+        # a client cert wins over the token
+        with_cert = cert_store("client") + "&token-file=/root/reader.jwt"
+        machine.succeed(f"nix store add --store '{with_cert}' /etc/hello.nix")
+        machine.succeed(
+            "journalctl -u nix-grpc-daemon-mtls.service | grep -q 'method=BuildPaths cn=oidc:mock:repo:myorg/x'"
         )
 
     with subtest("access log attributes clients by certificate CN"):
