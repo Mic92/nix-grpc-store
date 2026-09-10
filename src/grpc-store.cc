@@ -734,19 +734,27 @@ private:
                 }
                 batch.swap(infoBatch);
             }
+            StorePathSet paths;
+            for (const auto & [path, callback] : batch) {
+                paths.insert(path);
+            }
+            PathInfoMap infos;
             try {
-                StorePathSet paths;
-                for (const auto & [path, callback] : batch) {
-                    paths.insert(path);
-                }
-                auto infos = queryPathInfosNative(paths);
-                for (auto & [path, callback] : batch) {
-                    auto found = infos.find(path);
-                    callback(found == infos.end() ? nullptr : found->second);
-                }
+                infos = queryPathInfosNative(paths);
             } catch (...) {
                 for (auto & [path, callback] : batch) {
                     callback.rethrow();
+                }
+                continue;
+            }
+            // Each callback fires exactly once. One that throws must not
+            // take the worker down or re-fire the others.
+            for (auto & [path, callback] : batch) {
+                auto found = infos.find(path);
+                try {
+                    callback(found == infos.end() ? nullptr : found->second);
+                } catch (...) {
+                    ignoreExceptionExceptInterrupt();
                 }
             }
         }

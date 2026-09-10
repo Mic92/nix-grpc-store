@@ -83,8 +83,9 @@ inline auto sdWatchdogInterval() -> std::chrono::microseconds
     return std::chrono::microseconds(usec.value_or(0) / 2);
 }
 
-// The threads live until process exit. After Server::Shutdown() the acceptor
-// drops new connections itself.
+// The threads live until process exit: the listen fds belong to systemd and
+// must not be shut down. After Server::Shutdown() the acceptor drops new
+// connections itself.
 inline void
 acceptInto(const std::vector<int> & listenFds, const std::shared_ptr<grpc::experimental::ExternalConnectionAcceptor> & acceptor)
 {
@@ -94,7 +95,10 @@ acceptInto(const std::vector<int> & listenFds, const std::shared_ptr<grpc::exper
                 // No accept4 on macOS.
                 int const conn = ::accept(listenFd, nullptr, nullptr);
                 if (conn < 0) {
-                    continue;
+                    if (errno == EINTR || errno == ECONNABORTED || errno == EMFILE || errno == ENFILE) {
+                        continue;
+                    }
+                    return;
                 }
                 // NOLINTBEGIN(cppcoreguidelines-pro-type-vararg): C API.
                 ::fcntl(conn, F_SETFD, FD_CLOEXEC);
