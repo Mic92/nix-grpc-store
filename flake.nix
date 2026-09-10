@@ -3,12 +3,16 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Build farm mode (PLAN.md). Only the NixOS test uses it.
+    niks3.url = "github:Mic92/niks3/build-farm";
+    niks3.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
     {
       self,
       nixpkgs,
+      niks3,
     }:
     let
       lib = nixpkgs.lib;
@@ -18,16 +22,17 @@
       nixGitPin = lib.importJSON ./nix-git.json;
       nixGitFor =
         pkgs:
-        ((pkgs.nixVersions.nixComponents_git.overrideSource (
-          pkgs.fetchFromGitHub {
-            inherit (nixGitPin)
-              owner
-              repo
-              rev
-              hash
-              ;
-          }
-        )).overrideScope
+        (
+          (pkgs.nixVersions.nixComponents_git.overrideSource (
+            pkgs.fetchFromGitHub {
+              inherit (nixGitPin)
+                owner
+                repo
+                rev
+                hash
+                ;
+            }
+          )).overrideScope
           (
             _final: prev: {
               inherit (nixGitPin) version;
@@ -88,6 +93,7 @@
 
       nixosModules = {
         server = ./nixos/server.nix;
+        lb = ./nixos/lb.nix;
         # Reuse the flake's package set so hosts get the same derivations as
         # `nix build` instead of rebuilding the plugins per machine.
         client =
@@ -99,6 +105,7 @@
         default.imports = [
           self.nixosModules.server
           self.nixosModules.client
+          self.nixosModules.lb
         ];
       };
 
@@ -111,6 +118,7 @@
           packages = self.packages.${system};
           nixPackages = nixPackagesFor nixpkgs.legacyPackages.${system};
           nixosModule = self.nixosModules.default;
+          inherit niks3;
         }
       );
 
