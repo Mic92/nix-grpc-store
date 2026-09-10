@@ -43,6 +43,7 @@
 #include <nix/util/serialise.hh>
 #include <nix/util/strings.hh>
 #include <nix/util/types.hh>
+#include <nix/util/signals.hh>
 #include <nix/util/util.hh>
 #include <openssl/bio.h>
 #include <openssl/crypto.h>
@@ -432,8 +433,7 @@ public:
     }
 
     // Same: keep read-only clients off the tunnel.
-    // RemoteStore asks the daemon even with an eval store, which needs
-    // Connect. Static outputs suffice as floating CA is unsupported here.
+    // RemoteStore would tunnel this even with an eval store at hand.
     auto queryPartialDerivationOutputMap(const StorePath & path, Store * evalStore)
         -> std::map<std::string, std::optional<StorePath>> override {
       if (evalStore != nullptr && evalStore != this) {
@@ -594,7 +594,11 @@ public:
 
     static constexpr unsigned unavailableRetries = 5;
 
-    // Farm workers are picked by the load balancer from these headers.
+    static auto firstLine(const std::string & msg) -> std::string {
+      return msg.substr(0, msg.find('\n'));
+    }
+
+    // What the load balancer routes on.
     auto routingFor(const StorePath & drvPath, const BasicDerivation & drv) -> Metadata {
       return {{"x-nix-drv", std::string(drvPath.hashPart())},
               {"x-nix-system", drv.platform},
@@ -635,12 +639,13 @@ public:
       addMultipleToStoreRouted(std::move(sources), act, NoRepair, CheckSigs, headers);
     }
 
-    // One RPC per build: log lines stream during the build, the result
-    // arrives with the output path infos so no follow-up queries are needed.
+    // Log lines stream, the result carries the output path infos.
     auto tryBuildDerivation(const remote::BuildDerivationRequest & request, const Metadata & headers,
                             std::optional<BuildResult> & res) -> grpc::Status {
       grpc::ClientContext ctx;
       addHeaders(ctx, headers);
+      // ^C cancels the stream so the worker stops the build at once.
+      auto const onInterrupt = createInterruptCallback([&ctx]() -> void { ctx.TryCancel(); });
       auto reader = stub->BuildDerivation(&ctx, request);
 
       PathInfoMap infos;
@@ -683,22 +688,25 @@ public:
 
       auto headers = routingFor(drvPath, drv);
       std::optional<BuildResult> res;
-      auto status = tryBuildDerivation(request, headers, res);
-      if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
-        if (evalStore == nullptr) {
-          throw Error("farm worker lacks '%s'\nhint: pass --eval-store auto",
-                      printStorePath(drvPath));
+      grpc::Status status;
+      for (unsigned attempt = 0;; attempt++) {
+        status = tryBuildDerivation(request, headers, res);
+        if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
+          if (evalStore == nullptr) {
+            throw Error("farm worker lacks '%s'\nhint: pass --eval-store auto",
+                        printStorePath(drvPath));
+          }
+          uploadDrvClosure(*evalStore, drvPath, headers);
+          status = tryBuildDerivation(request, headers, res);
         }
-        uploadDrvClosure(*evalStore, drvPath, headers);
-        status = tryBuildDerivation(request, headers, res);
-      }
-      // Worker drained or lost its claim. The balancer picks another.
-      for (unsigned attempt = 1; attempt <= unavailableRetries
-                                 && status.error_code() == grpc::StatusCode::UNAVAILABLE;
-           attempt++) {
-        printError("%s, retrying", status.error_message());
-        std::this_thread::sleep_for(std::chrono::seconds(attempt));
-        status = tryBuildDerivation(request, headers, res);
+        // Salt the hash header so a consistent-hashing balancer picks another worker.
+        if (status.error_code() != grpc::StatusCode::UNAVAILABLE
+            || attempt == unavailableRetries) {
+          break;
+        }
+        printError("%s, retrying elsewhere", firstLine(status.error_message()));
+        std::this_thread::sleep_for(std::chrono::seconds(attempt + 1));
+        headers.front().second = std::string(drvPath.hashPart()) + "-" + std::to_string(attempt + 1);
       }
       checkStatus(status, "BuildDerivation");
       if (!res) {
@@ -767,15 +775,20 @@ public:
       }
     };
 
-    // Runs on a fan-out thread: nothing may escape, or the process terminates.
+    // Runs on a fan-out thread, nothing may escape.
     auto runFarmJob(FarmJob & job, BuildMode buildMode, Store & evalStore) -> BuildResult {
       using nixcompat::FailureStatus;
       if (job.failedInput) {
         return nixcompat::failed(FailureStatus::DependencyFailed,
                                  fmt("dependency '%s' failed", job.failedInput->to_string()));
       }
+      if (isInterrupted()) {
+        return nixcompat::failed(FailureStatus::MiscFailure, "interrupted");
+      }
       try {
         return buildDerivationNative(job.drvPath, job.drv, buildMode, &evalStore);
+      } catch (Interrupted &) {
+        return nixcompat::failed(FailureStatus::MiscFailure, "interrupted");
       } catch (Error & err) {
         return nixcompat::failed(FailureStatus::MiscFailure, err.msg());
       } catch (std::exception & err) {
@@ -812,6 +825,7 @@ public:
           thread = std::jthread(worker);
         }
       }
+      checkInterrupt();
 
       std::vector<KeyedBuildResult> results;
       results.reserve(reqs.size());

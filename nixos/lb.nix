@@ -38,10 +38,18 @@ let
         };
       };
     };
+    # Eject a worker that keeps bouncing builds (UNAVAILABLE counts as 5xx).
+    outlier_detection = {
+      consecutive_5xx = 3;
+      base_ejection_time = "30s";
+      max_ejection_percent = 50;
+    };
     health_checks = [
       {
         timeout = "2s";
         interval = "5s";
+        # Farms idle between evaluations. Keep checking.
+        no_traffic_interval = "5s";
         unhealthy_threshold = 2;
         healthy_threshold = 1;
         grpc_health_check = { };
@@ -104,6 +112,12 @@ in
       description = "Cluster for requests without or with an unknown `x-nix-system` (store queries, uploads, `builtin`).";
     };
 
+    admin = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = "127.0.0.1:9901";
+      description = "Envoy admin listener (`/clusters`, `/stats`), or null.";
+    };
+
     maxStreams = lib.mkOption {
       type = lib.types.ints.positive;
       default = 1024;
@@ -118,6 +132,7 @@ in
       # Validation resolves STRICT_DNS names, which the build sandbox cannot.
       requireValidConfig = false;
       settings = {
+        admin = lib.mkIf (cfg.admin != null) { address = (endpoint cfg.admin).endpoint.address; };
         static_resources = {
           listeners = [
             {
