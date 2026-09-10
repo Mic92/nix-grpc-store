@@ -15,7 +15,10 @@
 #include <cstdio>
 #include <grpc/grpc.h>
 #include <grpc/impl/channel_arg_names.h>
+#include <grpcpp/security/auth_context.h>
 #include <grpcpp/security/credentials.h>
+#include <grpcpp/support/config.h>
+#include <grpcpp/support/string_ref.h>
 #include <grpcpp/support/channel_arguments.h>
 #include <grpcpp/support/status.h>
 #include <atomic>
@@ -147,6 +150,32 @@ auto defaultClientCred(const char *envVar, const std::string &fileName) -> std::
   return firstReadable(candidates);
 }
 
+// Reads the token per call so k8s projected volumes and CI refreshers work.
+class TokenFileCredentials final : public grpc::MetadataCredentialsPlugin {
+  std::string path;
+
+public:
+  explicit TokenFileCredentials(std::string path) : path(std::move(path)) {}
+
+  [[nodiscard]] auto IsBlocking() const -> bool override { return true; }
+  auto DebugString() -> std::string override { return "TokenFile(" + path + ")"; }
+
+  auto GetMetadata(grpc::string_ref /*serviceUrl*/, grpc::string_ref /*methodName*/,
+                   const grpc::AuthContext & /*channelAuthContext*/,
+                   std::multimap<grpc::string, grpc::string> * metadata) -> grpc::Status override {
+    try {
+      auto token = nix::chomp(nix::readFile(path));
+      if (token.empty() || token.find_first_of("\r\n") != std::string::npos) {
+        return {grpc::StatusCode::UNAUTHENTICATED, "token file '" + path + "' is empty or multi-line"};
+      }
+      metadata->emplace("authorization", "Bearer " + token);
+      return grpc::Status::OK;
+    } catch (std::exception & err) {
+      return {grpc::StatusCode::UNAUTHENTICATED, std::string("reading token file: ") + err.what()};
+    }
+  }
+};
+
 // grpc_shutdown() is asynchronous, so gRPC worker threads can still touch
 // OpenSSL while its atexit cleanup frees global state (SIGSEGV on Darwin
 // with short-lived clients). Hold one reference for the process lifetime and
@@ -205,6 +234,14 @@ private:
         "client-key",
         "Path to the PEM private key for `client-cert`. Defaults to "
         "`$NIX_GRPC_CLIENT_KEY`, then `client.key` next to the default `client-cert`."};
+
+    Setting<std::string> tokenFile{
+        this,
+        "",
+        "token-file",
+        "File holding an OIDC bearer token, re-read for every call so it may be "
+        "rotated in place. Defaults to `$NIX_GRPC_TOKEN_FILE`, then `token` next to "
+        "the default `client-cert`. Requires TLS."};
 
     static constexpr unsigned defaultMaxBuilds = 64;
     Setting<unsigned> maxBuilds{
@@ -303,6 +340,9 @@ public:
               [this] -> std::shared_ptr<grpc::Channel> { return makeChannel(true); },
               config->authority.to_string(), config->narConnections} {
       if (config->insecure) {
+        if (!config->tokenFile.get().empty()) {
+          throw Error("gRPC store '%s': token-file needs TLS", config->authority.to_string());
+        }
         creds = grpc::InsecureChannelCredentials();
       } else {
         grpc::SslCredentialsOptions ssl;
@@ -326,6 +366,15 @@ public:
           haveClientCert = true;
         }
         creds = grpc::SslCredentials(ssl);
+        auto tokenFile = config->tokenFile.get();
+        if (tokenFile.empty()) {
+          tokenFile = defaultClientCred("NIX_GRPC_TOKEN_FILE", "token");
+        }
+        if (!tokenFile.empty()) {
+          creds = grpc::CompositeChannelCredentials(
+              creds, grpc::MetadataCredentialsFromPlugin(std::make_unique<TokenFileCredentials>(tokenFile)));
+          haveClientCert = true;
+        }
       }
 
       stub = remote::NixRemote::NewStub(makeChannel(false));

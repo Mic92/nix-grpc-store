@@ -35,6 +35,8 @@ stdenv.mkDerivation {
       ./tests/farm-mock.py
       ./tests/farm-client-test.cc
       ./tests/farm-client-test.sh
+      ./tests/oidc-test.cc
+      ./tests/oidc-test.sh
     ];
   };
 
