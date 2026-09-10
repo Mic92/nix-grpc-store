@@ -15,6 +15,9 @@ prometheus_dep = [dependency('prometheus-cpp-core'), dependency('prometheus-cpp-
 
 nix_store_dep = dependency('nix-store')
 nix_util_dep  = dependency('nix-util')
+# Farm mode: niks3 claims over HTTPS, niks3 push acks as JSON lines.
+curl_dep = dependency('libcurl')
+json_dep = dependency('nlohmann_json')
 
 # Pre-release versions look like "2.35pre20260619_f8bb823a".
 nix_ver = nix_store_dep.version().split('.')
@@ -108,8 +111,20 @@ executable('nix-grpc-daemon',
   include_directories : gen_inc,
   cpp_args : nix_compat_args,
   # nix-store: native QueryValidPaths / AddMultipleToStore handlers.
-  dependencies : common_deps + prometheus_dep + [nix_util_dep, nix_store_dep],
+  dependencies : common_deps + prometheus_dep + [nix_util_dep, nix_store_dep, curl_dep, json_dep],
   install : true,
+)
+
+# --- tests ------------------------------------------------------------------
+
+farm_client_test = executable('farm-client-test',
+  sources : ['tests/farm-client-test.cc'],
+  include_directories : include_directories('src'),
+  dependencies : [nix_util_dep, curl_dep, json_dep, threads_dep],
+)
+test('farm-client', find_program('tests/farm-client-test.sh'),
+  args : [farm_client_test, files('tests/farm-mock.py')],
+  timeout : 60,
 )
 
 # --- fuzzers ----------------------------------------------------------------
