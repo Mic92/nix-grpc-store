@@ -280,7 +280,9 @@ public:
             throw nix::Error("curl_easy_init failed");
         }
         constexpr long timeoutSecs = 30;
-        header("Authorization: Bearer " + bearer);
+        if (!bearer.empty()) {
+            header("Authorization: Bearer " + bearer);
+        }
         if (body) {
             payload = body->dump();
             header("Content-Type: application/json");
