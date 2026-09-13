@@ -215,7 +215,7 @@ inline auto ok(long status) -> bool
 }
 
 // NOLINTBEGIN(cppcoreguidelines-pro-type-vararg): curl_easy_* are vararg.
-// One prepared request. Callbacks run inside C frames and must not throw.
+// Callbacks run inside C frames and must not throw.
 class Call
 {
     struct CurlDeleter
@@ -295,7 +295,7 @@ public:
         opt(CURLOPT_WRITEDATA, &body_);
     }
 
-    // Returns the HTTP status. Throws on transport errors.
+    // HTTP status, throws on transport errors.
     auto perform() -> long
     {
         auto code = curl_easy_perform(curl.get());
@@ -333,7 +333,6 @@ public:
 private:
     using Clock = std::chrono::steady_clock;
 
-    // Immutable after construction, read by the stream thread without locking.
     const std::string baseUrl;
     const std::string bearer;
     const Clock::duration heartbeat;
@@ -347,14 +346,14 @@ private:
         Clock::time_point lastSeen = Clock::now();
         std::chrono::seconds retryAfter{};
         bool stop = false;
+        bool released = false;
 
         [[nodiscard]] auto decided() const -> bool
         {
             return status == Status::built || status == Status::failed;
         }
 
-        // A waiter losing niks3 costs nothing, so it may back off for a long
-        // time. A holder is fenced after 3 heartbeats and must not outlive that.
+        // A holder is fenced after 3 heartbeats, a waiter can afford patience.
         [[nodiscard]] auto giveUpAfter(Clock::duration heartbeat) const -> Clock::duration
         {
             constexpr int waiterPatience = 60;
@@ -365,8 +364,7 @@ private:
     nix::Sync<State> state_;
     std::condition_variable cv;
 
-    // Declared last: starts after, and is joined before, everything above.
-    std::thread streamThread;
+    std::thread streamThread; // last: joined before the rest goes
 
     void onLine(std::string_view line)
     {
@@ -507,17 +505,28 @@ public:
     auto operator=(const Claim &) -> Claim & = delete;
     auto operator=(Claim &&) -> Claim & = delete;
 
-    // Closing the stream is enough: niks3 releases a held claim when the
-    // holder's connection drops, so early returns need no explicit fail().
+    // niks3 keeps the row when the stream drops, so a holder hands it back.
     ~Claim()
     {
+        bool held = false;
+        {
+            auto state(state_.lock());
+            held = state->status == Status::build && !state->released;
+        }
+        if (held) {
+            try {
+                fail("");
+            } catch (...) {
+                nix::ignoreExceptionInDestructor();
+            }
+        }
         halt();
         if (streamThread.joinable()) {
             streamThread.join();
         }
     }
 
-    // First word from niks3, possibly `wait`.
+    // Possibly `wait`.
     auto first() -> Status
     {
         return waitFor([](const State & state) -> bool { return state.status != Status::pending; });
@@ -539,16 +548,22 @@ public:
         return state_.lock()->kind;
     }
 
-    // Held, then silent for 3 heartbeats: abandon the build.
+    // Held, then silent for 3 heartbeats.
     auto lost() -> bool
     {
         auto state(state_.lock());
         return state->status == Status::build && state->stop;
     }
 
+    void published()
+    {
+        state_.lock()->released = true;
+    }
+
     // Empty kind = transient. False on stale token.
     auto fail(const std::string & kind) -> bool
     {
+        state_.lock()->released = true;
         http::Call call(baseUrl + "/api/builds/fail", bearer, nlohmann::json{{"claim_token", token()}, {"kind", kind}});
         auto status = call.perform();
         halt();
