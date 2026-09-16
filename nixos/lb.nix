@@ -257,6 +257,10 @@ in
         message = "services.nix-grpc-farm-lb.tls.upstream.{certFile,keyFile,caFile} go together";
       }
     ];
+    # restart in one step instead of stop ... activate ... start, so a
+    # deploy is a sub-second blip that the client's connect retry absorbs.
+    systemd.services.envoy.stopIfChanged = false;
+
     services.envoy = {
       enable = true;
       package = lib.mkDefault pkgs.envoy-bin;

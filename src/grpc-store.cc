@@ -272,6 +272,10 @@ private:
 
     Setting<bool> insecure{this, false, "insecure", "Use plaintext instead of TLS. Only for local testing."};
 
+    static constexpr unsigned defaultConnectTimeout = 30;
+    Setting<unsigned int> connectTimeout{this, defaultConnectTimeout, "connect-timeout",
+        "Seconds the first call waits for the server to become reachable before failing."};
+
     Setting<std::string> routeSystem{this, "", "system",
         "Send `x-nix-system: VALUE` on every call, not only on builds. Use one "
         "`nix.buildMachines` entry per system behind a balancer so input uploads "
@@ -598,15 +602,36 @@ public:
     }
 
     // The build hook probes reachability at store open. One StoreInfo RPC
-    // answers it and caches the trust flag, no tunnel needed.
+    // answers it and caches the trust flag, no tunnel needed. TCP-level
+    // failures are retried for connect-timeout so a balancer or worker
+    // restart does not fail the build; TLS rejections fail at once.
     void connect() override { isTrustedClient(); }
+
+    static auto transportDown(const grpc::Status & status) -> bool {
+      auto const & msg = status.error_message();
+      return status.error_code() == grpc::StatusCode::UNAVAILABLE &&
+             (msg.contains("Connection refused") || msg.contains("Connection reset") ||
+              msg.contains("No route") || msg.contains("unreachable") || msg.contains("GOAWAY"));
+    }
 
     auto isTrustedClient() -> std::optional<TrustedFlag> override {
       std::call_once(trustedOnce, [&]() -> void {
-        grpc::ClientContext ctx;
         remote::StoreInfoRequest const request;
         remote::StoreInfoReply reply;
-        checkStatus(stub->StoreInfo(&ctx, request, &reply), "StoreInfo");
+        auto giveUp = std::chrono::steady_clock::now() + std::chrono::seconds(config->connectTimeout.get());
+        auto pause = std::chrono::milliseconds(500); // NOLINT(*-magic-numbers)
+        grpc::Status status;
+        for (;;) {
+          grpc::ClientContext ctx;
+          status = stub->StoreInfo(&ctx, request, &reply);
+          if (!transportDown(status) || std::chrono::steady_clock::now() + pause > giveUp) {
+            break;
+          }
+          printError("%s: %s, retrying", config->authority.to_string(), firstLine(status.error_message()));
+          std::this_thread::sleep_for(pause);
+          pause = std::min(pause * 2, std::chrono::milliseconds(4000)); // NOLINT(*-magic-numbers)
+        }
+        checkStatus(status, "StoreInfo");
         if (reply.has_trusted()) {
           trusted = reply.trusted() ? Trusted : NotTrusted;
         }
