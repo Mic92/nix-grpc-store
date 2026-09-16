@@ -144,6 +144,25 @@ void testClaims(Suite & tst, const nixgrpc::Niks3 & niks3)
         tst.check(holder->lost(), "claim lost after 3 silent heartbeats");
         tst.post("/_mock/freeze", {{"frozen", false}});
     }
+    {
+        auto holder = niks3.claim({"g.narinfo"}, {});
+        tst.check(holder->await() == Status::build, "g: holder");
+        auto waiter = niks3.claim({"g.narinfo"}, {});
+        tst.check(waiter->first() == Status::wait, "g: second claim waits");
+        bool stop = false;
+        std::thread canceller([&]() -> void {
+            std::this_thread::sleep_for(settle);
+            stop = true;
+        });
+        bool cancelled = false;
+        try {
+            waiter->await([&]() -> bool { return stop; });
+        } catch (nixgrpc::CancelledWait &) {
+            cancelled = true;
+        }
+        canceller.join();
+        tst.check(cancelled, "await returns once cancelled while another worker holds the claim");
+    }
 }
 
 void testPush(Suite & tst, nixgrpc::PushProcess & push)
@@ -165,6 +184,24 @@ void testPush(Suite & tst, nixgrpc::PushProcess & push)
     // The child dies mid-request: the waiter fails, the next request respawns.
     tst.check(throws("/nix/store/crash") == "error", "dead child fails the waiter");
     tst.check(throws("/nix/store/z") == "ok", "child is respawned");
+    {
+        bool stop = false;
+        std::thread canceller([&]() -> void {
+            std::this_thread::sleep_for(settle);
+            stop = true;
+        });
+        std::string got = "ok";
+        try {
+            push.pushWait({"/nix/store/hang"}, 1, [&]() -> bool { return stop; });
+        } catch (nixgrpc::CancelledWait &) {
+            got = "cancelled";
+        } catch (nix::Error &) {
+            got = "error";
+        }
+        canceller.join();
+        tst.check(got == "cancelled", "pushWait returns once cancelled while niks3 never acks");
+        tst.check(throws("/nix/store/z2") == "ok", "push usable after a cancelled wait");
+    }
     tst.check(
         tst.countLog([](const nlohmann::json & entry) -> bool {
             return entry.value("ev", "") == "push" && entry.value("claim_token", int64_t{0}) == someToken

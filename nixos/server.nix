@@ -392,8 +392,6 @@ in
         );
         # Builds run in nix-daemon. This only bounds the proxy.
         MemoryMax = lib.mkDefault "2G";
-        # A farm worker holds claims for running builds.
-        TimeoutStopSec = lib.mkIf cfg.farm.enable "infinity";
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         ProtectHome = true;

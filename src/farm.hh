@@ -6,7 +6,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <future>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -37,6 +37,21 @@ struct StaleClaim : nix::Error
 {
     using nix::Error::Error;
 };
+
+// Polled about once a second by blocking waits so a gone client or a
+// daemon shutdown does not pin a handler thread forever.
+using Cancelled = std::function<bool()>;
+constexpr std::chrono::seconds cancelPoll{1};
+
+struct CancelledWait : nix::Error
+{
+    using nix::Error::Error;
+};
+
+inline auto never() -> bool
+{
+    return false;
+}
 
 // One long-lived `niks3 push --stdin`. A build writes a request line naming
 // its outputs and claim token and blocks until every output was acked.
@@ -80,7 +95,7 @@ public:
     }
 
     // Returns after niks3 committed all of `paths`. StaleClaim if superseded.
-    void pushWait(const std::vector<std::string> & paths, int64_t claimToken)
+    void pushWait(const std::vector<std::string> & paths, int64_t claimToken, const Cancelled & cancelled = never)
     {
         auto pending = std::make_shared<Pending>(paths.size());
         {
@@ -99,7 +114,14 @@ public:
                 throw;
             }
         }
-        auto [status, message] = pending->result.get_future().get();
+        auto [status, message] = pending->wait(cancelled);
+        if (status == "cancelled") {
+            auto lck = state.lock();
+            for (const auto & path : paths) {
+                lck->waiting.erase(path);
+            }
+            throw CancelledWait("niks3 push: %s", message);
+        }
         if (status == "stale") {
             throw StaleClaim("niks3 push: claim superseded, outputs not published");
         }
@@ -109,26 +131,51 @@ public:
     }
 
 private:
+    // ack() runs under the State lock, wait() under its own.
     struct Pending
     {
-        size_t left;
-        std::pair<std::string, std::string> worst{"ok", ""};
-        std::promise<std::pair<std::string, std::string>> result;
+        using Result = std::pair<std::string, std::string>;
 
         explicit Pending(size_t count)
-            : left(count)
+            : sync(Inner{.left = count})
         {
         }
 
         void ack(const std::string & status, const std::string & message)
         {
-            if (status != "ok" && worst.first != "stale") {
-                worst = {status, message};
+            auto inner = sync.lock();
+            if (status != "ok" && inner->worst.first != "stale") {
+                inner->worst = {status, message};
             }
-            if (--left == 0) {
-                result.set_value(worst);
+            if (inner->left == 0) {
+                return;
+            }
+            inner->left--;
+            if (inner->left == 0) {
+                done.notify_all();
             }
         }
+
+        auto wait(const Cancelled & cancelled) -> Result
+        {
+            auto inner = sync.lock();
+            while (inner->left > 0) {
+                if (cancelled()) {
+                    return {"cancelled", "gave up waiting for niks3 push"};
+                }
+                inner.wait_for(done, cancelPoll, []() -> bool { return false; });
+            }
+            return inner->worst;
+        }
+
+    private:
+        struct Inner
+        {
+            size_t left;
+            Result worst{"ok", ""};
+        };
+        nix::Sync<Inner> sync;
+        std::condition_variable done;
     };
 
     struct State
@@ -449,11 +496,14 @@ private:
     }
 
     template<typename Pred>
-    auto waitFor(Pred done) -> Status
+    auto waitFor(Pred done, const Cancelled & cancelled) -> Status
     {
         auto state(state_.lock());
         while (!done(*state) && !state->stop) {
-            state.wait(cv);
+            if (cancelled()) {
+                throw CancelledWait("gave up waiting for niks3 claim");
+            }
+            state.wait_for(cv, cancelPoll, []() -> bool { return false; });
         }
         if (!done(*state)) {
             throw nix::Error("niks3 claim stream lost before a decision");
@@ -529,15 +579,16 @@ public:
     }
 
     // Possibly `wait`.
-    auto first() -> Status
+    auto first(const Cancelled & cancelled = never) -> Status
     {
-        return waitFor([](const State & state) -> bool { return state.status != Status::pending; });
+        return waitFor([](const State & state) -> bool { return state.status != Status::pending; }, cancelled);
     }
 
     // build, built or failed.
-    auto await() -> Status
+    auto await(const Cancelled & cancelled = never) -> Status
     {
-        return waitFor([](const State & state) -> bool { return state.status == Status::build || state.decided(); });
+        return waitFor(
+            [](const State & state) -> bool { return state.status == Status::build || state.decided(); }, cancelled);
     }
 
     auto token() -> int64_t

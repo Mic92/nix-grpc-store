@@ -222,6 +222,8 @@ def push_result(line: str) -> list[dict[str, Any]]:
     else:
         paths, tok = [line], 0
     S.record(ev="push", paths=paths, claim_token=tok)
+    if any("hang" in p for p in paths):
+        return []
     time.sleep(HB)
     if any("fail" in p for p in paths):
         status, msg = "error", "push failed"

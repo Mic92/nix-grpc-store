@@ -342,6 +342,18 @@ pkgs.testers.runNixOSTest {
         client.succeed("systemctl kill -s INT intr")
         retry(lambda _: not building(), timeout_seconds=20)
 
+    with subtest("stopping a worker mid-build is prompt and the client retries elsewhere"):
+        client.succeed(f"systemd-run --unit stopme nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag stopme")
+        retry(lambda _: building(), timeout_seconds=60)
+        busy = worker1 if worker1.execute(builder)[0] == 0 else worker2
+        other = worker2 if busy is worker1 else worker1
+        busy.succeed("timeout 30 systemctl stop nix-grpc-daemon.socket nix-grpc-daemon.service")
+        busy.fail(builder)
+        retry(lambda _: other.execute(builder)[0] == 0, timeout_seconds=90)
+        busy.succeed("systemctl start nix-grpc-daemon.socket")
+        client.succeed("systemctl kill -s INT stopme")
+        retry(lambda _: not building(), timeout_seconds=20)
+
     with subtest("low disk drains a worker and builds go to the other"):
         # Leave less than minFree on worker1.
         worker1.succeed("fallocate -l $(( $(df --output=avail -B1 /nix/store | tail -1) - 100*1024*1024 )) /nix/.rw-store/fill")

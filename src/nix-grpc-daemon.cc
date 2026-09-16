@@ -95,6 +95,8 @@ using BuildWriter = grpc::ServerWriter<nix::remote::BuildDerivationChunk>;
 using BuildPathsWriter = grpc::ServerWriter<nix::remote::BuildPathsChunk>;
 
 namespace {
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): signal handler.
+volatile std::sig_atomic_t stopSignal = 0;
 
 struct FarmConfig
 {
@@ -222,6 +224,8 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         nixgrpc::IdleTracker::Guard const active(idle);
         try {
             return std::forward<F>(func)();
+        } catch (nixgrpc::CancelledWait & err) {
+            return {grpc::StatusCode::UNAVAILABLE, err.what()};
         } catch (std::exception & err) {
             nixgrpc::logLine(
                 nixgrpc::LogLevel::info, {{"event", "handler_error"}, {"error", std::string(err.what())}});
@@ -545,10 +549,10 @@ public:
         {
             canceller = std::jthread([&context, this](const std::stop_token & stop) -> void {
                 constexpr std::chrono::milliseconds poll{200};
-                while (!stop.stop_requested() && !context.IsCancelled()) {
+                while (!stop.stop_requested() && !context.IsCancelled() && stopSignal == 0) {
                     std::this_thread::sleep_for(poll);
                 }
-                if (context.IsCancelled()) {
+                if (!stop.stop_requested()) {
                     ::shutdown(sock.get(), SHUT_RDWR);
                 }
             });
@@ -775,13 +779,14 @@ public:
         if (!frm.healthy) {
             return {grpc::StatusCode::UNAVAILABLE, "worker low on disk space"};
         }
+        auto cancelled = [&]() -> bool { return context.IsCancelled() || stopSignal != 0; };
         auto slot = SlotGuard::acquire(frm.slots);
         auto claim = frm.niks3.claim(narinfoKeys(outPaths | std::views::values), narinfoKeys(nixcompat::drvInputs(drv)));
-        if (claim->first() == nixgrpc::Claim::Status::wait) {
+        if (claim->first(cancelled) == nixgrpc::Claim::Status::wait) {
             slot.reset();
             log(hostName + ": waiting for another worker building " + std::string(drvPath.to_string()));
         }
-        switch (claim->await()) {
+        switch (claim->await(cancelled)) {
         case nixgrpc::Claim::Status::built:
             res = nixcompat::alreadyValid(drvPath, std::move(outPaths));
             return grpc::Status::OK;
@@ -818,7 +823,14 @@ public:
         }
 
         log(hostName + ": building " + std::string(drvPath.to_string()));
-        res = storedBuild(context, localStore, drvPath, log);
+        try {
+            res = storedBuild(context, localStore, drvPath, log);
+        } catch (nix::Error &) {
+            if (cancelled()) {
+                throw nixgrpc::CancelledWait("worker shutting down, build interrupted");
+            }
+            throw;
+        }
 
         if (claim->lost()) {
             return {grpc::StatusCode::UNAVAILABLE, "lost niks3 claim during build"};
@@ -842,10 +854,12 @@ public:
             built.push_back(localStore.printStorePath(path));
         }
         try {
-            frm.push.pushWait(built, claim->token());
+            frm.push.pushWait(built, claim->token(), cancelled);
         } catch (nixgrpc::StaleClaim &) {
             claim->published();
             return {grpc::StatusCode::UNAVAILABLE, "lost niks3 claim before publishing"};
+        } catch (nixgrpc::CancelledWait &) {
+            throw;
         } catch (nix::Error & err) {
             return {grpc::StatusCode::UNAVAILABLE, std::string("publish failed: ") + err.what()};
         }
@@ -1222,11 +1236,6 @@ auto makeServerCredentials(const Options & options) -> std::shared_ptr<grpc::Ser
     return grpc::SslServerCredentials(ssl);
 }
 
-} // namespace
-
-namespace {
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): signal handler.
-volatile std::sig_atomic_t stopSignal = 0;
 } // namespace
 
 auto main(int argc, char ** argv) -> int
