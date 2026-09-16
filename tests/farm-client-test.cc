@@ -167,7 +167,8 @@ void testClaims(Suite & tst, const nixgrpc::Niks3 & niks3)
 
 void testPush(Suite & tst, nixgrpc::PushProcess & push)
 {
-    push.queue({"/nix/store/x.drv"});
+    // The child must outlive the thread that spawned it.
+    std::thread([&]() -> void { push.queue({"/nix/store/x.drv"}); }).join();
     push.pushWait({"/nix/store/y", "/nix/store/y2"}, someToken);
     auto throws = [&](const char * path) -> std::string {
         try {

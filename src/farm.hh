@@ -201,14 +201,18 @@ private:
         nix::Pipe fromChild;
         toChild.create();
         fromChild.create();
-        lck->pid = nix::startProcess([&]() -> void {
-            if (dup2(toChild.readSide.get(), STDIN_FILENO) == -1 || dup2(fromChild.writeSide.get(), STDOUT_FILENO) == -1) {
-                throw nix::SysError("dup2");
-            }
-            nix::Strings const args(argv.begin(), argv.end());
-            execvp(argv.front().c_str(), nix::stringsToCharPtrs(args).data());
-            throw nix::SysError("exec %s", argv.front());
-        });
+        // dieWithParent (PDEATHSIG) fires when the forking gRPC thread exits.
+        lck->pid = nix::startProcess(
+            [&]() -> void {
+                if (dup2(toChild.readSide.get(), STDIN_FILENO) == -1
+                    || dup2(fromChild.writeSide.get(), STDOUT_FILENO) == -1) {
+                    throw nix::SysError("dup2");
+                }
+                nix::Strings const args(argv.begin(), argv.end());
+                execvp(argv.front().c_str(), nix::stringsToCharPtrs(args).data());
+                throw nix::SysError("exec %s", argv.front());
+            },
+            {.dieWithParent = false});
         lck->stdinFd = std::move(toChild.writeSide);
         reader = std::thread([this, acks = std::make_shared<nix::AutoCloseFD>(std::move(fromChild.readSide))]() -> void {
             readAcks(acks->get());
@@ -242,7 +246,7 @@ private:
         auto lck = state.lock();
         lck->stdinFd.close();
         int const status = lck->pid.kill();
-        logLine(LogLevel::info, {{"event", "niks3_push_exited"}, {"status", nix::statusToString(status)}});
+        logLine(LogLevel::info, {{"event", "niks3_push_exited"}, {"status", nix::statusToString(status)}, {"why", why}});
         for (auto & [path, pending] : lck->waiting) {
             pending->ack("error", why);
         }
