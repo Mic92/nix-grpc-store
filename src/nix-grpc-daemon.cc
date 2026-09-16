@@ -71,6 +71,7 @@
 #include <nix/util/util.hh>
 
 #include "acl.hh"
+#include "xfcc.hh"
 #include "build-log.hh"
 #include "farm.hh"
 #include "idle.hh"
@@ -189,6 +190,7 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     nixgrpc::IdleTracker & idle;
     nixgrpc::LogLevel logLevel;
     nixgrpc::Acl acl;
+    nixgrpc::xfcc::TrustedProxies proxies;
     std::optional<nixgrpc::oidc::Verifier> & oidc;
     std::optional<Farm> & farm;
 
@@ -247,10 +249,14 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         Kind kind = Kind::anonymous;
     };
 
-    // Client certificate first, then bearer token, then anonymous.
+    // Client certificate first, then bearer token, then anonymous. A trusted
+    // proxy's own certificate stands in for whatever client it forwards.
     auto identify(const grpc::ServerContext & context) -> Caller
     {
         auto cert = nixgrpc::clientCommonName(context);
+        if (proxies.matches(cert)) {
+            cert = nixgrpc::xfcc::forwardedCommonName(context);
+        }
         auto token = cert || !oidc ? std::nullopt : nixgrpc::oidc::bearerToken(context);
         if (!token) {
             return {
@@ -316,6 +322,7 @@ public:
         nixgrpc::IdleTracker & idle,
         nixgrpc::LogLevel logLevel,
         nixgrpc::Acl acl,
+        nixgrpc::xfcc::TrustedProxies proxies,
         std::optional<nixgrpc::oidc::Verifier> & oidc,
         std::optional<Farm> & farm)
         : socketPath(std::move(socketPath))
@@ -324,6 +331,7 @@ public:
         , idle(idle)
         , logLevel(logLevel)
         , acl(std::move(acl))
+        , proxies(std::move(proxies))
         , oidc(oidc)
         , farm(farm)
     {
@@ -1065,6 +1073,7 @@ struct Options
     std::string metricsListen;
     nixgrpc::LogLevel logLevel = nixgrpc::LogLevel::info;
     nixgrpc::Acl acl;
+    nixgrpc::xfcc::TrustedProxies proxies;
     std::string oidcConfig;
     FarmConfig farm; // active when niks3Url is set
 };
@@ -1106,6 +1115,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.clientCA = next();
         } else if (arg == "--allow") {
             options.acl.addRule(next());
+        } else if (arg == "--trusted-proxy") {
+            options.proxies.add(next());
         } else if (arg == "--allow-anonymous") {
             options.acl.allowAnonymous(nixgrpc::parseRole(next()));
         } else if (arg == "--metrics-listen") {
@@ -1158,6 +1169,9 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
     if (!options.oidcConfig.empty() && options.tlsCert.empty()) {
         // Bearer tokens in clear text are replayable by anyone on the path.
         nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "warning"}, {"msg", "--oidc-config without --tls-cert sends bearer tokens in clear"}});
+    }
+    if (!options.proxies.empty() && options.clientCA.empty()) {
+        throw nix::Error("--trusted-proxy requires --client-ca");
     }
     if (!options.clientCA.empty() && !options.acl.anonymousRole()) {
         options.acl.requireCertificate();
@@ -1242,7 +1256,7 @@ try {
             {{"event", "farm_mode"}, {"niks3", options.farm.niks3Url}, {"max_jobs", std::to_string(options.farm.maxJobs)}});
     }
     NixRemoteService service(
-        options.socketPath, options.storeUri, metrics, idle, options.logLevel, options.acl, oidc, farm);
+        options.socketPath, options.storeUri, metrics, idle, options.logLevel, options.acl, options.proxies, oidc, farm);
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;

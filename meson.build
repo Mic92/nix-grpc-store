@@ -134,12 +134,19 @@ oidc_test = executable('oidc-test',
 )
 test('oidc', find_program('tests/oidc-test.sh'), args : [oidc_test], timeout : 60)
 
+test('xfcc', executable('xfcc-test',
+  sources : ['tests/xfcc-test.cc'],
+  include_directories : include_directories('src'),
+  dependencies : [grpc_dep],
+  cpp_args : ['-UNDEBUG'],
+))
+
 # --- fuzzers ----------------------------------------------------------------
 
 # Built only with -Dfuzzers=true (requires clang for libFuzzer).
 # Run them with scripts/fuzz.sh.
 if get_option('fuzzers')
-  foreach name : ['zstd-reader', 'tunnel-pump', 'import-paths', 'build-log', 'nar-frames', 'wire', 'acl']
+  foreach name : ['zstd-reader', 'tunnel-pump', 'import-paths', 'build-log', 'nar-frames', 'wire', 'acl', 'xfcc']
     executable('fuzz-' + name,
       sources : ['fuzz' / name + '.cc', 'fuzz/support.cc', gen],
       include_directories : gen_inc,

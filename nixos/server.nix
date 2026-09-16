@@ -160,6 +160,18 @@ in
       '';
     };
 
+    trustedProxies = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "lb-*" ];
+      description = ''
+        CN globs of TLS-terminating balancers (see `services.nix-grpc-farm-lb.tls`).
+        A peer with such a certificate is a proxy: the client identity comes
+        from the `x-forwarded-client-cert` header it sets, or a forwarded
+        bearer token. Requires {option}`tls.clientCaFile`.
+      '';
+    };
+
     oidc = lib.mkOption {
       type = lib.types.nullOr (pkgs.formats.json { }).type;
       default = null;
@@ -265,6 +277,10 @@ in
         message = "services.nix-grpc-daemon.accessRules/anonymousRole requires tls.clientCaFile or oidc";
       }
       {
+        assertion = cfg.trustedProxies == [ ] || cfg.tls.clientCaFile != null;
+        message = "services.nix-grpc-daemon.trustedProxies requires tls.clientCaFile";
+      }
+      {
         assertion = cfg.oidc == null || cfg.tls.certFile != null || (cfg.oidc.allow_insecure or false);
         message = "services.nix-grpc-daemon.oidc sends bearer tokens, enable tls.certFile";
       }
@@ -272,7 +288,9 @@ in
 
     # Reach the local nix-daemon even when allowed-users is restricted.
     nix.settings.extra-allowed-users = [ "nix-grpc-daemon" ];
-    nix.settings.extra-trusted-users = lib.mkIf cfg.trustClients [ "nix-grpc-daemon" ];
+    # In farm mode the gRPC access rules decide who may import unsigned
+    # paths, so the proxy itself has to be allowed to.
+    nix.settings.extra-trusted-users = lib.mkIf (cfg.trustClients || cfg.farm.enable) [ "nix-grpc-daemon" ];
 
     # The cache is the share between workers. A path another
     # worker just pushed must not be negatively cached here.
@@ -342,6 +360,10 @@ in
             "--allow-anonymous"
             cfg.anonymousRole
           ]
+          ++ lib.concatMap (cn: [
+            "--trusted-proxy"
+            cn
+          ]) cfg.trustedProxies
           ++ lib.optionals (cfg.oidc != null) [
             "--oidc-config"
             ((pkgs.formats.json { }).generate "nix-grpc-daemon-oidc.json" cfg.oidc)

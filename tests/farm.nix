@@ -1,11 +1,13 @@
 # Farm end to end: niks3 + S3, two farm workers behind two load
-# balancers at opposite ends: envoy (L7, MAGLEV on x-nix-drv, gRPC health)
-# and nginx stream (L4, knows nothing). Both must yield correct builds.
+# balancers at opposite ends: envoy (L7, MAGLEV on x-nix-drv, gRPC health,
+# TLS with client certs or bearer tokens, mTLS to workers) and nginx stream
+# (L4, knows nothing). Both must yield correct builds.
 {
   pkgs,
   nixPkgs,
   module,
   niks3,
+  mockOidc,
 }:
 
 let
@@ -16,6 +18,38 @@ let
   signingPublicKey = "farm-test-1:RkClDwvfixdOwourBI4UD9hudE3xfU5EBQcMFUVuRV8=";
   niks3Url = "http://cache:5751";
   niks3Pkgs = niks3.packages.${pkgs.stdenv.hostPlatform.system};
+
+  certs = pkgs.runCommand "farm-certs" { nativeBuildInputs = [ pkgs.openssl ]; } ''
+    mkdir $out && cd $out
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout ca.key -out ca.pem -subj /CN=farm-ca
+    issue() {
+      openssl req -newkey rsa:2048 -nodes -keyout $1.key -out $1.csr -subj /CN=$2
+      openssl x509 -req -in $1.csr -days 3650 -CA ca.pem -CAkey ca.key -set_serial 0x$(openssl rand -hex 8) \
+        -extfile <(printf "subjectAltName=DNS:$3") -out $1.pem
+    }
+    issue lb lb lb
+    issue lb-client lb-1 lb
+    issue worker worker "worker1,DNS:worker2,DNS:lb"
+    issue ci ci-1 client
+    issue stranger stranger client
+  '';
+
+  # mock-oidc puts its listen address in the issuer.
+  lbAddr = "192.168.1.3";
+  oidcAudience = "grpc://lb:50051";
+  oidcConfig = {
+    allow_insecure = true;
+    providers.mock = {
+      issuer = "http://${lbAddr}:8080/oidc";
+      audience = oidcAudience;
+      rules = [
+        {
+          bound_subject = [ "dev:*" ];
+          scopes = [ "write" ];
+        }
+      ];
+    };
+  };
 
   common = {
     virtualisation.memorySize = 1536;
@@ -36,6 +70,19 @@ let
         logLevel = "debug";
         idleTimeout = null;
         package = config.programs.nix-grpc-store.package;
+        tls = {
+          certFile = "${certs}/worker.pem";
+          keyFile = "${certs}/worker.key";
+          clientCaFile = "${certs}/ca.pem";
+        };
+        trustedProxies = [ "lb-*" ];
+        accessRules = [
+          {
+            cn = "ci-*";
+            role = "trusted";
+          }
+        ];
+        oidc = oidcConfig;
         farm = {
           enable = true;
           niks3Package = niks3Pkgs.niks3;
@@ -140,8 +187,14 @@ pkgs.testers.runNixOSTest {
     worker2 = worker;
 
     lb =
-      { ... }:
+      { config, ... }:
       {
+        assertions = [
+          {
+            assertion = config.networking.primaryIPAddress == lbAddr;
+            message = "lbAddr";
+          }
+        ];
         imports = [
           common
           module
@@ -152,6 +205,23 @@ pkgs.testers.runNixOSTest {
             "worker1:50051"
             "worker2:50051"
           ];
+          tls = {
+            certFile = "${certs}/lb.pem";
+            keyFile = "${certs}/lb.key";
+            clientCaFile = "${certs}/ca.pem";
+            upstream = {
+              certFile = "${certs}/lb-client.pem";
+              keyFile = "${certs}/lb-client.key";
+              caFile = "${certs}/ca.pem";
+            };
+          };
+        };
+        systemd.services.mock-oidc = {
+          wantedBy = [ "multi-user.target" ];
+          after = [ "network-online.target" ];
+          wants = [ "network-online.target" ];
+          serviceConfig.Restart = "on-failure";
+          serviceConfig.ExecStart = "${pkgs.lib.getExe mockOidc} -addr ${lbAddr}:8080 -issue-addr 0.0.0.0:8081";
         };
         services.nginx = {
           enable = true;
@@ -167,10 +237,15 @@ pkgs.testers.runNixOSTest {
           '';
         };
         networking.firewall.allowedTCPPorts = [
+          8080
+          8081
           50051
           50052
         ];
-        environment.systemPackages = [ pkgs.grpc-health-probe ];
+        environment.systemPackages = [
+          pkgs.grpc-health-probe
+          pkgs.curl
+        ];
       };
 
     client =
@@ -195,12 +270,15 @@ pkgs.testers.runNixOSTest {
     lb.wait_for_open_port(50051)
     lb.wait_for_open_port(50052)
     # Envoy only routes to endpoints that passed a gRPC health check.
+    probe_tls = "-tls -tls-ca-cert ${certs}/ca.pem -tls-client-cert ${certs}/lb-client.pem -tls-client-key ${certs}/lb-client.key"
     for w in ["worker1", "worker2"]:
-        lb.wait_until_succeeds(f"grpc-health-probe -addr {w}:50051", timeout=180)
-    lb.wait_until_succeeds("grpc-health-probe -addr localhost:50051", timeout=60)
+        lb.wait_until_succeeds(f"grpc-health-probe -addr {w}:50051 {probe_tls} -tls-server-name {w}", timeout=180)
+    lb.wait_until_succeeds("curl -sf localhost:9901/clusters | grep -c 'health_flags::healthy' | grep -qx 2", timeout=60)
 
-    envoy = "grpc://lb:50051?insecure=1"
-    l4 = "grpc://lb:50052?insecure=1"
+    tls = "ca-cert=${certs}/ca.pem"
+    ci = f"{tls}&client-cert=${certs}/ci.pem&client-key=${certs}/ci.key"
+    envoy = f"grpc://lb:50051?{ci}"
+    l4 = f"grpc://lb:50052?{ci}"
 
     def build(store: str, tag: str) -> str:
         client.succeed(f"nix build -L --store '{store}' --eval-store auto -f ${jobExpr} --argstr tag {tag} >&2")
@@ -208,6 +286,19 @@ pkgs.testers.runNixOSTest {
 
     def holders(path: str) -> int:
         return sum(w.execute(f"test -e {path}")[0] == 0 for w in [worker1, worker2])
+
+    def probe(query: str) -> str:
+        rc, out = client.execute(f"nix path-info --store 'grpc://lb:50051?{tls}{query}' ${jobExpr} 2>&1")
+        return "ok" if rc == 0 or "is not valid" in out else out
+
+    with subtest("balancer auth: client cert, bearer token, nothing, unknown CN"):
+        assert probe("&client-cert=${certs}/ci.pem&client-key=${certs}/ci.key") == "ok"
+        client.succeed("curl -sfG http://lb:8081/issue --data-urlencode 'aud=${oidcAudience}' --data-urlencode sub=dev:alice > /root/dev.jwt && test -s /root/dev.jwt")
+        assert probe("&token-file=/root/dev.jwt") == "ok"
+        out = probe("")
+        assert "client certificate or bearer token" in out, out
+        out = probe("&client-cert=${certs}/stranger.pem&client-key=${certs}/stranger.key")
+        assert "no access rule matches 'stranger'" in out, out
 
     with subtest("without --eval-store the farm refuses and hints"):
         out = client.fail(f"nix build --store '{envoy}' -f ${jobExpr} --argstr tag t0 2>&1")

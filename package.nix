@@ -37,6 +37,7 @@ stdenv.mkDerivation {
       ./tests/farm-client-test.sh
       ./tests/oidc-test.cc
       ./tests/oidc-test.sh
+      ./tests/xfcc-test.cc
     ];
   };
 

@@ -10,6 +10,51 @@
 let
   cfg = config.services.nix-grpc-farm-lb;
 
+  file = path: { filename = toString path; };
+  tlsCert = {
+    certificate_chain = file cfg.tls.certFile;
+    private_key = file cfg.tls.keyFile;
+  };
+
+  upstreamTls = lib.optionalAttrs (cfg.tls.upstream.certFile != null) {
+    transport_socket = {
+      name = "envoy.transport_sockets.tls";
+      typed_config = {
+        "@type" = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
+        common_tls_context = {
+          alpn_protocols = [ "h2" ];
+          tls_certificates = [
+            {
+              certificate_chain = file cfg.tls.upstream.certFile;
+              private_key = file cfg.tls.upstream.keyFile;
+            }
+          ];
+          validation_context.trusted_ca = file cfg.tls.upstream.caFile;
+        };
+      }
+      // lib.optionalAttrs (cfg.tls.upstream.sni != null) { inherit (cfg.tls.upstream) sni; };
+    };
+  };
+
+  downstreamTls = lib.optionalAttrs (cfg.tls.certFile != null) {
+    transport_socket = {
+      name = "envoy.transport_sockets.tls";
+      typed_config = {
+        "@type" = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext";
+        common_tls_context = {
+          alpn_protocols = [ "h2" ];
+          tls_certificates = [ tlsCert ];
+        }
+        // lib.optionalAttrs (cfg.tls.clientCaFile != null) {
+          validation_context.trusted_ca = file cfg.tls.clientCaFile;
+        };
+      }
+      // lib.optionalAttrs (cfg.tls.clientCaFile != null) {
+        require_client_certificate = false;
+      };
+    };
+  };
+
   endpoint = addr: {
     endpoint.address.socket_address =
       let
@@ -22,9 +67,12 @@ let
       };
   };
 
-  cluster = system: workers: {
-    name = system;
-    type = "STRICT_DNS";
+  cluster =
+    system: workers:
+    upstreamTls
+    // {
+      name = system;
+      type = "STRICT_DNS";
     connect_timeout = "5s";
     lb_policy = "MAGLEV";
     # Worker slots are few. Spread rather than pile onto one hash bucket.
@@ -124,9 +172,73 @@ in
       default = 1024;
       description = "HTTP/2 streams per connection, both directions. Must exceed client `max-builds`.";
     };
+
+    tls = {
+      certFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = "PEM server certificate presented to clients. Plaintext listener if unset.";
+      };
+      keyFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+      };
+      clientCaFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = ''
+          Verify client certificates against this CA and forward the subject to
+          workers in `x-forwarded-client-cert`. Clients without a certificate
+          are still accepted so bearer tokens keep working. The header is
+          always overwritten, a client cannot inject one.
+        '';
+      };
+      upstream = {
+        certFile = lib.mkOption {
+          type = lib.types.nullOr lib.types.path;
+          default = null;
+          description = ''
+            Client certificate envoy presents to workers. Its CN must match the
+            workers' `services.nix-grpc-daemon.trustedProxies`. Plaintext to
+            workers if unset.
+          '';
+        };
+        keyFile = lib.mkOption {
+          type = lib.types.nullOr lib.types.path;
+          default = null;
+        };
+        caFile = lib.mkOption {
+          type = lib.types.nullOr lib.types.path;
+          default = null;
+          description = "CA that signed the workers' server certificates.";
+        };
+        sni = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = "SNI and name to verify on worker certificates. Unset verifies the chain only.";
+        };
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = (cfg.tls.certFile == null) == (cfg.tls.keyFile == null);
+        message = "services.nix-grpc-farm-lb.tls.certFile and keyFile go together";
+      }
+      {
+        assertion = cfg.tls.clientCaFile == null || cfg.tls.certFile != null;
+        message = "services.nix-grpc-farm-lb.tls.clientCaFile requires tls.certFile";
+      }
+      {
+        assertion =
+          (cfg.tls.upstream.certFile == null)
+          == (cfg.tls.upstream.keyFile == null)
+          && (cfg.tls.upstream.certFile == null) == (cfg.tls.upstream.caFile == null);
+        message = "services.nix-grpc-farm-lb.tls.upstream.{certFile,keyFile,caFile} go together";
+      }
+    ];
     services.envoy = {
       enable = true;
       package = lib.mkDefault pkgs.envoy-bin;
@@ -140,7 +252,9 @@ in
               name = "farm";
               address = (endpoint cfg.listen).endpoint.address;
               filter_chains = [
-                {
+                (
+                  downstreamTls
+                  // {
                   filters = [
                     {
                       name = "envoy.filters.network.http_connection_manager";
@@ -151,6 +265,8 @@ in
                         codec_type = "HTTP2";
                         stream_idle_timeout = "0s";
                         http2_protocol_options.max_concurrent_streams = cfg.maxStreams;
+                        forward_client_cert_details = "SANITIZE_SET";
+                        set_current_client_cert_details.subject = true;
                         route_config.virtual_hosts = [
                           {
                             name = "farm";
@@ -168,6 +284,7 @@ in
                     }
                   ];
                 }
+                )
               ];
             }
           ];
