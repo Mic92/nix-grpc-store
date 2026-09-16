@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <grpc/event_engine/event_engine.h>
 #include <grpc/grpc.h>
 #include <grpc/impl/channel_arg_names.h>
 #include <grpcpp/security/auth_context.h>
@@ -222,20 +223,31 @@ public:
   }
 };
 
-// grpc_shutdown() is asynchronous, so gRPC worker threads can still touch
-// OpenSSL while its atexit cleanup frees global state (SIGSEGV on Darwin
-// with short-lived clients). Hold one reference for the process lifetime and
-// release it with the blocking variant. Initialising OpenSSL first orders its
-// atexit handler before ours. Taken on first store use rather than at plugin
-// load: nix-daemon loads plugins too and its forked workers must not run
-// gRPC shutdown at exit.
+// gRPC frees TLS endpoints on EventEngine threads that outlive
+// grpc_shutdown_blocking(), racing OpenSSL's atexit cleanup. Owning the
+// default EventEngine lets us wait for those threads. The wait is bounded
+// because nix may exit with a store still referenced. OpenSSL is initialised
+// first so its atexit handler runs after ours. Not done at plugin load:
+// nix-daemon's forked workers must not run this.
 void retainGrpcRuntime() {
   struct GrpcRuntime {
+    std::shared_ptr<grpc_event_engine::experimental::EventEngine> engine =
+        grpc_event_engine::experimental::CreateEventEngine();
     GrpcRuntime() {
       OPENSSL_init_crypto(0, nullptr);
       grpc_init();
+      grpc_event_engine::experimental::SetDefaultEventEngine(engine);
     }
-    ~GrpcRuntime() { grpc_shutdown_blocking(); }
+    ~GrpcRuntime() {
+      grpc_shutdown_blocking();
+      grpc_event_engine::experimental::SetDefaultEventEngine(nullptr);
+      constexpr std::chrono::seconds patience{2};
+      constexpr std::chrono::milliseconds pollEvery{5};
+      auto deadline = std::chrono::steady_clock::now() + patience;
+      while (engine.use_count() > 1 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(pollEvery);
+      }
+    }
     GrpcRuntime(const GrpcRuntime &) = delete;
     GrpcRuntime(GrpcRuntime &&) = delete;
     auto operator=(const GrpcRuntime &) -> GrpcRuntime & = delete;
@@ -832,11 +844,11 @@ public:
       auto headers = routingFor(drvPath, drv);
       std::optional<BuildResult> res;
       grpc::Status status;
+      std::shared_ptr<Store> local;
       for (unsigned attempt = 0;; attempt++) {
         status = tryBuildDerivation(request, headers, res);
         if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
           // The build hook has the drv in the local store but passes no evalStore.
-          std::shared_ptr<Store> local;
           if (evalStore == nullptr) {
             local = nix::openStore();
             if (local.get() == this || !local->isValidPath(drvPath)) {
