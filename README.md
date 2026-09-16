@@ -275,6 +275,11 @@ read-only` grants it substituter access. See
 [`tests/acme-substituter-test.nix`](tests/acme-substituter-test.nix)
 for a complete, tested NixOS setup (built as the `acme-vm` check).
 
+## Build farm
+
+Several workers behind one balancer with deduplicated builds and S3
+outputs: see [docs/farm.md](docs/farm.md).
+
 ## Remote builder
 
     nix.buildMachines = [{
