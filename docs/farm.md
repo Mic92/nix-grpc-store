@@ -140,8 +140,8 @@ x86_64-linux::10.0.0.4:50052::health_flags::healthy
 aarch64-linux::10.0.0.5:50052::health_flags::healthy
 ```
 
-`accessLog = true` adds one journal line per connection and per RPC with
-the client certificate subject and, for failed TLS handshakes, the reason.
+`accessLog = true` adds one journal line per connection with the client
+certificate subject and, for failed TLS handshakes, the reason.
 
 ## Step 3: Connect a CI host
 

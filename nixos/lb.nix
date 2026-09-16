@@ -179,9 +179,8 @@ in
       type = lib.types.bool;
       default = false;
       description = ''
-        Log one line per connection and per request to the journal, including
-        TLS handshake failures (`DOWNSTREAM_TRANSPORT_FAILURE_REASON`) and the
-        client certificate subject.
+        Log one line per connection to the journal with the TLS handshake
+        failure reason and the client certificate subject.
       '';
     };
 
@@ -286,7 +285,6 @@ in
                           "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager";
                         stat_prefix = "farm";
                         codec_type = "HTTP2";
-                        access_log = lib.optional cfg.accessLog (stderrLog "rpc peer=%DOWNSTREAM_REMOTE_ADDRESS% subject=\"%DOWNSTREAM_PEER_SUBJECT%\" %REQ(:PATH)% system=%REQ(x-nix-system)% upstream=%UPSTREAM_HOST% grpc=%GRPC_STATUS% flags=%RESPONSE_FLAGS% ms=%DURATION%");
                         stream_idle_timeout = "0s";
                         http2_protocol_options.max_concurrent_streams = cfg.maxStreams;
                         forward_client_cert_details = "SANITIZE_SET";

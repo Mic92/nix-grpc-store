@@ -126,19 +126,6 @@ auto readValidCert(const std::string &path) -> std::string {
   return pem;
 }
 
-auto certSubject(const std::string & pem) -> std::string {
-  std::unique_ptr<BIO, decltype(&BIO_free)> const bio{
-      BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size())), BIO_free};
-  std::unique_ptr<X509, decltype(&X509_free)> const cert{
-      PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr), X509_free};
-  if (!cert) {
-    return "?";
-  }
-  constexpr size_t maxSubject = 256;
-  std::array<char, maxSubject> buf{};
-  X509_NAME_oneline(X509_get_subject_name(cert.get()), buf.data(), buf.size());
-  return buf.data();
-}
 
 // Must run before the first channel: gRPC reads these once at init.
 void enableGrpcTracing() {
@@ -410,11 +397,10 @@ private:
         haveClientCert = true;
       }
       if (config->debug) {
-        warn("grpc-store %s: ca=%s (%d bytes) client-cert=%s client-key=%s%s",
+        warn("grpc-store %s: ca=%s (%d bytes) client-cert=%s client-key=%s",
              config->authority.to_string(), caCert.empty() ? "<grpc builtin>" : caCert,
              ssl.pem_root_certs.size(), clientCert.empty() ? "<none>" : clientCert,
-             clientKey.empty() ? "<none>" : clientKey,
-             haveClientCert ? " subject=" + certSubject(ssl.pem_cert_chain) : "");
+             clientKey.empty() ? "<none>" : clientKey);
       }
       return ssl;
     }
@@ -483,12 +469,18 @@ public:
 
 private:
     // gRPC folds every connect failure into UNAVAILABLE. Tell TCP from TLS apart by the message.
+    // gRPC folds TCP and TLS failures into UNAVAILABLE, only the text differs.
+    static auto transportError(std::string_view msg) -> bool {
+      return std::ranges::any_of(
+          std::array{"Connection refused", "Connection reset", "No route", "unreachable", "timed out", "DNS", "GOAWAY"},
+          [&](const char * needle) -> bool { return msg.contains(needle); });
+    }
+
     auto connectHint(const std::string & msg) const -> std::string
     {
       auto has = [&](std::string_view needle) -> bool { return msg.contains(needle); };
       std::string const more = config->debug ? "" : " Set NIX_GRPC_DEBUG=1 for a handshake trace.";
-      if (has("Connection refused") || has("No route") || has("Network is unreachable") ||
-          has("timed out") || has("Deadline") || has("DNS")) {
+      if (transportError(msg)) {
         return "\nhint: could not reach the server (TCP/DNS), not a certificate problem." + more;
       }
       if (has("handshaker shutdown") || has("Handshake") || has("SSL") || has("TLS") ||
@@ -607,13 +599,6 @@ public:
     // restart does not fail the build; TLS rejections fail at once.
     void connect() override { isTrustedClient(); }
 
-    static auto transportDown(const grpc::Status & status) -> bool {
-      auto const & msg = status.error_message();
-      return status.error_code() == grpc::StatusCode::UNAVAILABLE &&
-             (msg.contains("Connection refused") || msg.contains("Connection reset") ||
-              msg.contains("No route") || msg.contains("unreachable") || msg.contains("GOAWAY"));
-    }
-
     auto isTrustedClient() -> std::optional<TrustedFlag> override {
       std::call_once(trustedOnce, [&]() -> void {
         remote::StoreInfoRequest const request;
@@ -624,7 +609,8 @@ public:
         for (;;) {
           grpc::ClientContext ctx;
           status = stub->StoreInfo(&ctx, request, &reply);
-          if (!transportDown(status) || std::chrono::steady_clock::now() + pause > giveUp) {
+          if (status.error_code() != grpc::StatusCode::UNAVAILABLE || !transportError(status.error_message()) ||
+              std::chrono::steady_clock::now() + pause > giveUp) {
             break;
           }
           printError("%s: %s, retrying", config->authority.to_string(), firstLine(status.error_message()));
@@ -664,6 +650,23 @@ public:
       return results;
     }
 
+    // Farm fan-out, else already-valid short cut, else native BuildPaths.
+    // nullopt: server predates the RPC, use the worker-protocol tunnel.
+    auto dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
+                       const std::shared_ptr<Store> & evalStore)
+        -> std::optional<std::vector<KeyedBuildResult>> {
+      if (isFarm()) {
+        return farmBuildPaths(reqs, buildMode, evalStore.get());
+      }
+      if (buildMode == bmNormal) {
+        if (auto results = alreadyValidResults(reqs)) {
+          return results;
+        }
+      }
+      importDrvsFromEvalStore(reqs, evalStore);
+      return buildPathsWithResultsNative(reqs, buildMode);
+    }
+
 #if NIX_COMPAT_HAS_BUILDER
     auto getBuilder(std::shared_ptr<Store> evalStore) -> ref<Builder> override {
       class GrpcBuilder : public Builder {
@@ -678,16 +681,7 @@ public:
               inner(std::move(inner)) {}
         void buildPaths(const std::vector<DerivedPath> & reqs,
                         BuildMode buildMode) override {
-          if (store->isFarm()) {
-            auto results = store->farmBuildPaths(reqs, buildMode, evalStore.get());
-            store->throwOnFailedBuilds(results);
-            return;
-          }
-          if (buildMode == bmNormal && store->alreadyValidResults(reqs)) {
-            return;
-          }
-          store->importDrvsFromEvalStore(reqs, evalStore);
-          if (auto results = store->buildPathsWithResultsNative(reqs, buildMode)) {
+          if (auto results = store->dispatchBuild(reqs, buildMode, evalStore)) {
             store->throwOnFailedBuilds(*results);
             return;
           }
@@ -696,16 +690,7 @@ public:
         auto buildPathsWithResults(const std::vector<DerivedPath> & reqs,
                                    BuildMode buildMode)
             -> std::vector<KeyedBuildResult> override {
-          if (store->isFarm()) {
-            return store->farmBuildPaths(reqs, buildMode, evalStore.get());
-          }
-          if (buildMode == bmNormal) {
-            if (auto results = store->alreadyValidResults(reqs)) {
-              return std::move(*results);
-            }
-          }
-          store->importDrvsFromEvalStore(reqs, evalStore);
-          if (auto results = store->buildPathsWithResultsNative(reqs, buildMode)) {
+          if (auto results = store->dispatchBuild(reqs, buildMode, evalStore)) {
             return std::move(*results);
           }
           return inner->buildPathsWithResults(reqs, buildMode);
@@ -728,16 +713,7 @@ public:
 #else
     void buildPaths(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
                     std::shared_ptr<Store> evalStore) override {
-      if (isFarm()) {
-        auto results = farmBuildPaths(reqs, buildMode, evalStore.get());
-        throwOnFailedBuilds(results);
-        return;
-      }
-      if (buildMode == bmNormal && alreadyValidResults(reqs)) {
-        return;
-      }
-      importDrvsFromEvalStore(reqs, evalStore);
-      if (auto results = buildPathsWithResultsNative(reqs, buildMode)) {
+      if (auto results = dispatchBuild(reqs, buildMode, evalStore)) {
         throwOnFailedBuilds(*results);
         return;
       }
@@ -747,16 +723,7 @@ public:
                                BuildMode buildMode,
                                std::shared_ptr<Store> evalStore)
         -> std::vector<KeyedBuildResult> override {
-      if (isFarm()) {
-        return farmBuildPaths(reqs, buildMode, evalStore.get());
-      }
-      if (buildMode == bmNormal) {
-        if (auto results = alreadyValidResults(reqs)) {
-          return std::move(*results);
-        }
-      }
-      importDrvsFromEvalStore(reqs, evalStore);
-      if (auto results = buildPathsWithResultsNative(reqs, buildMode)) {
+      if (auto results = dispatchBuild(reqs, buildMode, evalStore)) {
         return std::move(*results);
       }
       return RemoteStore::buildPathsWithResults(reqs, buildMode,

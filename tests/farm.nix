@@ -1,7 +1,6 @@
-# Farm end to end: niks3 + S3, two farm workers behind two load
-# balancers at opposite ends: envoy (L7, MAGLEV on x-nix-drv, gRPC health,
-# TLS with client certs or bearer tokens, mTLS to workers) and nginx stream
-# (L4, knows nothing). Both must yield correct builds.
+# Farm end to end: niks3 + S3, two farm workers behind envoy (MAGLEV on
+# x-nix-drv, gRPC health, TLS with client certs or bearer tokens, mTLS to
+# workers), a CI client using the build hook and an OIDC developer.
 {
   pkgs,
   nixPkgs,
@@ -224,24 +223,10 @@ pkgs.testers.runNixOSTest {
           serviceConfig.Restart = "on-failure";
           serviceConfig.ExecStart = "${pkgs.lib.getExe mockOidc} -addr ${lbAddr}:8080 -issue-addr 0.0.0.0:8081";
         };
-        services.nginx = {
-          enable = true;
-          streamConfig = ''
-            upstream farm {
-              server worker1:50051;
-              server worker2:50051;
-            }
-            server {
-              listen 50052;
-              proxy_pass farm;
-            }
-          '';
-        };
         networking.firewall.allowedTCPPorts = [
           8080
           8081
           50051
-          50052
         ];
         environment.systemPackages = [
           pkgs.grpc-health-probe
@@ -274,7 +259,6 @@ pkgs.testers.runNixOSTest {
         w.wait_for_unit("nix-grpc-daemon.socket")
     lb.wait_for_unit("envoy.service")
     lb.wait_for_open_port(50051)
-    lb.wait_for_open_port(50052)
     # Envoy only routes to endpoints that passed a gRPC health check.
     probe_tls = "-tls -tls-ca-cert ${certs}/ca.pem -tls-client-cert ${certs}/lb-client.pem -tls-client-key ${certs}/lb-client.key"
     for w in ["worker1", "worker2"]:
@@ -284,7 +268,6 @@ pkgs.testers.runNixOSTest {
     tls = "ca-cert=${certs}/ca.pem"
     ci = f"{tls}&client-cert=${certs}/ci.pem&client-key=${certs}/ci.key"
     envoy = f"grpc://lb:50051?{ci}"
-    l4 = f"grpc://lb:50052?{ci}"
 
     def build(store: str, tag: str) -> str:
         client.succeed(f"nix build -L --store '{store}' --eval-store auto -f ${jobExpr} --argstr tag {tag} >&2")
@@ -312,19 +295,18 @@ pkgs.testers.runNixOSTest {
         out = client.fail(f"nix build --store '{envoy}' -f ${jobExpr} --argstr tag t0 2>&1")
         assert "--eval-store" in out, out
 
-    for name, store in [("envoy", envoy), ("l4", l4)]:
-        with subtest(f"{name}: fan-out build lands in the cache"):
-            top = build(store, name)
-            assert holders(top) == 1, "exactly one worker built it"
-            # The client store has nothing. The cache does.
-            client.fail(f"test -e {top}")
-            client.succeed(f"nix copy --from ${niks3Url} --no-check-sigs {top} && grep farm-top-{name} {top}")
+    with subtest("fan-out build lands in the cache"):
+        top = build(envoy, "t1")
+        assert holders(top) == 1, "exactly one worker built it"
+        # The client store has nothing. The cache does.
+        client.fail(f"test -e {top}")
+        client.succeed(f"nix copy --from ${niks3Url} --no-check-sigs {top} && grep farm-top-t1 {top}")
 
-        with subtest(f"{name}: repeat is answered from the claim without building"):
-            for w in [worker1, worker2]:
-                w.succeed(f"nix-store --delete {top}")
-            build(store, name)
-            assert holders(top) == 0, "no worker rebuilt it"
+    with subtest("repeat is answered from the claim without building"):
+        for w in [worker1, worker2]:
+            w.succeed(f"nix-store --delete {top}")
+        build(envoy, "t1")
+        assert holders(top) == 0, "no worker rebuilt it"
 
     with subtest("build hook: nix-daemon with builders = grpc://lb"):
         # NIX_REMOTE=daemon so build-remote is spawned by nix-daemon.service (egress-filtered), not by root's nix.

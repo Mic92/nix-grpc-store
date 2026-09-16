@@ -141,38 +141,26 @@ struct Farm
     }
 };
 
-// One of the worker's max-jobs.
-class SlotGuard
+// One of the worker's max-jobs, released when the pointer drops.
+struct SlotRelease
 {
-    std::counting_semaphore<> & sem;
-
-    explicit SlotGuard(std::counting_semaphore<> & sem)
-        : sem(sem)
+    void operator()(std::counting_semaphore<> * sem) const
     {
-    }
-
-public:
-    SlotGuard(const SlotGuard &) = delete;
-    SlotGuard(SlotGuard &&) = delete;
-    auto operator=(const SlotGuard &) -> SlotGuard & = delete;
-    auto operator=(SlotGuard &&) -> SlotGuard & = delete;
-
-    ~SlotGuard()
-    {
-        sem.release();
-    }
-
-    static auto acquire(std::counting_semaphore<> & sem) -> std::unique_ptr<SlotGuard>
-    {
-        sem.acquire();
-        return std::unique_ptr<SlotGuard>(new SlotGuard(sem));
-    }
-
-    static auto tryAcquire(std::counting_semaphore<> & sem) -> std::unique_ptr<SlotGuard>
-    {
-        return sem.try_acquire() ? std::unique_ptr<SlotGuard>(new SlotGuard(sem)) : nullptr;
+        sem->release();
     }
 };
+using Slot = std::unique_ptr<std::counting_semaphore<>, SlotRelease>;
+
+inline auto acquireSlot(std::counting_semaphore<> & sem) -> Slot
+{
+    sem.acquire();
+    return Slot(&sem);
+}
+
+inline auto tryAcquireSlot(std::counting_semaphore<> & sem) -> Slot
+{
+    return Slot(sem.try_acquire() ? &sem : nullptr);
+}
 
 auto localHostName() -> std::string
 {
@@ -780,7 +768,7 @@ public:
             return {grpc::StatusCode::UNAVAILABLE, "worker low on disk space"};
         }
         auto cancelled = [&]() -> bool { return context.IsCancelled() || stopSignal != 0; };
-        auto slot = SlotGuard::acquire(frm.slots);
+        auto slot = acquireSlot(frm.slots);
         auto claim = frm.niks3.claim(narinfoKeys(outPaths | std::views::values), narinfoKeys(nixcompat::drvInputs(drv)));
         if (claim->first(cancelled) == nixgrpc::Claim::Status::wait) {
             slot.reset();
@@ -799,7 +787,7 @@ public:
         }
         // Blocking would keep the claim alive while every other worker waits on us.
         if (!slot) {
-            slot = SlotGuard::tryAcquire(frm.slots);
+            slot = tryAcquireSlot(frm.slots);
         }
         if (!slot) {
             return {grpc::StatusCode::UNAVAILABLE, "promoted to build but no free slot"};
