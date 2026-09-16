@@ -111,6 +111,23 @@ let
     in
     mk "farm-top" [ a b ]
   '';
+  depExpr = pkgs.writeText "dep.nix" ''
+    { tag, salt ? "" }:
+    rec {
+      input = derivation {
+        name = "local-input-''${tag}";
+        system = builtins.currentSystem;
+        builder = "/bin/sh";
+        args = [ "-c" "echo ''${tag} > $out" ];
+      };
+      job = derivation {
+        name = "uses-input-''${tag}''${salt}";
+        system = builtins.currentSystem;
+        builder = "/bin/sh";
+        args = [ "-c" "read x < ''${input}; echo $x > $out" ];
+      };
+    }
+  '';
   slowExpr = pkgs.writeText "slow.nix" ''
     { tag }:
     derivation {
@@ -312,6 +329,14 @@ pkgs.testers.runNixOSTest {
         # NIX_REMOTE=daemon so build-remote is spawned by nix-daemon.service (egress-filtered), not by root's nix.
         out = client.succeed(f"NIX_REMOTE=daemon nix build -L --max-jobs 0 --builders '{envoy}&system=${pkgs.stdenv.hostPlatform.system} ${pkgs.stdenv.hostPlatform.system} - 4' --print-out-paths --no-link -f ${jobExpr} --argstr tag hook 2>&1 | tee /dev/stderr | tail -1").strip()
         client.succeed(f"grep farm-top-hook {out}")
+
+    with subtest("an input only one worker has still reaches the builder"):
+        inp = client.succeed("nix-build --no-out-link ${depExpr} -A input --argstr tag w1only").strip()
+        client.succeed(f"nix-store --export {inp} > /tmp/shared/inp.closure")
+        worker1.succeed("nix-store --import < /tmp/shared/inp.closure")
+        worker2.fail(f"test -e {inp}")
+        for salt in ["a", "b", "c", "d"]:
+            client.succeed(f"NIX_REMOTE=daemon nix build -L --max-jobs 0 --builders '{envoy}&system=${pkgs.stdenv.hostPlatform.system} ${pkgs.stdenv.hostPlatform.system} - 4' --no-link -f ${depExpr} job --argstr tag w1only --argstr salt {salt} >&2")
 
     with subtest("interrupting the client stops the build on the worker"):
         # [6] keeps the probe from matching its own command line.

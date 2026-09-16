@@ -408,9 +408,15 @@ public:
             for (const auto & path : request->paths()) {
                 paths.insert(nix::StorePath(path));
             }
+            std::vector<std::string> valid;
             for (const auto & path :
                  localStore->queryValidPaths(paths, request->substitute() ? nix::Substitute : nix::NoSubstitute)) {
                 reply->add_paths(std::string(path.to_string()));
+                valid.push_back(localStore->printStorePath(path));
+            }
+            // Whatever we report or accept must be reachable from any worker.
+            if (farm && !valid.empty()) {
+                farm->push.pushWait(valid, 0, [&]() -> bool { return context->IsCancelled(); });
             }
             return grpc::Status::OK;
         });
@@ -456,12 +462,7 @@ public:
                     imported.push_back(localStore->printStorePath(info.path));
                 });
             if (farm && !imported.empty()) {
-                try {
-                    farm->push.queue(imported);
-                } catch (nix::Error & err) {
-                    nixgrpc::logLine(
-                        nixgrpc::LogLevel::info, {{"event", "push_queue_failed"}, {"error", std::string(err.what())}});
-                }
+                farm->push.pushWait(imported, 0, [&]() -> bool { return context->IsCancelled(); });
             }
             nixgrpc::logLine(
                 nixgrpc::LogLevel::info,

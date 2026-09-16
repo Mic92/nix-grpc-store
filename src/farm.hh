@@ -82,18 +82,6 @@ public:
         }
     }
 
-    // Fire and forget, e.g. inputs a client just uploaded.
-    void queue(const std::vector<std::string> & paths)
-    {
-        std::string lines;
-        for (const auto & path : paths) {
-            lines += path + "\n";
-        }
-        auto lck = state.lock();
-        ensureChild(lck);
-        nix::writeFull(lck->stdinFd.get(), lines, false);
-    }
-
     // Returns after niks3 committed all of `paths`. StaleClaim if superseded.
     void pushWait(const std::vector<std::string> & paths, int64_t claimToken, const Cancelled & cancelled = never)
     {
@@ -233,7 +221,7 @@ private:
                 auto lck = state.lock();
                 auto found = lck->waiting.find(ack.value("path", ""));
                 if (found == lck->waiting.end()) {
-                    continue; // a queue()d path
+                    continue;
                 }
                 found->second->ack(ack.value("status", "error"), ack.value("message", ""));
                 lck->waiting.erase(found);
