@@ -74,6 +74,7 @@
         {
           inherit (scope)
             default
+            jwt-cpp
             plugin-dispatcher
             fuzzers
             fuzzers-coverage

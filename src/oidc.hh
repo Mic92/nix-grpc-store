@@ -3,7 +3,6 @@
 // schema and rule semantics follow niks3 so one file can serve both.
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cstddef>
 #include <fnmatch.h>
@@ -13,24 +12,16 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <tuple>
 #include <utility>
 #include <vector>
 
-#include <openssl/bn.h>
-#include <openssl/core_names.h>
-#include <openssl/ec.h>
-#include <openssl/ecdsa.h>
 #include <openssl/evp.h>
-#include <openssl/obj_mac.h>
-#include <openssl/param_build.h>
-#include <openssl/rsa.h>
-#include <openssl/types.h>
+#include <openssl/pem.h>
 
 #include <grpcpp/server_context.h>
+#include <jwt-cpp/traits/nlohmann-json/defaults.h>
 #include <nlohmann/json.hpp>
 
-#include <nix/util/base-n.hh>
 #include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
 #include <nix/util/util.hh>
@@ -72,48 +63,16 @@ struct Identity
     std::optional<Role> role; // nullopt: verified but no rule matched
 };
 
-inline auto base64UrlDecode(std::string_view input) -> std::string
-{
-    std::string plain(input);
-    std::ranges::replace(plain, '-', '+');
-    std::ranges::replace(plain, '_', '/');
-    while (plain.size() % 4 != 0) {
-        plain += '=';
-    }
-    return nix::base64::decode(plain); // throws on junk
-}
-
-struct ParsedToken
-{
-    Json header;
-    Json claims;
-    std::string_view signingInput;
-    std::string signature;
-};
-
 constexpr size_t maxTokenBytes = 16UL * 1024;
+using Decoded = jwt::decoded_jwt<jwt::traits::nlohmann_json>;
 
-inline auto parseToken(std::string_view token) -> std::optional<ParsedToken>
+inline auto parseToken(const std::string & token) -> std::optional<Decoded>
 {
     if (token.empty() || token.size() > maxTokenBytes) {
         return std::nullopt;
     }
-    auto first = token.find('.');
-    auto second = first == std::string_view::npos ? first : token.find('.', first + 1);
-    if (second == std::string_view::npos || token.find('.', second + 1) != std::string_view::npos) {
-        return std::nullopt;
-    }
     try {
-        ParsedToken res{
-            .header = Json::parse(base64UrlDecode(token.substr(0, first))),
-            .claims = Json::parse(base64UrlDecode(token.substr(first + 1, second - first - 1))),
-            .signingInput = token.substr(0, second),
-            .signature = base64UrlDecode(token.substr(second + 1)),
-        };
-        if (!res.header.is_object() || !res.claims.is_object()) {
-            return std::nullopt;
-        }
-        return res;
+        return jwt::decode(token);
     } catch (...) {
         return std::nullopt;
     }
@@ -155,10 +114,10 @@ inline auto ruleFrom(const Json & json) -> Rule
 inline auto issuerFromTokenFile(const std::string & path) -> std::string
 {
     auto parsed = parseToken(nix::chomp(nix::readFile(path)));
-    if (!parsed) {
-        throw nix::Error("%s: not a JWT", path);
+    if (!parsed || !parsed->has_issuer()) {
+        throw nix::Error("%s: not a JWT with an issuer", path);
     }
-    return parsed->claims.at("iss").get<std::string>();
+    return parsed->get_issuer();
 }
 
 inline auto providerFrom(const std::string & name, const Json & prov, bool allowInsecure) -> Provider
@@ -288,206 +247,99 @@ inline auto roleFor(const Provider & provider, const Json & claims) -> std::opti
     return role;
 }
 
-inline auto audienceMatches(const Json & claims, const std::string & audience) -> bool
-{
-    auto found = claims.find("aud");
-    return found != claims.end() && std::ranges::contains(claimStrings(*found), audience);
-}
-
-struct Alg
-{
-    std::string_view name;
-    std::string_view kty;
-    std::string_view crv; // JWK "crv", empty for RSA
-    const char * digest;  // nullptr for EdDSA
-    bool pss = false;
-};
-
-constexpr std::array<Alg, 10> algs{{
-    {.name = "RS256", .kty = "RSA", .crv = "", .digest = "SHA256"},
-    {.name = "RS384", .kty = "RSA", .crv = "", .digest = "SHA384"},
-    {.name = "RS512", .kty = "RSA", .crv = "", .digest = "SHA512"},
-    {.name = "PS256", .kty = "RSA", .crv = "", .digest = "SHA256", .pss = true},
-    {.name = "PS384", .kty = "RSA", .crv = "", .digest = "SHA384", .pss = true},
-    {.name = "PS512", .kty = "RSA", .crv = "", .digest = "SHA512", .pss = true},
-    {.name = "ES256", .kty = "EC", .crv = "P-256", .digest = "SHA256"},
-    {.name = "ES384", .kty = "EC", .crv = "P-384", .digest = "SHA384"},
-    {.name = "ES512", .kty = "EC", .crv = "P-521", .digest = "SHA512"},
-    {.name = "EdDSA", .kty = "OKP", .crv = "Ed25519", .digest = nullptr},
-}};
-
-inline auto findAlg(std::string_view name) -> const Alg *
-{
-    const auto * found = std::ranges::find(algs, name, &Alg::name);
-    return found == algs.end() ? nullptr : found;
-}
-
+// A JWKS entry turned into a PEM public key once, at fetch time.
 struct Jwk
 {
     std::string kid;
     std::string kty;
     std::string crv;
-    std::shared_ptr<EVP_PKEY> key;
-
-    [[nodiscard]] auto usableFor(const Alg & alg, const std::string & wantKid) const -> bool
-    {
-        return kty == alg.kty && crv == alg.crv && (wantKid.empty() || kid == wantKid);
-    }
+    std::string pem;
 };
 
-namespace detail {
-
-constexpr size_t maxKeyBytes = 2048; // 16k-bit RSA
-
-// NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL takes unsigned char.
-inline auto uchars(const std::string & bytes) -> const unsigned char *
+// jwt-cpp has helpers for RSA and EC components but not for OKP.
+inline auto ed25519Pem(const std::string & xB64) -> std::string
 {
-    return reinterpret_cast<const unsigned char *>(bytes.data());
+    auto raw = jwt::base::decode<jwt::alphabet::base64url>(jwt::base::pad<jwt::alphabet::base64url>(xB64));
+    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> const key(
+        EVP_PKEY_new_raw_public_key(
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL takes unsigned char.
+            EVP_PKEY_ED25519, nullptr, reinterpret_cast<const unsigned char *>(raw.data()), raw.size()),
+        EVP_PKEY_free);
+    std::unique_ptr<BIO, decltype(&BIO_free_all)> const bio(BIO_new(BIO_s_mem()), BIO_free_all);
+    if (!key || !bio || PEM_write_bio_PUBKEY(bio.get(), key.get()) != 1) {
+        return {};
+    }
+    char * data = nullptr;
+    auto len = BIO_get_mem_data(bio.get(), &data); // NOLINT(cppcoreguidelines-pro-type-cstyle-cast): macro
+    return {data, static_cast<size_t>(len)};
 }
-
-inline auto uchars(std::string & bytes) -> unsigned char *
-{
-    return reinterpret_cast<unsigned char *>(bytes.data());
-}
-// NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
-
-using BnPtr = std::unique_ptr<BIGNUM, decltype(&BN_free)>;
-
-inline auto bnFrom(const std::string & bytes) -> BnPtr
-{
-    if (bytes.empty() || bytes.size() > maxKeyBytes) {
-        return {nullptr, BN_free};
-    }
-    return {BN_bin2bn(uchars(bytes), static_cast<int>(bytes.size()), nullptr), BN_free};
-}
-
-inline auto pkeyFromParams(const char * type, OSSL_PARAM_BLD * bld) -> std::shared_ptr<EVP_PKEY>
-{
-    std::unique_ptr<OSSL_PARAM, decltype(&OSSL_PARAM_free)> const params(OSSL_PARAM_BLD_to_param(bld), OSSL_PARAM_free);
-    std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> const ctx(
-        EVP_PKEY_CTX_new_from_name(nullptr, type, nullptr), EVP_PKEY_CTX_free);
-    EVP_PKEY * raw = nullptr;
-    if (!params || !ctx || EVP_PKEY_fromdata_init(ctx.get()) <= 0
-        || EVP_PKEY_fromdata(ctx.get(), &raw, EVP_PKEY_PUBLIC_KEY, params.get()) <= 0) {
-        return nullptr;
-    }
-    return {raw, EVP_PKEY_free};
-}
-
-constexpr std::array<std::pair<std::string_view, const char *>, 3> curves{{
-    {"P-256", SN_X9_62_prime256v1}, {"P-384", SN_secp384r1}, {"P-521", SN_secp521r1}}};
-
-inline auto makeKey(const Json & jwk, const std::string & kty, const std::string & crv) -> std::shared_ptr<EVP_PKEY>
-{
-    auto field = [&](const char * name) -> std::string { return base64UrlDecode(jwk.at(name).get<std::string>()); };
-    std::unique_ptr<OSSL_PARAM_BLD, decltype(&OSSL_PARAM_BLD_free)> const bld(OSSL_PARAM_BLD_new(), OSSL_PARAM_BLD_free);
-    if (!bld) {
-        return nullptr;
-    }
-    if (kty == "RSA") {
-        auto mod = bnFrom(field("n"));
-        auto exp = bnFrom(field("e"));
-        if (!mod || !exp || OSSL_PARAM_BLD_push_BN(bld.get(), OSSL_PKEY_PARAM_RSA_N, mod.get()) != 1
-            || OSSL_PARAM_BLD_push_BN(bld.get(), OSSL_PKEY_PARAM_RSA_E, exp.get()) != 1) {
-            return nullptr;
-        }
-        return pkeyFromParams("RSA", bld.get());
-    }
-    if (kty == "EC") {
-        const auto * curve = std::ranges::find(curves, crv, &decltype(curves)::value_type::first);
-        auto pub = '\x04' + field("x") + field("y");
-        if (curve == curves.end() || pub.size() > maxKeyBytes
-            || OSSL_PARAM_BLD_push_utf8_string(bld.get(), OSSL_PKEY_PARAM_GROUP_NAME, curve->second, 0) != 1
-            || OSSL_PARAM_BLD_push_octet_string(bld.get(), OSSL_PKEY_PARAM_PUB_KEY, pub.data(), pub.size()) != 1) {
-            return nullptr;
-        }
-        return pkeyFromParams("EC", bld.get());
-    }
-    if (kty == "OKP" && crv == "Ed25519") {
-        auto pub = field("x");
-        return {EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, uchars(pub), pub.size()), EVP_PKEY_free};
-    }
-    return nullptr;
-}
-
-} // namespace detail
 
 // nullopt for anything unusable. JWKS content is remote input.
-inline auto parseJwk(const Json & jwk) -> std::optional<Jwk>
+inline auto parseJwk(const Json & json) -> std::optional<Jwk>
 {
     try {
-        if (!jwk.is_object() || jwk.value("use", "sig") != "sig") {
+        if (!json.is_object() || json.value("use", "sig") != "sig") {
             return std::nullopt;
         }
-        Jwk res{.kid = jwk.value("kid", ""), .kty = jwk.value("kty", ""), .crv = jwk.value("crv", ""), .key = nullptr};
-        res.key = detail::makeKey(jwk, res.kty, res.crv);
-        return res.key ? std::optional(std::move(res)) : std::nullopt;
+        auto str = [&](const char * name) -> std::string { return json.at(name).get<std::string>(); };
+        Jwk jwk{.kid = json.value("kid", ""), .kty = json.value("kty", ""), .crv = json.value("crv", ""), .pem = {}};
+        if (jwk.kty == "RSA") {
+            jwk.pem = jwt::helper::create_public_key_from_rsa_components(str("n"), str("e"));
+        } else if (jwk.kty == "EC") {
+            jwk.pem = jwt::helper::create_public_key_from_ec_components(jwk.crv, str("x"), str("y"));
+        } else if (jwk.kty == "OKP" && jwk.crv == "Ed25519") {
+            jwk.pem = ed25519Pem(str("x"));
+        }
+        return jwk.pem.empty() ? std::nullopt : std::optional(std::move(jwk));
     } catch (...) {
         return std::nullopt;
     }
 }
 
-// JWS carries ECDSA as fixed-width r||s, OpenSSL wants DER.
-inline auto ecdsaToDer(const std::string & raw) -> std::string
+// Tests pin the time.
+struct FixedClock
 {
-    if (raw.empty() || raw.size() % 2 != 0) {
-        return {};
+    std::chrono::system_clock::time_point at;
+    [[nodiscard]] auto now() const -> std::chrono::system_clock::time_point
+    {
+        return at;
     }
-    auto half = raw.size() / 2;
-    std::unique_ptr<ECDSA_SIG, decltype(&ECDSA_SIG_free)> const sig(ECDSA_SIG_new(), ECDSA_SIG_free);
-    auto sigR = detail::bnFrom(raw.substr(0, half));
-    auto sigS = detail::bnFrom(raw.substr(half));
-    if (!sig || !sigR || !sigS || ECDSA_SIG_set0(sig.get(), sigR.get(), sigS.get()) != 1) {
-        return {};
+};
+using VerifierBuilder = jwt::verifier<FixedClock, jwt::traits::nlohmann_json>;
+
+// Adds `key` as the algorithm `alg` names, if the key type fits. False if not.
+inline auto allowKey(VerifierBuilder & verifier, const std::string & alg, const Jwk & key) -> bool
+{
+    namespace algo = jwt::algorithm;
+    auto rsa = key.kty == "RSA";
+    auto ecc = [&](std::string_view crv) -> bool { return key.kty == "EC" && key.crv == crv; };
+    if (alg == "RS256" && rsa) {
+        verifier.allow_algorithm(algo::rs256(key.pem));
+    } else if (alg == "RS384" && rsa) {
+        verifier.allow_algorithm(algo::rs384(key.pem));
+    } else if (alg == "RS512" && rsa) {
+        verifier.allow_algorithm(algo::rs512(key.pem));
+    } else if (alg == "PS256" && rsa) {
+        verifier.allow_algorithm(algo::ps256(key.pem));
+    } else if (alg == "PS384" && rsa) {
+        verifier.allow_algorithm(algo::ps384(key.pem));
+    } else if (alg == "PS512" && rsa) {
+        verifier.allow_algorithm(algo::ps512(key.pem));
+    } else if (alg == "ES256" && ecc("P-256")) {
+        verifier.allow_algorithm(algo::es256(key.pem));
+    } else if (alg == "ES384" && ecc("P-384")) {
+        verifier.allow_algorithm(algo::es384(key.pem));
+    } else if (alg == "ES512" && ecc("P-521")) {
+        verifier.allow_algorithm(algo::es512(key.pem));
+    } else if (alg == "EdDSA" && key.kty == "OKP") {
+        verifier.allow_algorithm(algo::ed25519(key.pem));
+    } else {
+        return false;
     }
-    std::ignore = sigR.release(); // owned by sig now
-    std::ignore = sigS.release();
-    int const len = i2d_ECDSA_SIG(sig.get(), nullptr);
-    if (len <= 0) {
-        return {};
-    }
-    std::string der(static_cast<size_t>(len), '\0');
-    auto * out = detail::uchars(der);
-    i2d_ECDSA_SIG(sig.get(), &out);
-    return der;
+    return true;
 }
 
-inline auto verifySignature(const Alg & alg, EVP_PKEY & key, std::string_view signingInput, std::string sig) -> bool
-{
-    if (alg.kty == "EC") {
-        sig = ecdsaToDer(sig);
-    }
-    if (sig.empty()) {
-        return false;
-    }
-    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> const ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
-    EVP_PKEY_CTX * pctx = nullptr;
-    if (!ctx || EVP_DigestVerifyInit_ex(ctx.get(), &pctx, alg.digest, nullptr, nullptr, &key, nullptr) <= 0) {
-        return false;
-    }
-    if (alg.pss
-        && (EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PSS_PADDING) <= 0
-            || EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, RSA_PSS_SALTLEN_AUTO) <= 0)) {
-        return false;
-    }
-    std::string const input(signingInput);
-    return EVP_DigestVerify(ctx.get(), detail::uchars(sig), sig.size(), detail::uchars(input), input.size()) == 1;
-}
-
-constexpr double clockSkewSecs = 60;
-
-// exp is mandatory. Compared as double so absurd values cannot overflow.
-inline auto timeValid(const Json & claims, std::chrono::system_clock::time_point now) -> bool
-{
-    auto const secs = std::chrono::duration<double>(now.time_since_epoch()).count();
-    auto const skew = clockSkewSecs;
-    auto exp = claims.find("exp");
-    if (exp == claims.end() || !exp->is_number() || exp->get<double>() + skew < secs) {
-        return false;
-    }
-    auto nbf = claims.find("nbf");
-    return nbf == claims.end() || !nbf->is_number() || nbf->get<double>() - skew <= secs;
-}
+constexpr size_t clockSkewSecs = 60;
 
 class Verifier
 {
@@ -508,7 +360,7 @@ public:
     }
 
     // Total: unknown/bad input is a Result with no identity.
-    auto verify(std::string_view token, std::chrono::system_clock::time_point now = std::chrono::system_clock::now()) -> Result
+    auto verify(const std::string & token, std::chrono::system_clock::time_point now = std::chrono::system_clock::now()) -> Result
     {
         try {
             return doVerify(token, now);
@@ -600,24 +452,30 @@ public:
     }
 
 private:
-    // Keys of `provider` usable for `alg`, narrowed to `kid` if given.
-    auto candidates(const Provider & provider, KeySet & set, const Alg & alg, const std::string & kid)
-        -> std::vector<std::shared_ptr<EVP_PKEY>>
+    // Keys of `provider` that the token's alg can use, narrowed to its kid if given.
+    auto candidates(const Provider & provider, KeySet & set, const Decoded & token,
+                    std::chrono::system_clock::time_point now) -> VerifierBuilder
     {
+        auto alg = token.has_algorithm() ? token.get_algorithm() : "";
+        auto kid = token.has_key_id() ? token.get_key_id() : "";
         std::scoped_lock const guard(set.lock);
-        auto pick = [&]() -> std::vector<std::shared_ptr<EVP_PKEY>> {
-            std::vector<std::shared_ptr<EVP_PKEY>> res;
+        auto pick = [&]() -> std::optional<VerifierBuilder> {
+            auto verifier = jwt::verify<FixedClock, jwt::traits::nlohmann_json>(FixedClock{now})
+                                .with_issuer(provider.issuer)
+                                .with_audience(provider.audience)
+                                .leeway(clockSkewSecs);
+            bool any = false;
             for (const auto & key : set.keys) {
-                if (key.usableFor(alg, kid)) {
-                    res.push_back(key.key);
+                if (kid.empty() || key.kid == kid) {
+                    any = allowKey(verifier, alg, key) || any;
                 }
             }
-            return res;
+            return any ? std::optional(std::move(verifier)) : std::nullopt;
         };
         auto res = pick();
-        auto now = std::chrono::steady_clock::now();
-        if (fetchDue(set.fetched, now, !res.empty(), refetchOnMiss)) {
-            set.fetched = now;
+        auto mono = std::chrono::steady_clock::now();
+        if (fetchDue(set.fetched, mono, res.has_value(), refetchOnMiss)) {
+            set.fetched = mono;
             try {
                 set.keys = fetchKeys(provider);
             } catch (std::exception & err) {
@@ -626,45 +484,38 @@ private:
             }
             res = pick();
         }
-        return res;
+        if (!res) {
+            throw nix::Error("no signing keys for provider %s and alg %s (issuer unreachable?)", provider.name, alg);
+        }
+        return std::move(*res);
     }
 
-    auto doVerify(std::string_view token, std::chrono::system_clock::time_point now) -> Result
+    auto doVerify(const std::string & token, std::chrono::system_clock::time_point now) -> Result
     {
         auto parsed = parseToken(token);
         if (!parsed) {
             return fail("malformed token");
         }
-        const auto * alg = findAlg(parsed->header.value("alg", ""));
-        if (alg == nullptr) {
-            return fail("unsupported alg");
-        }
-        auto iss = parsed->claims.value("iss", "");
+        auto iss = parsed->has_issuer() ? parsed->get_issuer() : "";
         for (size_t idx = 0; idx < config.providers.size(); ++idx) {
             const auto & provider = config.providers.at(idx);
             if (provider.issuer != iss) {
                 continue;
             }
-            if (!audienceMatches(parsed->claims, provider.audience)) {
-                return fail("audience mismatch for provider " + provider.name);
+            if (!parsed->has_expires_at()) {
+                return fail("token has no exp");
             }
-            if (!timeValid(parsed->claims, now)) {
-                return fail("token expired or not yet valid");
+            std::error_code err;
+            candidates(provider, keys.at(idx), *parsed, now).verify(*parsed, err);
+            if (err) {
+                return fail(provider.name + ": " + err.message());
             }
-            auto pkeys = candidates(provider, keys.at(idx), *alg, parsed->header.value("kid", ""));
-            if (pkeys.empty()) {
-                return fail("no signing keys for provider " + provider.name + " (issuer unreachable?)");
-            }
-            if (!std::ranges::any_of(pkeys, [&](const auto & key) -> bool {
-                    return verifySignature(*alg, *key, parsed->signingInput, parsed->signature);
-                })) {
-                return fail("bad signature for provider " + provider.name);
-            }
-            auto sub = parsed->claims.value("sub", "");
+            auto claims = Json::parse(parsed->get_payload());
+            auto sub = claims.value("sub", "");
             if (sub.empty() || sub.contains('\0')) {
                 return fail("token lacks sub");
             }
-            auto role = roleFor(provider, parsed->claims);
+            auto role = roleFor(provider, claims);
             return {
                 .identity = Identity{.subject = "oidc:" + provider.name + ":" + sub, .role = role},
                 .error = role ? "" : "no rule matched"};

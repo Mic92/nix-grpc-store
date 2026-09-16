@@ -15,10 +15,8 @@ in
     package = lib.mkOption {
       type = lib.types.package;
       # The daemon only links `nix-util`, so any recent Nix's libs will do.
-      default = pkgs.callPackage ../package.nix {
-        inherit (pkgs.nix.libs) nix-store nix-util;
-      };
-      defaultText = lib.literalExpression "pkgs.callPackage ./package.nix { }";
+      default = (pkgs.callPackage ../packages.nix { nixPackages = pkgs.nix.libs; }).default;
+      defaultText = lib.literalExpression "(pkgs.callPackage ./packages.nix { nixPackages = pkgs.nix.libs; }).default";
       description = "Package providing {command}`nix-grpc-daemon`.";
     };
 

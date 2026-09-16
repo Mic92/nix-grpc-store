@@ -18,6 +18,8 @@ nix_util_dep  = dependency('nix-util')
 # Farm mode: niks3 claims over HTTPS, niks3 push acks as JSON lines.
 curl_dep = dependency('libcurl')
 json_dep = dependency('nlohmann_json')
+# Header-only, ships only cmake config: found through the include path.
+meson.get_compiler('cpp').check_header('jwt-cpp/traits/nlohmann-json/defaults.h', required: true)
 
 # Pre-release versions look like "2.35pre20260619_f8bb823a".
 nix_ver = nix_store_dep.version().split('.')

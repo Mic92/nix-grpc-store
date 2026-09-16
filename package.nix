@@ -11,6 +11,7 @@
   zstd,
   curl,
   nlohmann_json,
+  jwt-cpp,
   python3,
   # Nix component libraries. When building the client plugin these must be
   # ABI-compatible with the `nix` binary that will dlopen() the .so; the NixOS
@@ -62,6 +63,7 @@ stdenv.mkDerivation {
     nix-util
     curl
     nlohmann_json
+    jwt-cpp
   ];
 
   # Frame pointers + symbols so `perf` in the VM test can attribute samples
