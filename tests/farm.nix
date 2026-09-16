@@ -200,6 +200,7 @@ pkgs.testers.runNixOSTest {
           module
         ];
         services.nix-grpc-farm-lb = {
+          accessLog = true;
           enable = true;
           workers.${pkgs.stdenv.hostPlatform.system} = [
             "worker1:50051"

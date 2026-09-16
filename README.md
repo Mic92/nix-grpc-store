@@ -305,6 +305,9 @@ which also requires `trustClients` (see above).
   * `system` — send `x-nix-system` on every call, not just builds, so a
     balancer routes input uploads and substitution to a worker of that
     system. Use one `nix.buildMachines` entry per system.
+  * `debug` — print which CA bundle and client certificate were loaded and
+    turn on gRPC's TCP/TLS handshake tracing on stderr. `NIX_GRPC_DEBUG=1`
+    does the same and also reaches the build hook.
 
 ## Server flags
 

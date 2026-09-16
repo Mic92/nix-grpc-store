@@ -24,6 +24,7 @@
 #include <grpcpp/support/interceptor.h>
 #include <grpcpp/support/status.h>
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cassert>
@@ -123,6 +124,26 @@ auto readValidCert(const std::string &path) -> std::string {
     throw nix::Error("client certificate '%s' is not yet valid", path);
   }
   return pem;
+}
+
+auto certSubject(const std::string & pem) -> std::string {
+  std::unique_ptr<BIO, decltype(&BIO_free)> const bio{
+      BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size())), BIO_free};
+  std::unique_ptr<X509, decltype(&X509_free)> const cert{
+      PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr), X509_free};
+  if (!cert) {
+    return "?";
+  }
+  constexpr size_t maxSubject = 256;
+  std::array<char, maxSubject> buf{};
+  X509_NAME_oneline(X509_get_subject_name(cert.get()), buf.data(), buf.size());
+  return buf.data();
+}
+
+// Must run before the first channel: gRPC reads these once at init.
+void enableGrpcTracing() {
+  nix::setEnv("GRPC_TRACE", nix::getEnv("GRPC_TRACE").value_or("handshaker,tcp,http,secure_endpoint,tsi").c_str());
+  nix::setEnv("GRPC_VERBOSITY", nix::getEnv("GRPC_VERBOSITY").value_or("debug").c_str());
 }
 
 // Same lookup order as Nix's ssl-cert-file setting.
@@ -256,6 +277,9 @@ private:
         "`nix.buildMachines` entry per system behind a balancer so input uploads "
         "and substitution land on a worker of that system."};
 
+    Setting<bool> debug{this, nix::getEnv("NIX_GRPC_DEBUG").value_or("") == "1", "debug",
+        "Log TLS setup and enable gRPC handshake tracing on stderr. Also `NIX_GRPC_DEBUG=1`."};
+
     Setting<std::string> caCert{
         this,
         "",
@@ -360,6 +384,37 @@ private:
 
     nixgrpc::NarFetcher narFetcher;
 
+    auto sslOptions() -> grpc::SslCredentialsOptions {
+      grpc::SslCredentialsOptions ssl;
+      auto caCert = config->caCert.get().empty() ? defaultCaCert() : config->caCert.get();
+      if (!caCert.empty()) {
+        ssl.pem_root_certs = readFile(caCert);
+      }
+      auto clientCert = config->clientCert.get();
+      auto clientKey = config->clientKey.get();
+      if (clientCert.empty() != clientKey.empty()) {
+        throw Error("gRPC store '%s': client-cert and client-key must be set together",
+                    config->authority.to_string());
+      }
+      if (clientCert.empty()) {
+        clientCert = defaultClientCred("NIX_GRPC_CLIENT_CERT", "client.crt");
+        clientKey = defaultClientCred("NIX_GRPC_CLIENT_KEY", "client.key");
+      }
+      if (!clientCert.empty() && !clientKey.empty()) {
+        ssl.pem_cert_chain = readValidCert(clientCert);
+        ssl.pem_private_key = readFile(clientKey);
+        haveClientCert = true;
+      }
+      if (config->debug) {
+        warn("grpc-store %s: ca=%s (%d bytes) client-cert=%s client-key=%s%s",
+             config->authority.to_string(), caCert.empty() ? "<grpc builtin>" : caCert,
+             ssl.pem_root_certs.size(), clientCert.empty() ? "<none>" : clientCert,
+             clientKey.empty() ? "<none>" : clientKey,
+             haveClientCert ? " subject=" + certSubject(ssl.pem_cert_chain) : "");
+      }
+      return ssl;
+    }
+
     auto makeChannel(bool ownConnection) -> std::shared_ptr<grpc::Channel>
     {
       grpc::ChannelArguments args;
@@ -388,33 +443,16 @@ public:
           narFetcher{
               [this] -> std::shared_ptr<grpc::Channel> { return makeChannel(true); },
               config->authority.to_string(), config->narConnections} {
+      if (config->debug) {
+        enableGrpcTracing();
+      }
       if (config->insecure) {
         if (!config->tokenFile.get().empty()) {
           throw Error("gRPC store '%s': token-file needs TLS", config->authority.to_string());
         }
         creds = grpc::InsecureChannelCredentials();
       } else {
-        grpc::SslCredentialsOptions ssl;
-        auto caCert = config->caCert.get().empty() ? defaultCaCert() : config->caCert.get();
-        if (!caCert.empty()) {
-          ssl.pem_root_certs = readFile(caCert);
-        }
-        auto clientCert = config->clientCert.get();
-        auto clientKey = config->clientKey.get();
-        if (clientCert.empty() != clientKey.empty()) {
-          throw Error("gRPC store '%s': client-cert and client-key must be set together",
-                      config->authority.to_string());
-        }
-        if (clientCert.empty()) {
-          clientCert = defaultClientCred("NIX_GRPC_CLIENT_CERT", "client.crt");
-          clientKey = defaultClientCred("NIX_GRPC_CLIENT_KEY", "client.key");
-        }
-        if (!clientCert.empty() && !clientKey.empty()) {
-          ssl.pem_cert_chain = readValidCert(clientCert);
-          ssl.pem_private_key = readFile(clientKey);
-          haveClientCert = true;
-        }
-        creds = grpc::SslCredentials(ssl);
+        creds = grpc::SslCredentials(sslOptions());
         auto tokenFile = config->tokenFile.get();
         if (tokenFile.empty()) {
           tokenFile = defaultClientCred("NIX_GRPC_TOKEN_FILE", "token");
@@ -440,20 +478,35 @@ public:
     }
 
 private:
+    // gRPC folds every connect failure into UNAVAILABLE. Tell TCP from TLS apart by the message.
+    auto connectHint(const std::string & msg) const -> std::string
+    {
+      auto has = [&](std::string_view needle) -> bool { return msg.contains(needle); };
+      std::string const more = config->debug ? "" : " Set NIX_GRPC_DEBUG=1 for a handshake trace.";
+      if (has("Connection refused") || has("No route") || has("Network is unreachable") ||
+          has("timed out") || has("Deadline") || has("DNS")) {
+        return "\nhint: could not reach the server (TCP/DNS), not a certificate problem." + more;
+      }
+      if (has("handshaker shutdown") || has("Handshake") || has("SSL") || has("TLS") ||
+          has("certificate") || has("Socket closed")) {
+        if (!haveClientCert) {
+          return "\nhint: TLS handshake failed and no client certificate was presented. If the "
+                 "server requires mTLS set 'client-cert'/'client-key' or install client.crt/"
+                 "client.key in $XDG_DATA_HOME/nix-grpc-store or /var/lib/nix-grpc-store." + more;
+        }
+        return "\nhint: TLS handshake failed: server certificate not trusted by our CA bundle, "
+               "server rejected our client certificate, or the peer is not speaking TLS." + more;
+      }
+      return more.empty() ? "" : "\nhint:" + more;
+    }
+
     auto statusError(const grpc::Status & status, const char * opName) const -> Error
     {
       std::string hint;
       auto code = status.error_code();
-      // UNAVAILABLE: a TLS-level rejection shows up only as "Socket closed".
       if (!config->insecure &&
           (code == grpc::StatusCode::UNAUTHENTICATED || code == grpc::StatusCode::UNAVAILABLE)) {
-        hint = haveClientCert
-                   ? "\nhint: the server may have rejected the client certificate "
-                     "(untrusted CA or revoked)."
-                   : "\nhint: no client certificate was presented. If the server requires "
-                     "mTLS, set the 'client-cert'/'client-key' store parameters or install "
-                     "client.crt/client.key in $XDG_DATA_HOME/nix-grpc-store or "
-                     "/var/lib/nix-grpc-store.";
+        hint = connectHint(status.error_message());
       }
       if (code == grpc::StatusCode::UNIMPLEMENTED && std::string_view(opName) == "Connect") {
         hint = "\nhint: this is a build farm endpoint. Pass --eval-store auto.";

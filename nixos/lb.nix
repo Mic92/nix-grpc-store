@@ -36,6 +36,14 @@ let
     };
   };
 
+  stderrLog = fmt: {
+    name = "envoy.access_loggers.stderr";
+    typed_config = {
+      "@type" = "type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StderrAccessLog";
+      log_format.text_format_source.inline_string = fmt + "\n";
+    };
+  };
+
   downstreamTls = lib.optionalAttrs (cfg.tls.certFile != null) {
     transport_socket = {
       name = "envoy.transport_sockets.tls";
@@ -167,6 +175,16 @@ in
       description = "Envoy admin listener (`/clusters`, `/stats`), or null.";
     };
 
+    accessLog = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Log one line per connection and per request to the journal, including
+        TLS handshake failures (`DOWNSTREAM_TRANSPORT_FAILURE_REASON`) and the
+        client certificate subject.
+      '';
+    };
+
     maxStreams = lib.mkOption {
       type = lib.types.ints.positive;
       default = 1024;
@@ -251,6 +269,7 @@ in
             {
               name = "farm";
               address = (endpoint cfg.listen).endpoint.address;
+              access_log = lib.optional cfg.accessLog (stderrLog "conn peer=%DOWNSTREAM_REMOTE_ADDRESS% tls=%DOWNSTREAM_TLS_VERSION% subject=\"%DOWNSTREAM_PEER_SUBJECT%\" sni=%REQUESTED_SERVER_NAME% flags=%RESPONSE_FLAGS% tls_fail=\"%DOWNSTREAM_TRANSPORT_FAILURE_REASON%\" rx=%BYTES_RECEIVED% tx=%BYTES_SENT% ms=%DURATION%");
               filter_chains = [
                 (
                   downstreamTls
@@ -263,6 +282,7 @@ in
                           "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager";
                         stat_prefix = "farm";
                         codec_type = "HTTP2";
+                        access_log = lib.optional cfg.accessLog (stderrLog "rpc peer=%DOWNSTREAM_REMOTE_ADDRESS% subject=\"%DOWNSTREAM_PEER_SUBJECT%\" %REQ(:PATH)% system=%REQ(x-nix-system)% upstream=%UPSTREAM_HOST% grpc=%GRPC_STATUS% flags=%RESPONSE_FLAGS% ms=%DURATION%");
                         stream_idle_timeout = "0s";
                         http2_protocol_options.max_concurrent_streams = cfg.maxStreams;
                         forward_client_cert_details = "SANITIZE_SET";
