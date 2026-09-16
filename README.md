@@ -302,6 +302,9 @@ which also requires `trustClients` (see above).
     `/var/lib/nix-grpc-store` (unreadable candidates are skipped)
   * `token-file` — OIDC bearer token, re-read per call. Defaults to
     `$NIX_GRPC_TOKEN_FILE`, then `token` in the directories above
+  * `system` — send `x-nix-system` on every call, not just builds, so a
+    balancer routes input uploads and substitution to a worker of that
+    system. Use one `nix.buildMachines` entry per system.
 
 ## Server flags
 

@@ -20,6 +20,8 @@
 #include <grpcpp/support/config.h>
 #include <grpcpp/support/string_ref.h>
 #include <grpcpp/support/channel_arguments.h>
+#include <grpcpp/support/client_interceptor.h>
+#include <grpcpp/support/interceptor.h>
 #include <grpcpp/support/status.h>
 #include <atomic>
 #include <chrono>
@@ -32,8 +34,10 @@
 #include <memory>
 #include <mutex>
 #include <nix/store/globals.hh>
+#include <nix/store/derived-path.hh>
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
+#include <nix/store/store-open.hh>
 #include <nix/store/store-reference.hh>
 #include <nix/util/configuration.hh>
 #include <nix/util/environment-variables.hh>
@@ -151,6 +155,40 @@ auto defaultClientCred(const char *envVar, const std::string &fileName) -> std::
 }
 
 // Reads the token per call so k8s projected volumes and CI refreshers work.
+// Stamps fixed headers (x-nix-system from `system=`) on every RPC so a
+// balancer routes store queries and uploads like the builds that follow.
+class StaticHeaders final : public grpc::experimental::Interceptor {
+public:
+  using Headers = std::vector<std::pair<std::string, std::string>>;
+  explicit StaticHeaders(std::shared_ptr<const Headers> headers) : headers(std::move(headers)) {}
+  void Intercept(grpc::experimental::InterceptorBatchMethods * methods) override {
+    if (methods->QueryInterceptionHookPoint(
+            grpc::experimental::InterceptionHookPoints::PRE_SEND_INITIAL_METADATA)) {
+      auto * metadata = methods->GetSendInitialMetadata();
+      for (const auto & [key, value] : *headers) {
+        if (!metadata->contains(key)) {
+          metadata->emplace(key, value);
+        }
+      }
+    }
+    methods->Proceed();
+  }
+
+  class Factory final : public grpc::experimental::ClientInterceptorFactoryInterface {
+  public:
+    explicit Factory(Headers hdrs) : headers(std::make_shared<const Headers>(std::move(hdrs))) {}
+    auto CreateClientInterceptor(grpc::experimental::ClientRpcInfo * /*info*/)
+        -> grpc::experimental::Interceptor * override {
+      return new StaticHeaders(headers); // NOLINT(cppcoreguidelines-owning-memory): gRPC deletes it
+    }
+  private:
+    std::shared_ptr<const Headers> headers;
+  };
+
+private:
+  std::shared_ptr<const Headers> headers;
+};
+
 class TokenFileCredentials final : public grpc::MetadataCredentialsPlugin {
   std::string path;
 
@@ -212,6 +250,11 @@ private:
     ParsedURL::Authority authority;
 
     Setting<bool> insecure{this, false, "insecure", "Use plaintext instead of TLS. Only for local testing."};
+
+    Setting<std::string> routeSystem{this, "", "system",
+        "Send `x-nix-system: VALUE` on every call, not only on builds. Use one "
+        "`nix.buildMachines` entry per system behind a balancer so input uploads "
+        "and substitution land on a worker of that system."};
 
     Setting<std::string> caCert{
         this,
@@ -327,7 +370,13 @@ private:
         // Private subchannel pool = own TCP connection.
         args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);
       }
-      auto channel = grpc::CreateCustomChannel(config->authority.to_string(), creds, args);
+      std::vector<std::unique_ptr<grpc::experimental::ClientInterceptorFactoryInterface>> interceptors;
+      if (!config->routeSystem.get().empty()) {
+        interceptors.push_back(std::make_unique<StaticHeaders::Factory>(
+            StaticHeaders::Headers{{"x-nix-system", config->routeSystem.get()}}));
+      }
+      auto channel = grpc::experimental::CreateCustomChannelWithInterceptors(
+          config->authority.to_string(), creds, args, std::move(interceptors));
       // Start TCP+TLS setup now instead of stalling the first RPC.
       channel->GetState(true);
       return channel;
@@ -741,9 +790,15 @@ public:
       for (unsigned attempt = 0;; attempt++) {
         status = tryBuildDerivation(request, headers, res);
         if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
+          // The build hook has the drv in the local store but passes no evalStore.
+          std::shared_ptr<Store> local;
           if (evalStore == nullptr) {
-            throw Error("farm worker lacks '%s'\nhint: pass --eval-store auto",
-                        printStorePath(drvPath));
+            local = nix::openStore();
+            if (local.get() == this || !local->isValidPath(drvPath)) {
+              throw Error("farm worker lacks '%s'\nhint: pass --eval-store auto",
+                          printStorePath(drvPath));
+            }
+            evalStore = local.get();
           }
           uploadDrvClosure(*evalStore, drvPath, headers);
           status = tryBuildDerivation(request, headers, res);
@@ -847,12 +902,32 @@ public:
       }
     }
 
+    // The build hook (untrusted role) and plain `--store grpc://` pass no
+    // eval store but usually have the derivations in the local store.
+    auto localEvalStore(const std::vector<DerivedPath> & reqs) -> std::shared_ptr<Store> {
+      std::shared_ptr<Store> local = nix::openStore();
+      bool haveDrvs = local.get() != this;
+      for (const auto & req : reqs) {
+        if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
+          if (const auto * drv = std::get_if<SingleDerivedPath::Opaque>(&built->drvPath->raw())) {
+            haveDrvs = haveDrvs && local->isValidPath(drv->path);
+          }
+        }
+      }
+      if (!haveDrvs) {
+        throw Error("'%s' is a build farm\nhint: pass --eval-store auto", config->authority.to_string());
+      }
+      return local;
+    }
+
     // The farm builds one derivation per RPC, so walk the DAG here and send
     // every ready derivation at once. Cached ones come back AlreadyValid.
     auto farmBuildPaths(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
                         Store * evalStore) -> std::vector<KeyedBuildResult> {
+      std::shared_ptr<Store> local;
       if (evalStore == nullptr || evalStore == this) {
-        throw Error("'%s' is a build farm\nhint: pass --eval-store auto", config->authority.to_string());
+        local = localEvalStore(reqs);
+        evalStore = local.get();
       }
       std::map<StorePath, FarmJob> jobs;
       loadFarmJobs(reqs, *evalStore, jobs);

@@ -39,6 +39,7 @@
 #include <unistd.h>
 
 #include <grpc/grpc_security_constants.h>
+#include <grpc/impl/channel_arg_names.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
 #include <grpcpp/security/server_credentials.h>
@@ -507,6 +508,12 @@ public:
             for (const auto & path : request->paths()) {
                 std::shared_ptr<const nix::ValidPathInfo> info;
                 try {
+                    substituteIfFarm(*localStore, nix::StorePath(path));
+                } catch (nix::Error & err) {
+                    logDebug({{"event", "substitute_failed"}, {"path", path}, {"error", err.what()}});
+                    continue;
+                }
+                try {
                     info = localStore->queryPathInfo(nix::StorePath(path));
                 } catch (nix::InvalidPath &) {
                     continue;
@@ -612,12 +619,25 @@ public:
             }
             logDebug({{"event", "rpc"}, {"method", "StoreInfo"}, {"cn", commonName}, {"peer", context->peer()}});
             metrics.countRpc("StoreInfo", commonName);
+            if (farm) {
+                // build-remote sends BuildDerivation and unsigned inputs only to stores that trust it.
+                reply->set_trusted(caller.role == nixgrpc::Role::trusted);
+                return grpc::Status::OK;
+            }
             auto backend = connectBackend(*getStore());
             if (backend->info.remoteTrustsUs) {
                 reply->set_trusted(*backend->info.remoteTrustsUs == nix::Trusted);
             }
             return grpc::Status::OK;
         });
+    }
+
+    // Farm outputs may live only in the cache. The build hook reads them back through us.
+    void substituteIfFarm(nix::Store & store, const nix::StorePath & path)
+    {
+        if (farm && !store.isValidPath(path)) {
+            nixcompat::ensurePath(store, path);
+        }
     }
 
     static void appendOutputInfo(nix::Store & store, nix::remote::PathInfo * out, const nix::StorePath & outPath)
@@ -1035,7 +1055,9 @@ public:
 
             for (int idx = 0; idx < request->paths_size(); ++idx) {
                 tagged.setPathIndex(static_cast<uint32_t>(idx));
-                localStore->narFromPath(nix::StorePath(request->paths(idx)), counting);
+                nix::StorePath const path(request->paths(idx));
+                substituteIfFarm(*localStore, path);
+                localStore->narFromPath(path, counting);
                 sink.flush();
                 nix::remote::NarFrame eofFrame;
                 eofFrame.set_path_index(static_cast<uint32_t>(idx));

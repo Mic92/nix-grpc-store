@@ -257,6 +257,11 @@ pkgs.testers.runNixOSTest {
         ];
         programs.nix-grpc-store.enable = true;
         nix.settings.substituters = pkgs.lib.mkForce [ ];
+        # build-remote runs inside nix-daemon.service; prove the hook still
+        # reaches the balancer with daemon egress filtering on.
+        networking.nftables.enable = true;
+        networking.nftables.flushRuleset = false;
+        nix.firewall.enable = true;
       };
   };
 
@@ -288,13 +293,15 @@ pkgs.testers.runNixOSTest {
         return sum(w.execute(f"test -e {path}")[0] == 0 for w in [worker1, worker2])
 
     def probe(query: str) -> str:
-        rc, out = client.execute(f"nix path-info --store 'grpc://lb:50051?{tls}{query}' ${jobExpr} 2>&1")
+        rc, out = client.execute(f"nix path-info --store 'grpc://lb:50051?{tls}{query}' $(readlink -f /run/current-system) 2>&1")
         return "ok" if rc == 0 or "is not valid" in out else out
 
     with subtest("balancer auth: client cert, bearer token, nothing, unknown CN"):
-        assert probe("&client-cert=${certs}/ci.pem&client-key=${certs}/ci.key") == "ok"
+        out = probe("&client-cert=${certs}/ci.pem&client-key=${certs}/ci.key")
+        assert out == "ok", out
         client.succeed("curl -sfG http://lb:8081/issue --data-urlencode 'aud=${oidcAudience}' --data-urlencode sub=dev:alice > /root/dev.jwt && test -s /root/dev.jwt")
-        assert probe("&token-file=/root/dev.jwt") == "ok"
+        out = probe("&token-file=/root/dev.jwt")
+        assert out == "ok", out
         out = probe("")
         assert "client certificate or bearer token" in out, out
         out = probe("&client-cert=${certs}/stranger.pem&client-key=${certs}/stranger.key")
@@ -317,6 +324,11 @@ pkgs.testers.runNixOSTest {
                 w.succeed(f"nix-store --delete {top}")
             build(store, name)
             assert holders(top) == 0, "no worker rebuilt it"
+
+    with subtest("build hook: nix-daemon with builders = grpc://lb"):
+        # NIX_REMOTE=daemon so build-remote is spawned by nix-daemon.service (egress-filtered), not by root's nix.
+        out = client.succeed(f"NIX_REMOTE=daemon nix build -L --max-jobs 0 --builders '{envoy}&system=${pkgs.stdenv.hostPlatform.system} ${pkgs.stdenv.hostPlatform.system} - 4' --print-out-paths --no-link -f ${jobExpr} --argstr tag hook 2>&1 | tee /dev/stderr | tail -1").strip()
+        client.succeed(f"grep farm-top-hook {out}")
 
     with subtest("interrupting the client stops the build on the worker"):
         # [6] keeps the probe from matching its own command line.
