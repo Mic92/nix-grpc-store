@@ -28,6 +28,20 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     doCheck = false;
     dontFixup = true;
   });
+  claims-spec = pkgs.runCommand "nix-grpc-store-claims-spec" { nativeBuildInputs = [ pkgs.quint ]; } ''
+    cd ${./spec}
+    export HOME=$TMPDIR
+    quint typecheck claims.qnt
+    quint typecheck hook.qnt
+    quint typecheck push.qnt
+    quint run claims.qnt --invariant=safety --max-steps=30 --max-samples=20000
+    quint run hook.qnt --main hookFixed --invariant=safety --max-steps=15 --max-samples=20000
+    ! quint run hook.qnt --main hookNoSubstituteRefs --invariant=safety --max-steps=15 --max-samples=20000
+    ! quint run hook.qnt --main hookNoSubstituteDrv --invariant=safety --max-steps=15 --max-samples=20000
+    quint run push.qnt --main pushFixed --invariant=safety --max-steps=12 --max-samples=20000
+    quint run claims.qnt --step=stepBlips --invariant=oneBuilder --max-steps=30 --max-samples=20000
+    touch $out
+  '';
   exit-stress = import ./tests/exit-stress.nix {
     inherit pkgs;
     nix = nixPackages.nix-everything;
