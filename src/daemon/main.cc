@@ -30,7 +30,6 @@
 #include <string_view>
 #include <thread>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include <sys/socket.h>
@@ -138,6 +137,12 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         return nix::openStore(storeUri);
     }
 
+    // begin() throws this for callers the ACL refuses.
+    struct Denied
+    {
+        grpc::Status status;
+    };
+
     // gRPC aborts the process if a handler lets an exception escape.
     template<typename F>
     auto guarded(F && func) -> grpc::Status
@@ -145,6 +150,8 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         nixgrpc::IdleTracker::Guard const active(idle);
         try {
             return std::forward<F>(func)();
+        } catch (Denied & denied) {
+            return denied.status;
         } catch (nixgrpc::CancelledWait & err) {
             return {grpc::StatusCode::UNAVAILABLE, err.what()};
         } catch (std::exception & err) {
@@ -190,11 +197,11 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
 
     // identify + authorize + count. Cheap RPCs log at debug here, expensive ones call done().
     auto begin(grpc::ServerContext & context, std::string_view method, nixgrpc::Role minRole, uint32_t buildMode = 0)
-        -> std::variant<grpc::Status, Rpc>
+        -> Rpc
     {
         auto caller = auth.identify(context);
         if (auto status = nixgrpc::Auth::authorize(caller, method, minRole, buildMode); !status.ok()) {
-            return status;
+            throw Denied{status};
         }
         metrics.countRpc(std::string(method), caller.name);
         logDebug({{"event", "rpc_start"}, {"method", std::string(method)}, {"cn", caller.name}, {"peer", context.peer()}});
@@ -224,45 +231,42 @@ public:
 
     auto Connect(grpc::ServerContext * context, GrpcStream * stream) -> grpc::Status override
     {
-        if (farm) {
-            return {grpc::StatusCode::UNIMPLEMENTED, "farm endpoint: pass --eval-store auto and build via BuildDerivation"};
-        }
-        nixgrpc::IdleTracker::Guard const active(idle);
-        // The opaque worker protocol cannot be inspected here.
-        auto started = begin(*context, "Connect", nixgrpc::Role::trusted);
-        if (auto * denied = std::get_if<grpc::Status>(&started)) {
-            return *denied;
-        }
-        auto & rpc = std::get<Rpc>(started);
+        return guarded([&]() -> grpc::Status {
+            if (farm) {
+                return {grpc::StatusCode::UNIMPLEMENTED, "farm endpoint: pass --eval-store auto and build via BuildDerivation"};
+            }
+            // The opaque worker protocol cannot be inspected here.
+            auto const rpc = begin(*context, "Connect", nixgrpc::Role::trusted);
 
-        nix::AutoCloseFD sock;
-        try {
-            sock = nix::connect(std::filesystem::path{backends.socketPath});
-        } catch (nix::Error & err) {
-            return {grpc::StatusCode::UNAVAILABLE, err.what()};
-        }
-
-        std::atomic<uint64_t> bytesIn{0};
-        std::jthread receiver([&]() -> void {
+            nix::AutoCloseFD sock;
             try {
-                bytesIn = nixgrpc::pumpStreamToFd(*stream, sock.get());
+                sock = nix::connect(std::filesystem::path{backends.socketPath});
+            } catch (nix::Error & err) {
+                return {grpc::StatusCode::UNAVAILABLE, err.what()};
+            }
+
+            std::atomic<uint64_t> bytesIn{0};
+            std::jthread receiver([&]() -> void {
+                try {
+                    bytesIn = nixgrpc::pumpStreamToFd(*stream, sock.get());
+                } catch (...) {
+                    nix::ignoreExceptionInDestructor();
+                }
+                ::shutdown(sock.get(), SHUT_WR);
+            });
+
+            uint64_t bytesOut = 0;
+            try {
+                bytesOut = nixgrpc::pumpFdToStream(sock.get(), *stream);
             } catch (...) {
                 nix::ignoreExceptionInDestructor();
             }
-            ::shutdown(sock.get(), SHUT_WR);
+
+            receiver.join();
+            rpc.done({{"bytes_in", std::to_string(bytesIn.load())}, {"bytes_out", std::to_string(bytesOut)}});
+            metrics.countTunnelBytes(rpc.caller.name, bytesIn, bytesOut);
+            return grpc::Status::OK;
         });
-
-        uint64_t bytesOut = 0;
-        try {
-            bytesOut = nixgrpc::pumpFdToStream(sock.get(), *stream);
-        } catch (...) {
-            nix::ignoreExceptionInDestructor();
-        }
-
-        receiver.join();
-        rpc.done({{"bytes_in", std::to_string(bytesIn.load())}, {"bytes_out", std::to_string(bytesOut)}});
-        metrics.countTunnelBytes(rpc.caller.name, bytesIn, bytesOut);
-        return grpc::Status::OK;
     }
 
     auto QueryValidPaths(
@@ -271,12 +275,7 @@ public:
         nix::remote::QueryValidPathsReply * reply) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto started = begin(*context, "QueryValidPaths", nixgrpc::Role::readOnly);
-            if (auto * denied = std::get_if<grpc::Status>(&started)) {
-                return *denied;
-            }
-            auto & rpc = std::get<Rpc>(started);
-            static_cast<void>(rpc);
+            auto const rpc = begin(*context, "QueryValidPaths", nixgrpc::Role::readOnly);
             nixgrpc::Metrics::Held const held(metrics, "QueryValidPaths");
             auto localStore = getStore();
             nix::StorePathSet paths;
@@ -312,11 +311,7 @@ public:
         nix::remote::AddMultipleReply * /*reply*/) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto started = begin(*context, "AddMultipleToStore", nixgrpc::Role::write);
-            if (auto * denied = std::get_if<grpc::Status>(&started)) {
-                return *denied;
-            }
-            auto & rpc = std::get<Rpc>(started);
+            auto const rpc = begin(*context, "AddMultipleToStore", nixgrpc::Role::write);
             auto localStore = openScopedStore();
 
             nix::remote::AddMultipleChunk first;
@@ -365,12 +360,7 @@ public:
         nix::remote::QueryPathInfosReply * reply) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto started = begin(*context, "QueryPathInfos", nixgrpc::Role::readOnly);
-            if (auto * denied = std::get_if<grpc::Status>(&started)) {
-                return *denied;
-            }
-            auto & rpc = std::get<Rpc>(started);
-            static_cast<void>(rpc);
+            auto const rpc = begin(*context, "QueryPathInfos", nixgrpc::Role::readOnly);
             auto localStore = getStore();
             for (const auto & name : request->paths()) {
                 nix::StorePath const path(name);
@@ -395,12 +385,7 @@ public:
         nix::remote::QueryMissingReply * reply) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto started = begin(*context, "QueryMissing", nixgrpc::Role::readOnly);
-            if (auto * denied = std::get_if<grpc::Status>(&started)) {
-                return *denied;
-            }
-            auto & rpc = std::get<Rpc>(started);
-            static_cast<void>(rpc);
+            auto const rpc = begin(*context, "QueryMissing", nixgrpc::Role::readOnly);
             auto localStore = getStore();
             auto missing = localStore->queryMissing(parseTargets(*localStore, request->targets()));
             for (const auto & path : missing.willBuild) {
@@ -424,11 +409,7 @@ public:
         nix::remote::StoreInfoReply * reply) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto started = begin(*context, "StoreInfo", nixgrpc::Role::readOnly);
-            if (auto * denied = std::get_if<grpc::Status>(&started)) {
-                return *denied;
-            }
-            auto & rpc = std::get<Rpc>(started);
+            auto const rpc = begin(*context, "StoreInfo", nixgrpc::Role::readOnly);
             if (farm) {
                 // build-remote sends BuildDerivation and unsigned inputs only to stores that trust it.
                 reply->set_trusted(rpc.caller.role == nixgrpc::Role::trusted);
@@ -637,11 +618,7 @@ public:
         BuildWriter * writer) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto started = begin(*context, "BuildDerivation", nixgrpc::Role::write, request->build_mode());
-            if (auto * denied = std::get_if<grpc::Status>(&started)) {
-                return *denied;
-            }
-            auto & rpc = std::get<Rpc>(started);
+            auto const rpc = begin(*context, "BuildDerivation", nixgrpc::Role::write, request->build_mode());
             if (request->protocol() != nixcompat::kBuildProtocolWire
                 || request->build_mode() > static_cast<uint32_t>(nix::bmCheck)) {
                 return {grpc::StatusCode::INVALID_ARGUMENT, "unsupported build protocol or mode"};
@@ -689,11 +666,7 @@ public:
             if (farm) {
                 return {grpc::StatusCode::UNIMPLEMENTED, "farm endpoint: build per derivation"};
             }
-            auto started = begin(*context, "BuildPaths", nixgrpc::Role::write, request->build_mode());
-            if (auto * denied = std::get_if<grpc::Status>(&started)) {
-                return *denied;
-            }
-            auto & rpc = std::get<Rpc>(started);
+            auto const rpc = begin(*context, "BuildPaths", nixgrpc::Role::write, request->build_mode());
             if (request->protocol() != nixcompat::kBuildProtocolWire
                 || request->build_mode() > static_cast<uint32_t>(nix::bmCheck)) {
                 return {grpc::StatusCode::INVALID_ARGUMENT, "unsupported build protocol or mode"};
@@ -735,11 +708,7 @@ public:
         NarFrameWriter * writer) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            auto started = begin(*context, "FetchNars", nixgrpc::Role::readOnly);
-            if (auto * denied = std::get_if<grpc::Status>(&started)) {
-                return *denied;
-            }
-            auto & rpc = std::get<Rpc>(started);
+            auto const rpc = begin(*context, "FetchNars", nixgrpc::Role::readOnly);
             auto localStore = getStore();
 
             class TaggingWriter
