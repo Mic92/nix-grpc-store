@@ -216,6 +216,7 @@ pkgs.testers.runNixOSTest {
             "worker1:50051"
             "worker2:50051"
           ];
+          healthCheckInterval = "1s";
           tls = {
             certFile = "${certs}/lb.pem";
             keyFile = "${certs}/lb.key";

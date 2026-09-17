@@ -104,9 +104,9 @@ let
     health_checks = [
       {
         timeout = "2s";
-        interval = "5s";
+        interval = cfg.healthCheckInterval;
         # Farms idle between evaluations. Keep checking.
-        no_traffic_interval = "5s";
+        no_traffic_interval = cfg.healthCheckInterval;
         unhealthy_threshold = 2;
         healthy_threshold = 1;
         grpc_health_check = { };
@@ -167,6 +167,12 @@ in
       default = lib.head systems;
       defaultText = lib.literalMD "first attribute of `workers`";
       description = "Cluster for requests without or with an unknown `x-nix-system` (store queries, uploads, `builtin`).";
+    };
+
+    healthCheckInterval = lib.mkOption {
+      type = lib.types.str;
+      default = "5s";
+      description = "How often envoy probes each worker's gRPC health. Two misses eject it.";
     };
 
     admin = lib.mkOption {

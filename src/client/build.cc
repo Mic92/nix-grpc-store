@@ -204,7 +204,7 @@ auto GrpcStore::buildDerivationNative(const StorePath & drvPath,
     }
     // Salt the hash header so a consistent-hashing balancer picks another worker.
     if (status.error_code() != grpc::StatusCode::UNAVAILABLE
-        || attempt == unavailableRetries) {
+        || attempt >= config->unavailableRetries) {
       break;
     }
     printError("%s, retrying elsewhere", firstLine(status.error_message()));
@@ -245,12 +245,10 @@ auto GrpcStore::runFarmJob(FarmJob & job, BuildMode buildMode, Store & evalStore
     return buildDerivationNative(job.drvPath, job.drv, buildMode, &evalStore);
   } catch (Interrupted &) {
     return nixcompat::failed(FailureStatus::MiscFailure, "interrupted");
-  } catch (Error & err) {
-    return nixcompat::failed(FailureStatus::MiscFailure, err.msg());
   } catch (std::exception & err) {
+    // nix reports only the top-level result, so a failed leaf would just read "dependency failed".
+    printError("%s: %s", job.drvPath.to_string(), err.what());
     return nixcompat::failed(FailureStatus::MiscFailure, err.what());
-  } catch (...) {
-    return nixcompat::failed(FailureStatus::MiscFailure, "unknown exception");
   }
 }
 

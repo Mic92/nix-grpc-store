@@ -145,6 +145,10 @@ private:
         "the default `client-cert`. Requires TLS."};
 
     static constexpr unsigned defaultMaxBuilds = 64;
+
+    static constexpr unsigned defaultUnavailableRetries = 5;
+    Setting<unsigned> unavailableRetries{this, defaultUnavailableRetries, "unavailable-retries",
+        "How often a build bounced with UNAVAILABLE is retried on another worker."};
     Setting<unsigned> maxBuilds{
         this,
         defaultMaxBuilds,
@@ -398,8 +402,6 @@ public:
       return buildDerivationNative(drvPath, drv, buildMode);
     }
 #endif
-
-    static constexpr unsigned unavailableRetries = 5;
 
     static auto firstLine(const std::string & msg) -> std::string {
       return msg.substr(0, msg.find('\n'));

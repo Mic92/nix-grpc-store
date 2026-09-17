@@ -308,8 +308,10 @@ which also requires `trustClients` (see above).
   * `token-file` — OIDC bearer token, re-read per call. Defaults to
     `$NIX_GRPC_TOKEN_FILE`, then `token` in the directories above
   * `connect-timeout` (default 30) — seconds the first call keeps retrying
-    "connection refused" and similar, so a balancer or worker restart does
-    not fail a build.
+    "connection refused" and similar. Once the server has answered, a
+    restart is ridden out for up to 120 s.
+  * `unavailable-retries` (default 5) — how often a build a worker bounced
+    (low disk, missing feature, lost claim) is retried on another.
   * `system` — send `x-nix-system` on every call, not just builds, so a
     balancer routes input uploads and substitution to a worker of that
     system. Use one `nix.buildMachines` entry per system.
