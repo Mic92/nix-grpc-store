@@ -11,6 +11,7 @@
   zstd,
   curl,
   nlohmann_json,
+  jwt-cpp,
   python3,
   mold,
   # Nix component libraries. When building the client plugin these must be
@@ -37,6 +38,8 @@ stdenv.mkDerivation {
       ./tests/farm-mock.py
       ./tests/farm-client-test.cc
       ./tests/farm-client-test.sh
+      ./tests/oidc-test.cc
+      ./tests/oidc-test.sh
       ./tests/xfcc-test.cc
     ];
   };
@@ -62,6 +65,7 @@ stdenv.mkDerivation {
     nix-util
     curl
     nlohmann_json
+    jwt-cpp
   ];
 
   # Frame pointers + symbols so `perf` in the VM test can attribute samples

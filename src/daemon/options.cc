@@ -78,6 +78,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.idleTimeout = std::chrono::seconds(*secs);
         } else if (arg == "--log-level") {
             options.logLevel = parseLogLevel(next());
+        } else if (arg == "--oidc-config") {
+            options.oidcConfig = next();
         } else if (arg == "--niks3") {
             options.farm.niks3Url = next();
         } else if (arg == "--niks3-token-file") {
@@ -110,9 +112,12 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             argv.end(),
             {"--stdin", "--server-url", options.farm.niks3Url, "--auth-token-path", options.farm.niks3TokenFile});
     }
-    if ((options.acl.active() || options.acl.anonymousRole()) && options.clientCA.empty()) {
-        // Without mTLS every client's CN is "-".
-        throw nix::Error("--allow/--allow-anonymous requires --client-ca");
+    if ((options.acl.active() || options.acl.anonymousRole()) && options.clientCA.empty() && options.oidcConfig.empty()) {
+        throw nix::Error("--allow/--allow-anonymous requires --client-ca or --oidc-config");
+    }
+    if (!options.oidcConfig.empty() && options.tlsCert.empty()) {
+        // Bearer tokens in clear text are replayable by anyone on the path.
+        logLine(LogLevel::info, {{"event", "warning"}, {"msg", "--oidc-config without --tls-cert sends bearer tokens in clear"}});
     }
     if (!options.proxies.empty() && options.clientCA.empty()) {
         throw nix::Error("--trusted-proxy requires --client-ca");

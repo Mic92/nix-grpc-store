@@ -1,11 +1,12 @@
 # Farm end to end: niks3 + S3, two farm workers behind envoy (MAGLEV on
-# x-nix-drv, gRPC health, TLS with client certs, mTLS to workers) and a CI
-# client using the build hook.
+# x-nix-drv, gRPC health, TLS with client certs or bearer tokens, mTLS to
+# workers), a CI client using the build hook and an OIDC developer.
 {
   pkgs,
   nixPkgs,
   module,
   niks3,
+  mockOidc,
 }:
 
 let
@@ -31,6 +32,23 @@ let
     issue ci ci-1 client
     issue stranger stranger client
   '';
+
+  # mock-oidc puts its listen address in the issuer.
+  lbAddr = "192.168.1.2";
+  oidcAudience = "grpc://lb:50051";
+  oidcConfig = {
+    allow_insecure = true;
+    providers.mock = {
+      issuer = "http://${lbAddr}:8080/oidc";
+      audience = oidcAudience;
+      rules = [
+        {
+          bound_subject = [ "dev:*" ];
+          scopes = [ "write" ];
+        }
+      ];
+    };
+  };
 
   common = {
     virtualisation.memorySize = 1536;
@@ -63,6 +81,7 @@ let
             role = "trusted";
           }
         ];
+        oidc = oidcConfig;
         farm = {
           enable = true;
           niks3Package = niks3Pkgs.niks3;
@@ -134,8 +153,14 @@ pkgs.testers.runNixOSTest {
     worker2 = worker;
 
     lb =
-      { ... }:
+      { config, ... }:
       {
+        assertions = [
+          {
+            assertion = config.networking.primaryIPAddress == lbAddr;
+            message = "lbAddr";
+          }
+        ];
         imports = [
           common
           module
@@ -202,8 +227,17 @@ pkgs.testers.runNixOSTest {
             };
           };
         };
+        systemd.services.mock-oidc = {
+          wantedBy = [ "multi-user.target" ];
+          after = [ "network-online.target" ];
+          wants = [ "network-online.target" ];
+          serviceConfig.Restart = "on-failure";
+          serviceConfig.ExecStart = "${pkgs.lib.getExe mockOidc} -addr ${lbAddr}:8080 -issue-addr 0.0.0.0:8081";
+        };
         networking.firewall.allowedTCPPorts = [
           5751
+          8080
+          8081
           9000
           50051
         ];
@@ -281,13 +315,16 @@ pkgs.testers.runNixOSTest {
         rc, out = client.execute(f"nix path-info --store 'grpc://lb:50051?{tls}{query}' $(readlink -f /run/current-system) 2>&1")
         return "ok" if rc == 0 or "is not valid" in out else out
 
-    with subtest("balancer auth: client cert, nothing, unknown CN"):
+    with subtest("balancer auth: client cert, bearer token, nothing, unknown CN"):
         out = probe("&client-cert=${certs}/ci.pem&client-key=${certs}/ci.key")
         assert out == "ok", out
+        client.succeed("curl -sfG http://lb:8081/issue --data-urlencode 'aud=${oidcAudience}' --data-urlencode sub=dev:alice > /root/dev.jwt && test -s /root/dev.jwt")
+        out = probe("&token-file=/root/dev.jwt")
+        assert out == "ok", out
         out = probe("")
-        assert "requires a TLS client certificate" in out, out
+        assert "client certificate or bearer token" in out, out
         out = probe("&client-cert=${certs}/stranger.pem&client-key=${certs}/stranger.key")
-        assert "no access rule matches certificate CN 'stranger'" in out, out
+        assert "no access rule matches 'stranger'" in out, out
 
     with subtest("without --eval-store the farm refuses and hints"):
         out = client.fail(f"nix build --store '{envoy}' -f ${jobExpr} --argstr tag t0 2>&1")

@@ -195,10 +195,10 @@ where provisioners constrain which CNs each token may request.
 in front of the daemon. A peer presenting a certificate whose CN matches is
 a proxy: the daemon takes the client's identity from the
 `x-forwarded-client-cert` header it sets (`Subject` CN, evaluated against
-`--allow`) and treats the request as anonymous without one. From any other
-peer the header is ignored. The proxy must overwrite the header (envoy
-`forward_client_cert_details: SANITIZE_SET`) and authenticate to the
-daemon with its own client cert.
+`--allow`) or a forwarded bearer token, and treats the request as anonymous
+if neither is present. From any other peer the header is ignored. The
+proxy must overwrite the header (envoy `forward_client_cert_details:
+SANITIZE_SET`) and authenticate to the daemon with its own client cert.
 
 NixOS:
 
@@ -232,6 +232,49 @@ read-only` grants it substituter access. See
 [`tests/acme-substituter-test.nix`](tests/acme-substituter-test.nix)
 for a complete, tested NixOS setup (built as the `acme-vm` check).
 
+### OIDC bearer tokens
+
+Instead of (or next to) client certificates the daemon accepts
+`authorization: Bearer <jwt>` and maps token claims to the same roles.
+`--oidc-config FILE` takes the JSON schema of
+[niks3](https://github.com/Mic92/niks3)'s `--oidc-config`, so one file
+can serve the cache and the daemon. Scopes map to roles: `read` →
+`read-only`, `write` → `write`, `admin` → `trusted`.
+
+    {
+      "providers": {
+        "github": {
+          "issuer": "https://token.actions.githubusercontent.com",
+          "audience": "grpc://cache.example.com",
+          "rules": [
+            { "bound_subject": ["repo:myorg/*"], "scopes": ["write"] },
+            { "bound_claims": { "ref": ["refs/heads/main"] }, "scopes": ["admin"] }
+          ]
+        },
+        "k8s": {
+          "audience": "grpc://cache.example.com",
+          "ca_file": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+          "bearer_token_file": "/var/run/secrets/kubernetes.io/serviceaccount/token",
+          "bound_claims": { "kubernetes.io.namespace": ["ci"] }
+        }
+      }
+    }
+
+Without `issuer`, it is taken from `bearer_token_file` (Kubernetes
+workload identity). `jwks_url` skips discovery. Signing keys are
+fetched on first use and cached for an hour, so the daemon starts while
+the issuer is down and refuses tokens until it comes back. A presented
+client certificate takes precedence over a token. A verified token that
+matches no rule is denied, it does not fall back to `--allow-anonymous`.
+In logs and metrics the caller shows as `oidc:<provider>:<sub>`.
+
+Clients pass the token with the `token-file` URI parameter or
+`$NIX_GRPC_TOKEN_FILE` (default: `token` next to the default
+`client-cert`). The file is re-read for every call, so rotating it in
+place works. TLS is required.
+
+NixOS: `services.nix-grpc-daemon.oidc = { providers.github = { … }; };`
+
 ## Remote builder
 
     nix.buildMachines = [{
@@ -257,6 +300,8 @@ which also requires `trustClients` (see above).
     `$NIX_GRPC_CLIENT_CERT`/`$NIX_GRPC_CLIENT_KEY`, then `client.crt`/`client.key`
     in `$XDG_DATA_HOME/nix-grpc-store`, then `/run/nix-grpc-store`, then
     `/var/lib/nix-grpc-store` (unreadable candidates are skipped)
+  * `token-file` — OIDC bearer token, re-read per call. Defaults to
+    `$NIX_GRPC_TOKEN_FILE`, then `token` in the directories above
   * `connect-timeout` (default 30) — seconds the first call keeps retrying
     "connection refused" and similar, so a balancer or worker restart does
     not fail a build.
@@ -273,6 +318,7 @@ which also requires `trustClients` (see above).
   * `--proxy-socket PATH` — nix-daemon socket, default `/nix/var/nix/daemon-socket/socket`
   * `--tls-cert`, `--tls-key`, `--client-ca` — see above
   * `--allow 'cn-pattern=role'`, `--allow-anonymous ROLE`, `--trusted-proxy CN-PATTERN` — see access control
+  * `--oidc-config FILE` — accept OIDC bearer tokens, see access control
   * `--metrics-listen ADDR` — serve Prometheus metrics, disabled if unset
   * `--log-level info|debug` — access log verbosity, default `info`
 

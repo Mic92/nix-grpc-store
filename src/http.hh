@@ -1,5 +1,5 @@
 #pragma once
-// Blocking libcurl wrapper for the niks3 JSON API.
+// Blocking libcurl wrapper for the niks3 and OIDC JSON APIs.
 
 #include <algorithm>
 #include <chrono>

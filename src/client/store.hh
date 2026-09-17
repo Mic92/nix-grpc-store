@@ -136,8 +136,15 @@ private:
         "Path to the PEM private key for `client-cert`. Defaults to "
         "`$NIX_GRPC_CLIENT_KEY`, then `client.key` next to the default `client-cert`."};
 
-    static constexpr unsigned defaultMaxBuilds = 64;
+    Setting<std::string> tokenFile{
+        this,
+        "",
+        "token-file",
+        "File holding an OIDC bearer token, re-read for every call so it may be "
+        "rotated in place. Defaults to `$NIX_GRPC_TOKEN_FILE`, then `token` next to "
+        "the default `client-cert`. Requires TLS."};
 
+    static constexpr unsigned defaultMaxBuilds = 64;
     Setting<unsigned> maxBuilds{
         this,
         defaultMaxBuilds,

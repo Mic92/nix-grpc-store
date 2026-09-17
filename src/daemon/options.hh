@@ -32,6 +32,7 @@ struct Options
     LogLevel logLevel = LogLevel::info;
     Acl acl;
     xfcc::TrustedProxies proxies;
+    std::string oidcConfig;
     FarmConfig farm; // active when niks3Url is set
 };
 

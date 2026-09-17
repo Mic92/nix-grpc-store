@@ -14,19 +14,34 @@
 
 #include "acl.hh"
 #include "logfmt.hh"
+#include "oidc.hh"
 #include "xfcc.hh"
 
 namespace nixgrpc {
 
-// A trusted proxy's own certificate stands in for whatever client it forwards.
+// Client certificate first, then bearer token, then anonymous. A trusted
+// proxy's own certificate stands in for whatever client it forwards.
 auto Auth::identify(const grpc::ServerContext & context) const -> Caller
 {
     auto cert = clientCommonName(context);
     if (proxies.matches(cert)) {
         cert = xfcc::forwardedCommonName(context);
     }
-    return {
-        .name = cert.value_or("-"), .role = acl.roleFor(cert), .kind = cert ? Caller::Kind::named : Caller::Kind::anonymous};
+    auto token = cert || !*oidc ? std::nullopt : oidc::bearerToken(context);
+    if (!token) {
+        return {
+            .name = cert.value_or("-"),
+            .role = acl.roleFor(cert),
+            .kind = cert ? Caller::Kind::named : Caller::Kind::anonymous};
+    }
+    auto res = (*oidc)->verify(*token);
+    if (!res.identity) {
+        // Details stay in our log. The client learns nothing about providers or keys.
+        logLine(
+            LogLevel::info, {{"event", "oidc_rejected"}, {"error", res.error}, {"peer", context.peer()}});
+        return {.kind = Caller::Kind::badToken};
+    }
+    return {.name = res.identity->subject, .role = res.identity->role, .kind = Caller::Kind::named};
 }
 
 
@@ -47,10 +62,15 @@ auto Auth::authorize(const Caller & caller, std::string_view method, Role minRol
             grpc::StatusCode::PERMISSION_DENIED,
             "role '" + std::string(roleName(*role)) + "' may not call " + std::string(method)};
     }
-    if (caller.kind == Caller::Kind::anonymous) {
-        return {grpc::StatusCode::UNAUTHENTICATED, "server requires a TLS client certificate"};
+    switch (caller.kind) {
+    case Caller::Kind::anonymous:
+        return {grpc::StatusCode::UNAUTHENTICATED, "server requires a TLS client certificate or bearer token"};
+    case Caller::Kind::badToken:
+        return {grpc::StatusCode::UNAUTHENTICATED, "bearer token rejected"};
+    case Caller::Kind::named:
+        break;
     }
-    return {grpc::StatusCode::PERMISSION_DENIED, "no access rule matches certificate CN '" + caller.name + "'"};
+    return {grpc::StatusCode::PERMISSION_DENIED, "no access rule matches '" + caller.name + "'"};
 }
 
 auto Auth::authorize(const Caller & caller, std::string_view method, Role minRole, uint32_t buildMode) -> grpc::Status

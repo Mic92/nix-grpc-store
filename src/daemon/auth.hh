@@ -1,6 +1,6 @@
 #pragma once
-// Who is calling (client certificate or forwarded certificate) and whether
-// the ACL lets them call a given method.
+// Who is calling (client certificate, forwarded certificate or OIDC bearer
+// token) and whether the ACL lets them call a given method.
 
 #include <cstdint>
 #include <optional>
@@ -11,14 +11,15 @@
 #include <grpcpp/support/status.h>
 
 #include "acl.hh"
+#include "oidc.hh"
 #include "xfcc.hh"
 
 namespace nixgrpc {
 
 struct Caller
 {
-    enum class Kind : std::uint8_t { anonymous, named };
-    std::string name = "-"; // cert CN, for logs and metrics
+    enum class Kind : std::uint8_t { anonymous, named, badToken };
+    std::string name = "-"; // cert CN or oidc:<provider>:<sub>, for logs and metrics
     std::optional<Role> role;
     Kind kind = Kind::anonymous;
 };
@@ -27,6 +28,7 @@ struct Auth
 {
     Acl acl;
     xfcc::TrustedProxies proxies;
+    std::optional<oidc::Verifier> * oidc = nullptr;
 
     [[nodiscard]] auto identify(const grpc::ServerContext & context) const -> Caller;
     static auto authorize(const Caller & caller, std::string_view method, Role minRole) -> grpc::Status;

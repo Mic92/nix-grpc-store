@@ -104,9 +104,21 @@ GrpcStore::GrpcStore(const ref<const Config> &config)
     nixgrpc::enableGrpcTracing();
   }
   if (config->insecure) {
+    if (!config->tokenFile.get().empty()) {
+      throw Error("gRPC store '%s': token-file needs TLS", config->authority.to_string());
+    }
     creds = grpc::InsecureChannelCredentials();
   } else {
     creds = grpc::SslCredentials(sslOptions());
+    auto tokenFile = config->tokenFile.get();
+    if (tokenFile.empty()) {
+      tokenFile = nixgrpc::defaultClientCred("NIX_GRPC_TOKEN_FILE", "token");
+    }
+    if (!tokenFile.empty()) {
+      creds = grpc::CompositeChannelCredentials(
+          creds, grpc::MetadataCredentialsFromPlugin(std::make_unique<nixgrpc::TokenFileCredentials>(tokenFile)));
+      haveClientCert = true;
+    }
   }
 
   stub = remote::NixRemote::NewStub(makeChannel(false));

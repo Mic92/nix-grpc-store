@@ -15,10 +15,8 @@ in
     package = lib.mkOption {
       type = lib.types.package;
       # The daemon only links `nix-util`, so any recent Nix's libs will do.
-      default = pkgs.callPackage ../package.nix {
-        inherit (pkgs.nix.libs) nix-store nix-util;
-      };
-      defaultText = lib.literalExpression "pkgs.callPackage ./package.nix { }";
+      default = (pkgs.callPackage ../packages.nix { nixPackages = pkgs.nix.libs; }).default;
+      defaultText = lib.literalExpression "(pkgs.callPackage ./packages.nix { nixPackages = pkgs.nix.libs; }).default";
       description = "Package providing {command}`nix-grpc-daemon`.";
     };
 
@@ -167,11 +165,40 @@ in
       description = ''
         CN globs of TLS-terminating balancers (see `services.nix-grpc-farm-lb.tls`).
         A peer with such a certificate is a proxy: the client identity comes
-        from the `x-forwarded-client-cert` header it sets. Requires
-        {option}`tls.clientCaFile`.
+        from the `x-forwarded-client-cert` header it sets, or a forwarded
+        bearer token. Requires {option}`tls.clientCaFile`.
       '';
     };
 
+    oidc = lib.mkOption {
+      type = lib.types.nullOr (pkgs.formats.json { }).type;
+      default = null;
+      example = lib.literalExpression ''
+        {
+          providers.github = {
+            issuer = "https://token.actions.githubusercontent.com";
+            audience = "grpc://cache.example.com";
+            rules = [
+              { bound_claims.repository_owner = [ "myorg" ]; scopes = [ "write" ]; }
+              { bound_claims.ref = [ "refs/heads/main" ]; scopes = [ "admin" ]; }
+            ];
+          };
+          providers.k8s = {
+            audience = "grpc://cache.example.com";
+            ca_file = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+            bearer_token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+            bound_claims."kubernetes.io.namespace" = [ "ci" ];
+          };
+        }
+      '';
+      description = ''
+        Accept OIDC bearer tokens (`authorization: Bearer …`) besides client
+        certificates. Same schema as niks3's `--oidc-config`, so one attrset
+        can serve both. Scopes map to roles: `read` → read-only, `write` →
+        write, `admin` → trusted. A client certificate, when presented,
+        takes precedence. Clients set `token-file` or `$NIX_GRPC_TOKEN_FILE`.
+      '';
+    };
 
     extraFlags = lib.mkOption {
       type = lib.types.listOf lib.types.str;
@@ -243,12 +270,17 @@ in
         message = "services.nix-grpc-daemon.tls.certFile and tls.keyFile must be set together";
       }
       {
-        assertion = (cfg.accessRules == [ ] && cfg.anonymousRole == null) || cfg.tls.clientCaFile != null;
-        message = "services.nix-grpc-daemon.accessRules/anonymousRole requires tls.clientCaFile (mTLS)";
+        assertion =
+          (cfg.accessRules == [ ] && cfg.anonymousRole == null) || cfg.tls.clientCaFile != null || cfg.oidc != null;
+        message = "services.nix-grpc-daemon.accessRules/anonymousRole requires tls.clientCaFile or oidc";
       }
       {
         assertion = cfg.trustedProxies == [ ] || cfg.tls.clientCaFile != null;
         message = "services.nix-grpc-daemon.trustedProxies requires tls.clientCaFile";
+      }
+      {
+        assertion = cfg.oidc == null || cfg.tls.certFile != null || (cfg.oidc.allow_insecure or false);
+        message = "services.nix-grpc-daemon.oidc sends bearer tokens, enable tls.certFile";
       }
     ];
 
@@ -330,6 +362,10 @@ in
             "--trusted-proxy"
             cn
           ]) cfg.trustedProxies
+          ++ lib.optionals (cfg.oidc != null) [
+            "--oidc-config"
+            ((pkgs.formats.json { }).generate "nix-grpc-daemon-oidc.json" cfg.oidc)
+          ]
           ++ lib.optionals (cfg.metricsListen != null) [
             "--metrics-listen"
             cfg.metricsListen

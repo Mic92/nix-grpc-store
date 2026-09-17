@@ -75,6 +75,7 @@
 #include "idle.hh"
 #include "import-paths.hh"
 #include "logfmt.hh"
+#include "oidc.hh"
 #include "path-info-wire.hh"
 #include "metrics.hh"
 #include "nix-compat.hh"
@@ -209,12 +210,13 @@ public:
         nixgrpc::LogLevel logLevel,
         nixgrpc::Acl acl,
         nixgrpc::xfcc::TrustedProxies proxies,
+        std::optional<nixgrpc::oidc::Verifier> & oidc,
         std::optional<nixgrpc::Farm> & farm)
         : storeUri(std::move(storeUri))
         , metrics(metrics)
         , idle(idle)
         , logLevel(logLevel)
-        , auth{.acl = std::move(acl), .proxies = std::move(proxies)}
+        , auth{.acl = std::move(acl), .proxies = std::move(proxies), .oidc = &oidc}
         , backends{.socketPath = std::move(socketPath)}
         , farm(farm)
     {
@@ -799,6 +801,16 @@ try {
     if (options.storeUri.empty()) {
         options.storeUri = "unix://" + options.socketPath;
     }
+    std::optional<nixgrpc::oidc::Verifier> oidc;
+    if (!options.oidcConfig.empty()) {
+        auto cfg = nixgrpc::oidc::loadConfig(options.oidcConfig);
+        for (const auto & provider : cfg.providers) {
+            nixgrpc::logLine(
+                nixgrpc::LogLevel::info,
+                {{"event", "oidc_provider"}, {"name", provider.name}, {"issuer", provider.issuer}});
+        }
+        oidc.emplace(std::move(cfg));
+    }
     std::optional<nixgrpc::Farm> farm;
     if (!options.farm.niks3Url.empty()) {
         farm.emplace(options.farm);
@@ -807,7 +819,7 @@ try {
             {{"event", "farm_mode"}, {"niks3", options.farm.niks3Url}, {"max_jobs", std::to_string(options.farm.maxJobs)}});
     }
     NixRemoteService service(
-        options.socketPath, options.storeUri, metrics, idle, options.logLevel, options.acl, options.proxies, farm);
+        options.socketPath, options.storeUri, metrics, idle, options.logLevel, options.acl, options.proxies, oidc, farm);
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;

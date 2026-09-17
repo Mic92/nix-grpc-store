@@ -1,14 +1,24 @@
 #pragma once
-// Client channel setup: credential file lookup, fixed routing headers and
-// gRPC runtime lifetime.
+// Client channel setup: credential file lookup, per-call bearer token, fixed
+// routing headers and gRPC runtime lifetime.
 
+#include <exception>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <grpcpp/security/auth_context.h>
+#include <grpcpp/security/credentials.h>
 #include <grpcpp/support/client_interceptor.h>
+#include <grpcpp/support/config.h>
 #include <grpcpp/support/interceptor.h>
+#include <grpcpp/support/status.h>
+#include <grpcpp/support/string_ref.h>
+
+#include <nix/util/file-system.hh>
+#include <nix/util/util.hh>
 
 namespace nixgrpc {
 
@@ -60,6 +70,32 @@ public:
 
 private:
   std::shared_ptr<const Headers> headers;
+};
+
+// Reads the token per call so k8s projected volumes and CI refreshers work.
+class TokenFileCredentials final : public grpc::MetadataCredentialsPlugin {
+  std::string path;
+
+public:
+  explicit TokenFileCredentials(std::string path) : path(std::move(path)) {}
+
+  [[nodiscard]] auto IsBlocking() const -> bool override { return true; }
+  auto DebugString() -> std::string override { return "TokenFile(" + path + ")"; }
+
+  auto GetMetadata(grpc::string_ref /*serviceUrl*/, grpc::string_ref /*methodName*/,
+                   const grpc::AuthContext & /*channelAuthContext*/,
+                   std::multimap<grpc::string, grpc::string> * metadata) -> grpc::Status override {
+    try {
+      auto token = nix::chomp(nix::readFile(path));
+      if (token.empty() || token.find_first_of("\r\n") != std::string::npos) {
+        return {grpc::StatusCode::UNAUTHENTICATED, "token file '" + path + "' is empty or multi-line"};
+      }
+      metadata->emplace("authorization", "Bearer " + token);
+      return grpc::Status::OK;
+    } catch (std::exception & err) {
+      return {grpc::StatusCode::UNAUTHENTICATED, std::string("reading token file: ") + err.what()};
+    }
+  }
 };
 
 } // namespace nixgrpc

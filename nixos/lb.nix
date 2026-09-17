@@ -205,8 +205,9 @@ in
         default = null;
         description = ''
           Verify client certificates against this CA and forward the subject to
-          workers in `x-forwarded-client-cert`. The header is always
-          overwritten, a client cannot inject one.
+          workers in `x-forwarded-client-cert`. Clients without a certificate
+          are still accepted so bearer tokens keep working. The header is
+          always overwritten, a client cannot inject one.
         '';
       };
       upstream = {

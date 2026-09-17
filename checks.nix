@@ -79,6 +79,7 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
   };
 
   vm = import ./tests/nixos-test.nix {
+    mockOidc = niks3.packages.${pkgs.stdenv.hostPlatform.system}.mock-oidc-server;
     inherit pkgs;
     nixPkgs = nixPackages;
     module = nixosModule;
@@ -86,6 +87,7 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
 
   farm = import ./tests/farm.nix {
     inherit pkgs niks3;
+    mockOidc = niks3.packages.${pkgs.stdenv.hostPlatform.system}.mock-oidc-server;
     nixPkgs = nixPackages;
     module = nixosModule;
   };

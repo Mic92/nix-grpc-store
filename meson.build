@@ -18,6 +18,8 @@ nix_util_dep  = dependency('nix-util')
 # Farm mode: niks3 claims over HTTPS, niks3 push acks as JSON lines.
 curl_dep = dependency('libcurl')
 json_dep = dependency('nlohmann_json')
+# Header-only, ships only cmake config: found through the include path.
+meson.get_compiler('cpp').check_header('jwt-cpp/traits/nlohmann-json/defaults.h', required: true)
 
 # Pre-release versions look like "2.35pre20260619_f8bb823a".
 nix_ver = nix_store_dep.version().split('.')
@@ -127,7 +129,7 @@ executable('nix-grpc-daemon',
   cpp_pch : 'pch/daemon_pch.hh',
   cpp_args : nix_compat_args,
   # nix-store: native QueryValidPaths / AddMultipleToStore handlers.
-  dependencies : common_deps + prometheus_dep + [nix_util_dep, nix_store_dep, curl_dep, json_dep],
+  dependencies : common_deps + prometheus_dep + [nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep],
   install : true,
 )
 
@@ -142,6 +144,13 @@ test('farm-client', find_program('tests/farm-client-test.sh'),
   args : [farm_client_test, files('tests/farm-mock.py')],
   timeout : 60,
 )
+
+oidc_test = executable('oidc-test',
+  sources : ['tests/oidc-test.cc'],
+  include_directories : [src_inc, include_directories('src/daemon')],
+  dependencies : [nix_util_dep, curl_dep, json_dep, openssl_dep, grpc_dep, threads_dep],
+)
+test('oidc', find_program('tests/oidc-test.sh'), args : [oidc_test], timeout : 60)
 
 test('xfcc', executable('xfcc-test',
   sources : ['tests/xfcc-test.cc'],
