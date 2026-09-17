@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="470" viewBox="0 0 880 470" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="a" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#475569"/>
+    </marker>
+    <marker id="ab" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#2563eb"/>
+    </marker>
+    <marker id="ag" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#059669"/>
+    </marker>
+    <filter id="sh" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
+    <style>
+      .box   { fill: #fff; stroke: #cbd5e1; stroke-width: 1.2; filter: url(#sh); }
+      .title { font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .sub   { font-size: 11px; fill: #64748b; }
+      .zone  { font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+      .lbl   { font-size: 11px; fill: #475569; }
+      .edge  { stroke: #475569; stroke-width: 1.5; fill: none; }
+    </style>
+  </defs>
+
+  <rect width="880" height="470" fill="#f8fafc"/>
+
+  <!-- Clients -->
+  <rect x="28" y="28" width="250" height="200" rx="14" fill="#eef2ff" stroke="#a5b4fc" stroke-width="1.5"/>
+  <text x="48" y="54" class="zone" fill="#4f46e5">Clients</text>
+
+  <rect x="48" y="72" width="210" height="60" rx="10" class="box"/>
+  <text x="153" y="97" text-anchor="middle" class="title">CI nix-daemon</text>
+  <text x="153" y="115" text-anchor="middle" class="sub">build hook · client certificate</text>
+
+  <rect x="48" y="150" width="210" height="60" rx="10" class="box"/>
+  <text x="153" y="175" text-anchor="middle" class="title">developer</text>
+  <text x="153" y="193" text-anchor="middle" class="sub">--eval-store auto · OIDC token</text>
+
+  <!-- Balancer -->
+  <rect x="340" y="96" width="240" height="72" rx="10" fill="#4f46e5" filter="url(#sh)"/>
+  <text x="460" y="127" text-anchor="middle" class="title" fill="#fff">envoy :50051</text>
+  <text x="460" y="146" text-anchor="middle" font-size="11" fill="#c7d2fe">route by system · hash by drv</text>
+
+  <path d="M258 102 C300 102 300 120 336 120" stroke="#2563eb" stroke-width="2.2" fill="none" marker-end="url(#ab)"/>
+  <path d="M258 180 C300 180 300 146 336 146" stroke="#2563eb" stroke-width="2.2" fill="none" marker-end="url(#ab)"/>
+  <text x="298" y="92" text-anchor="middle" class="lbl" fill="#1d4ed8">gRPC · TLS</text>
+
+  <!-- Workers -->
+  <rect x="300" y="220" width="320" height="134" rx="14" fill="#ecfdf5" stroke="#6ee7b7" stroke-width="1.5"/>
+  <text x="320" y="246" class="zone" fill="#047857">Workers</text>
+  <text x="460" y="344" text-anchor="middle" class="sub">nix-daemon + nix-grpc-daemon --farm</text>
+
+  <rect x="320" y="262" width="86" height="68" rx="10" fill="#059669" filter="url(#sh)"/>
+  <text x="363" y="292" text-anchor="middle" class="title" fill="#fff">worker</text>
+  <text x="363" y="310" text-anchor="middle" font-size="11" fill="#a7f3d0">x86_64</text>
+  <rect x="417" y="262" width="86" height="68" rx="10" fill="#059669" filter="url(#sh)"/>
+  <text x="460" y="292" text-anchor="middle" class="title" fill="#fff">worker</text>
+  <text x="460" y="310" text-anchor="middle" font-size="11" fill="#a7f3d0">aarch64</text>
+  <rect x="514" y="262" width="86" height="68" rx="10" fill="#059669" filter="url(#sh)"/>
+  <text x="557" y="292" text-anchor="middle" class="title" fill="#fff">worker</text>
+  <text x="557" y="310" text-anchor="middle" font-size="11" fill="#a7f3d0">aarch64</text>
+
+  <path d="M410 168 L370 258" stroke="#2563eb" stroke-width="2.2" fill="none" marker-end="url(#ab)"/>
+  <path d="M460 168 L460 258" stroke="#2563eb" stroke-width="2.2" fill="none" marker-end="url(#ab)"/>
+  <path d="M510 168 L550 258" stroke="#2563eb" stroke-width="2.2" fill="none" marker-end="url(#ab)"/>
+  <text x="596" y="200" class="lbl" fill="#1d4ed8">mTLS · forwarded identity</text>
+
+  <!-- Cache -->
+  <rect x="660" y="220" width="192" height="222" rx="14" fill="#fff7ed" stroke="#fdba74" stroke-width="1.5"/>
+  <text x="680" y="246" class="zone" fill="#c2410c">Cache</text>
+
+  <rect x="680" y="262" width="152" height="68" rx="10" class="box"/>
+  <text x="756" y="290" text-anchor="middle" class="title">niks3</text>
+  <text x="756" y="308" text-anchor="middle" class="sub">build claims</text>
+
+  <rect x="680" y="356" width="152" height="68" rx="10" class="box"/>
+  <text x="756" y="384" text-anchor="middle" class="title">S3</text>
+  <text x="756" y="402" text-anchor="middle" class="sub">binary cache</text>
+
+  <path d="M600 284 H676" class="edge" marker-end="url(#a)"/>
+  <text x="638" y="278" text-anchor="middle" class="lbl">claim</text>
+  <path d="M600 310 H676" stroke="#059669" stroke-width="2.2" fill="none" marker-end="url(#ag)"/>
+  <text x="638" y="326" text-anchor="middle" class="lbl" fill="#047857">push</text>
+  <path d="M756 330 V352" stroke="#059669" stroke-width="2.2" fill="none" marker-end="url(#ag)"/>
+
+  <!-- Substitution -->
+  <path d="M680 400 C520 400 470 400 460 334" class="edge" stroke-dasharray="5 4" marker-end="url(#a)"/>
+  <text x="560" y="418" text-anchor="middle" class="lbl">substitute inputs · outputs</text>
+  <path d="M680 412 C120 460 120 300 150 214" class="edge" stroke-dasharray="5 4" marker-end="url(#a)"/>
+  <text x="150" y="300" class="lbl">results</text>
+</svg>

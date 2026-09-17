@@ -275,6 +275,11 @@ place works. TLS is required.
 
 NixOS: `services.nix-grpc-daemon.oidc = { providers.github = { … }; };`
 
+## Build farm
+
+Several workers behind one balancer with deduplicated builds and S3
+outputs: see [docs/farm.md](docs/farm.md).
+
 ## Remote builder
 
     nix.buildMachines = [{
