@@ -55,6 +55,7 @@ gen = custom_target('nix_remote_proto',
 )
 
 gen_inc = include_directories('.')
+src_inc = include_directories('src')
 
 common_deps = [grpc_dep, protobuf_dep, zstd_dep, threads_dep]
 
@@ -75,8 +76,8 @@ else
 endif
 
 shared_module('nix-grpc-store',
-  sources : ['src/grpc-store.cc', gen],
-  include_directories : gen_inc,
+  sources : ['src/client/store.cc', 'src/client/build.cc', 'src/client/transfer.cc', 'src/client/channel.cc', gen],
+  include_directories : [gen_inc, src_inc],
   # nix_plugin_entry() skips registering the store when the running Nix
   # version differs from the one the plugin was built against.
   cpp_args : nix_compat_args + ['-DNIX_GRPC_BUILT_AGAINST_NIX="' + nix_store_dep.version() + '"'],
@@ -92,7 +93,7 @@ shared_module('nix-grpc-store',
 # several builds support all of their Nix versions.
 
 shared_module('nix-grpc-store-loader',
-  sources : ['src/plugin-loader.cc'],
+  sources : ['src/client/plugin-loader.cc'],
   cpp_args : ['-DNIX_GRPC_MODULE_SUFFIX="' + module_suffix + '"'],
   dependencies : dependency('dl'),
   link_args : plugin_link_args,
@@ -103,9 +104,16 @@ shared_module('nix-grpc-store-loader',
 
 # --- server -----------------------------------------------------------------
 
+daemon_sources = [
+  'src/daemon/main.cc',
+  'src/daemon/auth.cc',
+  'src/daemon/backend.cc',
+  'src/daemon/options.cc',
+]
+
 executable('nix-grpc-daemon',
-  sources : ['src/nix-grpc-daemon.cc', gen],
-  include_directories : gen_inc,
+  sources : daemon_sources + [gen],
+  include_directories : [gen_inc, src_inc],
   cpp_args : nix_compat_args,
   # nix-store: native QueryValidPaths / AddMultipleToStore handlers.
   dependencies : common_deps + prometheus_dep + [nix_util_dep, nix_store_dep],
@@ -120,7 +128,7 @@ if get_option('fuzzers')
   foreach name : ['zstd-reader', 'tunnel-pump', 'import-paths', 'build-log', 'nar-frames', 'wire', 'acl']
     executable('fuzz-' + name,
       sources : ['fuzz' / name + '.cc', 'fuzz/support.cc', gen],
-      include_directories : gen_inc,
+      include_directories : [gen_inc, src_inc],
       cpp_args : nix_compat_args + ['-fsanitize=fuzzer'],
       link_args : ['-fsanitize=fuzzer'],
       dependencies : common_deps + [nix_util_dep, nix_store_dep],
@@ -128,7 +136,7 @@ if get_option('fuzzers')
   endforeach
   executable('fuzz-gen-seeds',
     sources : ['fuzz/gen-seeds.cc', gen],
-    include_directories : gen_inc,
+    include_directories : [gen_inc, src_inc],
     cpp_args : nix_compat_args,
     dependencies : common_deps + [nix_util_dep, nix_store_dep],
   )

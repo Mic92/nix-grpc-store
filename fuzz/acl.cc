@@ -10,7 +10,7 @@
 
 #include <nix/util/error.hh>
 
-#include "../src/acl.hh"
+#include "../src/daemon/acl.hh"
 #include "../src/logfmt.hh"
 #include "support.hh"
 

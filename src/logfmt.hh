@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <optional>
+#include <span>
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
@@ -51,7 +52,9 @@ inline auto logfmtValue(std::string_view value) -> std::string
 enum class LogLevel : std::uint8_t { info, debug };
 
 // Emit one logfmt line: ts=… level=… key=value …
-inline void logLine(LogLevel level, std::initializer_list<std::pair<std::string_view, std::string>> fields)
+using LogField = std::pair<std::string_view, std::string>;
+
+inline void logLine(LogLevel level, std::span<const LogField> fields)
 {
     auto const now = std::chrono::system_clock::now();
     auto const secs = std::chrono::system_clock::to_time_t(now);
@@ -72,6 +75,11 @@ inline void logLine(LogLevel level, std::initializer_list<std::pair<std::string_
     line += '\n';
     // Single write keeps lines from interleaving across handler threads.
     static_cast<void>(std::fputs(line.c_str(), stderr));
+}
+
+inline void logLine(LogLevel level, std::initializer_list<LogField> fields)
+{
+    logLine(level, std::span<const LogField>(fields.begin(), fields.size()));
 }
 
 // TLS client identity (x509 CN), or nullopt when the client did not present

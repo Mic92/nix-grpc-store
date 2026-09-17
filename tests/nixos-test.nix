@@ -388,16 +388,16 @@ pkgs.testers.runNixOSTest {
     with subtest("access log attributes clients by certificate CN"):
         machine.succeed(
             "journalctl -u nix-grpc-daemon-mtls.service | "
-            "grep -E 'event=session_end method=Connect cn=localhost .*bytes_out=[0-9]+'"
+            "grep -E 'event=rpc method=Connect cn=localhost .*bytes_out=[0-9]+'"
         )
         machine.succeed(
             "journalctl -u nix-grpc-daemon.service | "
-            "grep -E 'event=session_end method=Connect cn=- '"
+            "grep -E 'event=rpc method=Connect cn=- '"
         )
         # Path queries only show up at --log-level debug.
         machine.succeed(
             "journalctl -u nix-grpc-daemon.service | "
-            "grep -q 'level=debug event=rpc method=QueryPathInfos'"
+            "grep -q 'level=debug event=rpc_start method=QueryPathInfos'"
         )
         machine.fail(
             "journalctl -u nix-grpc-daemon-mtls.service | grep -q level=debug"

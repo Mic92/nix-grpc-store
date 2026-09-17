@@ -268,13 +268,12 @@ the CN and logs and metrics are per user.
 
 The daemon writes one logfmt line per RPC to stderr (journald):
 
-    ts=2025-01-15T12:03:41Z level=info event=session_end method=Connect cn=alice peer=ipv4:10.0.0.5:53211 duration_s=1832 bytes_in=52341 bytes_out=812345678
+    ts=2025-01-15T12:03:41Z level=info event=rpc method=Connect cn=alice peer=ipv4:10.0.0.5:53211 duration_s=1832 bytes_in=52341 bytes_out=812345678
 
 | event | logged for | extra fields |
 |---|---|---|
-| `session_end` | finished tunnel sessions | duration, uncompressed bytes in/out |
-| `rpc` | bulk transfers | path count, duration, NAR bytes |
-| `session_start`, path queries | only at `--log-level debug` | |
+| `rpc` | tunnel sessions, transfers, builds | duration, then per method: bytes in/out, path count, NAR bytes, drv |
+| `rpc_start`, path queries | only at `--log-level debug` | |
 
 Every line carries the client certificate CN and the peer address, so one
 user's activity is a grep away:
