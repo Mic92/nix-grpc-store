@@ -257,6 +257,15 @@ which also requires `trustClients` (see above).
     `$NIX_GRPC_CLIENT_CERT`/`$NIX_GRPC_CLIENT_KEY`, then `client.crt`/`client.key`
     in `$XDG_DATA_HOME/nix-grpc-store`, then `/run/nix-grpc-store`, then
     `/var/lib/nix-grpc-store` (unreadable candidates are skipped)
+  * `connect-timeout` (default 30) — seconds the first call keeps retrying
+    "connection refused" and similar, so a balancer or worker restart does
+    not fail a build.
+  * `system` — send `x-nix-system` on every call, not just builds, so a
+    balancer routes input uploads and substitution to a worker of that
+    system. Use one `nix.buildMachines` entry per system.
+  * `debug` — print which CA bundle and client certificate were loaded and
+    turn on gRPC's TCP/TLS handshake tracing on stderr. `NIX_GRPC_DEBUG=1`
+    does the same and also reaches the build hook.
 
 ## Server flags
 

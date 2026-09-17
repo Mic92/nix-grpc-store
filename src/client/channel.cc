@@ -56,6 +56,11 @@ auto readValidCert(const std::string &path) -> std::string {
   return pem;
 }
 
+void enableGrpcTracing() {
+  nix::setEnv("GRPC_TRACE", nix::getEnv("GRPC_TRACE").value_or("handshaker,tcp,http,secure_endpoint,tsi").c_str());
+  nix::setEnv("GRPC_VERBOSITY", nix::getEnv("GRPC_VERBOSITY").value_or("debug").c_str());
+}
+
 auto defaultCaCert() -> std::string {
   std::vector<std::string> candidates;
   for (const auto *env : {"NIX_SSL_CERT_FILE", "SSL_CERT_FILE"}) {

@@ -1,12 +1,22 @@
-// grpc:// Store: native BuildPaths/BuildDerivation.
+// grpc:// Store: native BuildPaths/BuildDerivation and the build-farm fan-out.
 
 #include "store.hh"
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -22,11 +32,17 @@
 #include <nix/store/path-info.hh>
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
+#include <nix/store/store-open.hh>
 #include <nix/store/worker-protocol.hh>
 #include <nix/util/error.hh>
+#include <nix/util/file-system.hh>
+#include <nix/util/fmt.hh>
 #include <nix/util/logging.hh>
 #include <nix/util/ref.hh>
+#include <nix/util/repair-flag.hh>
 #include <nix/util/serialise.hh>
+#include <nix/util/signals.hh>
+#include <nix/util/strings.hh>
 
 #include "nix-compat.hh"
 #include "nix_remote.grpc.pb.h"
@@ -61,6 +77,9 @@ auto GrpcStore::alreadyValidResults(const std::vector<DerivedPath> & reqs)
 auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
                    const std::shared_ptr<Store> & evalStore)
     -> std::optional<std::vector<KeyedBuildResult>> {
+  if (isFarm()) {
+    return farmBuildPaths(reqs, buildMode, evalStore.get());
+  }
   if (buildMode == bmNormal) {
     if (auto results = alreadyValidResults(reqs)) {
       return results;
@@ -70,27 +89,68 @@ auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode b
   return buildPathsWithResultsNative(reqs, buildMode);
 }
 
-auto GrpcStore::buildDerivationNative(const StorePath & drvPath, const BasicDerivation & drv,
-                                      BuildMode buildMode) -> BuildResult {
-  remote::BuildDerivationRequest request;
-  request.set_drv_path(std::string(drvPath.to_string()));
-  request.set_build_mode(static_cast<uint32_t>(buildMode));
-  request.set_protocol(nixcompat::kBuildProtocolWire);
-  {
-    StringSink sink;
-    nixcompat::writeDrv(sink, *this, drv);
-    *request.mutable_drv() = std::move(sink.s);
-  }
+auto GrpcStore::routingFor(const StorePath & drvPath, const BasicDerivation & drv) -> Metadata {
+  return {{"x-nix-drv", std::string(drvPath.hashPart())},
+          {"x-nix-system", drv.platform},
+          {"x-nix-features", concatStringsSep(",", nixcompat::requiredSystemFeatures(*this, drv))}};
+}
 
+void GrpcStore::uploadDrvClosure(Store & evalStore, const StorePath & drvPath, const Metadata & headers) {
+  StorePathSet closure;
+  evalStore.computeFSClosure(drvPath, closure);
+  auto present = queryValidPathsRouted(closure, NoSubstitute, headers);
+  StorePathSet missing;
+  for (const auto & path : closure) {
+    if (!present.contains(path)) {
+      missing.insert(path);
+    }
+  }
+  if (missing.empty()) {
+    return;
+  }
+  PathsSource sources;
+  // addMultipleToStore wants references before referrers.
+  Activity act(*logger, lvlInfo, actCopyPaths,
+               fmt("copying %d paths to '%s'", missing.size(), config->authority.to_string()));
+  for (const auto & path : evalStore.topoSortPaths(missing) | std::views::reverse) {
+    auto info = evalStore.queryPathInfo(path);
+    // Same per-path progress activity as Store::copyPaths.
+    // NOLINTNEXTLINE(bugprone-exception-escape): libc++ coroutine frames trip this.
+    sources.emplace_back(*info, sinkToSource([this, &evalStore, info, parent = act.id](Sink & sink) -> void {
+      auto pathS = printStorePath(info->path);
+      const std::vector<Logger::Field> fields{pathS, "local", config->authority.to_string()};
+      const Activity pathAct(*logger, lvlInfo, actCopyPath,
+                             fmt("copying path '%s' to '%s'", pathS, config->authority.to_string()), fields,
+                             parent);
+      uint64_t sent = 0;
+      LambdaSink progress([&](std::string_view data) -> void {
+        sent += data.size();
+        pathAct.progress(sent, info->narSize);
+      });
+      TeeSink tee{sink, progress};
+      evalStore.narFromPath(info->path, tee);
+    }));
+  }
+  addMultipleToStoreRouted(std::move(sources), act, NoRepair, CheckSigs, headers);
+}
+
+auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & request, const Metadata & headers,
+                        std::optional<BuildResult> & res) -> grpc::Status {
   grpc::ClientContext ctx;
+  addHeaders(ctx, headers);
+  // ^C cancels the stream so the worker stops the build at once.
+  auto const onInterrupt = createInterruptCallback([&ctx]() -> void { ctx.TryCancel(); });
   auto reader = stub->BuildDerivation(&ctx, request);
 
-  std::optional<BuildResult> res;
+  // build-remote only forwards results of an actBuild activity to nix. Named
+  // like nix's own so log UIs merge them, opened lazily so the NOT_FOUND probe is silent.
+  auto drv = printStorePath(StorePath(request.drv_path()));
+  BuildLogActivity act(fmt("building '%s' on %s", drv, config->authority.to_string()),
+                       {drv, config->authority.to_string(), 1, 1});
   PathInfoMap infos;
   remote::BuildDerivationChunk msg;
   while (reader->Read(&msg)) {
-    if (msg.has_log_line()) {
-      printError(msg.log_line());
+    if (act.relay(msg)) {
     } else if (msg.has_done()) {
       StringSource source(msg.done().result());
       res = WorkerProto::Serialise<BuildResult>::read(
@@ -101,15 +161,206 @@ auto GrpcStore::buildDerivationNative(const StorePath & drvPath, const BasicDeri
       }
     }
   }
-  checkStatus(reader->Finish(), "BuildDerivation");
-  if (!res) {
-    throw Error("gRPC BuildDerivation stream ended without a result");
-  }
-  if (!infos.empty()) {
+  auto status = reader->Finish();
+  if (status.ok() && !infos.empty()) {
     std::scoped_lock const lock(prefetchMutex);
     prefetchedInfos.merge(infos);
   }
+  return status;
+}
+
+auto GrpcStore::buildDerivationNative(const StorePath & drvPath,
+                           const BasicDerivation & drv,
+                           BuildMode buildMode,
+                           Store * evalStore) -> BuildResult {
+  remote::BuildDerivationRequest request;
+  request.set_drv_path(std::string(drvPath.to_string()));
+  request.set_build_mode(static_cast<uint32_t>(buildMode));
+  request.set_protocol(nixcompat::kBuildProtocolWire);
+  {
+    StringSink sink;
+    nixcompat::writeDrv(sink, *this, drv);
+    *request.mutable_drv() = std::move(sink.s);
+  }
+
+  auto headers = routingFor(drvPath, drv);
+  std::optional<BuildResult> res;
+  grpc::Status status;
+  std::shared_ptr<Store> local;
+  for (unsigned attempt = 0;; attempt++) {
+    status = tryBuildDerivation(request, headers, res);
+    if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
+      // The build hook has the drv in the local store but passes no evalStore.
+      if (evalStore == nullptr) {
+        local = nix::openStore();
+        if (local.get() == this || !local->isValidPath(drvPath)) {
+          throw Error("farm worker lacks '%s'\nhint: pass --eval-store auto",
+                      printStorePath(drvPath));
+        }
+        evalStore = local.get();
+      }
+      uploadDrvClosure(*evalStore, drvPath, headers);
+      status = tryBuildDerivation(request, headers, res);
+    }
+    // Salt the hash header so a consistent-hashing balancer picks another worker.
+    if (status.error_code() != grpc::StatusCode::UNAVAILABLE
+        || attempt == unavailableRetries) {
+      break;
+    }
+    printError("%s, retrying elsewhere", firstLine(status.error_message()));
+    std::this_thread::sleep_for(std::chrono::seconds(attempt + 1));
+    headers.front().second = std::string(drvPath.hashPart()) + "-" + std::to_string(attempt + 1);
+  }
+  checkStatus(status, "BuildDerivation");
+  if (!res) {
+    throw Error("gRPC BuildDerivation stream ended without a result");
+  }
   return std::move(*res);
+}
+
+auto GrpcStore::isFarm() -> bool {
+  std::call_once(farmOnce, [&]() -> void {
+    grpc::ClientContext ctx;
+    remote::BuildPathsRequest request;
+    request.set_protocol(nixcompat::kBuildProtocolWire);
+    auto reader = stub->BuildPaths(&ctx, request);
+    remote::BuildPathsChunk msg;
+    while (reader->Read(&msg)) {
+    }
+    farm = reader->Finish().error_code() == grpc::StatusCode::UNIMPLEMENTED;
+  });
+  return farm;
+}
+
+auto GrpcStore::runFarmJob(FarmJob & job, BuildMode buildMode, Store & evalStore) -> BuildResult {
+  using nixcompat::FailureStatus;
+  if (job.failedInput) {
+    return nixcompat::failed(FailureStatus::DependencyFailed,
+                             fmt("dependency '%s' failed", job.failedInput->to_string()));
+  }
+  if (isInterrupted()) {
+    return nixcompat::failed(FailureStatus::MiscFailure, "interrupted");
+  }
+  try {
+    return buildDerivationNative(job.drvPath, job.drv, buildMode, &evalStore);
+  } catch (Interrupted &) {
+    return nixcompat::failed(FailureStatus::MiscFailure, "interrupted");
+  } catch (Error & err) {
+    return nixcompat::failed(FailureStatus::MiscFailure, err.msg());
+  } catch (std::exception & err) {
+    return nixcompat::failed(FailureStatus::MiscFailure, err.what());
+  } catch (...) {
+    return nixcompat::failed(FailureStatus::MiscFailure, "unknown exception");
+  }
+}
+
+auto GrpcStore::localEvalStore(const std::vector<DerivedPath> & reqs) -> std::shared_ptr<Store> {
+  std::shared_ptr<Store> local = nix::openStore();
+  bool haveDrvs = local.get() != this;
+  for (const auto & req : reqs) {
+    if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
+      if (const auto * drv = std::get_if<SingleDerivedPath::Opaque>(&built->drvPath->raw())) {
+        haveDrvs = haveDrvs && local->isValidPath(drv->path);
+      }
+    }
+  }
+  if (!haveDrvs) {
+    throw Error("'%s' is a build farm\nhint: pass --eval-store auto", config->authority.to_string());
+  }
+  return local;
+}
+
+auto GrpcStore::farmBuildPaths(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
+                    Store * evalStore) -> std::vector<KeyedBuildResult> {
+  std::shared_ptr<Store> local;
+  if (evalStore == nullptr || evalStore == this) {
+    local = localEvalStore(reqs);
+    evalStore = local.get();
+  }
+  std::map<StorePath, FarmJob> jobs;
+  loadFarmJobs(reqs, *evalStore, jobs);
+
+  FarmRun run{.remaining = jobs.size()};
+  for (auto & [drvPath, job] : jobs) {
+    if (job.waiting == 0) {
+      run.ready.push_back(&job);
+    }
+  }
+  auto worker = [&]() -> void {
+    while (auto * job = run.next()) {
+      run.finish(*job, runFarmJob(*job, buildMode, *evalStore));
+    }
+  };
+  {
+    std::vector<std::jthread> threads(std::min<size_t>(config->maxBuilds, jobs.size()));
+    for (auto & thread : threads) {
+      thread = std::jthread(worker);
+    }
+  }
+  checkInterrupt();
+
+  std::vector<KeyedBuildResult> results;
+  results.reserve(reqs.size());
+  for (const auto & req : reqs) {
+    KeyedBuildResult res{{}, req};
+    if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
+      auto & job = jobs.at(built->drvPath->getBaseStorePath());
+      if (job.result) {
+        static_cast<BuildResult &>(res) = std::move(*job.result);
+      }
+    } else {
+      nixcompat::setAlreadyValid(res);
+    }
+    results.push_back(std::move(res));
+  }
+  return results;
+}
+
+auto GrpcStore::basicForFarm(Store & evalStore, const StorePath & drvPath, const Derivation & full)
+    -> BasicDerivation {
+  auto basic = nixcompat::toBasicDrv(full, [&](const StorePath & dep, const std::string & output) -> StorePath {
+    auto path = evalStore.queryStaticPartialDerivationOutputMap(dep)[output];
+    if (!path) {
+      throw Error("'%s': input '%s!%s' has no statically known path (floating content-addressed?)",
+                  printStorePath(drvPath), printStorePath(dep), output);
+    }
+    return *path;
+  });
+  if (!basic || std::ranges::any_of(basic->outputs, [&](const auto & out) -> bool {
+        return !out.second.path(*this, basic->name, out.first);
+      })) {
+    throw Error("'%s': the build farm needs statically known input and output paths "
+                "(no floating content-addressed or dynamic derivations)",
+                printStorePath(drvPath));
+  }
+  return std::move(*basic);
+}
+
+void GrpcStore::loadFarmJobs(const std::vector<DerivedPath> & reqs, Store & evalStore,
+                  std::map<StorePath, FarmJob> & jobs) {
+  std::function<FarmJob &(const StorePath &)> load = [&](const StorePath & drvPath) -> FarmJob & {
+    if (auto found = jobs.find(drvPath); found != jobs.end()) {
+      return found->second;
+    }
+    auto full = evalStore.readDerivation(drvPath);
+    auto & job = jobs.emplace(drvPath, FarmJob{.drvPath = drvPath,
+                                               .drv = basicForFarm(evalStore, drvPath, full)})
+                     .first->second;
+    nixcompat::forInputDrvs(full, [&](const StorePath & input) -> void {
+      load(input).dependants.push_back(&job);
+      job.waiting++;
+    });
+    return job;
+  };
+  for (const auto & req : reqs) {
+    if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
+      if (const auto * opaque = std::get_if<SingleDerivedPath::Opaque>(&built->drvPath->raw())) {
+        load(opaque->path);
+      } else {
+        throw Error("'%s': dynamic derivations are not supported by the build farm", req.to_string(*this));
+      }
+    }
+  }
 }
 
 auto GrpcStore::buildPathsWithResultsNative(
@@ -127,10 +378,10 @@ auto GrpcStore::buildPathsWithResultsNative(
 
   std::optional<std::vector<KeyedBuildResult>> results;
   PathInfoMap infos;
+  BuildLogActivity act(fmt("building %d paths on %s", reqs.size(), config->authority.to_string()), {});
   remote::BuildPathsChunk msg;
   while (reader->Read(&msg)) {
-    if (msg.has_log_line()) {
-      printError(msg.log_line());
+    if (act.relay(msg)) {
     } else if (msg.has_done()) {
       StringSource source(msg.done().results());
       results = WorkerProto::Serialise<std::vector<KeyedBuildResult>>::read(

@@ -2,6 +2,8 @@
 
 #include "store.hh"
 
+#include <algorithm>
+#include <array>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -9,6 +11,8 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <grpc/impl/channel_arg_names.h>
 #include <grpcpp/grpcpp.h>
@@ -60,6 +64,12 @@ auto GrpcStore::sslOptions() -> grpc::SslCredentialsOptions {
     ssl.pem_private_key = readFile(clientKey);
     haveClientCert = true;
   }
+  if (config->debug) {
+    warn("grpc-store %s: ca=%s (%d bytes) client-cert=%s client-key=%s",
+         config->authority.to_string(), caCert.empty() ? "<grpc builtin>" : caCert,
+         ssl.pem_root_certs.size(), clientCert.empty() ? "<none>" : clientCert,
+         clientKey.empty() ? "<none>" : clientKey);
+  }
   return ssl;
 }
 
@@ -73,7 +83,13 @@ auto GrpcStore::makeChannel(bool ownConnection) -> std::shared_ptr<grpc::Channel
     // Private subchannel pool = own TCP connection.
     args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);
   }
-  auto channel = grpc::CreateCustomChannel(config->authority.to_string(), creds, args);
+  std::vector<std::unique_ptr<grpc::experimental::ClientInterceptorFactoryInterface>> interceptors;
+  if (!config->routeSystem.get().empty()) {
+    interceptors.push_back(std::make_unique<nixgrpc::StaticHeaders::Factory>(
+        nixgrpc::StaticHeaders::Headers{{"x-nix-system", config->routeSystem.get()}}));
+  }
+  auto channel = grpc::experimental::CreateCustomChannelWithInterceptors(
+      config->authority.to_string(), creds, args, std::move(interceptors));
   // Start TCP+TLS setup now instead of stalling the first RPC.
   channel->GetState(true);
   return channel;
@@ -84,6 +100,9 @@ GrpcStore::GrpcStore(const ref<const Config> &config)
       narFetcher{
           [this] -> std::shared_ptr<grpc::Channel> { return makeChannel(true); },
           config->authority.to_string(), config->narConnections} {
+  if (config->debug) {
+    nixgrpc::enableGrpcTracing();
+  }
   if (config->insecure) {
     creds = grpc::InsecureChannelCredentials();
   } else {
@@ -93,32 +112,68 @@ GrpcStore::GrpcStore(const ref<const Config> &config)
   stub = remote::NixRemote::NewStub(makeChannel(false));
 }
 
+auto GrpcStore::transportError(std::string_view msg) -> bool {
+  return std::ranges::any_of(
+      std::array{"Connection refused", "Connection reset", "No route", "unreachable", "timed out", "DNS", "GOAWAY"},
+      [&](const char * needle) -> bool { return msg.contains(needle); });
+}
+
+auto GrpcStore::connectHint(const std::string & msg) const -> std::string
+{
+  auto has = [&](std::string_view needle) -> bool { return msg.contains(needle); };
+  std::string const more = config->debug ? "" : " Set NIX_GRPC_DEBUG=1 for a handshake trace.";
+  if (transportError(msg)) {
+    return "\nhint: could not reach the server (TCP/DNS), not a certificate problem." + more;
+  }
+  if (has("handshaker shutdown") || has("Handshake") || has("SSL") || has("TLS") ||
+      has("certificate") || has("Socket closed")) {
+    if (!haveClientCert) {
+      return "\nhint: TLS handshake failed and no client certificate was presented. If the "
+             "server requires mTLS set 'client-cert'/'client-key' or install client.crt/"
+             "client.key in $XDG_DATA_HOME/nix-grpc-store or /var/lib/nix-grpc-store." + more;
+    }
+    return "\nhint: TLS handshake failed: server certificate not trusted by our CA bundle, "
+           "server rejected our client certificate, or the peer is not speaking TLS." + more;
+  }
+  return more.empty() ? "" : "\nhint:" + more;
+}
+
 auto GrpcStore::statusError(const grpc::Status & status, const char * opName) const -> Error
 {
   std::string hint;
   auto code = status.error_code();
-  // UNAVAILABLE: a TLS-level rejection shows up only as "Socket closed".
   if (!config->insecure &&
       (code == grpc::StatusCode::UNAUTHENTICATED || code == grpc::StatusCode::UNAVAILABLE)) {
-    hint = haveClientCert
-               ? "\nhint: the server may have rejected the client certificate "
-                 "(untrusted CA or revoked)."
-               : "\nhint: no client certificate was presented. If the server requires "
-                 "mTLS, set the 'client-cert'/'client-key' store parameters or install "
-                 "client.crt/client.key in $XDG_DATA_HOME/nix-grpc-store or "
-                 "/var/lib/nix-grpc-store.";
+    hint = connectHint(status.error_message());
+  }
+  if (code == grpc::StatusCode::UNIMPLEMENTED && std::string_view(opName) == "Connect") {
+    hint = "\nhint: this is a build farm endpoint. Pass --eval-store auto.";
   }
   // NOLINTNEXTLINE(modernize-return-braced-init-list): Error ctor is explicit
   return Error("gRPC %s on '%s' failed: %s%s", opName, config->authority.to_string(),
                status.error_message(), hint);
 }
 
+auto GrpcStore::goneAway(const grpc::Status & status) -> bool {
+  switch (status.error_code()) {
+  case grpc::StatusCode::UNAVAILABLE:
+    return transportError(status.error_message()) || status.error_message().contains("upstream")
+           || status.error_message().contains("shutting down");
+  case grpc::StatusCode::CANCELLED:
+    return status.error_message().contains("Cancelling all calls");
+  default:
+    return false;
+  }
+}
+
 auto GrpcStore::isTrustedClient() -> std::optional<TrustedFlag> {
   std::call_once(trustedOnce, [&]() -> void {
-    grpc::ClientContext ctx;
     remote::StoreInfoRequest const request;
     remote::StoreInfoReply reply;
-    checkStatus(stub->StoreInfo(&ctx, request, &reply), "StoreInfo");
+    retrying("StoreInfo", [&]() -> grpc::Status {
+      grpc::ClientContext ctx;
+      return stub->StoreInfo(&ctx, request, &reply);
+    });
     if (reply.has_trusted()) {
       trusted = reply.trusted() ? Trusted : NotTrusted;
     }

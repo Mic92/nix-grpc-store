@@ -2,7 +2,6 @@
 
 #include "store.hh"
 
-#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -41,16 +40,20 @@
 
 namespace nix {
 
-auto GrpcStore::queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute)
-    -> StorePathSet {
-  grpc::ClientContext ctx;
+auto GrpcStore::queryValidPathsRouted(const StorePathSet & paths, SubstituteFlag maybeSubstitute,
+                           const Metadata & headers) -> StorePathSet {
   remote::QueryValidPathsRequest request;
   request.set_substitute(maybeSubstitute == Substitute);
   for (const auto &path : paths) {
     request.add_paths(std::string(path.to_string()));
   }
   remote::QueryValidPathsReply reply;
-  checkStatus(stub->QueryValidPaths(&ctx, request, &reply), "QueryValidPaths");
+  retrying("QueryValidPaths", [&]() -> grpc::Status {
+    grpc::ClientContext ctx;
+    addHeaders(ctx, headers);
+    reply.Clear();
+    return stub->QueryValidPaths(&ctx, request, &reply);
+  });
   StorePathSet res;
   for (const auto &path : reply.paths()) {
     res.insert(StorePath(path));
@@ -95,8 +98,11 @@ auto GrpcStore::queryPathInfosNative(const StorePathSet &paths) -> PathInfoMap {
     request.add_paths(std::string(path.to_string()));
   }
   remote::QueryPathInfosReply reply;
-  grpc::ClientContext ctx;
-  checkStatus(stub->QueryPathInfos(&ctx, request, &reply), "QueryPathInfos");
+  retrying("QueryPathInfos", [&]() -> grpc::Status {
+    grpc::ClientContext ctx;
+    reply.Clear();
+    return stub->QueryPathInfos(&ctx, request, &reply);
+  });
 
   PathInfoMap res;
   for (const auto &entry : reply.infos()) {
@@ -189,17 +195,31 @@ void GrpcStore::queryPathInfoUncached(const StorePath & path, InfoCallback callb
     }
 }
 
-void GrpcStore::addMultipleToStore(
-    PathsSource && pathsToCopy_, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs)
+void GrpcStore::addMultipleToStoreRouted(
+    PathsSource pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs, const Metadata & headers)
 {
-    auto pathsToCopy = std::move(pathsToCopy_);
+    std::vector<std::pair<ValidPathInfo, ReplayableNar>> paths;
+    paths.reserve(pathsToCopy.size());
+    for (auto & [pathInfo, pathSource] : pathsToCopy) {
+      paths.emplace_back(pathInfo, ReplayableNar(std::move(pathSource)));
+    }
+    retrying("AddMultipleToStore", [&]() -> grpc::Status {
+      return addMultipleToStoreOnce(paths, act, repair, checkSigs, headers);
+    });
+}
+
+auto GrpcStore::addMultipleToStoreOnce(
+    std::vector<std::pair<ValidPathInfo, ReplayableNar>> & paths, Activity & act, RepairFlag repair,
+    CheckSigsFlag checkSigs, const Metadata & headers) -> grpc::Status
+{
     uint64_t bytesExpected = 0;
-    for (auto &[pathInfo, pathSource] : pathsToCopy) {
+    for (auto & [pathInfo, nar] : paths) {
       bytesExpected += pathInfo.narSize;
     }
     act.setExpected(actCopyPath, bytesExpected);
 
     grpc::ClientContext ctx;
+    addHeaders(ctx, headers);
     remote::AddMultipleReply reply;
     auto writer = stub->AddMultipleToStore(&ctx, &reply);
 
@@ -215,30 +235,27 @@ void GrpcStore::addMultipleToStore(
 
         nixgrpc::ZstdWriterSink<grpc::ClientWriter<remote::AddMultipleChunk>, remote::AddMultipleChunk> sink(
             *writer);
-        size_t const nrTotal = pathsToCopy.size();
-        sink << nrTotal;
-        // Reverse, so we can release memory at the original start.
-        std::ranges::reverse(pathsToCopy);
-        while (!pathsToCopy.empty()) {
-            act.progress(
-                nrTotal - pathsToCopy.size(), nrTotal, static_cast<size_t>(1), static_cast<size_t>(0));
-            auto & [pathInfo, pathSource] = pathsToCopy.back();
+        sink << paths.size();
+        size_t done = 0;
+        for (auto & [pathInfo, nar] : paths) {
+            act.progress(done, paths.size(), static_cast<size_t>(1), static_cast<size_t>(0));
             WorkerProto::Serialise<ValidPathInfo>::write(
                 *this, WorkerProto::WriteConn{.to = sink, .version = nixcompat::infoProtocolVersion()}, pathInfo);
-            pathSource->drainInto(sink);
-            pathsToCopy.pop_back();
+            nar.drainInto(sink);
+            act.progress(++done, paths.size(), static_cast<size_t>(0), static_cast<size_t>(0));
         }
         sink.finish();
         writer->WritesDone();
     } catch (...) {
         // The server-side status usually explains a broken stream better
-        // than the local write failure. Finish() half-closes, so the
-        // server stops waiting for the remaining paths.
-        checkStatus(writer->Finish(), "AddMultipleToStore");
-        throw;
+        // than the local write failure.
+        auto status = writer->Finish();
+        if (status.ok()) {
+          throw;
+        }
+        return status;
     }
-
-    checkStatus(writer->Finish(), "AddMultipleToStore");
+    return writer->Finish();
 }
 
 } // namespace nix
