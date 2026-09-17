@@ -10,9 +10,13 @@ in
 # Every per-version plugin package doubles as a compile check.
 lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
 // {
-  clang-tidy = packages.default.overrideAttrs (old: {
+  # Same clang as clang-tidy so compile_commands carry flags it understands.
+  # No PCH: the cc-wrapper's hardening flags are not in compile_commands, so
+  # clang-tidy could not load it.
+  clang-tidy = (packages.default.override { stdenv = pkgs.llvmPackages_latest.stdenv; }).overrideAttrs (old: {
     pname = "nix-grpc-store-clang-tidy";
     nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.llvmPackages_latest.clang-tools ];
+    mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Db_pch=false" ];
     # Meson generates a clang-tidy target from .clang-tidy. The generated
     # protobuf headers must exist before it runs.
     buildPhase = ''

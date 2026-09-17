@@ -57,6 +57,11 @@ gen = custom_target('nix_remote_proto',
 gen_inc = include_directories('.')
 src_inc = include_directories('src')
 
+# ld.bfd needs ~70 s per binary for gRPC's ~100 abseil DSOs, mold ~1 s.
+if host_machine.system() == 'linux' and find_program('mold', required : false).found()
+  add_project_link_arguments('-fuse-ld=mold', language : 'cpp')
+endif
+
 common_deps = [grpc_dep, protobuf_dep, zstd_dep, threads_dep]
 
 # --- client plugin ----------------------------------------------------------
@@ -78,6 +83,7 @@ endif
 shared_module('nix-grpc-store',
   sources : ['src/client/store.cc', 'src/client/build.cc', 'src/client/transfer.cc', 'src/client/channel.cc', gen],
   include_directories : [gen_inc, src_inc],
+  cpp_pch : 'pch/client_pch.hh',
   # nix_plugin_entry() skips registering the store when the running Nix
   # version differs from the one the plugin was built against.
   cpp_args : nix_compat_args + ['-DNIX_GRPC_BUILT_AGAINST_NIX="' + nix_store_dep.version() + '"'],
@@ -114,6 +120,7 @@ daemon_sources = [
 executable('nix-grpc-daemon',
   sources : daemon_sources + [gen],
   include_directories : [gen_inc, src_inc],
+  cpp_pch : 'pch/daemon_pch.hh',
   cpp_args : nix_compat_args,
   # nix-store: native QueryValidPaths / AddMultipleToStore handlers.
   dependencies : common_deps + prometheus_dep + [nix_util_dep, nix_store_dep],
