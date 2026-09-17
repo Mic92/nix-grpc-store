@@ -1,5 +1,27 @@
 {
   "nodes": {
+    "niks3": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "treefmt-nix": "treefmt-nix"
+      },
+      "locked": {
+        "lastModified": 1789606230,
+        "narHash": "sha256-uUFpM99OyYNtmbt+gaKXpPRt6uErm5W1WtwSITNWLj8=",
+        "owner": "Mic92",
+        "repo": "niks3",
+        "rev": "0960ff4e46ba3714139197025c648cf131d2806f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Mic92",
+        "ref": "farm/claims",
+        "repo": "niks3",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1789006805,
@@ -18,7 +40,29 @@
     },
     "root": {
       "inputs": {
+        "niks3": "niks3",
         "nixpkgs": "nixpkgs"
+      }
+    },
+    "treefmt-nix": {
+      "inputs": {
+        "nixpkgs": [
+          "niks3",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1786901030,
+        "narHash": "sha256-WSFCsDSE5ffgD2MqzkM2CYjeFiKhRF/dJUN8uedb6YE=",
+        "owner": "numtide",
+        "repo": "treefmt-nix",
+        "rev": "27b3b12a8e6375f28ebe122f07d230ca5459bbfa",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "treefmt-nix",
+        "type": "github"
       }
     }
   },
