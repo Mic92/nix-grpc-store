@@ -324,6 +324,11 @@ public:
 
     auto isTrustedClient() -> std::optional<TrustedFlag> override;
 
+    auto isFarm() -> bool {
+      isTrustedClient();
+      return farm;
+    }
+
     // nix copy "builds" opaque paths; answering already-valid ones here
     // avoids the tunnel, which read-only clients may not open.
     auto alreadyValidResults(const std::vector<DerivedPath> & reqs)
@@ -445,6 +450,27 @@ public:
     // Same headers on every RPC so the balancer keeps us on that worker.
     void uploadDrvClosure(Store & evalStore, const StorePath & drvPath, const Metadata & headers);
 
+    // Relays log/phase chunks, hands `done` to onDone, keeps the output infos for queryPathInfo.
+    template<typename Chunk, typename F>
+    auto readBuildStream(grpc::ClientReader<Chunk> & reader, BuildLogActivity & act, const F & onDone) -> grpc::Status {
+      PathInfoMap infos;
+      Chunk msg;
+      while (reader.Read(&msg)) {
+        if (!act.relay(msg) && msg.has_done()) {
+          onDone(msg.done());
+          for (const auto & entry : msg.done().outputs()) {
+            infos.insert(nixgrpc::decodePathInfo(*this, entry));
+          }
+        }
+      }
+      auto status = reader.Finish();
+      if (status.ok() && !infos.empty()) {
+        std::scoped_lock const lock(prefetchMutex);
+        prefetchedInfos.merge(infos);
+      }
+      return status;
+    }
+
     // Log lines stream, the result carries the output path infos.
     auto tryBuildDerivation(const remote::BuildDerivationRequest & request, const Metadata & headers,
                             std::optional<BuildResult> & res) -> grpc::Status;
@@ -454,9 +480,6 @@ public:
                                const BasicDerivation & drv,
                                BuildMode buildMode,
                                Store * evalStore = nullptr) -> BuildResult;
-
-    // A farm refuses BuildPaths. An empty request is the cheapest probe.
-    auto isFarm() -> bool;
 
     struct FarmJob {
       StorePath drvPath;
@@ -506,9 +529,9 @@ public:
     // Runs on a fan-out thread, nothing may escape.
     auto runFarmJob(FarmJob & job, BuildMode buildMode, Store & evalStore) -> BuildResult;
 
-    // The build hook (untrusted role) and plain `--store grpc://` pass no
-    // eval store but usually have the derivations in the local store.
-    auto localEvalStore(const std::vector<DerivedPath> & reqs) -> std::shared_ptr<Store>;
+    // The build hook and plain `--store grpc://` pass no eval store but
+    // usually have the derivations in the local store.
+    auto localEvalStore(const StorePathSet & drvPaths) -> std::shared_ptr<Store>;
 
     // The farm builds one derivation per RPC, so walk the DAG here and send
     // every ready derivation at once. Cached ones come back AlreadyValid.
@@ -541,8 +564,7 @@ private:
     std::atomic<bool> everConnected = false;
     std::once_flag trustedOnce;
     std::optional<TrustedFlag> trusted;
-    std::once_flag farmOnce;
-    bool farm = false;
+    bool farm = false; // from StoreInfo
 
     /* Path infos fetched in bulk by topoSortPaths(), consumed by
        queryPathInfoUncached() so `nix copy` needs one QueryPathInfos RPC

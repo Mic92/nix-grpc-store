@@ -189,6 +189,7 @@ auto GrpcStore::isTrustedClient() -> std::optional<TrustedFlag> {
     if (reply.has_trusted()) {
       trusted = reply.trusted() ? Trusted : NotTrusted;
     }
+    farm = reply.farm();
   });
   return trusted;
 }

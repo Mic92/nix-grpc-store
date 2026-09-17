@@ -413,6 +413,7 @@ public:
             if (farm) {
                 // build-remote sends BuildDerivation and unsigned inputs only to stores that trust it.
                 reply->set_trusted(rpc.caller.role == nixgrpc::Role::trusted);
+                reply->set_farm(true);
                 return grpc::Status::OK;
             }
             auto backend = backends.connect(*getStore());

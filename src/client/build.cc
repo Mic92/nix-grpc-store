@@ -11,7 +11,6 @@
 #include <functional>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -24,7 +23,6 @@
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/support/client_interceptor.h>
 #include <grpcpp/support/status.h>
-#include <grpcpp/support/sync_stream.h>
 
 #include <nix/store/build-result.hh>
 #include <nix/store/derivations.hh>
@@ -47,7 +45,6 @@
 #include "nix-compat.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
-#include "path-info-wire.hh"
 
 namespace nix {
 
@@ -147,26 +144,11 @@ auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & reques
   auto drv = printStorePath(StorePath(request.drv_path()));
   BuildLogActivity act(fmt("building '%s' on %s", drv, config->authority.to_string()),
                        {drv, config->authority.to_string(), 1, 1});
-  PathInfoMap infos;
-  remote::BuildDerivationChunk msg;
-  while (reader->Read(&msg)) {
-    if (act.relay(msg)) {
-    } else if (msg.has_done()) {
-      StringSource source(msg.done().result());
-      res = WorkerProto::Serialise<BuildResult>::read(
-          *this, WorkerProto::ReadConn{.from = source,
-                                       .version = nixcompat::buildProtocolVersion()});
-      for (const auto & entry : msg.done().outputs()) {
-        infos.insert(nixgrpc::decodePathInfo(*this, entry));
-      }
-    }
-  }
-  auto status = reader->Finish();
-  if (status.ok() && !infos.empty()) {
-    std::scoped_lock const lock(prefetchMutex);
-    prefetchedInfos.merge(infos);
-  }
-  return status;
+  return readBuildStream(*reader, act, [&](const remote::BuildDerivationDone & done) -> void {
+    StringSource source(done.result());
+    res = WorkerProto::Serialise<BuildResult>::read(
+        *this, WorkerProto::ReadConn{.from = source, .version = nixcompat::buildProtocolVersion()});
+  });
 }
 
 auto GrpcStore::buildDerivationNative(const StorePath & drvPath,
@@ -190,13 +172,8 @@ auto GrpcStore::buildDerivationNative(const StorePath & drvPath,
   for (unsigned attempt = 0;; attempt++) {
     status = tryBuildDerivation(request, headers, res);
     if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
-      // The build hook has the drv in the local store but passes no evalStore.
       if (evalStore == nullptr) {
-        local = nix::openStore();
-        if (local.get() == this || !local->isValidPath(drvPath)) {
-          throw Error("farm worker lacks '%s'\nhint: pass --eval-store auto",
-                      printStorePath(drvPath));
-        }
+        local = localEvalStore({drvPath});
         evalStore = local.get();
       }
       uploadDrvClosure(*evalStore, drvPath, headers);
@@ -216,20 +193,6 @@ auto GrpcStore::buildDerivationNative(const StorePath & drvPath,
     throw Error("gRPC BuildDerivation stream ended without a result");
   }
   return std::move(*res);
-}
-
-auto GrpcStore::isFarm() -> bool {
-  std::call_once(farmOnce, [&]() -> void {
-    grpc::ClientContext ctx;
-    remote::BuildPathsRequest request;
-    request.set_protocol(nixcompat::kBuildProtocolWire);
-    auto reader = stub->BuildPaths(&ctx, request);
-    remote::BuildPathsChunk msg;
-    while (reader->Read(&msg)) {
-    }
-    farm = reader->Finish().error_code() == grpc::StatusCode::UNIMPLEMENTED;
-  });
-  return farm;
 }
 
 auto GrpcStore::runFarmJob(FarmJob & job, BuildMode buildMode, Store & evalStore) -> BuildResult {
@@ -252,17 +215,11 @@ auto GrpcStore::runFarmJob(FarmJob & job, BuildMode buildMode, Store & evalStore
   }
 }
 
-auto GrpcStore::localEvalStore(const std::vector<DerivedPath> & reqs) -> std::shared_ptr<Store> {
+auto GrpcStore::localEvalStore(const StorePathSet & drvPaths) -> std::shared_ptr<Store> {
   std::shared_ptr<Store> local = nix::openStore();
-  bool haveDrvs = local.get() != this;
-  for (const auto & req : reqs) {
-    if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
-      if (const auto * drv = std::get_if<SingleDerivedPath::Opaque>(&built->drvPath->raw())) {
-        haveDrvs = haveDrvs && local->isValidPath(drv->path);
-      }
-    }
-  }
-  if (!haveDrvs) {
+  if (local.get() == this || !std::ranges::all_of(drvPaths, [&](const StorePath & drv) -> bool {
+        return local->isValidPath(drv);
+      })) {
     throw Error("'%s' is a build farm\nhint: pass --eval-store auto", config->authority.to_string());
   }
   return local;
@@ -272,7 +229,13 @@ auto GrpcStore::farmBuildPaths(const std::vector<DerivedPath> & reqs, BuildMode 
                     Store * evalStore) -> std::vector<KeyedBuildResult> {
   std::shared_ptr<Store> local;
   if (evalStore == nullptr || evalStore == this) {
-    local = localEvalStore(reqs);
+    StorePathSet drvs;
+    for (const auto & req : reqs) {
+      if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
+        drvs.insert(built->drvPath->getBaseStorePath());
+      }
+    }
+    local = localEvalStore(drvs);
     evalStore = local.get();
   }
   std::map<StorePath, FarmJob> jobs;
@@ -375,32 +338,18 @@ auto GrpcStore::buildPathsWithResultsNative(
   auto reader = stub->BuildPaths(&ctx, request);
 
   std::optional<std::vector<KeyedBuildResult>> results;
-  PathInfoMap infos;
   BuildLogActivity act(fmt("building %d paths on %s", reqs.size(), config->authority.to_string()), {});
-  remote::BuildPathsChunk msg;
-  while (reader->Read(&msg)) {
-    if (act.relay(msg)) {
-    } else if (msg.has_done()) {
-      StringSource source(msg.done().results());
-      results = WorkerProto::Serialise<std::vector<KeyedBuildResult>>::read(
-          *this, WorkerProto::ReadConn{.from = source,
-                                       .version = nixcompat::buildProtocolVersion()});
-      for (const auto & entry : msg.done().outputs()) {
-        infos.insert(nixgrpc::decodePathInfo(*this, entry));
-      }
-    }
-  }
-  auto status = reader->Finish();
+  auto status = readBuildStream(*reader, act, [&](const remote::BuildPathsDone & done) -> void {
+    StringSource source(done.results());
+    results = WorkerProto::Serialise<std::vector<KeyedBuildResult>>::read(
+        *this, WorkerProto::ReadConn{.from = source, .version = nixcompat::buildProtocolVersion()});
+  });
   if (status.error_code() == grpc::StatusCode::UNIMPLEMENTED) {
     return std::nullopt;
   }
   checkStatus(status, "BuildPaths");
   if (!results) {
     throw Error("gRPC BuildPaths stream ended without a result");
-  }
-  if (!infos.empty()) {
-    std::scoped_lock const lock(prefetchMutex);
-    prefetchedInfos.merge(infos);
   }
   return results;
 }

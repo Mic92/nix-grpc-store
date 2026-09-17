@@ -116,6 +116,8 @@ message StoreInfoRequest {}
 
 message StoreInfoReply {
   optional bool trusted = 1;
+  // Builds go through BuildDerivation only, see docs/farm.md.
+  bool farm = 2;
 }
 
 message FetchNarsRequest {
