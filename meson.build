@@ -117,6 +117,7 @@ daemon_sources = [
   'src/daemon/main.cc',
   'src/daemon/auth.cc',
   'src/daemon/backend.cc',
+  'src/daemon/farm.cc',
   'src/daemon/options.cc',
 ]
 
@@ -126,7 +127,7 @@ executable('nix-grpc-daemon',
   cpp_pch : 'pch/daemon_pch.hh',
   cpp_args : nix_compat_args,
   # nix-store: native QueryValidPaths / AddMultipleToStore handlers.
-  dependencies : common_deps + prometheus_dep + [nix_util_dep, nix_store_dep],
+  dependencies : common_deps + prometheus_dep + [nix_util_dep, nix_store_dep, curl_dep, json_dep],
   install : true,
 )
 
@@ -142,12 +143,19 @@ test('farm-client', find_program('tests/farm-client-test.sh'),
   timeout : 60,
 )
 
+test('xfcc', executable('xfcc-test',
+  sources : ['tests/xfcc-test.cc'],
+  include_directories : [src_inc, include_directories('src/daemon')],
+  dependencies : [grpc_dep],
+  cpp_args : ['-UNDEBUG'],
+))
+
 # --- fuzzers ----------------------------------------------------------------
 
 # Built only with -Dfuzzers=true (requires clang for libFuzzer).
 # Run them with scripts/fuzz.sh.
 if get_option('fuzzers')
-  foreach name : ['zstd-reader', 'tunnel-pump', 'import-paths', 'build-log', 'nar-frames', 'wire', 'acl']
+  foreach name : ['zstd-reader', 'tunnel-pump', 'import-paths', 'build-log', 'nar-frames', 'wire', 'acl', 'xfcc']
     executable('fuzz-' + name,
       sources : ['fuzz' / name + '.cc', 'fuzz/support.cc', gen],
       include_directories : [gen_inc, src_inc],

@@ -14,12 +14,17 @@
 
 #include "acl.hh"
 #include "logfmt.hh"
+#include "xfcc.hh"
 
 namespace nixgrpc {
 
+// A trusted proxy's own certificate stands in for whatever client it forwards.
 auto Auth::identify(const grpc::ServerContext & context) const -> Caller
 {
     auto cert = clientCommonName(context);
+    if (proxies.matches(cert)) {
+        cert = xfcc::forwardedCommonName(context);
+    }
     return {
         .name = cert.value_or("-"), .role = acl.roleFor(cert), .kind = cert ? Caller::Kind::named : Caller::Kind::anonymous};
 }

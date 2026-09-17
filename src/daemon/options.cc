@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -14,10 +15,13 @@
 
 #include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
+#include <nix/util/strings.hh>
+#include <nix/util/util.hh>
 
 #include "acl.hh"
 #include "logfmt.hh"
 #include "parse-int.hh"
+#include "xfcc.hh"
 
 namespace nixgrpc {
 
@@ -60,6 +64,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.clientCA = next();
         } else if (arg == "--allow") {
             options.acl.addRule(next());
+        } else if (arg == "--trusted-proxy") {
+            options.proxies.add(next());
         } else if (arg == "--allow-anonymous") {
             options.acl.allowAnonymous(parseRole(next()));
         } else if (arg == "--metrics-listen") {
@@ -72,13 +78,44 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.idleTimeout = std::chrono::seconds(*secs);
         } else if (arg == "--log-level") {
             options.logLevel = parseLogLevel(next());
+        } else if (arg == "--niks3") {
+            options.farm.niks3Url = next();
+        } else if (arg == "--niks3-token-file") {
+            options.farm.niks3TokenFile = next();
+        } else if (arg == "--niks3-push") {
+            // The program plus extra flags, e.g. "niks3 push --max-concurrent-uploads 8".
+            auto words = nix::shellSplitString(next());
+            options.farm.pushArgv = {words.begin(), words.end()};
+        } else if (arg == "--max-jobs") {
+            auto jobs = parseInt<unsigned>(next());
+            if (!jobs || *jobs == 0) {
+                throw nix::Error("--max-jobs expects a positive integer");
+            }
+            options.farm.maxJobs = *jobs;
+        } else if (arg == "--min-free") {
+            options.farm.minFree = nix::string2IntWithUnitPrefix<uint64_t>(next());
         } else {
             throw nix::Error("unknown flag '%s'", arg);
         }
     }
+    if (!options.farm.niks3Url.empty()) {
+        if (options.farm.niks3TokenFile.empty()) {
+            throw nix::Error("--niks3 needs --niks3-token-file");
+        }
+        auto & argv = options.farm.pushArgv;
+        if (argv.empty()) {
+            argv = {"niks3", "push"};
+        }
+        argv.insert(
+            argv.end(),
+            {"--stdin", "--server-url", options.farm.niks3Url, "--auth-token-path", options.farm.niks3TokenFile});
+    }
     if ((options.acl.active() || options.acl.anonymousRole()) && options.clientCA.empty()) {
         // Without mTLS every client's CN is "-".
         throw nix::Error("--allow/--allow-anonymous requires --client-ca");
+    }
+    if (!options.proxies.empty() && options.clientCA.empty()) {
+        throw nix::Error("--trusted-proxy requires --client-ca");
     }
     if (!options.clientCA.empty() && !options.acl.anonymousRole()) {
         options.acl.requireCertificate();
@@ -106,5 +143,6 @@ auto makeServerCredentials(const Options & options) -> std::shared_ptr<grpc::Ser
     }
     return grpc::SslServerCredentials(ssl);
 }
+
 
 } // namespace nixgrpc

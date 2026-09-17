@@ -4,7 +4,9 @@
 
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <stop_token>
 #include <string>
@@ -19,6 +21,7 @@
 #include <nix/store/build-result.hh>
 #include <nix/store/derivations.hh>
 #include <nix/store/derived-path.hh>
+#include <nix/store/outputs-spec.hh>
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
 #include <nix/store/worker-protocol.hh>
@@ -36,6 +39,27 @@
 #include "path-info-wire.hh"
 
 namespace nixgrpc {
+
+namespace {
+// No build hook on a farm worker: it would bypass slots and claims.
+void buildLocally(Backend::Conn & conn)
+{
+    constexpr uint64_t off = 0;
+    constexpr uint64_t yes = 1;
+    conn.to << nix::WorkerProto::Op::SetOptions << off /* keepFailed */ << off /* keepGoing */
+            << off /* tryFallback */ << off /* verbosity */ << yes /* maxBuildJobs */
+            << off /* maxSilentTime */ << yes << off /* verbosity */ << off << off << off /* buildCores */
+            << yes /* useSubstitutes */;
+    std::map<std::string, std::string> const overrides{{"builders", ""}};
+    conn.to << overrides.size();
+    for (const auto & [name, value] : overrides) {
+        conn.to << name << value;
+    }
+    if (auto exc = conn.processStderrReturn()) {
+        std::rethrow_exception(exc);
+    }
+}
+} // namespace
 
 void Backend::cancelWith(grpc::ServerContext & context)
 {
@@ -110,6 +134,23 @@ auto Backends::buildPathsVia(
         localStore, nix::WorkerProto::ReadConn{.from = conn.from, .version = nixcompat::buildProtocolVersion()});
 }
 
+auto Backends::storedBuild(
+    grpc::ServerContext & context,
+    nix::Store & localStore,
+    const nix::StorePath & drvPath,
+    const BuildEventSink & sendLogLine) const -> nix::BuildResult
+{
+    auto backend = forBuild(context, localStore);
+    buildLocally(backend->conn);
+    std::vector<nix::DerivedPath> const targets{nix::DerivedPath::Built{
+        .drvPath = nix::makeConstantStorePathRef(drvPath), .outputs = nix::OutputsSpec::All{}}};
+    auto results = buildPathsVia(*backend, localStore, targets, nix::bmNormal, sendLogLine);
+    if (results.size() != 1) {
+        throw nix::Error("nix-daemon returned %d results for one derivation", results.size());
+    }
+    return std::move(results.front());
+}
+
 void encodeResult(nix::Store & localStore, nix::BuildResult & res, nix::remote::BuildDerivationDone * done)
 {
     nix::StringSink sink;
@@ -117,7 +158,9 @@ void encodeResult(nix::Store & localStore, nix::BuildResult & res, nix::remote::
         localStore, nix::WorkerProto::WriteConn{.to = sink, .version = nixcompat::buildProtocolVersion()}, res);
     *done->mutable_result() = std::move(sink.s);
     nixcompat::forBuiltOutputs(res, [&](const nix::StorePath & outPath) -> void {
-        encodePathInfo(localStore, *localStore.queryPathInfo(outPath), done->add_outputs());
+        if (localStore.isValidPath(outPath)) {
+            encodePathInfo(localStore, *localStore.queryPathInfo(outPath), done->add_outputs());
+        }
     });
 }
 

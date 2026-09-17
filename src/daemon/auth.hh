@@ -1,5 +1,6 @@
 #pragma once
-// Who is calling and whether the ACL lets them call a given method.
+// Who is calling (client certificate or forwarded certificate) and whether
+// the ACL lets them call a given method.
 
 #include <cstdint>
 #include <optional>
@@ -10,6 +11,7 @@
 #include <grpcpp/support/status.h>
 
 #include "acl.hh"
+#include "xfcc.hh"
 
 namespace nixgrpc {
 
@@ -24,6 +26,7 @@ struct Caller
 struct Auth
 {
     Acl acl;
+    xfcc::TrustedProxies proxies;
 
     [[nodiscard]] auto identify(const grpc::ServerContext & context) const -> Caller;
     static auto authorize(const Caller & caller, std::string_view method, Role minRole) -> grpc::Status;

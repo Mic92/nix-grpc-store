@@ -12,7 +12,9 @@
 #include <grpcpp/security/server_credentials.h>
 
 #include "acl.hh"
+#include "farm.hh"
 #include "logfmt.hh"
+#include "xfcc.hh"
 
 namespace nixgrpc {
 
@@ -29,6 +31,8 @@ struct Options
     std::string metricsListen;
     LogLevel logLevel = LogLevel::info;
     Acl acl;
+    xfcc::TrustedProxies proxies;
+    FarmConfig farm; // active when niks3Url is set
 };
 
 auto parseOptions(const std::vector<std::string_view> & args) -> Options;

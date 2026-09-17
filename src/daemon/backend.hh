@@ -65,6 +65,14 @@ struct Backends
         nix::BuildMode mode,
         const BuildEventSink & sendLogLine) const -> nix::BuildResult;
 
+    // By path, not inline: nix-daemon recomputes output paths from the stored
+    // closure, so a forged drv cannot claim foreign paths. No build hook.
+    [[nodiscard]] auto storedBuild(
+        grpc::ServerContext & context,
+        nix::Store & localStore,
+        const nix::StorePath & drvPath,
+        const BuildEventSink & sendLogLine) const -> nix::BuildResult;
+
     static auto buildPathsVia(
         Backend & backend,
         nix::Store & localStore,

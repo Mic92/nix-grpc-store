@@ -191,6 +191,15 @@ cache), certificate holders keep their `--allow` roles. Naming policies
 pair well with a CA like [step-ca](https://smallstep.com/docs/step-ca/),
 where provisioners constrain which CNs each token may request.
 
+`--trusted-proxy CN-PATTERN` is for a TLS-terminating L7 balancer (envoy)
+in front of the daemon. A peer presenting a certificate whose CN matches is
+a proxy: the daemon takes the client's identity from the
+`x-forwarded-client-cert` header it sets (`Subject` CN, evaluated against
+`--allow`) and treats the request as anonymous without one. From any other
+peer the header is ignored. The proxy must overwrite the header (envoy
+`forward_client_cert_details: SANITIZE_SET`) and authenticate to the
+daemon with its own client cert.
+
 NixOS:
 
     services.nix-grpc-daemon.accessRules = [
@@ -254,7 +263,7 @@ which also requires `trustClients` (see above).
   * `--listen ADDR` — default `0.0.0.0:50051`
   * `--proxy-socket PATH` — nix-daemon socket, default `/nix/var/nix/daemon-socket/socket`
   * `--tls-cert`, `--tls-key`, `--client-ca` — see above
-  * `--allow 'cn-pattern=role'`, `--allow-anonymous ROLE` — see access control
+  * `--allow 'cn-pattern=role'`, `--allow-anonymous ROLE`, `--trusted-proxy CN-PATTERN` — see access control
   * `--metrics-listen ADDR` — serve Prometheus metrics, disabled if unset
   * `--log-level info|debug` — access log verbosity, default `info`
 
