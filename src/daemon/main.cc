@@ -277,12 +277,14 @@ public:
             }
             auto & rpc = std::get<Rpc>(started);
             static_cast<void>(rpc);
+            nixgrpc::Metrics::Held const held(metrics, "QueryValidPaths");
             auto localStore = getStore();
             nix::StorePathSet paths;
             for (const auto & path : request->paths()) {
                 paths.insert(nix::StorePath(path));
             }
             std::vector<std::string> valid;
+            nixgrpc::Metrics::Phase phase(metrics, "QueryValidPaths", "query");
             for (const auto & path :
                  localStore->queryValidPaths(paths, request->substitute() ? nix::Substitute : nix::NoSubstitute)) {
                 reply->add_paths(std::string(path.to_string()));
@@ -296,6 +298,7 @@ public:
                 }
                 // And what only we have must become so before the client relies on it.
                 if (!valid.empty()) {
+                    phase.next("publish");
                     farm->push.pushWait(valid, 0, [&]() -> bool { return context->IsCancelled(); });
                 }
             }
@@ -333,7 +336,10 @@ public:
 
             nixgrpc::ZstdReaderSource<AddMultipleReader, nix::remote::AddMultipleChunk> source(
                 *reader, std::move(*first.mutable_data()));
+
+            nixgrpc::Metrics::Held const held(metrics, "AddMultipleToStore");
             std::vector<std::string> imported;
+            nixgrpc::Metrics::Phase phase(metrics, "AddMultipleToStore", "recv");
             auto stats = nixgrpc::importPaths(
                 *localStore, source, [&](const nix::ValidPathInfo & info, nix::Source & nar) -> void {
                     if (farm) {
@@ -342,7 +348,9 @@ public:
                     localStore->addToStore(info, nar, repair, checkSigs);
                     imported.push_back(localStore->printStorePath(info.path));
                 });
+            phase.done();
             if (farm && !imported.empty()) {
+                phase.next("publish");
                 farm->push.pushWait(imported, 0, [&]() -> bool { return context->IsCancelled(); });
             }
             rpc.done({{"paths", std::to_string(stats.paths)}, {"nar_bytes_in", std::to_string(stats.narBytes)}});
@@ -471,6 +479,7 @@ public:
             }
         } catch (nix::Error & err) {
             // Another worker may still hold it locally. UNAVAILABLE makes the client retry elsewhere.
+            metrics.event("input_not_substitutable");
             return {grpc::StatusCode::UNAVAILABLE, hostName + ": input not substitutable: " + err.what()};
         }
         return grpc::Status::OK;
@@ -526,17 +535,25 @@ public:
             return {grpc::StatusCode::UNAVAILABLE, "worker low on disk space"};
         }
         auto cancelled = [&]() -> bool { return context.IsCancelled() || stopSignal != 0; };
+        nixgrpc::Metrics::Held const held(metrics, "BuildDerivation");
+        nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "slot_wait");
         auto slot = nixgrpc::acquireSlot(frm.slots);
+        phase.next("claim");
         auto claim = frm.niks3.claim(narinfoKeys(outPaths | std::views::values), narinfoKeys(nixcompat::drvInputs(drv)));
         if (claim->first(cancelled) == nixgrpc::Claim::Status::wait) {
             slot.reset();
+            phase.next("claim_wait");
             log({.text = hostName + ": waiting for another worker building " + std::string(drvPath.to_string())});
         }
-        switch (claim->await(cancelled)) {
+        auto const verdict = claim->await(cancelled);
+        phase.done();
+        switch (verdict) {
         case nixgrpc::Claim::Status::built:
+            metrics.event("deduplicated");
             res = nixcompat::alreadyValid(drvPath, std::move(outPaths));
             return grpc::Status::OK;
         case nixgrpc::Claim::Status::failed:
+            metrics.event("deduplicated");
             res = nixcompat::failed(
                 nixcompat::FailureStatus::PermanentFailure, "failed on another worker: " + claim->kind());
             return grpc::Status::OK;
@@ -553,6 +570,7 @@ public:
 
         // Roots inputs and outputs until publish is done.
         auto roots = openScopedStore();
+        phase.next("substitute");
         if (auto status = gatherInputs(localStore, drvPath, drv, *roots); !status.ok()) {
             return status;
         }
@@ -562,7 +580,10 @@ public:
 
         log({.text = hostName + ": building " + std::string(drvPath.to_string())});
         try {
+            phase.next("build");
+            nixgrpc::Metrics::Held const building(metrics, "build_slot");
             res = backends.storedBuild(context, localStore, drvPath, log);
+            phase.done();
         } catch (nix::Error &) {
             if (cancelled()) {
                 throw nixgrpc::CancelledWait("worker shutting down, build interrupted");
@@ -571,8 +592,10 @@ public:
         }
 
         if (claim->lost()) {
+            metrics.event("claim_lost");
             return {grpc::StatusCode::UNAVAILABLE, "lost niks3 claim during build"};
         }
+        metrics.event(nixcompat::succeeded(res) ? "built" : "build_failed");
         if (!nixcompat::succeeded(res)) {
             // The client gets the result even if niks3 is down.
             try {
@@ -592,8 +615,11 @@ public:
             built.push_back(localStore.printStorePath(path));
         }
         try {
+            phase.next("publish");
             frm.push.pushWait(built, claim->token(), cancelled);
+            phase.done();
         } catch (nixgrpc::StaleClaim &) {
+            metrics.event("claim_lost");
             claim->published();
             return {grpc::StatusCode::UNAVAILABLE, "lost niks3 claim before publishing"};
         } catch (nixgrpc::CancelledWait &) {
@@ -797,6 +823,9 @@ try {
     }
 
     nixgrpc::Metrics metrics(options.metricsListen);
+    if (!options.farm.niks3Url.empty()) {
+        metrics.buildSlots(options.farm.maxJobs);
+    }
     nixgrpc::IdleTracker idle;
     if (options.storeUri.empty()) {
         options.storeUri = "unix://" + options.socketPath;
