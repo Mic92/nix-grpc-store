@@ -6,11 +6,13 @@
 #    sync_stream.h template definitions; nothing to fix on our side
 #  - clang-analyzer-optin.cplusplus.VirtualCall: fires only inside Nix's
 #    serialise.hh (EnsureRead destructor); nothing to fix on our side
+#  - misc-header-include-cycle: curl.h includes itself via multi.h/urlapi.h
 Checks: >
   *,
   -portability-avoid-pragma-once,
   -portability-template-virtual-member-function,
   -clang-analyzer-optin.cplusplus.VirtualCall,
+  -misc-header-include-cycle,
   -abseil-*,
   -altera-*,
   -android-*,

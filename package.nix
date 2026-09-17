@@ -9,6 +9,9 @@
   openssl,
   prometheus-cpp,
   zstd,
+  curl,
+  nlohmann_json,
+  python3,
   mold,
   # Nix component libraries. When building the client plugin these must be
   # ABI-compatible with the `nix` binary that will dlopen() the .so; the NixOS
@@ -31,8 +34,14 @@ stdenv.mkDerivation {
       ./proto
       ./src
       ./fuzz
+      ./tests/farm-mock.py
+      ./tests/farm-client-test.cc
+      ./tests/farm-client-test.sh
     ];
   };
+
+  doCheck = true;
+  nativeCheckInputs = [ python3 ];
 
   nativeBuildInputs = [
     meson
@@ -50,6 +59,8 @@ stdenv.mkDerivation {
     zstd
     nix-store
     nix-util
+    curl
+    nlohmann_json
   ];
 
   # Frame pointers + symbols so `perf` in the VM test can attribute samples
