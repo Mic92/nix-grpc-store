@@ -15,8 +15,9 @@ balancer, and two kinds of client: a CI host and a developer laptop.
 There is no scheduler. Coordination comes from two places:
 
 * **The balancer** (envoy) routes each request by the `x-nix-system` header
-  and picks a worker by hashing `x-nix-drv`, so the same derivation tends
-  to reach the same worker. This is an optimisation only: every worker
+  (and `x-nix-features` where workers differ, e.g. `kvm`) and picks a
+  worker by hashing `x-nix-drv`, so the same derivation tends to reach the
+  same worker. This is an optimisation only: every worker
   publishes what it accepts or reports as valid to the cache before
   answering, and substitutes from the cache whatever it lacks (uploaded
   paths' references, the `.drv` closure, build inputs, outputs to serve).
@@ -112,6 +113,9 @@ services.nix-grpc-farm-lb = {
     x86_64-linux  = [ "10.0.0.4:50052" ];
     aarch64-linux = [ "10.0.0.5:50052" "10.0.0.6:50052" ];
   };
+  # Only 10.0.0.5 has /dev/kvm. Drvs with requiredSystemFeatures = [ "kvm" ]
+  # go there, a worker without the feature would bounce them.
+  features.aarch64-linux.kvm = [ "10.0.0.5:50052" ];
   tls = {
     certFile = "/var/lib/acme/farm.example.com/fullchain.pem";
     keyFile  = "/var/lib/acme/farm.example.com/key.pem";

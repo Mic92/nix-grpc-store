@@ -98,11 +98,12 @@ let
 
   # Distinct name per run so the cache never already has it.
   jobExpr = pkgs.writeText "job.nix" ''
-    { tag }:
+    { tag, features ? [ ] }:
     let
       mk = name: deps: derivation {
         inherit name;
         system = builtins.currentSystem;
+        requiredSystemFeatures = features;
         builder = "/bin/sh";
         args = [ "-c" "echo '@nix {\"action\":\"setPhase\",\"phase\":\"farmPhase\"}' >&2; echo LOG-''${name}-''${tag} >&2; echo ''${name}-''${tag} ''${toString deps} > $out" ];
       };
@@ -149,8 +150,14 @@ pkgs.testers.runNixOSTest {
   globalTimeout = 900;
 
   nodes = {
-    worker1 = worker;
-    worker2 = worker;
+    worker1 = {
+      imports = [ worker ];
+      nix.settings.system-features = [ "vip" ];
+    };
+    worker2 = {
+      imports = [ worker ];
+      nix.settings.system-features = [ ];
+    };
 
     lb =
       { config, ... }:
@@ -216,6 +223,7 @@ pkgs.testers.runNixOSTest {
             "worker1:50051"
             "worker2:50051"
           ];
+          features.${pkgs.stdenv.hostPlatform.system}.vip = [ "worker1:50051" ];
           healthCheckInterval = "1s";
           tls = {
             certFile = "${certs}/lb.pem";
@@ -430,6 +438,15 @@ pkgs.testers.runNixOSTest {
         busy.succeed("systemctl start nix-grpc-daemon.socket")
         client.succeed("systemctl kill -s INT stopme")
         retry(lambda _: not building(), timeout_seconds=20)
+
+    with subtest("requiredSystemFeatures route to workers that have them"):
+        worker2.succeed("journalctl --rotate --vacuum-time=1s -u nix-grpc-daemon")
+        # Several graphs at once so MAGLEV would spread them if the vip cluster had worker2.
+        client.succeed(f"nix build -L --store '{envoy}' --eval-store auto --expr 'map (tag: import ${jobExpr} {{ inherit tag; features = [\"vip\"]; }}) [\"f1\" \"f2\" \"f3\"]' --impure >&2")
+        worker2.fail("journalctl -u nix-grpc-daemon -o cat | grep -q 'event=rpc method=BuildDerivation'")
+        # Without the balancer's help the worker refuses and names the feature.
+        out = client.fail(f"nix build -L --store 'grpc://worker2:50051?{ci}&unavailable-retries=0' --eval-store auto -f ${jobExpr} --argstr tag f5 --arg features '[\"vip\"]' 2>&1")
+        assert "lacks system feature 'vip'" in out, out
 
     with subtest("low disk drains a worker and builds go to the other"):
         # Leave less than minFree on worker1.

@@ -139,6 +139,37 @@ let
     };
   };
 
+  # Drvs with requiredSystemFeatures go to the workers that have the feature.
+  featureRoute = system: feature: {
+    match = {
+      prefix = "/";
+      grpc = { };
+      headers = [
+        {
+          name = "x-nix-features";
+          string_match.safe_regex.regex = "(.*,)?${lib.escapeRegex feature}(,.*)?";
+        }
+      ]
+      ++ lib.optional (system != cfg.defaultSystem) {
+        name = "x-nix-system";
+        string_match.exact = system;
+      };
+    };
+    route = {
+      cluster = "${system}/${feature}";
+      timeout = "0s";
+      hash_policy = [ { header.header_name = "x-nix-drv"; } ];
+    };
+  };
+  featureRoutes = lib.concatLists (
+    lib.mapAttrsToList (system: fs: lib.mapAttrsToList (feature: _: featureRoute system feature) fs) cfg.features
+  );
+  featureClusters = lib.concatLists (
+    lib.mapAttrsToList (
+      system: fs: lib.mapAttrsToList (feature: workers: cluster "${system}/${feature}" workers) fs
+    ) cfg.features
+  );
+
   systems = lib.attrNames cfg.workers;
   ordered = lib.filter (s: s != cfg.defaultSystem) systems ++ [ cfg.defaultSystem ];
 in
@@ -160,6 +191,20 @@ in
         ];
       };
       description = "host:port of farm workers per system.";
+    };
+
+    features = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.attrsOf (lib.types.nonEmptyListOf lib.types.str));
+      default = { };
+      example = {
+        x86_64-linux.kvm = [ "w1:50051" ];
+      };
+      description = ''
+        Per system and system feature, the subset of `workers` that has it.
+        Builds whose `requiredSystemFeatures` name the feature are routed
+        there. Unlisted features are assumed present on every worker. A drv
+        requiring several listed features goes to the first match.
+      '';
     };
 
     defaultSystem = lib.mkOption {
@@ -299,7 +344,7 @@ in
                           {
                             name = "farm";
                             domains = [ "*" ];
-                            routes = map route ordered;
+                            routes = featureRoutes ++ map route ordered;
                           }
                         ];
                         http_filters = [
@@ -316,7 +361,7 @@ in
               ];
             }
           ];
-          clusters = lib.mapAttrsToList cluster cfg.workers;
+          clusters = lib.mapAttrsToList cluster cfg.workers ++ featureClusters;
         };
       };
     };

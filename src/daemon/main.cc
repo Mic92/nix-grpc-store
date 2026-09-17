@@ -476,6 +476,16 @@ public:
         }
     }
 
+    static auto missingFeature(nix::Store & store, const nix::BasicDerivation & drv) -> std::optional<std::string>
+    {
+        for (const auto & feature : nixcompat::requiredSystemFeatures(store, drv)) {
+            if (!nix::settings.systemFeatures.get().contains(feature)) {
+                return feature;
+            }
+        }
+        return std::nullopt;
+    }
+
     static auto narinfoKeys(const auto & paths) -> std::vector<std::string>
     {
         std::vector<std::string> keys;
@@ -514,6 +524,10 @@ public:
         }
         if (!frm.healthy) {
             return {grpc::StatusCode::UNAVAILABLE, "worker low on disk space"};
+        }
+        // The balancer should route by x-nix-features. If it did not, let the client try another worker.
+        if (auto feature = missingFeature(localStore, drv)) {
+            return {grpc::StatusCode::UNAVAILABLE, "lacks system feature '" + *feature + "'"};
         }
         auto cancelled = [&]() -> bool { return context.IsCancelled() || stopSignal != 0; };
         nixgrpc::Metrics::Held const held(metrics, "BuildDerivation");
