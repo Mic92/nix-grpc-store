@@ -233,8 +233,19 @@ event=rpc method=BuildDerivation cn=ci-build01 duration_s=42 …
 Set `services.nix-grpc-daemon.logLevel = "debug"` to also log claim
 decisions.
 
-**Metrics.** Set `services.nix-grpc-daemon.metricsListen` on workers for
-Prometheus. Envoy's admin port has balancer stats.
+**Metrics.** Set `services.nix-grpc-daemon.metricsListen` on workers and
+scrape envoy's admin port (`/stats/prometheus`). A Grafana dashboard for
+both ships as `nixos/grafana/farm.json` (flake: `nix-grpc-store.dashboards.farm`):
+
+```nix
+services.grafana.provision.dashboards.settings.providers = [{
+  name = "nix-farm";
+  options.path = pkgs.linkFarm "dashboards" { "farm.json" = inputs.nix-grpc-store.dashboards.farm; };
+}];
+```
+
+The `prefix` and `instance` variables at the top cover pipelines that
+rename things (telegraf: prefix `prometheus_`, worker label `host`).
 
 ## Troubleshooting
 

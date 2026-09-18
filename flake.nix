@@ -92,6 +92,8 @@
         }
       );
 
+      dashboards.farm = ./nixos/grafana/farm.json;
+
       nixosModules = {
         server = ./nixos/server.nix;
         lb = ./nixos/lb.nix;
