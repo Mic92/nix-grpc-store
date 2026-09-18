@@ -70,6 +70,8 @@ message BuildDerivationChunk {
     // Raw builder stderr, which need not be valid UTF-8.
     bytes log_line = 1;
     BuildDerivationDone done = 2;
+    // stdenv phase name (resSetPhase), for progress displays.
+    string phase = 3;
   }
 }
 
@@ -93,6 +95,7 @@ message BuildPathsChunk {
     // Raw builder stderr, which need not be valid UTF-8.
     bytes log_line = 1;
     BuildPathsDone done = 2;
+    string phase = 3;
   }
 }
 
@@ -113,6 +116,8 @@ message StoreInfoRequest {}
 
 message StoreInfoReply {
   optional bool trusted = 1;
+  // Builds go through BuildDerivation only, see docs/farm.md.
+  bool farm = 2;
 }
 
 message FetchNarsRequest {

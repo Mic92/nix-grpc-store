@@ -15,7 +15,7 @@
 #include <nix/util/error.hh>
 
 #include "nix_remote.pb.h"
-#include "../src/nar-fetcher.hh"
+#include "../src/client/nar-fetcher.hh"
 #include "../src/pump.hh"
 #include "support.hh"
 

@@ -9,6 +9,11 @@
   openssl,
   prometheus-cpp,
   zstd,
+  curl,
+  nlohmann_json,
+  jwt-cpp,
+  python3,
+  mold,
   # Nix component libraries. When building the client plugin these must be
   # ABI-compatible with the `nix` binary that will dlopen() the .so; the NixOS
   # client module passes `config.nix.package.libs.*` here for that reason.
@@ -26,11 +31,21 @@ stdenv.mkDerivation {
       ./.version
       ./meson.build
       ./meson.options
+      ./pch
       ./proto
       ./src
       ./fuzz
+      ./tests/farm-mock.py
+      ./tests/farm-client-test.cc
+      ./tests/farm-client-test.sh
+      ./tests/oidc-test.cc
+      ./tests/oidc-test.sh
+      ./tests/xfcc-test.cc
     ];
   };
+
+  doCheck = true;
+  nativeCheckInputs = [ python3 ];
 
   nativeBuildInputs = [
     meson
@@ -38,7 +53,7 @@ stdenv.mkDerivation {
     pkg-config
     protobuf
     grpc
-  ];
+  ] ++ lib.optional stdenv.hostPlatform.isLinux mold;
 
   buildInputs = [
     grpc
@@ -48,6 +63,9 @@ stdenv.mkDerivation {
     zstd
     nix-store
     nix-util
+    curl
+    nlohmann_json
+    jwt-cpp
   ];
 
   # Frame pointers + symbols so `perf` in the VM test can attribute samples

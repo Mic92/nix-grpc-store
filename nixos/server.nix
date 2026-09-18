@@ -15,10 +15,8 @@ in
     package = lib.mkOption {
       type = lib.types.package;
       # The daemon only links `nix-util`, so any recent Nix's libs will do.
-      default = pkgs.callPackage ../package.nix {
-        inherit (pkgs.nix.libs) nix-store nix-util;
-      };
-      defaultText = lib.literalExpression "pkgs.callPackage ./package.nix { }";
+      default = (pkgs.callPackage ../packages.nix { nixPackages = pkgs.nix.libs; }).default;
+      defaultText = lib.literalExpression "(pkgs.callPackage ./packages.nix { nixPackages = pkgs.nix.libs; }).default";
       description = "Package providing {command}`nix-grpc-daemon`.";
     };
 
@@ -160,10 +158,104 @@ in
       '';
     };
 
+    trustedProxies = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "lb-*" ];
+      description = ''
+        CN globs of TLS-terminating balancers (see `services.nix-grpc-farm-lb.tls`).
+        A peer with such a certificate is a proxy: the client identity comes
+        from the `x-forwarded-client-cert` header it sets, or a forwarded
+        bearer token. Requires {option}`tls.clientCaFile`.
+      '';
+    };
+
+    oidc = lib.mkOption {
+      type = lib.types.nullOr (pkgs.formats.json { }).type;
+      default = null;
+      example = lib.literalExpression ''
+        {
+          providers.github = {
+            issuer = "https://token.actions.githubusercontent.com";
+            audience = "grpc://cache.example.com";
+            rules = [
+              { bound_claims.repository_owner = [ "myorg" ]; scopes = [ "write" ]; }
+              { bound_claims.ref = [ "refs/heads/main" ]; scopes = [ "admin" ]; }
+            ];
+          };
+          providers.k8s = {
+            audience = "grpc://cache.example.com";
+            ca_file = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+            bearer_token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+            bound_claims."kubernetes.io.namespace" = [ "ci" ];
+          };
+        }
+      '';
+      description = ''
+        Accept OIDC bearer tokens (`authorization: Bearer …`) besides client
+        certificates. Same schema as niks3's `--oidc-config`, so one attrset
+        can serve both. Scopes map to roles: `read` → read-only, `write` →
+        write, `admin` → trusted. A client certificate, when presented,
+        takes precedence. Clients set `token-file` or `$NIX_GRPC_TOKEN_FILE`.
+      '';
+    };
+
     extraFlags = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
       description = "Additional command-line flags.";
+    };
+
+    farm = {
+      enable = lib.mkEnableOption ''
+        build farm worker mode. `BuildDerivation` claims outputs at niks3,
+        substitutes inputs from the cache and publishes results through a
+        long-lived `niks3 push --stdin`
+      '';
+      niks3Package = lib.mkOption {
+        type = lib.types.package;
+        example = lib.literalExpression "inputs.niks3.packages.\${system}.niks3";
+        description = "Package providing the `niks3` client.";
+      };
+      niks3Url = lib.mkOption {
+        type = lib.types.str;
+        example = "https://niks3.example.org";
+        description = "niks3 server URL.";
+      };
+      tokenFile = lib.mkOption {
+        type = lib.types.path;
+        example = "/run/secrets/niks3-token";
+        description = "File with the niks3 API bearer token.";
+      };
+      cacheUrl = lib.mkOption {
+        type = lib.types.str;
+        example = "https://cache.example.org";
+        description = "Binary cache the farm publishes to. Workers substitute inputs from it.";
+      };
+      publicKeys = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        description = "Signing keys of {option}`cacheUrl`.";
+      };
+      maxJobs = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 1;
+        description = "Concurrent builds on this worker.";
+      };
+      minFree = lib.mkOption {
+        type = lib.types.str;
+        default = "10G";
+        description = ''
+          Below this much free space under /nix the worker reports
+          NOT_SERVING to the balancer and bounces builds with UNAVAILABLE so
+          they run elsewhere. `0` disables.
+        '';
+      };
+      pushFlags = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "--max-concurrent-uploads" "8" ];
+        description = "Extra flags for `niks3 push --stdin`.";
+      };
     };
   };
 
@@ -178,14 +270,33 @@ in
         message = "services.nix-grpc-daemon.tls.certFile and tls.keyFile must be set together";
       }
       {
-        assertion = (cfg.accessRules == [ ] && cfg.anonymousRole == null) || cfg.tls.clientCaFile != null;
-        message = "services.nix-grpc-daemon.accessRules/anonymousRole requires tls.clientCaFile (mTLS)";
+        assertion =
+          (cfg.accessRules == [ ] && cfg.anonymousRole == null) || cfg.tls.clientCaFile != null || cfg.oidc != null;
+        message = "services.nix-grpc-daemon.accessRules/anonymousRole requires tls.clientCaFile or oidc";
+      }
+      {
+        assertion = cfg.trustedProxies == [ ] || cfg.tls.clientCaFile != null;
+        message = "services.nix-grpc-daemon.trustedProxies requires tls.clientCaFile";
+      }
+      {
+        assertion = cfg.oidc == null || cfg.tls.certFile != null || (cfg.oidc.allow_insecure or false);
+        message = "services.nix-grpc-daemon.oidc sends bearer tokens, enable tls.certFile";
       }
     ];
 
     # Reach the local nix-daemon even when allowed-users is restricted.
     nix.settings.extra-allowed-users = [ "nix-grpc-daemon" ];
-    nix.settings.extra-trusted-users = lib.mkIf cfg.trustClients [ "nix-grpc-daemon" ];
+    # In farm mode the gRPC access rules decide who may import unsigned
+    # paths, so the proxy itself has to be allowed to.
+    nix.settings.extra-trusted-users = lib.mkIf (cfg.trustClients || cfg.farm.enable) [ "nix-grpc-daemon" ];
+
+    # The cache is the share between workers. A path another
+    # worker just pushed must not be negatively cached here.
+    nix.settings.substituters = lib.mkIf cfg.farm.enable [ cfg.farm.cacheUrl ];
+    nix.settings.trusted-public-keys = lib.mkIf cfg.farm.enable cfg.farm.publicKeys;
+    nix.settings.narinfo-cache-negative-ttl = lib.mkIf cfg.farm.enable 0;
+    nix.settings.max-jobs = lib.mkIf cfg.farm.enable (lib.mkDefault cfg.farm.maxJobs);
+    nix.settings.keep-build-log = lib.mkIf cfg.farm.enable true;
 
     # gRPC clients inherit the store privileges of this uid via the proxied
     # nix-daemon connection, so default to a dedicated unprivileged user.
@@ -203,6 +314,8 @@ in
 
     systemd.services.nix-grpc-daemon = {
       description = "Nix worker-protocol over gRPC";
+      # niks3 push shells out to `nix path-info`.
+      path = lib.optional cfg.farm.enable config.nix.package;
       requires = [ "nix-grpc-daemon.socket" ];
       # nix-daemon is socket-activated; ordering after the socket is enough,
       # the first proxied connection will start it.
@@ -245,6 +358,14 @@ in
             "--allow-anonymous"
             cfg.anonymousRole
           ]
+          ++ lib.concatMap (cn: [
+            "--trusted-proxy"
+            cn
+          ]) cfg.trustedProxies
+          ++ lib.optionals (cfg.oidc != null) [
+            "--oidc-config"
+            ((pkgs.formats.json { }).generate "nix-grpc-daemon-oidc.json" cfg.oidc)
+          ]
           ++ lib.optionals (cfg.metricsListen != null) [
             "--metrics-listen"
             cfg.metricsListen
@@ -252,6 +373,18 @@ in
           ++ [
             "--log-level"
             cfg.logLevel
+          ]
+          ++ lib.optionals cfg.farm.enable [
+            "--niks3"
+            cfg.farm.niks3Url
+            "--niks3-token-file"
+            cfg.farm.tokenFile
+            "--niks3-push"
+            (lib.escapeShellArgs ([ (lib.getExe cfg.farm.niks3Package) "push" ] ++ cfg.farm.pushFlags))
+            "--max-jobs"
+            (toString cfg.farm.maxJobs)
+            "--min-free"
+            cfg.farm.minFree
           ]
           ++ cfg.extraFlags
         );

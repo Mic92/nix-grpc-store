@@ -15,6 +15,11 @@ prometheus_dep = [dependency('prometheus-cpp-core'), dependency('prometheus-cpp-
 
 nix_store_dep = dependency('nix-store')
 nix_util_dep  = dependency('nix-util')
+# Farm mode: niks3 claims over HTTPS, niks3 push acks as JSON lines.
+curl_dep = dependency('libcurl')
+json_dep = dependency('nlohmann_json')
+# Header-only, ships only cmake config: found through the include path.
+meson.get_compiler('cpp').check_header('jwt-cpp/traits/nlohmann-json/defaults.h', required: true)
 
 # Pre-release versions look like "2.35pre20260619_f8bb823a".
 nix_ver = nix_store_dep.version().split('.')
@@ -55,6 +60,12 @@ gen = custom_target('nix_remote_proto',
 )
 
 gen_inc = include_directories('.')
+src_inc = include_directories('src')
+
+# ld.bfd needs ~70 s per binary for gRPC's ~100 abseil DSOs, mold ~1 s.
+if host_machine.system() == 'linux' and find_program('mold', required : false).found()
+  add_project_link_arguments('-fuse-ld=mold', language : 'cpp')
+endif
 
 common_deps = [grpc_dep, protobuf_dep, zstd_dep, threads_dep]
 
@@ -75,8 +86,9 @@ else
 endif
 
 shared_module('nix-grpc-store',
-  sources : ['src/grpc-store.cc', gen],
-  include_directories : gen_inc,
+  sources : ['src/client/store.cc', 'src/client/build.cc', 'src/client/transfer.cc', 'src/client/channel.cc', gen],
+  include_directories : [gen_inc, src_inc],
+  cpp_pch : 'pch/client_pch.hh',
   # nix_plugin_entry() skips registering the store when the running Nix
   # version differs from the one the plugin was built against.
   cpp_args : nix_compat_args + ['-DNIX_GRPC_BUILT_AGAINST_NIX="' + nix_store_dep.version() + '"'],
@@ -92,7 +104,7 @@ shared_module('nix-grpc-store',
 # several builds support all of their Nix versions.
 
 shared_module('nix-grpc-store-loader',
-  sources : ['src/plugin-loader.cc'],
+  sources : ['src/client/plugin-loader.cc'],
   cpp_args : ['-DNIX_GRPC_MODULE_SUFFIX="' + module_suffix + '"'],
   dependencies : dependency('dl'),
   link_args : plugin_link_args,
@@ -103,24 +115,59 @@ shared_module('nix-grpc-store-loader',
 
 # --- server -----------------------------------------------------------------
 
+daemon_sources = [
+  'src/daemon/main.cc',
+  'src/daemon/auth.cc',
+  'src/daemon/backend.cc',
+  'src/daemon/farm.cc',
+  'src/daemon/options.cc',
+]
+
 executable('nix-grpc-daemon',
-  sources : ['src/nix-grpc-daemon.cc', gen],
-  include_directories : gen_inc,
+  sources : daemon_sources + [gen],
+  include_directories : [gen_inc, src_inc],
+  cpp_pch : 'pch/daemon_pch.hh',
   cpp_args : nix_compat_args,
   # nix-store: native QueryValidPaths / AddMultipleToStore handlers.
-  dependencies : common_deps + prometheus_dep + [nix_util_dep, nix_store_dep],
+  dependencies : common_deps + prometheus_dep + [nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep],
   install : true,
 )
+
+# --- tests ------------------------------------------------------------------
+
+farm_client_test = executable('farm-client-test',
+  sources : ['tests/farm-client-test.cc'],
+  include_directories : [src_inc, include_directories('src/daemon')],
+  dependencies : [nix_util_dep, curl_dep, json_dep, threads_dep],
+)
+test('farm-client', find_program('tests/farm-client-test.sh'),
+  args : [farm_client_test, files('tests/farm-mock.py')],
+  timeout : 60,
+)
+
+oidc_test = executable('oidc-test',
+  sources : ['tests/oidc-test.cc'],
+  include_directories : [src_inc, include_directories('src/daemon')],
+  dependencies : [nix_util_dep, curl_dep, json_dep, openssl_dep, grpc_dep, threads_dep],
+)
+test('oidc', find_program('tests/oidc-test.sh'), args : [oidc_test], timeout : 60)
+
+test('xfcc', executable('xfcc-test',
+  sources : ['tests/xfcc-test.cc'],
+  include_directories : [src_inc, include_directories('src/daemon')],
+  dependencies : [grpc_dep],
+  cpp_args : ['-UNDEBUG'],
+))
 
 # --- fuzzers ----------------------------------------------------------------
 
 # Built only with -Dfuzzers=true (requires clang for libFuzzer).
 # Run them with scripts/fuzz.sh.
 if get_option('fuzzers')
-  foreach name : ['zstd-reader', 'tunnel-pump', 'import-paths', 'build-log', 'nar-frames', 'wire', 'acl']
+  foreach name : ['zstd-reader', 'tunnel-pump', 'import-paths', 'build-log', 'nar-frames', 'wire', 'acl', 'xfcc']
     executable('fuzz-' + name,
       sources : ['fuzz' / name + '.cc', 'fuzz/support.cc', gen],
-      include_directories : gen_inc,
+      include_directories : [gen_inc, src_inc],
       cpp_args : nix_compat_args + ['-fsanitize=fuzzer'],
       link_args : ['-fsanitize=fuzzer'],
       dependencies : common_deps + [nix_util_dep, nix_store_dep],
@@ -128,7 +175,7 @@ if get_option('fuzzers')
   endforeach
   executable('fuzz-gen-seeds',
     sources : ['fuzz/gen-seeds.cc', gen],
-    include_directories : gen_inc,
+    include_directories : [gen_inc, src_inc],
     cpp_args : nix_compat_args,
     dependencies : common_deps + [nix_util_dep, nix_store_dep],
   )

@@ -23,6 +23,8 @@ lib.makeScope newScope (
     ) (builtins.attrNames nixVersions);
   in
   {
+    jwt-cpp = self.callPackage ./jwt-cpp.nix { };
+
     default = self.callPackage ./package.nix {
       inherit (nixPackages) nix-store nix-util;
     };

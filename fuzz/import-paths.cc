@@ -16,7 +16,7 @@
 #include <nix/util/serialise.hh>
 
 #include "nix_remote.pb.h"
-#include "../src/import-paths.hh"
+#include "../src/daemon/import-paths.hh"
 #include "../src/pump.hh"
 #include "support.hh"
 

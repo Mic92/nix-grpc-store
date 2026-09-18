@@ -63,14 +63,22 @@ inline auto readLogFields(nix::Source & source) -> std::vector<std::string>
 
 } // namespace detail
 
-// Consumes the stream up to STDERR_LAST, forwarding plain build log lines.
-// Throws BackendError on STDERR_ERROR.
-inline void relayBuildLog(nix::Source & source, const std::function<void(std::string)> & sendLogLine)
+struct BuildEvent
+{
+    enum class Kind : std::uint8_t { line, phase } kind = Kind::line;
+    std::string text;
+};
+
+using BuildEventSink = std::function<void(BuildEvent)>;
+
+// Consumes the stream up to STDERR_LAST, forwarding build log lines and phase
+// changes. Throws BackendError on STDERR_ERROR.
+inline void relayBuildLog(nix::Source & source, const BuildEventSink & send)
 {
     while (true) {
         auto msg = nix::readNum<uint64_t>(source);
         if (msg == STDERR_NEXT) {
-            sendLogLine(nix::chomp(nix::readString(source, kMaxLogString)));
+            send({.text = nix::chomp(nix::readString(source, kMaxLogString))});
         } else if (msg == STDERR_START_ACTIVITY) {
             nix::readNum<uint64_t>(source); // id
             nix::readNum<uint64_t>(source); // level
@@ -85,7 +93,9 @@ inline void relayBuildLog(nix::Source & source, const std::function<void(std::st
             auto type = nix::readNum<uint64_t>(source);
             auto fields = detail::readLogFields(source);
             if (type == nix::resBuildLogLine && !fields.empty()) {
-                sendLogLine(std::move(fields.front()));
+                send({.text = std::move(fields.front())});
+            } else if (type == nix::resSetPhase && !fields.empty()) {
+                send({.kind = BuildEvent::Kind::phase, .text = std::move(fields.front())});
             }
         } else if (msg == STDERR_ERROR) {
             throw BackendError(nix::readError(source).info());
