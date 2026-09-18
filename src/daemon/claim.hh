@@ -32,6 +32,7 @@
 #include "http.hh"
 #include "logfmt.hh"
 #include "push.hh"
+#include "token-file.hh"
 
 namespace nixgrpc {
 
@@ -46,7 +47,7 @@ private:
     using Clock = std::chrono::steady_clock;
 
     const std::string baseUrl;
-    const std::string bearer;
+    const std::shared_ptr<TokenFile> bearer;
     const Clock::duration heartbeat;
 
     struct State
@@ -141,7 +142,7 @@ private:
     {
         std::optional<nlohmann::json> const body = state_.lock()->request;
         StreamCtx ctx{.self = this, .buf = {}};
-        http::Call call(baseUrl + "/api/builds/claim", bearer, body);
+        http::Call call(baseUrl + "/api/builds/claim", bearer->get(), body);
         call.opt(CURLOPT_TIMEOUT, 0L);
         call.opt(CURLOPT_WRITEFUNCTION, &Claim::onData);
         call.opt(CURLOPT_WRITEDATA, &ctx);
@@ -206,7 +207,7 @@ private:
     }
 
 public:
-    Claim(std::string baseUrl, std::string bearer, Clock::duration heartbeat, nlohmann::json request)
+    Claim(std::string baseUrl, std::shared_ptr<TokenFile> bearer, Clock::duration heartbeat, nlohmann::json request)
         : baseUrl(std::move(baseUrl))
         , bearer(std::move(bearer))
         , heartbeat(heartbeat)
@@ -280,7 +281,7 @@ public:
     auto fail(const std::string & kind) -> bool
     {
         state_.lock()->released = true;
-        http::Call call(baseUrl + "/api/builds/fail", bearer, nlohmann::json{{"claim_token", token()}, {"kind", kind}});
+        http::Call call(baseUrl + "/api/builds/fail", bearer->get(), nlohmann::json{{"claim_token", token()}, {"kind", kind}});
         auto status = call.perform();
         halt();
         if (status == http::conflict) {
@@ -296,18 +297,18 @@ public:
 class Niks3
 {
     std::string baseUrl;
-    std::string bearer;
+    std::shared_ptr<TokenFile> bearer;
     std::chrono::milliseconds heartbeat{0};
 
 public:
-    Niks3(std::string url, std::string bearerToken)
+    Niks3(std::string url, std::shared_ptr<TokenFile> token)
         : baseUrl(std::move(url))
-        , bearer(std::move(bearerToken))
+        , bearer(std::move(token))
     {
         while (baseUrl.ends_with('/')) {
             baseUrl.pop_back();
         }
-        http::Call call(baseUrl + "/api/cache-config", bearer, std::nullopt);
+        http::Call call(baseUrl + "/api/cache-config", bearer->get(), std::nullopt);
         if (auto status = call.perform(); !http::ok(status)) {
             throw nix::Error("niks3 cache-config: HTTP %d", status);
         }

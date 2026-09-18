@@ -39,7 +39,7 @@ struct Farm
     std::atomic<bool> healthy{true}; // enough disk, mirrored to gRPC health
 
     explicit Farm(const FarmConfig & cfg)
-        : niks3(cfg.niks3Url, nix::chomp(nix::readFile(cfg.niks3TokenFile)))
+        : niks3(cfg.niks3Url, std::make_shared<TokenFile>(cfg.niks3TokenFile))
         , push(cfg.pushArgv)
         , slots(static_cast<std::ptrdiff_t>(cfg.maxJobs))
         , minFree(cfg.minFree)
