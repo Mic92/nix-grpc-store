@@ -304,7 +304,8 @@ which also requires `trustClients` (see above).
   * `client-cert`, `client-key` — PEM pair to present for mTLS. Default to
     `$NIX_GRPC_CLIENT_CERT`/`$NIX_GRPC_CLIENT_KEY`, then `client.crt`/`client.key`
     in `$XDG_DATA_HOME/nix-grpc-store`, then `/run/nix-grpc-store`, then
-    `/var/lib/nix-grpc-store` (unreadable candidates are skipped)
+    `/var/lib/nix-grpc-store` (unreadable candidates are skipped, and none
+    is looked up when `token-file` is given)
   * `token-file` — OIDC bearer token, re-read per call. Defaults to
     `$NIX_GRPC_TOKEN_FILE`, then `token` in the directories above
   * `connect-timeout` (default 30) — seconds the first call keeps retrying

@@ -31,6 +31,7 @@ let
     issue worker worker "worker1,DNS:worker2,DNS:lb"
     issue ci ci-1 client
     issue stranger stranger client
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout foreign.key -out foreign.pem -subj /CN=foreign
   '';
 
   # mock-oidc puts its listen address in the issuer.
@@ -328,7 +329,10 @@ pkgs.testers.runNixOSTest {
         out = probe("&client-cert=${certs}/ci.pem&client-key=${certs}/ci.key")
         assert out == "ok", out
         client.succeed("curl -sfG http://lb:8081/issue --data-urlencode 'aud=${oidcAudience}' --data-urlencode sub=dev:alice > /root/dev.jwt && test -s /root/dev.jwt")
+        # nix-daemon connects, so the default cert it would pick up lives in /var/lib.
+        client.succeed("install -D ${certs}/foreign.pem /var/lib/nix-grpc-store/client.crt && install -D ${certs}/foreign.key /var/lib/nix-grpc-store/client.key")
         out = probe("&token-file=/root/dev.jwt")
+        client.succeed("rm -r /var/lib/nix-grpc-store")
         assert out == "ok", out
         out = probe("")
         assert "client certificate or bearer token" in out, out

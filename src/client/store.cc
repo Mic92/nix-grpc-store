@@ -55,7 +55,8 @@ auto GrpcStore::sslOptions() -> grpc::SslCredentialsOptions {
     throw Error("gRPC store '%s': client-cert and client-key must be set together",
                 config->authority.to_string());
   }
-  if (clientCert.empty()) {
+  // A stray default cert from another CA would abort the handshake before the token counts.
+  if (clientCert.empty() && config->tokenFile.get().empty()) {
     clientCert = nixgrpc::defaultClientCred("NIX_GRPC_CLIENT_CERT", "client.crt");
     clientKey = nixgrpc::defaultClientCred("NIX_GRPC_CLIENT_KEY", "client.key");
   }
