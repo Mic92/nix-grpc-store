@@ -154,6 +154,8 @@ pkgs.testers.runNixOSTest {
     worker1 = {
       imports = [ worker ];
       nix.settings.system-features = [ "vip" ];
+      services.nix-grpc-daemon.workerName = "node-a";
+      services.nix-grpc-daemon.metricsListen = "127.0.0.1:9464";
     };
     worker2 = {
       imports = [ worker ];
@@ -446,7 +448,10 @@ pkgs.testers.runNixOSTest {
     with subtest("requiredSystemFeatures route to workers that have them"):
         worker2.succeed("journalctl --rotate --vacuum-time=1s -u nix-grpc-daemon")
         # Several graphs at once so MAGLEV would spread them if the vip cluster had worker2.
-        client.succeed(f"nix build -L --store '{envoy}' --eval-store auto --expr 'map (tag: import ${jobExpr} {{ inherit tag; features = [\"vip\"]; }}) [\"f1\" \"f2\" \"f3\"]' --impure >&2")
+        out = client.succeed(f"nix build -L --store '{envoy}' --eval-store auto --expr 'map (tag: import ${jobExpr} {{ inherit tag; features = [\"vip\"]; }}) [\"f1\" \"f2\" \"f3\"]' --impure 2>&1")
+        # --worker-name replaces the hostname in what the client sees and in metrics.
+        assert "node-a: building " in out, out
+        worker1.succeed("curl -sf http://127.0.0.1:9464/metrics | grep -E 'nix_grpc_build_info\\{.*features=\"[^\"]*vip[^\"]*\".*worker=\"node-a\"\\} 1'")
         worker2.fail("journalctl -u nix-grpc-daemon -o cat | grep -q 'event=rpc method=BuildDerivation'")
         # Without the balancer's help the worker refuses and names the feature.
         out = client.fail(f"nix build -L --store 'grpc://worker2:50051?{ci}&unavailable-retries=0' --eval-store auto -f ${jobExpr} --argstr tag f5 --arg features '[\"vip\"]' 2>&1")

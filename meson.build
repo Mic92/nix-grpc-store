@@ -127,7 +127,7 @@ executable('nix-grpc-daemon',
   sources : daemon_sources + [gen],
   include_directories : [gen_inc, src_inc],
   cpp_pch : 'pch/daemon_pch.hh',
-  cpp_args : nix_compat_args,
+  cpp_args : nix_compat_args + ['-DNIX_GRPC_VERSION="' + meson.project_version() + '"'],
   # nix-store: native QueryValidPaths / AddMultipleToStore handlers.
   dependencies : common_deps + prometheus_dep + [nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep],
   install : true,

@@ -29,6 +29,7 @@ struct Options
     std::string tlsKey;
     std::string clientCA;
     std::string metricsListen;
+    std::string workerName;
     LogLevel logLevel = LogLevel::info;
     Acl acl;
     xfcc::TrustedProxies proxies;

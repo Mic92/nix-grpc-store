@@ -120,6 +120,18 @@ public:
         events->Add({{"kind", kind}}).Increment();
     }
 
+    // Join target for dashboards. Pod names are not stable on Kubernetes.
+    void buildInfo(
+        const std::string & version, const std::string & worker, const std::string & system, const std::string & features)
+    {
+        prometheus::BuildGauge()
+            .Name("nix_grpc_build_info")
+            .Help("Constant 1, labelled with daemon version, --worker-name, system and system-features")
+            .Register(*registry)
+            .Add({{"version", version}, {"worker", worker}, {"system", system}, {"features", features}})
+            .Set(1);
+    }
+
     void buildSlots(unsigned count)
     {
         prometheus::BuildGauge()
