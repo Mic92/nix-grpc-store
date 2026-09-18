@@ -36,8 +36,6 @@
           (
             _final: prev: {
               inherit (nixGitPin) version;
-              # NixOS/nix#16399, drop once merged.
-              patches = prev.patches ++ [ ./patches/nix-readerror-level.patch ];
               # The eval cache moved into libexpr. nixpkgs' packaging lags.
               nix-expr = prev.nix-expr.overrideAttrs (old: {
                 buildInputs = old.buildInputs ++ [ pkgs.sqlite ];
