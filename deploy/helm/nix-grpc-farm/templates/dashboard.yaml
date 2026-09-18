@@ -1,0 +1,11 @@
+{{- if .Values.grafanaDashboard.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "farm.fullname" . }}-dashboard
+  labels: {{- include "farm.labels" . | nindent 4 }}
+    {{- toYaml .Values.grafanaDashboard.labels | nindent 4 }}
+data:
+  nix-grpc-farm.json: |-
+    {{- .Files.Get "files/farm.json" | nindent 4 }}
+{{- end }}

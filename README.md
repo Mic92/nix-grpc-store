@@ -278,7 +278,8 @@ NixOS: `services.nix-grpc-daemon.oidc = { providers.github = { … }; };`
 ## Build farm
 
 Several workers behind one balancer with deduplicated builds and S3
-outputs: see [docs/farm.md](docs/farm.md).
+outputs: see [docs/farm.md](docs/farm.md). Comes with NixOS modules and
+a Helm chart (`oci://ghcr.io/mic92/charts/nix-grpc-farm`).
 
 ## Remote builder
 

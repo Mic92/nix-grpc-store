@@ -1,0 +1,21 @@
+{{- if .Values.metrics.podMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "farm.fullname" . }}
+  labels: {{- include "farm.labels" . | nindent 4 }}
+    {{- with .Values.metrics.podMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels: {{- include "farm.selectorLabels" . | nindent 6 }}
+  podMetricsEndpoints:
+    # nix_grpc_* from workers, envoy_* from the lb admin listener
+    - port: metrics
+      interval: {{ .Values.metrics.podMonitor.interval }}
+    - port: admin
+      path: /stats/prometheus
+      interval: {{ .Values.metrics.podMonitor.interval }}
+  podTargetLabels: [nix-grpc-farm/group, nix-grpc-farm/system, app.kubernetes.io/component]
+{{- end }}

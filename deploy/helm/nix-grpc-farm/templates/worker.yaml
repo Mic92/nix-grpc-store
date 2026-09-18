@@ -1,0 +1,320 @@
+{{- include "farm.validate" . }}
+{{- $root := . }}
+{{- $oidc := include "farm.oidcProviders" . }}
+{{- range $g, $overrides := .Values.workers }}
+{{- $w := mustMergeOverwrite (deepCopy $root.Values.workerDefaults) ($overrides | default dict) }}
+{{- $svc := include "farm.workerService" (dict "root" $root "group" $g) }}
+{{- $sel := include "farm.workerSelectorLabels" (dict "root" $root "group" $g) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $svc }}
+  labels: {{- include "farm.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: worker
+    nix-grpc-farm/group: {{ $g }}
+spec:
+  # Headless: envoy resolves one endpoint per Ready pod.
+  clusterIP: None
+  selector: {{- $sel | nindent 4 }}
+  ports:
+    - name: grpc
+      port: 50051
+    - name: metrics
+      port: 9464
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $svc }}
+  labels: {{- include "farm.labels" $root | nindent 4 }}
+data:
+  farm.conf: |
+    # The cache first: a path another worker just pushed must be found there.
+    substituters = {{ $root.Values.niks3.cacheURL }} {{ join " " $root.Values.upstreamCaches.urls }}
+    trusted-public-keys = {{ join " " (concat $root.Values.niks3.publicKeys $root.Values.upstreamCaches.publicKeys) }}
+    narinfo-cache-negative-ttl = 0
+    keep-build-log = true
+    max-jobs = {{ $w.maxJobs }}
+    cores = {{ $w.cores }}
+    system-features = {{ join " " $w.features }}
+    {{- with $w.system }}
+    system = {{ . }}
+    {{- end }}
+    {{- if not $root.Values.sandbox.enabled }}
+    sandbox = false
+    {{- end }}
+    {{- with $w.extraNixConf }}
+    {{- . | nindent 4 }}
+    {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $svc }}
+  labels: {{- include "farm.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: worker
+    nix-grpc-farm/group: {{ $g }}
+  {{- with $w.deploymentAnnotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ $w.replicas }}
+  selector:
+    matchLabels: {{- $sel | nindent 6 }}
+  # The hash ring reshuffles on any membership change, so surge buys nothing.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ print $w $root.Values.niks3 $root.Values.sandbox $oidc | sha256sum }}
+        {{- with $w.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels: {{- $sel | nindent 8 }}
+        {{- with $w.system }}
+        nix-grpc-farm/system: {{ . }}
+        {{- end }}
+        {{- with $w.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "farm.serviceAccountName" $root }}
+      automountServiceAccountToken: {{ if include "farm.needsServiceAccountToken" $root }}true{{ else }}false{{ end }}
+      terminationGracePeriodSeconds: {{ $root.Values.terminationGracePeriodSeconds }}
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.podSecurityContext }}
+      securityContext: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $w.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with $w.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $w.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $w.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $w.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range . }}
+        - {{- toYaml (merge (dict "labelSelector" (dict "matchLabels" ($sel | fromYaml))) .) | nindent 10 }}
+        {{- end }}
+      {{- end }}
+      initContainers:
+        # /nix is an emptyDir so the store is writable and sized. Seed it
+        # from the image. The image's DB registration comes along.
+        - name: seed-store
+          image: {{ include "farm.image" $root }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              if [ -e /vol/nix/var/nix/db/db.sqlite ]; then exit 0; fi
+              mkdir -p /vol/nix
+              cp -a /nix/store /nix/var /vol/nix/
+              mkdir -p /vol/nix/var/nix/daemon-socket /vol/nix/var/nix/gcroots /vol/nix/var/nix/profiles
+          volumeMounts:
+            - {name: nix, mountPath: /vol}
+      containers:
+        - name: nix-daemon
+          image: {{ include "farm.image" $root }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          command: [/bin/nix-daemon]
+          securityContext:
+            {{- if $root.Values.sandbox.enabled }}
+            privileged: true
+            {{- else }}
+            runAsUser: 0
+            {{- end }}
+          env:
+            - {name: TMPDIR, value: /build}
+          volumeMounts:
+            - {name: nix, mountPath: /nix, subPath: nix}
+            - {name: build, mountPath: /build}
+            - {name: nixconf, mountPath: /etc/nix/nix.conf.d}
+          livenessProbe:
+            exec:
+              command: [nix, store, info, --store, daemon]
+            periodSeconds: 30
+            timeoutSeconds: 10
+          {{- with $w.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+        - name: nix-grpc-daemon
+          image: {{ include "farm.image" $root }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          command: [/bin/nix-grpc-daemon]
+          args:
+            - --listen=[::]:50051
+            # civetweb binds [::] v6-only and pod IPs are mostly v4.
+            - --metrics-listen=0.0.0.0:9464
+            - --worker-name=$(NODE_NAME)/$(POD_NAME)
+            - --log-level={{ $root.Values.logLevel }}
+            - --niks3={{ $root.Values.niks3.serverURL }}
+            - --niks3-token-file=/secrets/niks3/token
+            {{- with $root.Values.niks3.pushFlags }}
+            - --niks3-push=niks3 push {{ join " " . }}
+            {{- end }}
+            - --max-jobs={{ $w.maxJobs }}
+            - --min-free={{ $w.minFree }}
+            {{- if $root.Values.tls.worker.existingSecret }}
+            - --tls-cert=/secrets/tls/tls.crt
+            - --tls-key=/secrets/tls/tls.key
+            {{- end }}
+            {{- if $root.Values.tls.clientCA.existingSecret }}
+            - --client-ca=/secrets/ca/ca.crt
+            {{- range $root.Values.auth.trustedProxies }}
+            - --trusted-proxy={{ . }}
+            {{- end }}
+            {{- end }}
+            {{- range $root.Values.auth.accessRules }}
+            - --allow={{ .cn }}={{ .role }}
+            {{- end }}
+            {{- with $root.Values.auth.anonymousRole }}
+            - --allow-anonymous={{ . }}
+            {{- end }}
+            {{- if $oidc }}
+            - --oidc-config=/secrets/oidc/oidc.json
+            {{- end }}
+            {{- with $w.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            {{- with $w.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          securityContext:
+            runAsUser: 990
+            runAsGroup: 990
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          ports:
+            - {name: grpc, containerPort: 50051}
+            - {name: metrics, containerPort: 9464}
+          {{- /* kubelet gRPC probes are plaintext; with TLS fall back to TCP and let envoy judge health. */}}
+          {{- $probe := ternary (dict "tcpSocket" (dict "port" 50051)) (dict "grpc" (dict "port" 50051)) (not (empty $root.Values.tls.worker.existingSecret)) }}
+          # Covers the store seed and niks3 becoming reachable.
+          startupProbe: {{- toYaml (merge (dict "periodSeconds" 5 "failureThreshold" 120) $probe) | nindent 12 }}
+          readinessProbe: {{- toYaml (merge (dict "periodSeconds" 5) $probe) | nindent 12 }}
+          livenessProbe: {{- toYaml (merge (dict "periodSeconds" 30 "timeoutSeconds" 10) $probe) | nindent 12 }}
+          volumeMounts:
+            - {name: nix, mountPath: /nix, subPath: nix}
+            - {name: nixconf, mountPath: /etc/nix/nix.conf.d}
+            - {name: niks3-token, mountPath: /secrets/niks3, readOnly: true}
+            {{- if $root.Values.tls.worker.existingSecret }}
+            - {name: tls, mountPath: /secrets/tls, readOnly: true}
+            {{- end }}
+            {{- if $root.Values.tls.clientCA.existingSecret }}
+            - {name: ca, mountPath: /secrets/ca, readOnly: true}
+            {{- end }}
+            {{- if $oidc }}
+            - {name: oidc, mountPath: /secrets/oidc, readOnly: true}
+            {{- end }}
+            {{- with $w.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with $w.daemonResources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- if $root.Values.gc.enabled }}
+        - name: gc
+          image: {{ include "farm.image" $root }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              while :; do
+                harmonia-gc --ensure-free {{ $root.Values.gc.ensureFree }} --no-vacuum
+                {{- with $root.Values.gc.keepRecent }} --keep-recent {{ . }}{{ end }} || echo "gc: exit $?" >&2
+                sleep {{ $root.Values.gc.interval }}
+              done
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - {name: nix, mountPath: /nix, subPath: nix}
+            - {name: nixconf, mountPath: /etc/nix/nix.conf.d}
+          {{- with $root.Values.gc.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
+      volumes:
+        - name: nix
+          emptyDir: {{- if $w.store.sizeLimit }} {sizeLimit: {{ $w.store.sizeLimit }}} {{- else }} {} {{- end }}
+        - name: build
+          emptyDir:
+            {{- if or $w.buildDir.medium $w.buildDir.sizeLimit }}
+            {{- with $w.buildDir.medium }}
+            medium: {{ . }}
+            {{- end }}
+            {{- with $w.buildDir.sizeLimit }}
+            sizeLimit: {{ . }}
+            {{- end }}
+            {{- else }} {}
+            {{- end }}
+        - name: nixconf
+          configMap:
+            name: {{ $svc }}
+        - name: niks3-token
+          {{- if $root.Values.niks3.auth.serviceAccountToken.enabled }}
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: {{ $root.Values.niks3.auth.serviceAccountToken.audience }}
+                  expirationSeconds: {{ $root.Values.niks3.auth.serviceAccountToken.expirationSeconds }}
+          {{- else }}
+          secret:
+            secretName: {{ $root.Values.niks3.auth.existingSecret }}
+            items: [{key: token, path: token}]
+          {{- end }}
+        {{- with $root.Values.tls.worker.existingSecret }}
+        - name: tls
+          secret: {secretName: {{ . }}}
+        {{- end }}
+        {{- with $root.Values.tls.clientCA.existingSecret }}
+        - name: ca
+          secret: {secretName: {{ . }}}
+        {{- end }}
+        {{- if $oidc }}
+        - name: oidc
+          secret:
+            secretName: {{ include "farm.fullname" $root }}-oidc
+        {{- end }}
+        {{- with $w.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- with $w.podDisruptionBudget }}
+{{- if .enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $svc }}
+  labels: {{- include "farm.labels" $root | nindent 4 }}
+spec:
+  {{- with .minAvailable }}
+  {{- if ge (int .) (int $w.replicas) }}
+  {{- fail (printf "workers.%s.podDisruptionBudget.minAvailable must be below replicas, otherwise node drains block forever" $g) }}
+  {{- end }}
+  minAvailable: {{ . }}
+  {{- else }}
+  maxUnavailable: {{ $w.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels: {{- $sel | nindent 6 }}
+{{- end }}
+{{- end }}
+{{- end }}
