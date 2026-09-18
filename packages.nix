@@ -32,6 +32,7 @@ lib.makeScope newScope (
     # libFuzzer + ASan/UBSan builds of fuzz/*.cc, installed as bin/fuzz-*.
     fuzzers = (self.default.override { stdenv = clangStdenv; }).overrideAttrs (old: {
       pname = "nix-grpc-store-fuzzers";
+      separateDebugInfo = false;
       mesonFlags = (old.mesonFlags or [ ]) ++ [
         "-Dfuzzers=true"
         "-Db_sanitize=address,undefined"

@@ -68,10 +68,10 @@ stdenv.mkDerivation {
     jwt-cpp
   ];
 
-  # Frame pointers + symbols so `perf` in the VM test can attribute samples
-  # inside the plugin and daemon.
-  env.NIX_CFLAGS_COMPILE = "-fno-omit-frame-pointer -g";
-  dontStrip = true;
+  # Frame pointers for perf in the VM test. DWARF goes to the debug output,
+  # unstripped it dragged every -dev input into the runtime closure.
+  env.NIX_CFLAGS_COMPILE = "-fno-omit-frame-pointer";
+  separateDebugInfo = true;
 
   meta = {
     description = "gRPC transport for the Nix remote store protocol";
