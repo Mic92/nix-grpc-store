@@ -217,6 +217,99 @@ Tip: wrap the token fetch (an OIDC device-code login is a few lines of
 `curl`) and the `nix build` call in a script and expose it as
 `nix run .#nix-farm`.
 
+## On Kubernetes
+
+The Helm chart deploys the same pieces: a Deployment per worker group,
+envoy in front and a [harmonia-gc](https://github.com/nix-community/harmonia)
+sidecar per worker for disk space. niks3 is its own release, see its
+[Kubernetes page](https://github.com/Mic92/niks3/wiki/Kubernetes).
+
+```console
+$ helm install farm oci://ghcr.io/mic92/charts/nix-grpc-farm -n farm --create-namespace -f values.yaml
+```
+
+```yaml
+# values.yaml
+niks3:
+  serverURL: http://niks3.niks3.svc      # where workers claim and push
+  cacheURL: https://cache.example.com    # where everyone substitutes from
+  publicKeys: ["cache.example.com-1:…"]
+  auth:
+    serviceAccountToken: {enabled: true} # or existingSecret with key `token`
+workers:
+  x86-64:
+    system: x86_64-linux
+    replicas: 4
+    maxJobs: 2
+    features: [big-parallel, kvm]
+    store: {sizeLimit: 200Gi}
+    nodeSelector: {kubernetes.io/arch: amd64}
+  aarch64:
+    system: aarch64-linux
+    replicas: 2
+    nodeSelector: {kubernetes.io/arch: arm64}
+gc:
+  ensureFree: 40G                        # above every group's minFree (20G)
+tls:
+  clientCA: {existingSecret: farm-ca}    # ca.crt
+  lb: {existingSecret: farm-lb-tls}      # kubernetes.io/tls, e.g. from cert-manager
+  worker: {existingSecret: farm-worker-tls, serverName: worker}
+auth:
+  accessRules: [{cn: "ci-*", role: trusted}]
+lb:
+  service: {type: LoadBalancer}
+```
+
+`helm install` prints the farm address and a `builders =` line.
+
+Things to know:
+
+* **Sandbox.** Builds are sandboxed, which needs the `nix-daemon`
+  container to run privileged. Where that is forbidden set
+  `sandbox.enabled: false` and builds run unsandboxed as root in the
+  container.
+* **Store volume.** `/nix` is an `emptyDir` seeded from the image at pod
+  start. `gc.ensureFree` and `minFree` see the free space of the node
+  disk behind it, shared by all pods on the node (`sizeLimit` evicts, it
+  is not a quota). Size them for that disk and keep `ensureFree` above
+  `minFree`.
+* **Resources.** Builds run in the `nix-daemon` container, so
+  `workers.<group>.resources` is the one to size.
+* **Identity to niks3.** With `niks3.auth.serviceAccountToken.enabled` the
+  workers present a projected service account token (audience `niks3`).
+  Allow `<namespace>:<release>-nix-grpc-farm` with scope `write` in the
+  niks3 chart's `auth.workloadIdentity.allowedServiceAccounts`. The two
+  releases share no secret.
+* **Identity of clients.** CI pods in the cluster can skip certificates:
+
+  ```yaml
+  auth:
+    workloadIdentity:
+      enabled: true
+      allowedServiceAccounts: ["ci:builder"]
+  ```
+
+  and mount a token for the farm:
+
+  ```yaml
+  volumes:
+    - name: farm-token
+      projected:
+        sources:
+          - serviceAccountToken: {audience: nix-grpc-farm, path: token}
+  ```
+
+  then `nix build --store 'grpc://farm-nix-grpc-farm.farm.svc:50051?token-file=/var/run/secrets/farm/token&ca-cert=…' --eval-store auto`.
+  Tokens need TLS on the balancer (`tls.lb`).
+* **Bring your own balancer.** `lb.enabled: false` drops envoy. Whatever
+  replaces it must hash on the `x-nix-drv` request header, route
+  `x-nix-system` to the matching group's headless Service, and health-check
+  `grpc.health.v1`.
+* **Monitoring.** `metrics.podMonitor.enabled` scrapes workers and envoy.
+  `grafanaDashboard.enabled` ships the dashboard as a ConfigMap for the
+  Grafana sidecar, with its `instance` variable set to `pod`. Workers show
+  up as `<node>/<pod>` in build logs and `nix_grpc_build_info`.
+
 ## Managing the farm
 
 **Add a worker.** Deploy it with the Step 1 config, add its address under

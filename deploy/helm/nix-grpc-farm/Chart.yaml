@@ -1,0 +1,10 @@
+apiVersion: v2
+name: nix-grpc-farm
+description: Nix build farm on nix-grpc-store, publishing to a niks3 cache
+type: application
+version: 0.1.0
+# version/appVersion are set from the git tag on release.
+appVersion: "0.1.0"
+home: https://github.com/Mic92/nix-grpc-store
+sources:
+  - https://github.com/Mic92/nix-grpc-store

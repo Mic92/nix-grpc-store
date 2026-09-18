@@ -1,0 +1,34 @@
+{{- $svc := include "farm.fullname" . -}}
+{{- $tls := "" -}}
+{{- if .Values.tls.lb.existingSecret }}{{ $tls = "?ca-cert=/path/ca.crt&client-cert=/path/client.crt&client-key=/path/client.key" }}{{ end -}}
+Farm address inside the cluster:
+
+  grpc://{{ $svc }}.{{ .Release.Namespace }}.svc:{{ .Values.lb.service.port }}{{ $tls }}
+{{- if eq .Values.lb.service.type "LoadBalancer" }}
+
+External address once the cloud LB is up:
+
+  kubectl -n {{ .Release.Namespace }} get svc {{ $svc }} -o jsonpath='{.status.loadBalancer.ingress[0]}'
+{{- end }}
+
+Build through it (drvs are evaluated locally, outputs land in {{ .Values.niks3.cacheURL }}):
+
+  nix build --store 'grpc://…' --eval-store auto nixpkgs#hello
+
+Or as a remote builder in nix.conf on a CI host:
+
+{{- $d := mustMergeOverwrite (deepCopy .Values.workerDefaults) ((index .Values.workers (include "farm.defaultGroup" .)) | default dict) }}
+  builders = grpc://…?system={{ $d.system | default "x86_64-linux" }} - - {{ mul ($d.maxJobs | int) ($d.replicas | int) }}
+  substituters = {{ .Values.niks3.cacheURL }} https://cache.nixos.org
+  trusted-public-keys = {{ join " " .Values.niks3.publicKeys }} cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+{{- if .Values.auth.workloadIdentity.enabled }}
+
+Pods authenticate with a projected service account token (audience {{ .Values.auth.workloadIdentity.audience }}):
+
+  grpc://{{ $svc }}.{{ .Release.Namespace }}.svc:{{ .Values.lb.service.port }}?token-file=/var/run/secrets/nix-grpc-farm/token
+{{- end }}
+{{- if .Values.niks3.auth.serviceAccountToken.enabled }}
+
+Workers authenticate to niks3 as {{ .Release.Namespace }}:{{ include "farm.serviceAccountName" . }}.
+Add that to the niks3 chart's auth.workloadIdentity.allowedServiceAccounts with scope `write`.
+{{- end }}

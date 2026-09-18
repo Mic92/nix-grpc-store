@@ -1,0 +1,167 @@
+image:
+  repository: ghcr.io/mic92/nix-grpc-farm
+  tag: "" # defaults to appVersion
+  pullPolicy: IfNotPresent
+lbImage:
+  repository: ghcr.io/mic92/nix-grpc-farm-lb
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+niks3:
+  # API the workers claim builds at and push to. May be cluster-internal.
+  serverURL: ""
+  # Binary cache URL as the workers reach it, to substitute each other's
+  # outputs. Clients may know the same cache by another name.
+  cacheURL: ""
+  publicKeys: []
+  pushFlags: [] # extra `niks3 push` flags, e.g. [--max-concurrent-uploads, "8"]
+  auth:
+    # Secret with key `token`, or
+    existingSecret: ""
+    # a projected service account token. Add "<namespace>:<serviceaccount>"
+    # with scope `write` to the niks3 chart's auth.workloadIdentity.allowedServiceAccounts.
+    serviceAccountToken:
+      enabled: false
+      audience: niks3
+      expirationSeconds: 3600
+
+# TLS is optional. Secrets are kubernetes.io/tls (tls.crt, tls.key), the CA
+# Secret has key ca.crt. cert-manager Certificates produce this layout.
+tls:
+  # Verifies user client certificates at the balancer and the balancer's
+  # certificate at the workers.
+  clientCA:
+    existingSecret: ""
+  # Balancer: server certificate towards clients, also used as client
+  # certificate towards workers (its CN must match auth.trustedProxies).
+  lb:
+    existingSecret: ""
+  # Workers: server certificate towards the balancer.
+  worker:
+    existingSecret: ""
+    # Name the balancer verifies on worker certificates. Empty: chain only.
+    serverName: ""
+
+auth:
+  # Client certificate CN patterns to roles: read-only | write | trusted.
+  # CI that builds through the farm needs `trusted`.
+  accessRules: [] # [{cn: "ci-*", role: trusted}]
+  anonymousRole: null
+  # CNs whose x-forwarded-client-cert header workers believe.
+  trustedProxies: [lb]
+  # Let pods use the farm with their service account token, see docs/farm.md.
+  workloadIdentity:
+    enabled: false
+    allowedServiceAccounts: [] # "<namespace>:<name>", globs allowed
+    scopes: [admin] # read | write | admin (= trusted)
+    audience: nix-grpc-farm
+    issuer: "" # detected from the pod's service account token
+  # Further OIDC providers, same schema as niks3's --oidc-config.
+  oidcProviders: {}
+
+# Defaults merged into every entry of `workers`.
+workerDefaults:
+  system: "" # nix `system`, empty for the node's. Required with several groups.
+  replicas: 1
+  # Advertised as system-features and routed on requiredSystemFeatures.
+  features: []
+  maxJobs: 1
+  cores: 0
+  # Below this the worker goes NOT_SERVING and builds bounce elsewhere.
+  minFree: 20G
+  store:
+    sizeLimit: null # emptyDir sizeLimit for /nix
+  buildDir:
+    medium: "" # "Memory" for tmpfs builds
+    sizeLimit: null
+  extraNixConf: ""
+  resources: {} # nix-daemon container, where builds run
+  daemonResources: {} # nix-grpc-daemon container
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: [] # labelSelector is filled in
+  priorityClassName: ""
+  deploymentAnnotations: {}
+  podAnnotations: {}
+  podLabels: {}
+  extraArgs: []
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
+  podDisruptionBudget:
+    enabled: false
+    maxUnavailable: 1
+    minAvailable: null
+# One Deployment per entry, the key names the group. E.g.
+#   x86-64: {system: x86_64-linux, replicas: 4, nodeSelector: {kubernetes.io/arch: amd64}}
+#   aarch64: {system: aarch64-linux, replicas: 2, nodeSelector: {kubernetes.io/arch: arm64}}
+workers: {}
+# Group whose system serves requests without x-nix-system (queries, uploads).
+defaultGroup: ""
+
+gc:
+  enabled: true
+  # Keep this above every group's minFree so workers do not flap unhealthy.
+  ensureFree: 40G
+  interval: 300
+  keepRecent: null # e.g. 1d
+  resources: {}
+
+# Substituters the workers use besides the niks3 cache.
+upstreamCaches:
+  urls: [https://cache.nixos.org]
+  publicKeys: ["cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="]
+
+sandbox:
+  # Runs the nix-daemon container privileged. Without it builds are unsandboxed.
+  enabled: true
+
+logLevel: info
+terminationGracePeriodSeconds: 3600
+
+lb:
+  enabled: true
+  replicas: 2
+  maxStreams: 1024
+  healthCheckInterval: 5s
+  accessLog: false
+  service:
+    type: ClusterIP
+    port: 50051
+    nodePort: null
+    annotations: {}
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  priorityClassName: ""
+  deploymentAnnotations: {}
+  podAnnotations: {}
+  podLabels: {}
+  extraVolumes: []
+  extraVolumeMounts: []
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+    minAvailable: null
+
+metrics:
+  podMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+grafanaDashboard:
+  enabled: false
+  labels:
+    grafana_dashboard: "1"
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podSecurityContext: {}
