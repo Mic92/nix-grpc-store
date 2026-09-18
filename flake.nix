@@ -54,8 +54,11 @@
         };
       packageSetFor =
         pkgs:
-        pkgs.callPackage ./packages.nix {
+        pkgs.callPackage ./nix/packages {
           nixPackages = nixPackagesFor pkgs;
+          niks3 = niks3.packages.${pkgs.stdenv.hostPlatform.system}.niks3 or null;
+          # For the multi-arch image merge.
+          scopeFor = system: packageSetFor nixpkgs.legacyPackages.${system};
         };
       forAllSystems = lib.genAttrs [
         "x86_64-linux"
@@ -80,6 +83,13 @@
         }
         // scope.versionPlugins
         // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
+          inherit (scope)
+            harmonia-gc
+            docker
+            docker-lb
+            docker-multiarch
+            docker-lb-multiarch
+            ;
           # Benchmarks, intentionally not in `checks` so CI skips them.
           bench-closure = nixpkgs.legacyPackages.${system}.callPackage ./tests/bench-closure.nix { };
           bench-latency = import ./tests/latency-test.nix {
@@ -103,11 +113,11 @@
         ];
       };
 
-      herculesCI = import ./effects.nix { inherit nixpkgs; };
+      herculesCI = import ./nix/effects.nix { inherit nixpkgs; };
 
       checks = forAllSystems (
         system:
-        import ./checks.nix {
+        import ./nix/checks.nix {
           pkgs = nixpkgs.legacyPackages.${system};
           packages = self.packages.${system};
           nixPackages = nixPackagesFor nixpkgs.legacyPackages.${system};

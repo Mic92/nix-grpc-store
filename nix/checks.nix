@@ -30,7 +30,7 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     dontFixup = true;
   });
   claims-spec = pkgs.runCommand "nix-grpc-store-claims-spec" { nativeBuildInputs = [ pkgs.quint ]; } ''
-    cd ${./spec}
+    cd ${../spec}
     export HOME=$TMPDIR
     quint typecheck claims.qnt
     quint typecheck hook.qnt
@@ -43,14 +43,14 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     quint run claims.qnt --step=stepBlips --invariant=oneBuilder --max-steps=30 --max-samples=20000
     touch $out
   '';
-  exit-stress = import ./tests/exit-stress.nix {
+  exit-stress = import ../tests/exit-stress.nix {
     inherit pkgs;
     nix = nixPackages.nix-everything;
     package = packages.default;
   };
 }
 // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-  sanitize-smoke = import ./tests/sanitize-smoke.nix {
+  sanitize-smoke = import ../tests/sanitize-smoke.nix {
     inherit pkgs;
     nix = nixPackages.nix-everything;
     package = packages.default.overrideAttrs (old: {
@@ -64,7 +64,7 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
   };
 
   # Smoke run so the fuzz targets keep compiling and do not crash on an
-  # empty input; real campaigns run locally via scripts/fuzz.sh.
+  # empty input. Real campaigns run locally via scripts/fuzz.sh.
   fuzz = pkgs.runCommand "nix-grpc-store-fuzz-smoke" { } ''
     for f in ${packages.fuzzers}/bin/fuzz-*; do
       "$f" -runs=200 2>&1 | tail -n2
@@ -73,20 +73,20 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
   '';
 
   # Exercises the README ACME/step-ca substituter example.
-  acme-vm = import ./tests/acme-substituter-test.nix {
+  acme-vm = import ../tests/acme-substituter-test.nix {
     inherit pkgs;
     nixPkgs = nixPackages;
     module = nixosModule;
   };
 
-  vm = import ./tests/nixos-test.nix {
+  vm = import ../tests/nixos-test.nix {
     mockOidc = niks3.packages.${pkgs.stdenv.hostPlatform.system}.mock-oidc-server;
     inherit pkgs;
     nixPkgs = nixPackages;
     module = nixosModule;
   };
 
-  farm = import ./tests/farm.nix {
+  farm = import ../tests/farm.nix {
     inherit pkgs niks3;
     mockOidc = niks3.packages.${pkgs.stdenv.hostPlatform.system}.mock-oidc-server;
     nixPkgs = nixPackages;

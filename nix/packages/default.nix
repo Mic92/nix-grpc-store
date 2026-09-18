@@ -7,10 +7,18 @@
   symlinkJoin,
   # Nix package set the default plugin builds against.
   nixPackages,
+  # Nix the images ship: nixpkgs' release, not the master pin the tests track.
+  nix,
+  niks3 ? null,
+  scopeFor ? null,
 }:
 lib.makeScope newScope (
   self:
   let
+    linuxSystems = [
+      "x86_64-linux"
+      "aarch64-linux"
+    ];
     # Nix releases from nixpkgs that ship split component libraries.
     # 2.31 is the oldest release with ParsedURL::Authority and
     # StoreConfig::getReference(), which the plugin relies on.
@@ -24,8 +32,27 @@ lib.makeScope newScope (
   in
   {
     jwt-cpp = self.callPackage ./jwt-cpp.nix { };
+    harmonia-gc = self.callPackage ./harmonia-gc.nix { };
 
-    default = self.callPackage ./package.nix {
+    # Kubernetes images, see deploy/helm. Built against `nix`, not nixPackages.
+    imagePlugin = self.callPackage ./plugin.nix { inherit (nix.libs) nix-store nix-util; };
+    docker = self.callPackage ./docker.nix {
+      inherit nix niks3;
+      nix-grpc-daemon = self.imagePlugin;
+    };
+    docker-lb = self.callPackage ./docker-lb.nix { tag = self.imagePlugin.version; };
+    docker-multiarch = self.callPackage ./docker-multiarch.nix {
+      name = "nix-grpc-farm-docker";
+      imageName = "nix-grpc-farm:latest";
+      perArch = lib.genAttrs linuxSystems (s: (scopeFor s).docker);
+    };
+    docker-lb-multiarch = self.callPackage ./docker-multiarch.nix {
+      name = "nix-grpc-farm-lb-docker";
+      imageName = "nix-grpc-farm-lb:latest";
+      perArch = lib.genAttrs linuxSystems (s: (scopeFor s).docker-lb);
+    };
+
+    default = self.callPackage ./plugin.nix {
       inherit (nixPackages) nix-store nix-util;
     };
 
@@ -61,7 +88,7 @@ lib.makeScope newScope (
       map (
         version:
         lib.nameValuePair "plugin-${version}" (
-          self.callPackage ./package.nix {
+          self.callPackage ./plugin.nix {
             inherit (nixVersions.${version}.libs) nix-store nix-util;
           }
         )
