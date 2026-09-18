@@ -33,8 +33,9 @@ Workers keep no state. You can add, remove or reboot them at any time.
 
 You need:
 
-* A niks3 instance with build claims enabled, an S3 bucket behind it, and
-  its API token and public signing key.
+* A [niks3](https://github.com/Mic92/niks3) instance (any version with
+  [build claims](https://github.com/Mic92/niks3/wiki/Build-Claims)), an S3
+  bucket behind it, and its API token and public signing key.
 * One or more NixOS machines per system type to act as workers.
 * One machine with a public DNS name for the balancer. It can also be a
   worker.

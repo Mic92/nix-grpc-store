@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     # Build farm mode (PLAN.md). Only the NixOS test uses it.
-    niks3.url = "github:Mic92/niks3/farm/claims";
+    niks3.url = "github:Mic92/niks3";
     niks3.inputs.nixpkgs.follows = "nixpkgs";
   };
 
