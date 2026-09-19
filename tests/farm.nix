@@ -12,8 +12,6 @@
 let
   apiToken = "farm-token-that-is-at-least-36-characters-long";
   tokenFile = pkgs.writeText "niks3-token" apiToken;
-  s3Key = "rustfsadmin";
-  signingSecretKey = pkgs.writeText "key" "farm-test-1:1/icU6Hlts+rG2LxnM8NoIMcrLWAzdCgJEOLjewE8DxGQKUPC9+LF07Ci6sEjhQP2G50TfF9TkQFBwwVRW5FXw==";
   signingPublicKey = "farm-test-1:RkClDwvfixdOwourBI4UD9hudE3xfU5EBQcMFUVuRV8=";
   niks3Url = "http://lb:5751";
   niks3Pkgs = niks3.packages.${pkgs.stdenv.hostPlatform.system};
@@ -174,51 +172,11 @@ pkgs.testers.runNixOSTest {
         imports = [
           common
           module
-          niks3.nixosModules.niks3
+          (import ./lib/niks3-node.nix {
+            inherit pkgs niks3 apiToken;
+            listenHost = "lb";
+          })
         ];
-        services.niks3 = {
-          enable = true;
-          package = niks3Pkgs.niks3;
-          httpAddr = "0.0.0.0:5751";
-          apiTokenFile = toString tokenFile;
-          signKeyFiles = [ signingSecretKey ];
-          readProxy.enable = true;
-          s3 = {
-            endpoint = "lb:9000";
-            bucket = "farm";
-            useSSL = false;
-            accessKeyFile = pkgs.writeText "ak" s3Key;
-            secretKeyFile = pkgs.writeText "sk" s3Key;
-          };
-        };
-        systemd.services.rustfs = {
-          wantedBy = [ "multi-user.target" ];
-          serviceConfig = {
-            ExecStart = "${pkgs.rustfs}/bin/rustfs --address 0.0.0.0:9000 --access-key ${s3Key} --secret-key ${s3Key} /var/lib/rustfs";
-            StateDirectory = "rustfs";
-            DynamicUser = true;
-          };
-        };
-        systemd.services.rustfs-bucket = {
-          requires = [ "rustfs.service" ];
-          after = [ "rustfs.service" ];
-          before = [ "niks3.service" ];
-          requiredBy = [ "niks3.service" ];
-          environment = {
-            S3_ENDPOINT_URL = "http://lb:9000";
-            AWS_ACCESS_KEY_ID = s3Key;
-            AWS_SECRET_ACCESS_KEY = s3Key;
-          };
-          path = [ pkgs.s5cmd ];
-          script = ''
-            for i in $(seq 60); do s5cmd ls && break; sleep 1; done
-            s5cmd mb s3://farm || true
-          '';
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = true;
-          };
-        };
         services.nix-grpc-farm-lb = {
           accessLog = true;
           enable = true;
@@ -247,10 +205,8 @@ pkgs.testers.runNixOSTest {
           serviceConfig.ExecStart = "${pkgs.lib.getExe mockOidc} -addr ${lbAddr}:8080 -issue-addr 0.0.0.0:8081";
         };
         networking.firewall.allowedTCPPorts = [
-          5751
           8080
           8081
-          9000
           50051
         ];
         environment.systemPackages = [

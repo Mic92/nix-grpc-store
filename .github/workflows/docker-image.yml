@@ -1,0 +1,121 @@
+name: Container images and chart
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  REGISTRY: ghcr.io
+  NIX_CONFIG: |
+    extra-substituters = https://cache.thalheim.io
+    extra-trusted-public-keys = cache.thalheim.io-1:R7msbosLEZKrxk/lKxf9BTjOOH7Ax3H0Qj0/6wiHOgc=
+jobs:
+  # C++ against nix does not cross-compile. Build each arch natively and merge.
+  build:
+    strategy:
+      matrix:
+        include:
+          - {system: x86_64-linux, runner: ubuntu-24.04}
+          - {system: aarch64-linux, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+      - run: |
+          nix build -L .#packages.${{ matrix.system }}.docker -o worker
+          nix build -L .#packages.${{ matrix.system }}.docker-lb -o lb
+          mkdir out && cp -L worker out/worker-${{ matrix.system }}.tar && cp -L lb out/lb-${{ matrix.system }}.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: images-${{ matrix.system }}
+          path: out/
+          retention-days: 1
+  push:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+      - uses: actions/download-artifact@v4
+        with: {path: images, merge-multiple: true}
+      - id: meta-worker
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/nix-grpc-farm
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - id: meta-lb
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/nix-grpc-farm-lb
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - name: Merge and push
+        env:
+          REGCTL_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          WORKER_TAGS: ${{ steps.meta-worker.outputs.tags }}
+          LB_TAGS: ${{ steps.meta-lb.outputs.tags }}
+        run: |
+          set -euo pipefail
+          PATH="$(nix build --inputs-from . nixpkgs#regctl --print-out-paths --no-link)/bin:$PATH"
+          regctl registry login "$REGISTRY" -u "${{ github.actor }}" --pass-stdin <<< "$REGCTL_PASSWORD"
+          push() { # <kind> <newline separated tags>
+            kind=$1
+            refs=()
+            for sys in x86_64-linux aarch64-linux; do
+              regctl image import "ocidir://$kind:$sys" "images/$kind-$sys.tar"
+              refs+=(--ref "ocidir://$kind:$sys")
+            done
+            regctl index create "ocidir://$kind:merged" "${refs[@]}"
+            echo "$2" | while read -r tag; do
+              [ -n "$tag" ] && regctl image copy "ocidir://$kind:merged" "$tag"
+            done
+          }
+          push worker "$WORKER_TAGS"
+          push lb "$LB_TAGS"
+  helm-chart:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+      - name: Publish chart
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          nix shell --inputs-from . nixpkgs#kubernetes-helm -c sh -ec "
+            helm package deploy/helm/nix-grpc-farm --version $version --app-version $version
+            echo '${{ secrets.GITHUB_TOKEN }}' | helm registry login ghcr.io -u '${{ github.actor }}' --password-stdin
+            helm push nix-grpc-farm-$version.tgz oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts
+          "
+  cleanup:
+    if: github.ref == 'refs/heads/main'
+    needs: push
+    runs-on: ubuntu-latest
+    concurrency: {group: ghcr-cleanup}
+    permissions:
+      packages: write
+    strategy:
+      matrix:
+        package: [nix-grpc-farm, nix-grpc-farm-lb]
+    steps:
+      # Deletes per-arch children only together with their last index (see niks3#291).
+      - uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          package: ${{ matrix.package }}
+          exclude-tags: "v*,main,[0-9]*"
+          keep-n-untagged: 5
+          older-than: 1 day
+          validate: true
