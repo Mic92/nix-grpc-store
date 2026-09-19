@@ -84,6 +84,8 @@ spec:
       serviceAccountName: {{ include "farm.serviceAccountName" $root }}
       automountServiceAccountToken: {{ if include "farm.needsServiceAccountToken" $root }}true{{ else }}false{{ end }}
       terminationGracePeriodSeconds: {{ $root.Values.terminationGracePeriodSeconds }}
+      # preStop hooks below find nix-grpc-daemon by name.
+      shareProcessNamespace: true
       {{- with $root.Values.imagePullSecrets }}
       imagePullSecrets: {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -128,6 +130,11 @@ spec:
           image: {{ include "farm.image" $root }}
           imagePullPolicy: {{ $root.Values.image.pullPolicy }}
           command: [/bin/nix-daemon]
+          # Outlive nix-grpc-daemon so draining builds keep their builder.
+          lifecycle:
+            preStop:
+              exec:
+                command: [/bin/sh, -c, "while pgrep -x nix-grpc-daemon >/dev/null; do sleep 1; done"]
           securityContext:
             {{- if $root.Values.sandbox.enabled }}
             privileged: true

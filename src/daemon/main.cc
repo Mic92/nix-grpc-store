@@ -521,8 +521,11 @@ public:
         if (auto feature = missingFeature(localStore, drv)) {
             return {grpc::StatusCode::UNAVAILABLE, "lacks system feature '" + *feature + "'"};
         }
-        auto cancelled = [&]() -> bool { return context.IsCancelled() || stopSignal != 0; };
+        auto cancelled = [&]() -> bool { return context.IsCancelled() || stopSignal >= nixgrpc::kCancelBuilds; };
         nixgrpc::Metrics::Held const held(metrics, "BuildDerivation");
+        if (stopSignal != 0) { // after `held` so the drain loop cannot miss us
+            return {grpc::StatusCode::UNAVAILABLE, "worker draining"};
+        }
         nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "slot_wait");
         auto slot = nixgrpc::acquireSlot(frm.slots);
         phase.next("claim");
@@ -771,6 +774,45 @@ public:
 
 } // namespace
 
+namespace {
+// Returns on idle timeout or SIGTERM. In farm mode the first SIGTERM only
+// stops taking builds and this returns once those in flight have published,
+// bounded by the supervisor's stop timeout or a second signal.
+void serve(
+    grpc::Server & server,
+    const nixgrpc::Options & options,
+    nixgrpc::IdleTracker & idle,
+    std::optional<nixgrpc::Farm> & farm,
+    nixgrpc::Metrics & metrics)
+{
+    auto const watchdog = nixgrpc::sdWatchdogInterval();
+    std::chrono::nanoseconds const tick =
+        watchdog.count() != 0 ? std::min<std::chrono::nanoseconds>(watchdog, std::chrono::seconds(1))
+                              : std::chrono::seconds(1);
+    bool draining = false;
+    for (;;) {
+        if (stopSignal == 0) {
+            if (options.idleTimeout && idle.idleFor() >= *options.idleTimeout) {
+                return;
+            }
+            if (farm) {
+                farm->updateHealth(server);
+            }
+        } else if (stopSignal >= nixgrpc::kCancelBuilds || !farm || metrics.inflightNow("BuildDerivation") == 0) {
+            return;
+        } else if (!draining) {
+            draining = true;
+            nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "draining"}});
+            server.GetHealthCheckService()->SetServingStatus(false);
+        }
+        if (watchdog.count() != 0) {
+            nixgrpc::sdNotify("WATCHDOG=1");
+        }
+        std::this_thread::sleep_for(tick);
+    }
+}
+} // namespace
+
 auto main(int argc, char ** argv) -> int
 try {
     // Pump threads write to a socket whose peer may already be gone; we want
@@ -780,7 +822,7 @@ try {
     act.sa_handler = SIG_IGN;
     sigaction(SIGPIPE, &act, nullptr);
     // Polled by the main loop so in-flight RPCs get the shutdown grace.
-    act.sa_handler = [](int) -> void { stopSignal = 1; };
+    act.sa_handler = [](int) -> void { stopSignal = stopSignal + 1; };
     for (int const sig : {SIGTERM, SIGINT}) {
         sigaction(sig, &act, nullptr);
     }
@@ -862,24 +904,11 @@ try {
         {{"event", "startup"}, {"listen", options.listen}, {"proxy_socket", options.socketPath}});
     nixgrpc::sdNotify("READY=1");
 
-    auto const watchdog = nixgrpc::sdWatchdogInterval();
-    std::chrono::nanoseconds const tick =
-        watchdog.count() != 0 ? std::min<std::chrono::nanoseconds>(watchdog, std::chrono::seconds(1))
-                              : std::chrono::seconds(1);
-    while (stopSignal == 0 && (!options.idleTimeout || idle.idleFor() < *options.idleTimeout)) {
-        if (watchdog.count() != 0) {
-            nixgrpc::sdNotify("WATCHDOG=1");
-        }
-        if (farm) {
-            farm->updateHealth(*server);
-        }
-        std::this_thread::sleep_for(tick);
-    }
+    serve(*server, options, idle, farm, metrics);
     nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", stopSignal != 0 ? "signal_exit" : "idle_exit"}});
+    stopSignal = nixgrpc::kCancelBuilds;
     nixgrpc::sdNotify("STOPPING=1");
-    if (auto * health = server->GetHealthCheckService()) {
-        health->SetServingStatus(false);
-    }
+    server->GetHealthCheckService()->SetServingStatus(false);
     // Shutdown() then waits for handlers stuck in nix. Clients already got CANCELLED.
     static constexpr std::chrono::seconds shutdownGrace{5};
     std::thread([]() -> void {

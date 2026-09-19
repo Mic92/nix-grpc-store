@@ -119,6 +119,8 @@ sandbox:
   enabled: true
 
 logLevel: info
+# A stopping worker leaves the balancer and exits once running builds have
+# published. kubelet kills what is left after this long.
 terminationGracePeriodSeconds: 3600
 
 lb:
