@@ -1,5 +1,6 @@
 {
   lib,
+  abseil-cpp,
   stdenv,
   meson,
   ninja,
@@ -41,6 +42,7 @@ stdenv.mkDerivation {
       ../../tests/oidc-test.cc
       ../../tests/oidc-test.sh
       ../../tests/xfcc-test.cc
+      ../../tests/scheduler-test.cc
     ];
   };
 
@@ -56,6 +58,7 @@ stdenv.mkDerivation {
   ] ++ lib.optional stdenv.hostPlatform.isLinux mold;
 
   buildInputs = [
+    abseil-cpp
     grpc
     openssl
     protobuf
