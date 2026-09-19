@@ -4,7 +4,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -17,9 +19,11 @@
 #include <nlohmann/json_fwd.hpp>
 
 #include <nix/util/error.hh>
+#include <nix/util/file-system.hh>
 
 #include "claim.hh"
 #include "push.hh"
+#include "token-file.hh"
 
 namespace {
 
@@ -245,6 +249,22 @@ void testPush(Suite & tst, nixgrpc::PushProcess & push)
         "request line carried both outputs and the claim token");
 }
 
+// A rotated token file (k8s projected SA token) is picked up without restart.
+void testTokenRotation(Suite & tst, const std::string & base)
+{
+    // nix::Path is std::string before 2.33 and std::filesystem::path after.
+    auto path = std::filesystem::path(nix::createTempDir()).string() + "/token";
+    // cache-config is unauthenticated in the mock, claims are not.
+    nix::writeFile(path, "stale");
+    nixgrpc::Niks3 const niks3(base, std::make_shared<nixgrpc::TokenFile>(path));
+    auto claim = niks3.claim({"rot.narinfo"}, {});
+    std::this_thread::sleep_for(settle);
+    // Projected volumes swap the file, giving it a new inode.
+    nix::writeFile(path + ".new", "testtoken");
+    std::filesystem::rename(path + ".new", path);
+    tst.check(claim->await() == Status::build, "claim succeeds after token file rotation");
+}
+
 } // namespace
 
 auto main(int argc, char ** argv) -> int
@@ -257,7 +277,10 @@ try {
     std::string const base = *std::next(args.begin());
     std::string const mock = *std::next(args.begin(), 2);
     Suite suite(base);
-    testClaims(suite, nixgrpc::Niks3(base, "testtoken"));
+    auto tokenFile = std::filesystem::path(nix::createTempDir()).string() + "/token";
+    nix::writeFile(tokenFile, "testtoken\n");
+    testClaims(suite, nixgrpc::Niks3(base, std::make_shared<nixgrpc::TokenFile>(tokenFile)));
+    testTokenRotation(suite, base);
     nixgrpc::PushProcess push({"python3", mock, "push", "--stdin", "--server-url", base});
     testPush(suite, push);
     return suite.result();
