@@ -1,15 +1,11 @@
 {{/* Envoy bootstrap, mirrors nixos/lb.nix. checks.helm diffs the two. */}}
 
-{{- define "farm.envoy.cluster" -}}
+{{- define "farm.envoy.clusterCommon" -}}
 {{- $root := .root }}
 name: {{ .name | quote }}
 type: STRICT_DNS
 connect_timeout: 5s
-lb_policy: MAGLEV
 dns_lookup_family: ALL
-common_lb_config:
-  consistent_hashing_lb_config:
-    hash_balance_factor: 125
 typed_extension_protocol_options:
   envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
     "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
@@ -17,17 +13,13 @@ typed_extension_protocol_options:
       http2_protocol_options:
         max_concurrent_streams: {{ $root.Values.lb.maxStreams }}
         connection_keepalive: {interval: 30s, timeout: 10s}
-outlier_detection:
-  consecutive_5xx: 3
-  base_ejection_time: 30s
-  max_ejection_percent: 50
 health_checks:
   - timeout: 2s
     interval: {{ $root.Values.lb.healthCheckInterval }}
     no_traffic_interval: {{ $root.Values.lb.healthCheckInterval }}
     unhealthy_threshold: 2
     healthy_threshold: 1
-    grpc_health_check: {}
+    grpc_health_check: {{ if .healthService }}{service_name: {{ .healthService }}}{{ else }}{}{{ end }}
 load_assignment:
   cluster_name: {{ .name | quote }}
   endpoints:
@@ -59,28 +51,36 @@ transport_socket:
 {{- end }}
 {{- end }}
 
+{{/* BuildDerivation goes to the worker the scheduler named in x-nix-worker. */}}
+{{- define "farm.envoy.workerCluster" -}}
+{{ include "farm.envoy.clusterCommon" . }}
+load_balancing_policy:
+  policies:
+    - typed_extension_config:
+        name: envoy.load_balancing_policies.override_host
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.override_host.v3.OverrideHost
+          override_host_sources: [{header: x-nix-worker}]
+          fallback_policy:
+            policies:
+              - typed_extension_config:
+                  name: envoy.load_balancing_policies.least_request
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.least_request.v3.LeastRequest
+{{- end }}
+
 {{- define "farm.envoy.route" -}}
 match:
-  prefix: /
+  prefix: {{ .prefix }}
   grpc: {}
-  {{- if or .feature (not .isDefault) }}
+  {{- if and .system (not .isDefault) }}
   headers:
-    {{- with .feature }}
-    - name: x-nix-features
-      string_match:
-        safe_regex:
-          regex: {{ printf "(.*,)?%s(,.*)?" (regexQuoteMeta .) | quote }}
-    {{- end }}
-    {{- if not .isDefault }}
     - name: x-nix-system
       string_match: {exact: {{ .system }}}
-    {{- end }}
   {{- end }}
 route:
   cluster: {{ .cluster | quote }}
   timeout: 0s # builds run for hours
-  hash_policy:
-    - header: {header_name: x-nix-drv}
 {{- end }}
 
 {{- define "farm.envoy.listener" -}}
@@ -143,22 +143,17 @@ filter_chains:
 {{- $groups := keys .Values.workers | sortAlpha }}
 {{- /* default group last so its catch-all route does not shadow the others */}}
 {{- $clusters := list }}
-{{- $featureRoutes := list }}
-{{- $routes := list }}
+{{- $routes := list (include "farm.envoy.route" (dict "prefix" "/nix.remote.Scheduler/" "cluster" "sched" "system" "" "isDefault" true) | fromYaml) }}
 {{- range $g := concat (without $groups $defaultGroup) (list $defaultGroup) }}
 {{- $w := mustMergeOverwrite (deepCopy $root.Values.workerDefaults) ((index $root.Values.workers $g) | default dict) }}
 {{- $svc := include "farm.workerService" (dict "root" $root "group" $g) }}
 {{- $isDefault := eq $g $defaultGroup }}
 {{- if and (not $isDefault) (not $w.system) }}{{ fail (printf "workers.%s.system is required for non-default groups" $g) }}{{ end }}
-{{- $clusters = append $clusters (include "farm.envoy.cluster" (dict "root" $root "name" $g "service" $svc) | fromYaml) }}
-{{- range $f := $w.features }}
-{{- $cname := printf "%s/%s" $g $f }}
-{{- $clusters = append $clusters (include "farm.envoy.cluster" (dict "root" $root "name" $cname "service" $svc) | fromYaml) }}
-{{- $featureRoutes = append $featureRoutes (include "farm.envoy.route" (dict "cluster" $cname "feature" $f "system" $w.system "isDefault" $isDefault) | fromYaml) }}
+{{- $clusters = append $clusters (include "farm.envoy.workerCluster" (dict "root" $root "name" $g "service" $svc "healthService" "") | fromYaml) }}
+{{- $routes = append $routes (include "farm.envoy.route" (dict "prefix" "/" "cluster" $g "system" $w.system "isDefault" $isDefault) | fromYaml) }}
 {{- end }}
-{{- $routes = append $routes (include "farm.envoy.route" (dict "cluster" $g "feature" "" "system" $w.system "isDefault" $isDefault) | fromYaml) }}
-{{- end }}
-{{- $listener := include "farm.envoy.listener" (dict "Values" .Values "routes" (concat $featureRoutes $routes)) | fromYaml }}
+{{- $clusters = append $clusters (include "farm.envoy.clusterCommon" (dict "root" $root "name" "sched" "service" (include "farm.schedulerService" $root) "healthService" "nix.scheduler") | fromYaml) }}
+{{- $listener := include "farm.envoy.listener" (dict "Values" .Values "routes" $routes) | fromYaml }}
 {{- toJson (dict
   "admin" (dict "address" (dict "socket_address" (dict "address" "::" "port_value" 9901 "ipv4_compat" true)))
   "static_resources" (dict "listeners" (list $listener) "clusters" $clusters)

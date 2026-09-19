@@ -1,6 +1,6 @@
 # Helm chart in k3s: worker + envoy from our images, niks3/rustfs/postgres
 # as NixOS services on the node. Workers authenticate to niks3 with their
-# service account token and the client uses one for the farm. Then: build
+# service account token; the client uses one for the farm. Then: build
 # through the balancer, fill a store to trigger harmonia-gc, kill a worker
 # mid-build.
 {
@@ -42,7 +42,7 @@ let
         -extfile <(printf "subjectAltName=$3") -out $1.crt
     }
     issue lb lb "IP:127.0.0.1,IP:${hostIP},DNS:nix-grpc-farm.farm.svc"
-    issue worker worker "DNS:worker"
+    issue worker worker "DNS:worker,DNS:nix-grpc-farm-scheduler.farm.svc"
   '';
 
   jobExpr = pkgs.writeText "job.nix" ''
@@ -171,7 +171,7 @@ pkgs.testers.runNixOSTest {
           scopes = [ "write" ];
         };
       };
-      # niks3 reads the issuer from a k8s token and the API server CA. In a
+      # niks3 reads the issuer from a k8s token and the API server CA; in a
       # pod both come from the service account mount.
       systemd.services.niks3 = {
         after = [ "k3s.service" ];
@@ -247,18 +247,21 @@ pkgs.testers.runNixOSTest {
     )
 
     def dump(_ok: bool = False) -> None:
-        machine.execute("{ kubectl get pods -A; kubectl get events -A --sort-by=.lastTimestamp | tail -40; kubectl -n kube-system logs -l batch.kubernetes.io/job-name=helm-install-nix-grpc-farm --tail=40; " + kubectl + "describe pods | tail -80; " + kubectl + "logs -l app.kubernetes.io/component=worker --all-containers --prefix --tail=30; } >&2")
+        machine.execute("{ kubectl get pods -A; kubectl get events -A --sort-by=.lastTimestamp | tail -40; kubectl -n kube-system logs -l batch.kubernetes.io/job-name=helm-install-nix-grpc-farm --tail=40; " + kubectl + "describe pods | tail -80; " + kubectl + "logs -l app.kubernetes.io/component=worker --all-containers --prefix --tail=30; " + kubectl + "logs -l app.kubernetes.io/component=scheduler --tail=30; } >&2")
 
     with subtest("chart deploys and workers become Ready"):
         try:
             machine.wait_until_succeeds(kubectl + "rollout status deployment nix-grpc-farm-lb --timeout=10s", timeout=420)
+            machine.wait_until_succeeds(kubectl + "rollout status deployment nix-grpc-farm-scheduler --timeout=10s", timeout=420)
             machine.wait_until_succeeds(kubectl + "rollout status deployment nix-grpc-farm-worker-${groupName} --timeout=10s", timeout=420)
         except Exception:
             dump()
             raise
         machine.wait_for_unit("niks3.service")
-        # envoy has health-checked both pods
-        machine.wait_until_succeeds("test $(curl -sf $(" + kubectl + "get pod -l app.kubernetes.io/component=lb -o jsonpath='{.items[0].status.podIP}'):9901/clusters | grep -c 'health_flags::healthy') -ge 2", timeout=120)
+        # envoy has health-checked both workers and the scheduler
+        machine.wait_until_succeeds("test $(curl -sf $(" + kubectl + "get pod -l app.kubernetes.io/component=lb -o jsonpath='{.items[0].status.podIP}'):9901/clusters | grep -c 'health_flags::healthy') -ge 3", timeout=120)
+        sched_ip = machine.succeed(kubectl + "get pod -l app.kubernetes.io/component=scheduler -o jsonpath='{.items[0].status.podIP}'").strip()
+        machine.wait_until_succeeds(f"curl -sf http://{sched_ip}:9464/metrics | grep -qx 'nix_grpc_sched{{kind=\"workers\"}} 2'", timeout=120)
 
     def worker_pods() -> list[str]:
         return machine.succeed(kubectl + "get pods -l app.kubernetes.io/component=worker --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.name}'").split()
