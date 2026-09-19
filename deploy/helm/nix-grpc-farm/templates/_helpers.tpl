@@ -95,8 +95,3 @@ app.kubernetes.io/component: lb
 {{- end }}
 {{- if $providers }}{{ toJson (dict "providers" $providers) }}{{- end }}
 {{- end }}
-
-{{/* nix-daemon reads the API server for OIDC discovery or mounts a projected token. */}}
-{{- define "farm.needsServiceAccountToken" -}}
-{{- if or .Values.auth.workloadIdentity.enabled .Values.niks3.auth.serviceAccountToken.enabled }}true{{ end }}
-{{- end }}

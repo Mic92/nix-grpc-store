@@ -34,9 +34,6 @@ metadata:
   name: {{ include "farm.fullname" . }}-lb
   labels: {{- include "farm.labels" . | nindent 4 }}
     app.kubernetes.io/component: lb
-  {{- with .Values.lb.deploymentAnnotations }}
-  annotations: {{- toYaml . | nindent 4 }}
-  {{- end }}
 spec:
   replicas: {{ .Values.lb.replicas }}
   selector:
@@ -49,9 +46,6 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       labels: {{- $sel | nindent 8 }}
-        {{- with .Values.lb.podLabels }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
     spec:
       serviceAccountName: {{ include "farm.serviceAccountName" . }}
       automountServiceAccountToken: false
@@ -63,9 +57,6 @@ spec:
         runAsUser: 65534
         runAsGroup: 65534
         seccompProfile: {type: RuntimeDefault}
-      {{- with .Values.lb.priorityClassName }}
-      priorityClassName: {{ . }}
-      {{- end }}
       {{- with .Values.lb.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -74,12 +65,6 @@ spec:
       {{- end }}
       {{- with .Values.lb.affinity }}
       affinity: {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.lb.topologySpreadConstraints }}
-      topologySpreadConstraints:
-        {{- range . }}
-        - {{- toYaml (merge (dict "labelSelector" (dict "matchLabels" ($sel | fromYaml))) .) | nindent 10 }}
-        {{- end }}
       {{- end }}
       containers:
         - name: envoy
@@ -108,9 +93,6 @@ spec:
             {{- if .Values.tls.clientCA.existingSecret }}
             - {name: tls-ca, mountPath: /etc/envoy/tls/ca, readOnly: true}
             {{- end }}
-            {{- with .Values.lb.extraVolumeMounts }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
           {{- with .Values.lb.resources }}
           resources: {{- toYaml . | nindent 12 }}
           {{- end }}
@@ -129,28 +111,4 @@ spec:
         - name: tls-ca
           secret: {secretName: {{ . }}}
         {{- end }}
-        {{- with .Values.lb.extraVolumes }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
-{{- with .Values.lb.podDisruptionBudget }}
-{{- if .enabled }}
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: {{ include "farm.fullname" $ }}-lb
-  labels: {{- include "farm.labels" $ | nindent 4 }}
-spec:
-  {{- with .minAvailable }}
-  {{- if ge (int .) (int $.Values.lb.replicas) }}
-  {{- fail "lb.podDisruptionBudget.minAvailable must be below lb.replicas, otherwise node drains block forever" }}
-  {{- end }}
-  minAvailable: {{ . }}
-  {{- else }}
-  maxUnavailable: {{ $.Values.lb.podDisruptionBudget.maxUnavailable }}
-  {{- end }}
-  selector:
-    matchLabels: {{- $sel | nindent 6 }}
-{{- end }}
-{{- end }}
 {{- end }}

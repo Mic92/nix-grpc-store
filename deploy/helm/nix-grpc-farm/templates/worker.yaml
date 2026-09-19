@@ -55,9 +55,6 @@ metadata:
   labels: {{- include "farm.labels" $root | nindent 4 }}
     app.kubernetes.io/component: worker
     nix-grpc-farm/group: {{ $g }}
-  {{- with $w.deploymentAnnotations }}
-  annotations: {{- toYaml . | nindent 4 }}
-  {{- end }}
 spec:
   replicas: {{ $w.replicas }}
   selector:
@@ -77,12 +74,10 @@ spec:
         {{- with $w.system }}
         nix-grpc-farm/system: {{ . }}
         {{- end }}
-        {{- with $w.podLabels }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
     spec:
       serviceAccountName: {{ include "farm.serviceAccountName" $root }}
-      automountServiceAccountToken: {{ if include "farm.needsServiceAccountToken" $root }}true{{ else }}false{{ end }}
+      # For OIDC discovery against the API server and the projected niks3 token.
+      automountServiceAccountToken: {{ or $root.Values.auth.workloadIdentity.enabled $root.Values.niks3.auth.serviceAccountToken.enabled }}
       terminationGracePeriodSeconds: {{ $root.Values.terminationGracePeriodSeconds }}
       # preStop hooks below find nix-grpc-daemon by name.
       shareProcessNamespace: true
@@ -92,9 +87,6 @@ spec:
       {{- with $root.Values.podSecurityContext }}
       securityContext: {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with $w.priorityClassName }}
-      priorityClassName: {{ . }}
-      {{- end }}
       {{- with $w.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -103,12 +95,6 @@ spec:
       {{- end }}
       {{- with $w.affinity }}
       affinity: {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with $w.topologySpreadConstraints }}
-      topologySpreadConstraints:
-        {{- range . }}
-        - {{- toYaml (merge (dict "labelSelector" (dict "matchLabels" ($sel | fromYaml))) .) | nindent 10 }}
-        {{- end }}
       {{- end }}
       initContainers:
         # /nix is an emptyDir so the store is writable and sized. Seed it
@@ -191,17 +177,11 @@ spec:
             {{- if $oidc }}
             - --oidc-config=/secrets/oidc/oidc.json
             {{- end }}
-            {{- with $w.extraArgs }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
           env:
             - name: NODE_NAME
               valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
             - name: POD_NAME
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
-            {{- with $w.extraEnv }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
           securityContext:
             runAsUser: 990
             runAsGroup: 990
@@ -229,13 +209,9 @@ spec:
             {{- if $oidc }}
             - {name: oidc, mountPath: /secrets/oidc, readOnly: true}
             {{- end }}
-            {{- with $w.extraVolumeMounts }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
           {{- with $w.daemonResources }}
           resources: {{- toYaml . | nindent 12 }}
           {{- end }}
-        {{- if $root.Values.gc.enabled }}
         - name: gc
           image: {{ include "farm.image" $root }}
           imagePullPolicy: {{ $root.Values.image.pullPolicy }}
@@ -256,7 +232,6 @@ spec:
           {{- with $root.Values.gc.resources }}
           resources: {{- toYaml . | nindent 12 }}
           {{- end }}
-        {{- end }}
       volumes:
         - name: nix
           emptyDir: {{- if $w.store.sizeLimit }} {sizeLimit: {{ $w.store.sizeLimit }}} {{- else }} {} {{- end }}
@@ -300,28 +275,4 @@ spec:
           secret:
             secretName: {{ include "farm.fullname" $root }}-oidc
         {{- end }}
-        {{- with $w.extraVolumes }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
-{{- with $w.podDisruptionBudget }}
-{{- if .enabled }}
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: {{ $svc }}
-  labels: {{- include "farm.labels" $root | nindent 4 }}
-spec:
-  {{- with .minAvailable }}
-  {{- if ge (int .) (int $w.replicas) }}
-  {{- fail (printf "workers.%s.podDisruptionBudget.minAvailable must be below replicas, otherwise node drains block forever" $g) }}
-  {{- end }}
-  minAvailable: {{ . }}
-  {{- else }}
-  maxUnavailable: {{ $w.podDisruptionBudget.maxUnavailable }}
-  {{- end }}
-  selector:
-    matchLabels: {{- $sel | nindent 6 }}
-{{- end }}
-{{- end }}
 {{- end }}

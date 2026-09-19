@@ -43,19 +43,11 @@ jobs:
       - uses: cachix/install-nix-action@v31
       - uses: actions/download-artifact@v4
         with: {path: images, merge-multiple: true}
-      - id: meta-worker
+      - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/nix-grpc-farm
-          tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-      - id: meta-lb
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/nix-grpc-farm-lb
+          images: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/nix-grpc-farm
           tags: |
             type=ref,event=branch
             type=ref,event=tag
@@ -64,26 +56,24 @@ jobs:
       - name: Merge and push
         env:
           REGCTL_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-          WORKER_TAGS: ${{ steps.meta-worker.outputs.tags }}
-          LB_TAGS: ${{ steps.meta-lb.outputs.tags }}
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           set -euo pipefail
           PATH="$(nix build --inputs-from . nixpkgs#regctl --print-out-paths --no-link)/bin:$PATH"
           regctl registry login "$REGISTRY" -u "${{ github.actor }}" --pass-stdin <<< "$REGCTL_PASSWORD"
-          push() { # <kind> <newline separated tags>
-            kind=$1
+          for kind in worker lb; do
             refs=()
             for sys in x86_64-linux aarch64-linux; do
               regctl image import "ocidir://$kind:$sys" "images/$kind-$sys.tar"
               refs+=(--ref "ocidir://$kind:$sys")
             done
             regctl index create "ocidir://$kind:merged" "${refs[@]}"
-            echo "$2" | while read -r tag; do
-              [ -n "$tag" ] && regctl image copy "ocidir://$kind:merged" "$tag"
+            # lb tags are the worker tags with the -lb image name.
+            for tag in $TAGS; do
+              [ "$kind" = lb ] && tag="${tag/nix-grpc-farm:/nix-grpc-farm-lb:}"
+              regctl image copy "ocidir://$kind:merged" "$tag"
             done
-          }
-          push worker "$WORKER_TAGS"
-          push lb "$LB_TAGS"
+          done
   helm-chart:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
