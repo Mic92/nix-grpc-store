@@ -312,8 +312,10 @@ which also requires `trustClients` (see above).
   * `token-file` — OIDC bearer token, re-read per call. Defaults to
     `$NIX_GRPC_TOKEN_FILE`, then `token` in the directories above
   * `connect-timeout` (default 30) — seconds the first call keeps retrying
-    "connection refused" and similar. Once the server has answered, a
-    restart is ridden out for up to 120 s.
+    "connection refused" and similar.
+  * `restart-grace` (default 120) — once the server has answered, seconds
+    to ride out a worker or scheduler restart, and to wait while the
+    scheduler says no worker can take a build.
   * `reschedule-retries` (default 8) — how often a derivation whose
     assigned worker went away is handed back to the scheduler.
   * `max-builds` (default 64) — concurrent `BuildDerivation` streams.

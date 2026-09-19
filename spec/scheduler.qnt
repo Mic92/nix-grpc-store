@@ -13,8 +13,12 @@ module scheduler {
   const PUSH: bool                // Expect{drv} reserves the slot; Build without it bounces
   const FENCED_PUBLISH: bool      // cache rejects a second publish
   const REPORT_ON_RECONNECT: bool // session (re)open carries running/expecting
+  // What happens to a Want no connected worker can take. true: the scheduler
+  // drops it and the client fails (old behaviour). false: it stays queued
+  // until a worker session is back and Unplaceable is only a warning.
+  const UNPLACEABLE_TERMINAL: bool
 
-  type CPhase = CIdle | CQueued | CAssigned(str) | CSent(str) | CDone
+  type CPhase = CIdle | CQueued | CAssigned(str) | CSent(str) | CDone | CFailed
   type Entry = { worker: str, followers: Set[str], leased: bool }
   type WState = { up: bool, running: bool, expecting: bool, attached: Set[str], built: bool, session: bool }
 
@@ -113,6 +117,8 @@ module scheduler {
         mResult' = mResult, mExpect' = mExpect,
       }
     } else all {
+      // No eligible worker: this branch is disabled and the Want waits in
+      // mSchedule (advisory Unplaceable). The terminal variant is below.
       nondet w = WORKERS.filter(k => free.get(k) > 0 and ws.get(k).session).oneOf()
       all {
         entry' = [{ worker: w, followers: Set(c), leased: true }],
@@ -124,6 +130,17 @@ module scheduler {
     },
     mBuild' = mBuild, mDone' = mDone, mRetry' = mRetry,
     keepCache, ws' = ws, cl' = cl, crashes' = crashes,
+  }
+
+  // Old behaviour: nobody connected can take it => tell the client no and forget it.
+  action rejectUnplaceable(c: str): bool = all {
+    UNPLACEABLE_TERMINAL,
+    mSchedule.contains(c), not(cached), entry.length() == 0,
+    WORKERS.filter(k => free.get(k) > 0 and ws.get(k).session).size() == 0,
+    mSchedule' = mSchedule.exclude(Set(c)),
+    cl' = cl.set(c, CFailed),
+    mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRetry' = mRetry,
+    keepSched, keepCache, ws' = ws, crashes' = crashes,
   }
 
   action recvDone(w: str): bool = all {
@@ -145,21 +162,32 @@ module scheduler {
     keepCache, ws' = ws, cl' = cl, crashes' = crashes,
   }
 
+  // Scheduler restarts empty. Worker sessions drop and come back in
+  // sessionsBack, so a client's re-Want can arrive before any worker has.
   action schedCrash: bool = all {
     crashes < MAX_CRASHES,
     crashes' = crashes + 1,
-    val running = WORKERS.filter(k => ws.get(k).up and (ws.get(k).running or ws.get(k).expecting))
-    all {
-      entry' = if (REPORT_ON_RECONNECT and running.size() > 0) {
-                 val w = running.fold("", (a, k) => if (a == "") k else a)
-                 [{ worker: w, followers: ws.get(w).attached, leased: true }]
-               } else [],
-      free' = WORKERS.mapBy(k => if (REPORT_ON_RECONNECT and running.contains(k)) SLOTS - 1 else SLOTS),
-    },
+    entry' = [],
+    free' = WORKERS.mapBy(_ => SLOTS),
     mAssigned' = Set(), mExpect' = Set(), mDone' = Set(),
     mRetry' = mRetry.union(CLIENTS.filter(c => cl.get(c) == CQueued)),
     mSchedule' = Set(), mBuild' = mBuild, mResult' = mResult,
-    keepCache, ws' = WORKERS.mapBy(k => { ...ws.get(k), session: ws.get(k).up }), cl' = cl,
+    keepCache, ws' = WORKERS.mapBy(k => { ...ws.get(k), session: false }), cl' = cl,
+  }
+
+  // Up workers re-open their sessions and report what they run.
+  action sessionsBack: bool = all {
+    WORKERS.exists(k => ws.get(k).up and not(ws.get(k).session)),
+    ws' = WORKERS.mapBy(k => { ...ws.get(k), session: ws.get(k).up }),
+    val running = WORKERS.filter(k => ws.get(k).up and not(ws.get(k).session) and (ws.get(k).running or ws.get(k).expecting))
+    all {
+      entry' = if (REPORT_ON_RECONNECT and entry.length() == 0 and running.size() > 0) {
+                 val w = running.fold("", (a, k) => if (a == "") k else a)
+                 [{ worker: w, followers: ws.get(w).attached, leased: true }]
+               } else entry,
+      free' = WORKERS.mapBy(k => if (REPORT_ON_RECONNECT and running.contains(k)) SLOTS - 1 else free.get(k)),
+    },
+    keepMsgs, keepCache, cl' = cl, crashes' = crashes,
   }
 
   // ---- worker ----
@@ -234,7 +262,18 @@ module scheduler {
     nondet w = WORKERS.oneOf()
     any {
       schedule(c), recvAssigned(c, w), recvResult(c), recvRetry(c),
-      recvSchedule(c), recvDone(w), sessionLost(w), schedCrash,
+      recvSchedule(c), rejectUnplaceable(c), recvDone(w), sessionLost(w), schedCrash, sessionsBack,
+      recvExpect(w), recvBuild(c, w), finish(w), workerCrash(w), workerBack(w),
+    }
+  }
+
+  // Everything but scheduler restarts: worker crashes, bounces, reordering.
+  action stepNoSchedCrash = {
+    nondet c = CLIENTS.oneOf()
+    nondet w = WORKERS.oneOf()
+    any {
+      schedule(c), recvAssigned(c, w), recvResult(c), recvRetry(c),
+      recvSchedule(c), rejectUnplaceable(c), recvDone(w), sessionLost(w),
       recvExpect(w), recvBuild(c, w), finish(w), workerCrash(w), workerBack(w),
     }
   }
@@ -269,20 +308,31 @@ module scheduler {
 
   // something in flight still concerns every waiting client
   val noStrandedClient = CLIENTS.forall(c =>
-    cl.get(c) == CIdle or cl.get(c) == CDone
+    cl.get(c) == CIdle or cl.get(c) == CDone or cl.get(c) == CFailed
     or mSchedule.contains(c) or mResult.contains(c) or mRetry.contains(c)
     or mAssigned.exists(p => p._1 == c) or mBuild.exists(p => p._1 == c)
     or WORKERS.exists(w => ws.get(w).attached.contains(c))
     or (entry.length() == 1 and entry[0].followers.contains(c)))
 
+  // Not in `safety`: a restarted scheduler places a re-Want on whoever has
+  // reconnected while a worker that has not is still building the same drv.
+  // The duplicate is wasted work, not a wrong result: singlePublish holds.
+  // Checked under stepNoSchedCrash, where Expect-before-Build does keep it.
   val oneBuilder = WORKERS.filter(w => ws.get(w).running).size() <= 1
 
-  val safety = all { doneImpliesPublished, slotsSane, singlePublish, noStrandedClient, noOversubscribe, entryLive, oneBuilder }
+  // Every worker here can build the drv and crashed ones come back, so a
+  // client told "unplaceable" for good was told wrong: it only saw the
+  // scheduler before its workers had reconnected.
+  val noSpuriousFail = CLIENTS.forall(c => cl.get(c) != CFailed)
+
+  val safety = all { doneImpliesPublished, slotsSane, singlePublish, noStrandedClient, noOversubscribe, entryLive, noSpuriousFail }
 }
 
-module schedFixed    { import scheduler(PUSH = true,  FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true).* }
+module schedFixed    { import scheduler(PUSH = true,  FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false).* }
 // each drops one mechanism; `safety` must find the hole
-module schedNoPush   { import scheduler(PUSH = false, FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true).* }
-module schedNoReport { import scheduler(PUSH = true,  FENCED_PUBLISH = false, REPORT_ON_RECONNECT = false).* }
-// fencing is defence in depth: Expect-before-Build alone keeps one builder
-module schedNoFence  { import scheduler(PUSH = true,  FENCED_PUBLISH = false, REPORT_ON_RECONNECT = true).* }
+module schedNoPush   { import scheduler(PUSH = false, FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false).* }
+module schedNoReport { import scheduler(PUSH = true,  FENCED_PUBLISH = false, REPORT_ON_RECONNECT = false, UNPLACEABLE_TERMINAL = false).* }
+// without fencing the duplicate build after a scheduler restart publishes twice
+module schedNoFence  { import scheduler(PUSH = true,  FENCED_PUBLISH = false, REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false).* }
+// scheduler answers "no worker" right after a restart and drops the Want
+module schedTerminal { import scheduler(PUSH = true,  FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = true).* }

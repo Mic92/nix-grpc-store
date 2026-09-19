@@ -178,7 +178,8 @@ message Cached {
   string drv_path = 1;
 }
 
-// No connected worker can run it (system features); the client fails the drv.
+// No connected worker can take this drv right now. The Want stays queued
+// and Assigned follows if one shows up. The client gives up on its own clock.
 message Unplaceable {
   string drv_path = 1;
   string reason = 2;
