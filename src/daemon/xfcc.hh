@@ -179,7 +179,7 @@ inline auto subjectCommonName(std::string_view value) -> std::optional<std::stri
 }
 
 // nullopt unless exactly one header is present and parses.
-inline auto forwardedCommonName(const grpc::ServerContext & context) -> std::optional<std::string>
+inline auto forwardedCommonName(const grpc::ServerContextBase & context) -> std::optional<std::string>
 {
     auto const & metadata = context.client_metadata();
     auto [first, last] = metadata.equal_range(std::string(header));

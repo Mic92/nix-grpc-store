@@ -32,7 +32,6 @@ let
       x86 = {
         system = "x86_64-linux";
         replicas = 2;
-        features = [ "kvm" ];
       };
       arm = {
         system = "aarch64-linux";
@@ -85,7 +84,7 @@ let
                 x86_64-linux = [ "HOST-x86:50051" ];
                 aarch64-linux = [ "HOST-arm:50051" ];
               };
-              features.x86_64-linux.kvm = [ "HOST-x86:50051" ];
+              scheduler = "HOST-sched:50051";
               tls = {
                 certFile = "/etc/envoy/tls/lb/tls.crt";
                 keyFile = "/etc/envoy/tls/lb/tls.key";
@@ -110,7 +109,7 @@ let
   # Cluster and system names differ by design (chart keys groups, the module
   # keys systems) and endpoints are hostnames vs. a headless Service.
   normalize = pkgs.writeText "normalize.jq" ''
-    def names: {"x86_64-linux": "x86", "aarch64-linux": "arm", "x86_64-linux/kvm": "x86/kvm"};
+    def names: {"x86_64-linux": "x86", "aarch64-linux": "arm"};
     def ren: . as $n | (names[$n] // $n);
     .static_resources
     | .clusters |= (map(.name |= ren | .load_assignment.cluster_name |= ren

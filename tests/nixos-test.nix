@@ -70,6 +70,8 @@ pkgs.testers.runNixOSTest {
         listen = "127.0.0.1:50051";
         logLevel = "debug";
         idleTimeout = 3;
+        # Test VM disk is ~1 GiB.
+        minFree = "0";
         # Reuse the client bundle so the test doesn't compile the project twice.
         package = config.programs.nix-grpc-store.package;
       };
@@ -371,7 +373,7 @@ pkgs.testers.runNixOSTest {
         # The opaque worker-protocol tunnel stays off limits.
         machine.fail(f"nix store add --store '{store_rw}' /root/denyfile")
 
-    with subtest("certificate ACL: write role builds via the native BuildPaths RPC"):
+    with subtest("certificate ACL: write role builds via Schedule + BuildDerivation"):
         # Evaluation stays local; the drv closure is imported
         # (content-addressed, passes CheckSigs) and built server-side, so no
         # trusted role or worker-protocol tunnel is needed.
@@ -387,7 +389,7 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"grep -q bp-payload '{out}'")
         machine.succeed(
             "journalctl -u nix-grpc-daemon-mtls.service | "
-            "grep -q 'event=rpc method=BuildPaths cn=rw-client'"
+            "grep -q 'event=rpc method=BuildDerivation cn=rw-client'"
         )
         # A failing build reports the error without the tunnel.
         machine.succeed(
@@ -406,7 +408,7 @@ pkgs.testers.runNixOSTest {
         )
         machine.succeed(
             "journalctl -u nix-grpc-daemon-mtls.service | "
-            "grep -q 'event=denied method=BuildPaths(repair) cn=rw-client'"
+            "grep -q 'event=denied method=BuildDerivation(repair) cn=rw-client'"
         )
 
     with subtest("certificate ACL: unmatched CN is denied"):
@@ -464,7 +466,7 @@ pkgs.testers.runNixOSTest {
         with_cert = cert_store("client") + "&token-file=/root/reader.jwt"
         machine.succeed(f"nix store add --store '{with_cert}' /etc/hello.nix")
         machine.succeed(
-            "journalctl -u nix-grpc-daemon-mtls.service | grep -q 'method=BuildPaths cn=oidc:mock:repo:myorg/x'"
+            "journalctl -u nix-grpc-daemon-mtls.service | grep -q 'method=BuildDerivation cn=oidc:mock:repo:myorg/x'"
         )
 
     with subtest("access log attributes clients by certificate CN"):

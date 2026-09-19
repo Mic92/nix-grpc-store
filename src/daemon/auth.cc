@@ -19,15 +19,17 @@
 
 namespace nixgrpc {
 
-// Client certificate first, then bearer token, then anonymous. A trusted
-// proxy's own certificate stands in for whatever client it forwards.
-auto Auth::identify(const grpc::ServerContext & context) const -> Caller
+// A client certificate with an access rule first, then bearer token, then
+// the certificate anyway (for the error), then anonymous. A trusted proxy's
+// own certificate stands in for whatever client it forwards.
+auto Auth::identify(const grpc::ServerContextBase & context) const -> Caller
 {
     auto cert = clientCommonName(context);
     if (proxies.matches(cert)) {
         cert = xfcc::forwardedCommonName(context);
     }
-    auto token = cert || !*oidc ? std::nullopt : oidc::bearerToken(context);
+    auto const certKnown = cert && acl.roleFor(cert);
+    auto token = certKnown || !*oidc ? std::nullopt : oidc::bearerToken(context);
     if (!token) {
         return {
             .name = cert.value_or("-"),

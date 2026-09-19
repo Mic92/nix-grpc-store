@@ -146,14 +146,14 @@ private:
 
     static constexpr unsigned defaultMaxBuilds = 64;
 
-    static constexpr unsigned defaultUnavailableRetries = 5;
-    Setting<unsigned> unavailableRetries{this, defaultUnavailableRetries, "unavailable-retries",
-        "How often a build bounced with UNAVAILABLE is retried on another worker."};
+    static constexpr unsigned defaultRescheduleRetries = 8;
+    Setting<unsigned> rescheduleRetries{this, defaultRescheduleRetries, "reschedule-retries",
+        "How often a derivation bounced by its assigned worker is handed back to the scheduler."};
     Setting<unsigned> maxBuilds{
         this,
         defaultMaxBuilds,
         "max-builds",
-        "Number of concurrent BuildDerivation calls when talking to a build farm."};
+        "Number of concurrent BuildDerivation streams."};
 
     Setting<unsigned> narConnections{
         this,
@@ -187,8 +187,8 @@ public:
     static auto uriSchemes() -> StringSet { return {"grpc"}; }
 
     static auto doc() -> std::string {
-      return "Connects to a `nix-grpc-daemon` and tunnels the Nix worker "
-             "protocol over a gRPC bidirectional stream.";
+      return "Connects to a `nix-grpc-daemon`: native RPCs for queries, copies and "
+             "scheduled builds, the tunnelled worker protocol for the rest.";
     }
 
     auto getReference() const -> StoreReference override {
@@ -219,6 +219,7 @@ private:
     /* One channel is shared by all connections in the pool; gRPC multiplexes
        streams over it internally. The stub keeps the channel alive. */
     std::unique_ptr<remote::NixRemote::Stub> stub;
+    std::unique_ptr<remote::Scheduler::Stub> sched;
 
     nixgrpc::NarFetcher narFetcher;
 
@@ -301,6 +302,8 @@ public:
     // connect-timeout until the service first answers, restartGrace after: a
     // worker restart behind the balancer is expected, being offline is not.
     static constexpr std::chrono::seconds restartGrace{120};
+    static constexpr std::chrono::milliseconds reconnectPause{500};
+    static constexpr std::chrono::milliseconds maxReconnectPause{4000};
     template<typename F>
     void retrying(const char * what, const F & attempt) {
       auto giveUp = std::chrono::steady_clock::now()
@@ -324,21 +327,9 @@ public:
 
     auto isTrustedClient() -> std::optional<TrustedFlag> override;
 
-    auto isFarm() -> bool {
-      isTrustedClient();
-      return farm;
-    }
-
-    // nix copy "builds" opaque paths; answering already-valid ones here
-    // avoids the tunnel, which read-only clients may not open.
-    auto alreadyValidResults(const std::vector<DerivedPath> & reqs)
-        -> std::optional<std::vector<KeyedBuildResult>>;
-
-    // Farm fan-out, else already-valid short cut, else native BuildPaths.
-    // nullopt: server predates the RPC, use the worker-protocol tunnel.
+    // One Schedule stream, whole DAG; never the tunnel.
     auto dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
-                       const std::shared_ptr<Store> & evalStore)
-        -> std::optional<std::vector<KeyedBuildResult>>;
+                       const std::shared_ptr<Store> & evalStore) -> std::vector<KeyedBuildResult>;
 
 #if NIX_COMPAT_HAS_BUILDER
     auto getBuilder(std::shared_ptr<Store> evalStore) -> ref<Builder> override {
@@ -354,24 +345,18 @@ public:
               inner(std::move(inner)) {}
         void buildPaths(const std::vector<DerivedPath> & reqs,
                         BuildMode buildMode) override {
-          if (auto results = store->dispatchBuild(reqs, buildMode, evalStore)) {
-            store->throwOnFailedBuilds(*results);
-            return;
-          }
-          inner->buildPaths(reqs, buildMode);
+          auto results = store->dispatchBuild(reqs, buildMode, evalStore);
+          store->throwOnFailedBuilds(results);
         }
         auto buildPathsWithResults(const std::vector<DerivedPath> & reqs,
                                    BuildMode buildMode)
             -> std::vector<KeyedBuildResult> override {
-          if (auto results = store->dispatchBuild(reqs, buildMode, evalStore)) {
-            return std::move(*results);
-          }
-          return inner->buildPathsWithResults(reqs, buildMode);
+          return store->dispatchBuild(reqs, buildMode, evalStore);
         }
         auto buildDerivation(const StorePath & drvPath,
                              const BasicDerivation & drv, BuildMode buildMode)
             -> BuildResult override {
-          return store->buildDerivationNative(drvPath, drv, buildMode, evalStore.get());
+          return store->buildOne(drvPath, drv, buildMode, evalStore.get());
         }
         void ensurePath(const StorePath & path) override {
           inner->ensurePath(path);
@@ -386,25 +371,18 @@ public:
 #else
     void buildPaths(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
                     std::shared_ptr<Store> evalStore) override {
-      if (auto results = dispatchBuild(reqs, buildMode, evalStore)) {
-        throwOnFailedBuilds(*results);
-        return;
-      }
-      RemoteStore::buildPaths(reqs, buildMode, std::move(evalStore));
+      auto results = dispatchBuild(reqs, buildMode, evalStore);
+      throwOnFailedBuilds(results);
     }
     auto buildPathsWithResults(const std::vector<DerivedPath> & reqs,
                                BuildMode buildMode,
                                std::shared_ptr<Store> evalStore)
         -> std::vector<KeyedBuildResult> override {
-      if (auto results = dispatchBuild(reqs, buildMode, evalStore)) {
-        return std::move(*results);
-      }
-      return RemoteStore::buildPathsWithResults(reqs, buildMode,
-                                                std::move(evalStore));
+      return dispatchBuild(reqs, buildMode, evalStore);
     }
     auto buildDerivation(const StorePath & drvPath, const BasicDerivation & drv,
                          BuildMode buildMode) -> BuildResult override {
-      return buildDerivationNative(drvPath, drv, buildMode);
+      return buildOne(drvPath, drv, buildMode, nullptr);
     }
 #endif
 
@@ -438,8 +416,8 @@ public:
       }
     };
 
-    // What the load balancer routes on.
-    auto routingFor(const StorePath & drvPath, const BasicDerivation & drv) -> Metadata;
+    // What the balancer routes on: shard for Schedule, shard + worker for the build.
+    auto routingFor(const BasicDerivation & drv, const std::string & workerAddr = "") -> Metadata;
 
     static void addHeaders(grpc::ClientContext & ctx, const Metadata & headers) {
       for (const auto & [key, value] : headers) {
@@ -475,86 +453,45 @@ public:
     auto tryBuildDerivation(const remote::BuildDerivationRequest & request, const Metadata & headers,
                             std::optional<BuildResult> & res) -> grpc::Status;
 
-    // NOT_FOUND: the worker lacks the drv closure, upload it and ask again.
-    auto buildDerivationNative(const StorePath & drvPath,
-                               const BasicDerivation & drv,
-                               BuildMode buildMode,
-                               Store * evalStore = nullptr) -> BuildResult;
-
-    struct FarmJob {
+    struct Job {
       StorePath drvPath;
       BasicDerivation drv;
-      std::vector<FarmJob *> dependants;
+      std::vector<Job *> dependants;
+      std::vector<Job *> inputs;
       size_t waiting = 0;
+      uint64_t cpHintMs = 0;
+      unsigned bounced = 0;
       std::optional<StorePath> failedInput;
       std::optional<BuildResult> result;
+      // Set by the reader thread, consumed by a build thread.
+      std::string workerAddr;
+      uint64_t assignId = 0;
+      bool lost = false; // scheduler stream gone before assignment
     };
+    struct Run;
 
-    struct FarmRun {
-      std::mutex mutex;
-      std::condition_variable cv;
-      std::deque<FarmJob *> ready;
-      size_t remaining;
-
-      auto next() -> FarmJob * {
-        std::unique_lock lock(mutex);
-        cv.wait(lock, [&]() -> bool { return !ready.empty() || remaining == 0; });
-        if (ready.empty()) {
-          return nullptr;
-        }
-        auto * job = ready.front();
-        ready.pop_front();
-        return job;
-      }
-
-      void finish(FarmJob & job, BuildResult res) {
-        std::scoped_lock const lock(mutex);
-        bool const succeeded = nixcompat::succeeded(res);
-        job.result = std::move(res);
-        assert(remaining > 0);
-        remaining--;
-        for (auto * dep : job.dependants) {
-          if (!succeeded) {
-            dep->failedInput = job.drvPath;
-          }
-          assert(dep->waiting > 0);
-          if (--dep->waiting == 0) {
-            ready.push_back(dep);
-          }
-        }
-        cv.notify_all();
-      }
-    };
-
-    // Runs on a fan-out thread, nothing may escape.
-    auto runFarmJob(FarmJob & job, BuildMode buildMode, Store & evalStore) -> BuildResult;
+    // One BuildDerivation against the assigned worker. NOT_FOUND: upload the
+    // drv closure there and ask again. Returns nullopt if the worker bounced us.
+    auto buildAssigned(Job & job, BuildMode buildMode, Store & evalStore) -> std::optional<BuildResult>;
 
     // The build hook and plain `--store grpc://` pass no eval store but
     // usually have the derivations in the local store.
     auto localEvalStore(const StorePathSet & drvPaths) -> std::shared_ptr<Store>;
 
-    // The farm builds one derivation per RPC, so walk the DAG here and send
-    // every ready derivation at once. Cached ones come back AlreadyValid.
-    auto farmBuildPaths(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
-                        Store * evalStore) -> std::vector<KeyedBuildResult>;
+    auto runJobs(std::map<StorePath, Job> & jobs, BuildMode buildMode, Store & evalStore) -> void;
+    auto scheduleUntilDone(Run & run, const Metadata & headers,
+                           const std::function<void(grpc::ClientContext *)> & setCtx) -> grpc::Status;
+
+    // Single drv without a DAG (build hook, legacy buildDerivation callers).
+    auto buildOne(const StorePath & drvPath, const BasicDerivation & drv, BuildMode buildMode,
+                  Store * evalStore) -> BuildResult;
 
     auto basicForFarm(Store & evalStore, const StorePath & drvPath, const Derivation & full)
         -> BasicDerivation;
 
-    void loadFarmJobs(const std::vector<DerivedPath> & reqs, Store & evalStore,
-                      std::map<StorePath, FarmJob> & jobs);
-
-    // Builds run server-side under the proxy user, so the write role
-    // suffices where the raw worker-protocol tunnel would not. Returns
-    // nullopt for servers without the RPC.
-    [[nodiscard]] auto buildPathsWithResultsNative(
-        const std::vector<DerivedPath> & reqs, BuildMode buildMode)
-        -> std::optional<std::vector<KeyedBuildResult>>;
-
-    // The server cannot reach the client's eval store, so the .drvs are
-    // imported first (content-addressed, passes signature checks).
-    void importDrvsFromEvalStore(const std::vector<DerivedPath> & paths,
-                               const std::shared_ptr<Store> & evalStore);
+    auto validInputDrvs(const std::vector<nix::DerivedPath> & reqs, nix::Store & evalStore) -> nix::StorePathSet;
+    void loadJobs(const std::vector<DerivedPath> & reqs, Store & evalStore,
+                  std::map<StorePath, Job> & jobs);
 
     void throwOnFailedBuilds(std::vector<KeyedBuildResult> & results);
 
@@ -564,7 +501,6 @@ private:
     std::atomic<bool> everConnected = false;
     std::once_flag trustedOnce;
     std::optional<TrustedFlag> trusted;
-    bool farm = false; // from StoreInfo
 
     /* Path infos fetched in bulk by topoSortPaths(), consumed by
        queryPathInfoUncached() so `nix copy` needs one QueryPathInfos RPC

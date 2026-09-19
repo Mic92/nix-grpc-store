@@ -1,8 +1,8 @@
-# Helm chart in k3s: worker + envoy from our images, niks3/rustfs/postgres
-# as NixOS services on the node. Workers authenticate to niks3 with their
-# service account token and the client uses one for the farm. Then: build
-# through the balancer, fill a store to trigger harmonia-gc, kill a worker
-# mid-build.
+# Helm chart in k3s. Workers and envoy run from our images, niks3, rustfs
+# and postgres as NixOS services on the node. Workers authenticate to niks3
+# with their service account token, and the client uses one for the farm.
+# The test builds through the balancer, fills a store to trigger
+# harmonia-gc, and kills a worker mid-build.
 {
   pkgs,
   niks3,
@@ -42,7 +42,7 @@ let
         -extfile <(printf "subjectAltName=$3") -out $1.crt
     }
     issue lb lb "IP:127.0.0.1,IP:${hostIP},DNS:nix-grpc-farm.farm.svc"
-    issue worker worker "DNS:worker"
+    issue worker worker "DNS:worker,DNS:nix-grpc-farm-scheduler.farm.svc"
   '';
 
   jobExpr = pkgs.writeText "job.nix" ''
@@ -235,81 +235,92 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     import shlex
+    from datetime import timedelta
+    def sec(n: int) -> timedelta:
+        return timedelta(seconds=n)
+
+    def kubectl(args: str) -> str:
+        return machine.succeed("kubectl -n farm " + args)
+    def pod_ip(selector: str) -> str:
+        return kubectl(f"get pod {selector} -o jsonpath='{{.items[0].status.podIP}}{{.status.podIP}}'").strip()
+    def rollout(deployment: str) -> None:
+        machine.wait_until_succeeds(f"kubectl -n farm rollout status deployment {deployment} --timeout=10s", timeout=sec(420))
+    def dump() -> None:
+        machine.execute(
+            "{ kubectl get pods -A; kubectl get events -A --sort-by=.lastTimestamp | tail -40;"
+            " kubectl -n kube-system logs -l batch.kubernetes.io/job-name=helm-install-nix-grpc-farm --tail=40;"
+            " kubectl -n farm describe pods | tail -80;"
+            " kubectl -n farm logs -l app.kubernetes.io/component=worker --all-containers --prefix --tail=30;"
+            " kubectl -n farm logs -l app.kubernetes.io/component=scheduler --tail=30; } >&2")
 
     machine.wait_for_unit("k3s.service")
-    kubectl = "kubectl -n farm "
     # Pods wait in ContainerCreating until these exist.
-    machine.wait_until_succeeds("kubectl get ns farm", timeout=180)
-    machine.succeed(
-        kubectl + "create secret tls farm-lb-tls --cert=${certs}/lb.crt --key=${certs}/lb.key",
-        kubectl + "create secret tls farm-worker-tls --cert=${certs}/worker.crt --key=${certs}/worker.key",
-        kubectl + "create secret generic farm-ca --from-file=ca.crt=${certs}/ca.crt",
-    )
-
-    def dump(_ok: bool = False) -> None:
-        machine.execute("{ kubectl get pods -A; kubectl get events -A --sort-by=.lastTimestamp | tail -40; kubectl -n kube-system logs -l batch.kubernetes.io/job-name=helm-install-nix-grpc-farm --tail=40; " + kubectl + "describe pods | tail -80; " + kubectl + "logs -l app.kubernetes.io/component=worker --all-containers --prefix --tail=30; } >&2")
+    machine.wait_until_succeeds("kubectl get ns farm", timeout=sec(180))
+    kubectl("create secret tls farm-lb-tls --cert=${certs}/lb.crt --key=${certs}/lb.key")
+    kubectl("create secret tls farm-worker-tls --cert=${certs}/worker.crt --key=${certs}/worker.key")
+    kubectl("create secret generic farm-ca --from-file=ca.crt=${certs}/ca.crt")
 
     with subtest("chart deploys and workers become Ready"):
         try:
-            machine.wait_until_succeeds(kubectl + "rollout status deployment nix-grpc-farm-lb --timeout=10s", timeout=420)
-            machine.wait_until_succeeds(kubectl + "rollout status deployment nix-grpc-farm-worker-${groupName} --timeout=10s", timeout=420)
+            for d in ["lb", "scheduler", "worker-${groupName}"]:
+                rollout(f"nix-grpc-farm-{d}")
         except Exception:
             dump()
             raise
         machine.wait_for_unit("niks3.service")
-        # envoy has health-checked both pods
-        machine.wait_until_succeeds("test $(curl -sf $(" + kubectl + "get pod -l app.kubernetes.io/component=lb -o jsonpath='{.items[0].status.podIP}'):9901/clusters | grep -c 'health_flags::healthy') -ge 2", timeout=120)
+        # envoy has health-checked both workers and the scheduler
+        lb_ip = pod_ip("-l app.kubernetes.io/component=lb")
+        machine.wait_until_succeeds(f"test $(curl -sf {lb_ip}:9901/clusters | grep -c 'health_flags::healthy') -ge 3", timeout=sec(120))
+        sched_ip = pod_ip("-l app.kubernetes.io/component=scheduler")
+        machine.wait_until_succeeds(f"curl -sf http://{sched_ip}:9464/metrics | grep -qx 'nix_grpc_sched{{kind=\"workers\"}} 2'", timeout=sec(120))
 
-    def worker_pods() -> list[str]:
-        return machine.succeed(kubectl + "get pods -l app.kubernetes.io/component=worker --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.name}'").split()
-    pods = worker_pods()
+    pods = kubectl("get pods -l app.kubernetes.io/component=worker --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.name}'").split()
     assert len(pods) == 2, pods
 
     machine.succeed("kubectl -n ci create token builder --audience nix-grpc-farm > /tmp/builder.jwt")
     store = "grpc://127.0.0.1:${toString nodePort}?ca-cert=${certs}/ca.crt&token-file=/tmp/builder.jwt"
+    def build(expr: str, tag: str) -> str:
+        return machine.succeed(f"nix build -L --store '{store}' --eval-store auto -f {expr} --argstr tag {tag} 2>&1")
+    def out_path(expr: str, tag: str) -> str:
+        return machine.succeed(f"nix eval --raw -f {expr} --argstr tag {tag} outPath").strip()
 
     with subtest("build through the balancer lands in the cache"):
-        machine.succeed(f"nix build -L --store '{store}' --eval-store auto -f ${jobExpr} --argstr tag t1 >&2")
-        top = machine.succeed("nix eval --raw -f ${jobExpr} --argstr tag t1 outPath").strip()
+        build("${jobExpr}", "t1")
+        top = out_path("${jobExpr}", "t1")
         machine.fail(f"test -e {top}")
         machine.succeed(f"nix copy --from ${niks3Url} {top} && grep k3s-top-t1 {top}")
-        out = machine.succeed(f"nix build -L --store '{store}' --eval-store auto -f ${jobExpr} --argstr tag t2 2>&1")
         # --worker-name from the downward API
+        out = build("${jobExpr}", "t2")
         assert "machine/nix-grpc-farm-worker-" in out, out
 
     with subtest("metrics carry build_info"):
-        ip = machine.succeed(kubectl + f"get pod {pods[0]} -o jsonpath='{{.status.podIP}}'").strip()
-        machine.succeed(f"curl -sf http://{ip}:9464/metrics | grep -E 'nix_grpc_build_info\\{{.*worker=\"machine/{pods[0]}\"'")
+        machine.succeed(f"curl -sf http://{pod_ip(pods[0])}:9464/metrics | grep -E 'nix_grpc_build_info\\{{.*worker=\"machine/{pods[0]}\"'")
 
     with subtest("harmonia-gc frees space and the worker stays Ready"):
         pod = pods[0]
-        sh = lambda c, cmd: machine.succeed(kubectl + f"exec {pod} -c {c} -- sh -c {shlex.quote(cmd)}")
-        avail = int(sh("gc", "df -B1 /nix/store | awk 'NR==2 {print $4}'").strip())
+        def sh(container: str, cmd: str) -> str:
+            return kubectl(f"exec {pod} -c {container} -- sh -c {shlex.quote(cmd)}")
         # emptyDir sizeLimit is not a filesystem, so gc sees the node's disk.
         # Garbage for gc to find, then leave ~1G free: below ensureFree (2G), above minFree (500M).
+        avail = int(sh("gc", "df -B1 /nix/store | awk 'NR==2 {print $4}'"))
         sh("nix-daemon", "for i in 1 2 3; do echo $i > /tmp/g$i; nix-store --add /tmp/g$i; done")
-        sh("gc", f"fallocate -l {avail - 1024 * 1024 * 1024} /nix/fill")
-        machine.wait_until_succeeds(kubectl + f"logs {pod} -c gc --since=30s | grep -E 'store paths deleted'", timeout=60)
+        sh("gc", f"fallocate -l {avail - 1024**3} /nix/fill")
+        machine.wait_until_succeeds(f"kubectl -n farm logs {pod} -c gc --since=30s | grep -q 'store paths deleted'", timeout=sec(60))
         sh("gc", "rm /nix/fill")
-        ready = machine.succeed(kubectl + f"get pod {pod} -o jsonpath='{{.status.conditions[?(@.type==\"Ready\")].status}}'").strip()
+        ready = kubectl(f"get pod {pod} -o jsonpath='{{.status.conditions[?(@.type==\"Ready\")].status}}'").strip()
         assert ready == "True", ready
         sh("gc", "command -v nix-daemon && command -v niks3")  # tools survived gc
 
     with subtest("killing a worker mid-build bounces the build to the other"):
-        machine.succeed(f"nix build -L --store '{store}' --eval-store auto -f ${slowExpr} --argstr tag s1 > /tmp/slow.log 2>&1 & echo $! > /tmp/slow.pid")
-        def building(_) -> bool:
-            for p in pods:
-                # [6] keeps the probe from matching itself.
-                if machine.execute(kubectl + f"exec {p} -c nix-daemon -- pgrep -f 'read -t [6]0 x'")[0] == 0:
-                    machine.succeed(f"echo {p} > /tmp/holder")
-                    return True
-            return False
-        retry(building, timeout_seconds=120)
-        holder = machine.succeed("cat /tmp/holder").strip()
-        machine.succeed(kubectl + f"delete pod {holder} --wait=false")
-        machine.wait_until_succeeds("! kill -0 $(cat /tmp/slow.pid) 2>/dev/null", timeout=300)
-        out = machine.succeed("nix eval --raw -f ${slowExpr} --argstr tag s1 outPath").strip()
-        narinfo = out.removeprefix("/nix/store/").split("-")[0] + ".narinfo"
-        machine.succeed(f"curl -sf ${niks3Url}/{narinfo} > /dev/null || (cat /tmp/slow.log >&2; false)")
+        machine.succeed(f"systemd-run --unit slow nix build -L --store '{store}' --eval-store auto -f ${slowExpr} --argstr tag s1")
+        def holder() -> str | None:
+            # [6] keeps the probe from matching itself.
+            return next((p for p in pods if machine.execute(f"kubectl -n farm exec {p} -c nix-daemon -- pgrep -f 'read -t [6]0 x'")[0] == 0), None)
+        retry(lambda _: holder() is not None, timeout=sec(120))
+        kubectl(f"delete pod {holder()} --wait=false")
+        machine.wait_until_succeeds("! systemctl is-active slow", timeout=sec(300))
+        machine.succeed("systemctl show -p Result --value slow | grep -qx success || { journalctl -u slow >&2; false; }")
+        narinfo = out_path("${slowExpr}", "s1").removeprefix("/nix/store/").split("-")[0] + ".narinfo"
+        machine.succeed(f"curl -sf ${niks3Url}/{narinfo} > /dev/null")
   '';
 }

@@ -41,7 +41,7 @@
 namespace nixgrpc {
 
 namespace {
-// No build hook on a farm worker: it would bypass slots and claims.
+// No build hook: it would bypass the scheduler.
 void buildLocally(Backend::Conn & conn)
 {
     constexpr uint64_t off = 0;
@@ -95,26 +95,8 @@ auto Backends::forBuild(grpc::ServerContext & context, nix::Store & localStore) 
     return backend;
 }
 
-auto Backends::proxyBuild(
-    grpc::ServerContext & context,
-    nix::Store & localStore,
-    const nix::StorePath & drvPath,
-    const nix::BasicDerivation & drv,
-    nix::BuildMode mode,
-    const BuildEventSink & sendLogLine) const -> nix::BuildResult
-{
-    auto backend = forBuild(context, localStore);
-    auto & conn = backend->conn;
-    relayBuildLog(conn.from, sendLogLine);
-    bool daemonException = false;
-    conn.putBuildDerivationRequest(localStore, &daemonException, drvPath, drv, mode);
-    conn.to.flush();
-    relayBuildLog(conn.from, sendLogLine);
-    return nix::WorkerProto::Serialise<nix::BuildResult>::read(
-        localStore, nix::WorkerProto::ReadConn{.from = conn.from, .version = nixcompat::buildProtocolVersion()});
-}
-
-auto Backends::buildPathsVia(
+namespace {
+auto buildPathsVia(
     Backend & backend,
     nix::Store & localStore,
     const std::vector<nix::DerivedPath> & targets,
@@ -133,18 +115,20 @@ auto Backends::buildPathsVia(
     return nix::WorkerProto::Serialise<std::vector<nix::KeyedBuildResult>>::read(
         localStore, nix::WorkerProto::ReadConn{.from = conn.from, .version = nixcompat::buildProtocolVersion()});
 }
+} // namespace
 
 auto Backends::storedBuild(
     grpc::ServerContext & context,
     nix::Store & localStore,
     const nix::StorePath & drvPath,
+    nix::BuildMode mode,
     const BuildEventSink & sendLogLine) const -> nix::BuildResult
 {
     auto backend = forBuild(context, localStore);
     buildLocally(backend->conn);
     std::vector<nix::DerivedPath> const targets{nix::DerivedPath::Built{
         .drvPath = nix::makeConstantStorePathRef(drvPath), .outputs = nix::OutputsSpec::All{}}};
-    auto results = buildPathsVia(*backend, localStore, targets, nix::bmNormal, sendLogLine);
+    auto results = buildPathsVia(*backend, localStore, targets, mode, sendLogLine);
     if (results.size() != 1) {
         throw nix::Error("nix-daemon returned %d results for one derivation", results.size());
     }

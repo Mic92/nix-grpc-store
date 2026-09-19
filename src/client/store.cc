@@ -122,7 +122,9 @@ GrpcStore::GrpcStore(const ref<const Config> &config)
     }
   }
 
-  stub = remote::NixRemote::NewStub(makeChannel(false));
+  auto channel = makeChannel(false);
+  stub = remote::NixRemote::NewStub(channel);
+  sched = remote::Scheduler::NewStub(channel);
 }
 
 auto GrpcStore::transportError(std::string_view msg) -> bool {
@@ -159,9 +161,6 @@ auto GrpcStore::statusError(const grpc::Status & status, const char * opName) co
       (code == grpc::StatusCode::UNAUTHENTICATED || code == grpc::StatusCode::UNAVAILABLE)) {
     hint = connectHint(status.error_message());
   }
-  if (code == grpc::StatusCode::UNIMPLEMENTED && std::string_view(opName) == "Connect") {
-    hint = "\nhint: this is a build farm endpoint. Pass --eval-store auto.";
-  }
   // NOLINTNEXTLINE(modernize-return-braced-init-list): Error ctor is explicit
   return Error("gRPC %s on '%s' failed: %s%s", opName, config->authority.to_string(),
                status.error_message(), hint);
@@ -190,7 +189,6 @@ auto GrpcStore::isTrustedClient() -> std::optional<TrustedFlag> {
     if (reply.has_trusted()) {
       trusted = reply.trusted() ? Trusted : NotTrusted;
     }
-    farm = reply.farm();
   });
   return trusted;
 }

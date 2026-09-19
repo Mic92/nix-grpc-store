@@ -27,7 +27,7 @@ jemalloc_dep = dependency('jemalloc')
 
 nix_store_dep = dependency('nix-store')
 nix_util_dep  = dependency('nix-util')
-# Farm mode: niks3 claims over HTTPS, niks3 push acks as JSON lines.
+# niks3 /present over HTTPS, niks3 push acks as JSON lines.
 curl_dep = dependency('libcurl')
 json_dep = dependency('nlohmann_json')
 # Header-only, ships only cmake config: found through the include path.
@@ -142,9 +142,10 @@ dispatcher_dep = declare_dependency(
 
 daemon_sources = [
   'src/daemon/main.cc',
+  'src/client/channel.cc',
   'src/daemon/auth.cc',
   'src/daemon/backend.cc',
-  'src/daemon/farm.cc',
+  'src/daemon/coordinator.cc',
   'src/daemon/options.cc',
 ]
 
@@ -154,7 +155,7 @@ executable('nix-grpc-daemon',
   cpp_pch : 'pch/daemon_pch.hh',
   cpp_args : nix_compat_args + ['-DNIX_GRPC_VERSION="' + meson.project_version() + '"'],
   # nix-store: native QueryValidPaths / AddMultipleToStore handlers.
-  dependencies : common_deps + prometheus_dep + [nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep],
+  dependencies : common_deps + prometheus_dep + [dispatcher_dep, nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep, jemalloc_dep],
   install : true,
 )
 
@@ -176,7 +177,8 @@ benchmark('scheduler-grpc', scheduler_grpc_bench, args : ['seconds=3'], timeout 
 farm_client_test = executable('farm-client-test',
   sources : ['tests/farm-client-test.cc'],
   include_directories : [src_inc, include_directories('src/daemon')],
-  dependencies : [nix_util_dep, curl_dep, json_dep, threads_dep],
+  cpp_args : nix_compat_args,
+  dependencies : [nix_util_dep, nix_store_dep, curl_dep, json_dep, threads_dep],
 )
 test('farm-client', find_program('tests/farm-client-test.sh'),
   args : [farm_client_test, files('tests/farm-mock.py')],

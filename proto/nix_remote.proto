@@ -50,11 +50,14 @@ message QueryPathInfosReply {
 
 // `drv` is the worker-protocol BasicDerivation serialisation. `protocol`
 // (major << 8 | minor) pins the BuildResult serialisation in the reply.
+// The worker only accepts this after the scheduler sent it Expect{drv_path}.
 message BuildDerivationRequest {
   string drv_path = 1;
   bytes drv = 2;
   uint32 build_mode = 3;
   uint32 protocol = 4;
+  // From Assigned, for log correlation only.
+  uint64 assign_id = 5;
 }
 
 // `result` is the worker-protocol BuildResult serialisation at the request's
@@ -71,30 +74,6 @@ message BuildDerivationChunk {
     bytes log_line = 1;
     BuildDerivationDone done = 2;
     // stdenv phase name (resSetPhase), for progress displays.
-    string phase = 3;
-  }
-}
-
-message BuildPathsRequest {
-  // DerivedPaths in nix's string notation.
-  repeated string targets = 1;
-  uint32 build_mode = 2;
-  uint32 protocol = 3;
-}
-
-// `results` is the worker-protocol vector<KeyedBuildResult> serialisation at
-// the request's `protocol`. Output path infos ride along so the client needs
-// no follow-up queries.
-message BuildPathsDone {
-  bytes results = 1;
-  repeated PathInfo outputs = 2;
-}
-
-message BuildPathsChunk {
-  oneof event {
-    // Raw builder stderr, which need not be valid UTF-8.
-    bytes log_line = 1;
-    BuildPathsDone done = 2;
     string phase = 3;
   }
 }
@@ -116,8 +95,7 @@ message StoreInfoRequest {}
 
 message StoreInfoReply {
   optional bool trusted = 1;
-  // Builds go through BuildDerivation only, see docs/farm.md.
-  bool farm = 2;
+  reserved 2;
 }
 
 message FetchNarsRequest {
@@ -150,7 +128,6 @@ service NixRemote {
   rpc QueryPathInfos(QueryPathInfosRequest) returns (QueryPathInfosReply);
   rpc FetchNars(FetchNarsRequest) returns (stream NarFrame);
   rpc BuildDerivation(BuildDerivationRequest) returns (stream BuildDerivationChunk);
-  rpc BuildPaths(BuildPathsRequest) returns (stream BuildPathsChunk);
   rpc QueryMissing(QueryMissingRequest) returns (QueryMissingReply);
   rpc StoreInfo(StoreInfoRequest) returns (StoreInfoReply);
 }
