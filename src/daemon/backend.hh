@@ -58,29 +58,14 @@ struct Backends
     [[nodiscard]] auto forBuild(grpc::ServerContext & context, nix::Store & localStore) const
         -> std::unique_ptr<Backend>;
 
-    // Inline drv through wopBuildDerivation (standalone mode).
-    [[nodiscard]] auto proxyBuild(
-        grpc::ServerContext & context,
-        nix::Store & localStore,
-        const nix::StorePath & drvPath,
-        const nix::BasicDerivation & drv,
-        nix::BuildMode mode,
-        const BuildEventSink & sendLogLine) const -> nix::BuildResult;
-
     // By path, not inline: nix-daemon recomputes output paths from the stored
     // closure, so a forged drv cannot claim foreign paths. No build hook.
     [[nodiscard]] auto storedBuild(
         grpc::ServerContext & context,
         nix::Store & localStore,
         const nix::StorePath & drvPath,
-        const BuildEventSink & sendLogLine) const -> nix::BuildResult;
-
-    static auto buildPathsVia(
-        Backend & backend,
-        nix::Store & localStore,
-        const std::vector<nix::DerivedPath> & targets,
         nix::BuildMode mode,
-        const BuildEventSink & sendLogLine) -> std::vector<nix::KeyedBuildResult>;
+        const BuildEventSink & sendLogLine) const -> nix::BuildResult;
 };
 
 template<typename Chunk>

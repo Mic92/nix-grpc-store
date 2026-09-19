@@ -1,6 +1,7 @@
-# Envoy in front of farm workers. One cluster per system, MAGLEV on
-# x-nix-drv so the same derivation lands on the same worker from every
-# client, gRPC health checks so a draining worker stops receiving work.
+# Envoy in front of the nodes. `/nix.remote.Scheduler/*` goes to the one
+# scheduler node (cluster `sched`, gRPC health service "nix.scheduler").
+# Everything else goes to the per-system worker cluster: BuildDerivation to
+# the worker named in x-nix-worker (override_host), the rest least-request.
 {
   config,
   lib,
@@ -75,16 +76,7 @@ let
       };
   };
 
-  cluster =
-    system: workers:
-    upstreamTls
-    // {
-      name = system;
-      type = "STRICT_DNS";
-    connect_timeout = "5s";
-    lb_policy = "MAGLEV";
-    # Worker slots are few. Spread rather than pile onto one hash bucket.
-    common_lb_config.consistent_hashing_lb_config.hash_balance_factor = 125;
+  http2 = {
     typed_extension_protocol_options."envoy.extensions.upstreams.http.v3.HttpProtocolOptions" = {
       "@type" = "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions";
       explicit_http_config.http2_protocol_options = {
@@ -95,35 +87,68 @@ let
         };
       };
     };
-    # Eject a worker that keeps bouncing builds (UNAVAILABLE counts as 5xx).
-    outlier_detection = {
-      consecutive_5xx = 3;
-      base_ejection_time = "30s";
-      max_ejection_percent = 50;
-    };
-    health_checks = [
-      {
-        timeout = "2s";
-        interval = cfg.healthCheckInterval;
-        # Farms idle between evaluations. Keep checking.
-        no_traffic_interval = cfg.healthCheckInterval;
-        unhealthy_threshold = 2;
-        healthy_threshold = 1;
-        grpc_health_check = { };
-      }
-    ];
-    load_assignment = {
-      cluster_name = system;
-      endpoints = [ { lb_endpoints = map endpoint workers; } ];
-    };
   };
 
-  route = system: {
-    match = {
-      prefix = "/";
-      grpc = { };
-    }
-    // lib.optionalAttrs (system != cfg.defaultSystem) {
+  healthCheck = service: {
+    timeout = "2s";
+    interval = cfg.healthCheckInterval;
+    no_traffic_interval = cfg.healthCheckInterval;
+    unhealthy_threshold = 2;
+    healthy_threshold = 1;
+    grpc_health_check = lib.optionalAttrs (service != "") { service_name = service; };
+  };
+
+  workerCluster =
+    name: workers:
+    upstreamTls
+    // http2
+    // {
+      inherit name;
+      type = "STRICT_DNS";
+      connect_timeout = "5s";
+      load_balancing_policy.policies = [
+        {
+          typed_extension_config = {
+            name = "envoy.load_balancing_policies.override_host";
+            typed_config = {
+              "@type" = "type.googleapis.com/envoy.extensions.load_balancing_policies.override_host.v3.OverrideHost";
+              override_host_sources = [ { header = "x-nix-worker"; } ];
+              fallback_policy.policies = [
+                {
+                  typed_extension_config = {
+                    name = "envoy.load_balancing_policies.least_request";
+                    typed_config."@type" = "type.googleapis.com/envoy.extensions.load_balancing_policies.least_request.v3.LeastRequest";
+                  };
+                }
+              ];
+            };
+          };
+        }
+      ];
+      health_checks = [ (healthCheck "") ];
+      load_assignment = {
+        cluster_name = name;
+        endpoints = [ { lb_endpoints = map endpoint workers; } ];
+      };
+    };
+
+  schedCluster =
+    upstreamTls
+    // http2
+    // {
+      name = "sched";
+      type = "STRICT_DNS";
+      connect_timeout = "5s";
+      health_checks = [ (healthCheck "nix.scheduler") ];
+      load_assignment = {
+        cluster_name = "sched";
+        endpoints = [ { lb_endpoints = [ (endpoint cfg.scheduler) ]; } ];
+      };
+    };
+
+  systemMatch =
+    system:
+    lib.optionalAttrs (system != cfg.defaultSystem) {
       headers = [
         {
           name = "x-nix-system";
@@ -131,44 +156,31 @@ let
         }
       ];
     };
+
+  schedRoute = {
+    match = {
+      prefix = "/nix.remote.Scheduler/";
+      grpc = { };
+    };
     route = {
-      cluster = system;
-      # Builds run for hours.
+      cluster = "sched";
       timeout = "0s";
-      hash_policy = [ { header.header_name = "x-nix-drv"; } ];
     };
   };
 
-  # Drvs with requiredSystemFeatures go to the workers that have the feature.
-  featureRoute = system: feature: {
-    match = {
-      prefix = "/";
-      grpc = { };
-      headers = [
-        {
-          name = "x-nix-features";
-          string_match.safe_regex.regex = "(.*,)?${lib.escapeRegex feature}(,.*)?";
-        }
-      ]
-      ++ lib.optional (system != cfg.defaultSystem) {
-        name = "x-nix-system";
-        string_match.exact = system;
+  routesFor = system: [
+    {
+      match = {
+        prefix = "/";
+        grpc = { };
+      }
+      // systemMatch system;
+      route = {
+        cluster = system;
+        timeout = "0s";
       };
-    };
-    route = {
-      cluster = "${system}/${feature}";
-      timeout = "0s";
-      hash_policy = [ { header.header_name = "x-nix-drv"; } ];
-    };
-  };
-  featureRoutes = lib.concatLists (
-    lib.mapAttrsToList (system: fs: lib.mapAttrsToList (feature: _: featureRoute system feature) fs) cfg.features
-  );
-  featureClusters = lib.concatLists (
-    lib.mapAttrsToList (
-      system: fs: lib.mapAttrsToList (feature: workers: cluster "${system}/${feature}" workers) fs
-    ) cfg.features
-  );
+    }
+  ];
 
   systems = lib.attrNames cfg.workers;
   ordered = lib.filter (s: s != cfg.defaultSystem) systems ++ [ cfg.defaultSystem ];
@@ -190,20 +202,21 @@ in
           "w2:50051"
         ];
       };
-      description = "host:port of farm workers per system.";
+      description = ''
+        `IP:port` of builder nodes per system. Must equal each node's
+        `services.nix-grpc-daemon.advertise` so `x-nix-worker` pins to it.
+      '';
     };
 
-    features = lib.mkOption {
-      type = lib.types.attrsOf (lib.types.attrsOf (lib.types.nonEmptyListOf lib.types.str));
-      default = { };
-      example = {
-        x86_64-linux.kvm = [ "w1:50051" ];
-      };
+    scheduler = lib.mkOption {
+      type = lib.types.str;
+      default = lib.head cfg.workers.${cfg.defaultSystem};
+      defaultText = lib.literalMD "first worker of `defaultSystem`";
+      example = "10.0.0.5:50051";
       description = ''
-        Per system and system feature, the subset of `workers` that has it.
-        Builds whose `requiredSystemFeatures` name the feature are routed
-        there. Unlisted features are assumed present on every worker. A drv
-        requiring several listed features goes to the first match.
+        The worker with the `scheduler` role. It serves all systems and there
+        is exactly one. While it is down new builds wait and running ones
+        finish.
       '';
     };
 
@@ -217,7 +230,7 @@ in
     healthCheckInterval = lib.mkOption {
       type = lib.types.str;
       default = "5s";
-      description = "How often envoy probes each worker's gRPC health. Two misses eject it.";
+      description = "How often envoy probes gRPC health of workers and scheduler candidates. Two misses eject.";
     };
 
     admin = lib.mkOption {
@@ -344,7 +357,7 @@ in
                           {
                             name = "farm";
                             domains = [ "*" ];
-                            routes = featureRoutes ++ map route ordered;
+                            routes = [ schedRoute ] ++ lib.concatMap routesFor ordered;
                           }
                         ];
                         http_filters = [
@@ -361,7 +374,7 @@ in
               ];
             }
           ];
-          clusters = lib.mapAttrsToList cluster cfg.workers ++ featureClusters;
+          clusters = lib.mapAttrsToList workerCluster cfg.workers ++ [ schedCluster ];
         };
       };
     };

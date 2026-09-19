@@ -524,7 +524,7 @@ private:
     }
 };
 
-inline auto bearerToken(const grpc::ServerContext & context) -> std::optional<std::string>
+inline auto bearerToken(const grpc::ServerContextBase & context) -> std::optional<std::string>
 {
     auto const & metadata = context.client_metadata();
     auto found = metadata.find("authorization");

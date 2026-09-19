@@ -1,0 +1,420 @@
+#include "coordinator.hh"
+#include "dispatcher.hh"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <initializer_list>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <stop_token>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include <sys/statvfs.h>
+
+#include <grpc/impl/channel_arg_names.h>
+#include <grpcpp/client_context.h>
+#include <grpcpp/create_channel.h>
+#include <grpcpp/health_check_service_interface.h>
+#include <grpcpp/security/credentials.h>
+#include <grpcpp/server.h>
+#include <grpcpp/server_context.h>
+#include <grpcpp/support/server_callback.h>
+#include <grpcpp/support/channel_arguments.h>
+#include <grpcpp/support/status.h>
+#include <grpcpp/support/sync_stream.h>
+
+#include <nix/store/globals.hh>
+#include <nix/util/file-system.hh>
+
+#include "acl.hh"
+#include "auth.hh"
+#include "backend.hh"
+#include "cache.hh"
+#include "logfmt.hh"
+#include "metrics.hh"
+#include "nix_remote.grpc.pb.h"
+#include "nix_remote.pb.h"
+#include "options.hh"
+#include "sched-reactor.hh"
+
+namespace nixgrpc {
+
+using nix::remote::ClientMsgs;
+using nix::remote::SchedCmd;
+using nix::remote::SchedCmds;
+using nix::remote::SchedMsgs;
+using nix::remote::WorkerMsg;
+using nix::remote::WorkerMsgs;
+
+namespace {
+constexpr int keepaliveMs = 20'000;
+constexpr std::chrono::milliseconds minBackoff{200};
+constexpr std::chrono::milliseconds maxBackoff{5000};
+} // namespace
+
+// ---------------------------------------------------------------- Builder
+
+Builder::Builder(const Options & options, Metrics & metrics)
+    : options(options)
+    , metrics(metrics)
+{
+}
+
+void Builder::onExpect(const nix::remote::Expect & exp)
+{
+    if (exp.drv_path().empty()) {
+        return;
+    }
+    auto lck = state.lock();
+    auto & ent = lck->expected[exp.drv_path()];
+    if (ent.running) {
+        return; // re-announced across a scheduler restart; keep the live one
+    }
+    ent.assignId = exp.assign_id();
+    ent.since = Clock::now();
+    metrics.event("expect");
+}
+
+void Builder::onRevoke(const nix::remote::Revoke & rev)
+{
+    uint64_t assignId = 0;
+    {
+        auto lck = state.lock();
+        auto found = lck->expected.find(rev.drv_path());
+        if (found == lck->expected.end() || found->second.running) {
+            return; // running builds finish; the client stream cancel stops them
+        }
+        assignId = found->second.assignId;
+        lck->expected.erase(found);
+    }
+    sendDone(rev.drv_path(), assignId, nix::remote::Done::CANCELLED, {});
+}
+
+auto Builder::admit(const std::string & drvPath) -> std::optional<Admission>
+{
+    auto lck = state.lock();
+    auto found = lck->expected.find(drvPath);
+    if (found == lck->expected.end()) {
+        return std::nullopt;
+    }
+    auto & ent = found->second;
+    Admission adm{.shared = ent.shared, .assignId = ent.assignId, .attach = ent.running};
+    ent.running = true;
+    return adm;
+}
+
+void Builder::finished(
+    const std::string & drvPath,
+    nix::remote::Done::Outcome outcome,
+    const std::vector<std::pair<std::string, uint64_t>> & outputs,
+    std::string resultWire)
+{
+    uint64_t assignId = 0;
+    std::shared_ptr<Expected::Shared> shared;
+    {
+        auto lck = state.lock();
+        auto found = lck->expected.find(drvPath);
+        if (found != lck->expected.end()) {
+            assignId = found->second.assignId;
+            shared = found->second.shared;
+            lck->expected.erase(found);
+        }
+    }
+    if (shared) {
+        const std::scoped_lock lock(shared->mutex);
+        shared->finished = true;
+        shared->resultWire = std::move(resultWire);
+        shared->cv.notify_all();
+    }
+    sendDone(drvPath, assignId, outcome, outputs);
+}
+
+void Builder::sendDone(
+    const std::string & drvPath,
+    uint64_t assignId,
+    nix::remote::Done::Outcome outcome,
+    const std::vector<std::pair<std::string, uint64_t>> & outputs)
+{
+    WorkerMsg msg;
+    auto * done = msg.mutable_done();
+    done->set_drv_path(drvPath);
+    done->set_assign_id(assignId);
+    done->set_outcome(outcome);
+    for (const auto & [path, size] : outputs) {
+        auto * out = done->add_outputs();
+        out->set_path(path);
+        out->set_nar_size(size);
+    }
+    if (!send(msg)) {
+        // Session down: the next Hello omits this drv, which frees the slot.
+        metrics.event("done_unsent");
+    }
+}
+
+auto Builder::hello() const -> WorkerMsg
+{
+    WorkerMsg msg;
+    auto * hel = msg.mutable_hello();
+    hel->set_addr(options.advertise);
+    hel->set_system(nix::settings.thisSystem.get());
+    for (const auto & feat : nix::settings.systemFeatures.get()) {
+        hel->add_features(feat);
+    }
+    hel->set_max_jobs(draining_ ? 0 : options.maxJobs);
+    auto lck = state.lock();
+    for (const auto & [drv, ent] : lck->expected) {
+        auto * run = ent.running ? hel->add_running() : hel->add_expecting();
+        run->set_drv_path(drv);
+        run->set_assign_id(ent.assignId);
+    }
+    return msg;
+}
+
+void Builder::setDraining(bool draining)
+{
+    if (draining_.exchange(draining) == draining) {
+        return;
+    }
+    WorkerMsg msg;
+    msg.mutable_load()->set_draining(draining);
+    send(msg);
+}
+
+void Builder::setSend(SendFn send)
+{
+    *sendFn.lock() = std::move(send);
+}
+
+auto Builder::send(const WorkerMsg & msg) const -> bool
+{
+    const SendFn cur = *sendFn.lock(); // copy: do not hold the lock across stream I/O
+    return cur && cur(msg);
+}
+
+void Builder::tick()
+{
+    std::vector<std::pair<std::string, uint64_t>> expired;
+    {
+        auto lck = state.lock();
+        const auto now = Clock::now();
+        for (auto iter = lck->expected.begin(); iter != lck->expected.end();) {
+            if (!iter->second.running && now - iter->second.since > expectTimeout) {
+                expired.emplace_back(iter->first, iter->second.assignId);
+                iter = lck->expected.erase(iter);
+            } else {
+                ++iter;
+            }
+        }
+    }
+    for (const auto & [drv, assignId] : expired) {
+        metrics.event("expect_no_show");
+        sendDone(drv, assignId, nix::remote::Done::NO_SHOW, {});
+    }
+}
+
+// ---------------------------------------------------------- SchedulerService
+
+SchedulerService::SchedulerService(Dispatcher & dispatcher, Auth & auth)
+    : dispatcher(&dispatcher)
+    , auth(&auth)
+{
+}
+
+void SchedulerService::registerHealth(grpc::HealthCheckServiceInterface * health)
+{
+    if (health == nullptr) {
+        return;
+    }
+    health->SetServingStatus("nix.scheduler", true);
+}
+
+auto SchedulerService::Schedule(grpc::CallbackServerContext * context)
+    -> grpc::ServerBidiReactor<ClientMsgs, SchedMsgs> *
+{
+    auto caller = auth->identify(*context);
+    if (auto status = Auth::authorize(caller, "Schedule", Role::write); !status.ok()) {
+        return new RejectReactor<ClientMsgs, SchedMsgs>(status); // NOLINT(cppcoreguidelines-owning-memory): deletes itself in OnDone
+    }
+    return new ScheduleReactor(context, *dispatcher); // NOLINT(cppcoreguidelines-owning-memory)
+}
+
+auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
+    -> grpc::ServerBidiReactor<WorkerMsgs, SchedCmds> *
+{
+    auto caller = auth->identify(*context);
+    if (auto status = Auth::authorize(caller, "WorkerSession", Role::trusted); !status.ok()) {
+        return new RejectReactor<WorkerMsgs, SchedCmds>(status); // NOLINT(cppcoreguidelines-owning-memory)
+    }
+    return new WorkerSessionReactor(context, *dispatcher); // NOLINT(cppcoreguidelines-owning-memory)
+}
+
+// -------------------------------------------------------------- Coordinator
+
+Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics)
+    : cache(options.niks3)
+    , options(options)
+{
+    if (options.builder) {
+        builder.emplace(options, metrics);
+        metrics.buildSlots(options.maxJobs);
+    }
+    if (options.scheduler) {
+        Dispatcher::PresentFn present;
+        if (cache.hasRemote()) {
+            present = [this](const std::vector<std::string> & keys) -> std::unordered_set<std::string> {
+                return cache.present(keys);
+            };
+        }
+        dispatcher.emplace(
+            Dispatcher::Config{
+                .defaultSystem = nix::settings.thisSystem.get(),
+                .present = std::move(present),
+                .logLevel = options.logLevel},
+            metrics);
+        scheduler = std::make_unique<SchedulerService>(*dispatcher, auth);
+    }
+    if (builder && dispatcher && options.schedulerAddr.empty()) {
+        // In-process worker: the Dispatcher calls straight into the Builder.
+        auto worker =
+            std::make_shared<Dispatcher::Worker>(Dispatcher::Worker{.send = [this](const SchedCmd & cmd) -> bool {
+                // Called under the dispatcher mutex; Builder takes only its own lock.
+                if (cmd.has_expect()) {
+                    builder->onExpect(cmd.expect());
+                } else if (cmd.has_revoke()) {
+                    // Revoke answers with Done, which re-enters the dispatcher: defer.
+                    std::thread([this, rev = cmd.revoke()]() -> void { builder->onRevoke(rev); }).detach();
+                }
+                return true;
+            }});
+        builder->setSend([this, worker](const WorkerMsg & msg) -> bool {
+            WorkerMsgs one;
+            *one.add_msgs() = msg;
+            dispatcher->workerMsgs(*worker, one);
+            return true;
+        });
+    }
+}
+
+// Members would go in reverse declaration order: session thread and
+// dispatcher after the Builder they call into. Cut the edges first.
+Coordinator::~Coordinator()
+{
+    if (sessionThread.joinable()) {
+        sessionThread.request_stop();
+        sessionThread.join();
+    }
+    if (builder) {
+        builder->setSend(nullptr);
+    }
+    scheduler.reset();
+    dispatcher.reset();
+}
+
+void Coordinator::start(grpc::Server & server)
+{
+    if (scheduler) {
+        SchedulerService::registerHealth(server.GetHealthCheckService());
+    }
+    if (!builder) {
+        return;
+    }
+    if (options.schedulerAddr.empty()) {
+        builder->send(builder->hello());
+    } else {
+        sessionThread = std::jthread(
+            [this, &bld = *builder](const std::stop_token & stop) -> void { runRemoteSession(bld, stop); });
+    }
+}
+
+void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
+{
+    // TLS to the scheduler iff --scheduler-ca; our server cert doubles as client
+    // cert.
+    std::shared_ptr<grpc::ChannelCredentials> creds;
+    if (options.schedulerCA.empty()) {
+        creds = grpc::InsecureChannelCredentials();
+    } else {
+        grpc::SslCredentialsOptions ssl;
+        ssl.pem_root_certs = nix::readFile(options.schedulerCA);
+        if (!options.tlsCert.empty()) {
+            ssl.pem_cert_chain = nix::readFile(options.tlsCert);
+            ssl.pem_private_key = nix::readFile(options.tlsKey);
+        }
+        creds = grpc::SslCredentials(ssl);
+    }
+    grpc::ChannelArguments args;
+    args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, keepaliveMs);
+    auto channel = grpc::CreateCustomChannel(options.schedulerAddr, creds, args);
+    auto stub = nix::remote::Scheduler::NewStub(channel);
+    auto backoff = minBackoff;
+    while (!stop.stop_requested()) {
+        grpc::ClientContext ctx;
+        auto stream = stub->WorkerSession(&ctx);
+        auto writeMutex = std::make_shared<std::mutex>();
+        auto live = std::make_shared<std::atomic<bool>>(true);
+        auto * raw = stream.get();
+        // Builders send a Done every few seconds at most; no batching needed.
+        bld.setSend([raw, writeMutex, live](const WorkerMsg & msg) -> bool {
+            WorkerMsgs one;
+            *one.add_msgs() = msg;
+            const std::scoped_lock lock(*writeMutex);
+            return *live && raw->Write(one);
+        });
+        const bool helloed = bld.send(bld.hello());
+        if (helloed) {
+            logLine(LogLevel::info, {{"event", "scheduler_connected"}, {"addr", options.schedulerAddr}});
+            backoff = minBackoff;
+        }
+        const std::stop_callback onStop(stop, [&ctx]() -> void { ctx.TryCancel(); });
+        SchedCmds cmds;
+        while (helloed && stream->Read(&cmds)) {
+            for (const auto & cmd : cmds.msgs()) {
+                if (cmd.has_expect()) {
+                    bld.onExpect(cmd.expect());
+                } else if (cmd.has_revoke()) {
+                    bld.onRevoke(cmd.revoke());
+                }
+            }
+        }
+        *live = false;
+        auto status = stream->Finish();
+        if (stop.stop_requested()) {
+            return;
+        }
+        logLine(
+            LogLevel::info,
+            {{"event", "scheduler_disconnected"}, {"addr", options.schedulerAddr}, {"error", status.error_message()}});
+        std::this_thread::sleep_for(backoff);
+        backoff = std::min(backoff * 2, maxBackoff);
+    }
+}
+
+void Coordinator::tick()
+{
+    if (!builder) {
+        return;
+    }
+    builder->tick();
+    struct statvfs vfs{};
+    if (options.minFree == 0 || statvfs(options.storeDir.c_str(), &vfs) != 0) {
+        return;
+    }
+    const bool healthy = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize >= options.minFree;
+    if (lastHealthy.exchange(healthy) != healthy) {
+        logLine(LogLevel::info, {{"event", healthy ? "healthy" : "unhealthy"}, {"reason", "min_free"}});
+        if (stopSignal == 0) {
+            builder->setDraining(!healthy);
+        }
+    }
+}
+
+} // namespace nixgrpc

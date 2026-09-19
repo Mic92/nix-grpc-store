@@ -12,7 +12,7 @@
 #include <grpcpp/security/server_credentials.h>
 
 #include "acl.hh"
-#include "farm.hh"
+#include "cache.hh"
 #include "logfmt.hh"
 #include "xfcc.hh"
 
@@ -34,7 +34,18 @@ struct Options
     Acl acl;
     xfcc::TrustedProxies proxies;
     std::string oidcConfig;
-    FarmConfig farm; // active when niks3Url is set
+    Niks3Config niks3;
+
+    bool builder = true;
+    bool scheduler = true;
+    // Empty: in-process scheduler. Else the balancer URL (host:port) to dial.
+    std::string schedulerAddr;
+    std::string schedulerCA; // server CA for schedulerAddr; client cert = tlsCert/tlsKey
+    // How the balancer reaches this worker; goes into Assigned.worker_addr.
+    std::string advertise;
+    unsigned maxJobs = 1;
+    uint64_t minFree = 0;
+    std::string storeDir;
 };
 
 auto parseOptions(const std::vector<std::string_view> & args) -> Options;

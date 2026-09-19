@@ -22,10 +22,12 @@
 #include <nix/util/file-system.hh>
 #include <nix/util/strings.hh>
 #include <nix/util/util.hh>
+#include <nix/util/environment-variables.hh>
 
 #include "acl.hh"
 #include "logfmt.hh"
 #include "parse-int.hh"
+#include "scheduler.hh"
 #include "xfcc.hh"
 
 namespace nixgrpc {
@@ -107,21 +109,38 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
         } else if (arg == "--oidc-config") {
             options.oidcConfig = next();
         } else if (arg == "--niks3") {
-            options.farm.niks3Url = next();
+            options.niks3.url = next();
         } else if (arg == "--niks3-token-file") {
-            options.farm.niks3TokenFile = next();
+            options.niks3.tokenFile = next();
         } else if (arg == "--niks3-push") {
             // The program plus extra flags, e.g. "niks3 push --max-concurrent-uploads 8".
             auto words = nix::shellSplitString(next());
-            options.farm.pushArgv = {words.begin(), words.end()};
+            options.niks3.pushArgv = {words.begin(), words.end()};
+        } else if (arg == "--role") {
+            options.builder = options.scheduler = false;
+            for (auto & role : nix::tokenizeString<std::vector<std::string>>(next(), ",")) {
+                if (role == "builder") {
+                    options.builder = true;
+                } else if (role == "scheduler") {
+                    options.scheduler = true;
+                } else {
+                    throw nix::Error("--role: unknown role '%s' (builder, scheduler)", role);
+                }
+            }
+        } else if (arg == "--scheduler") {
+            options.schedulerAddr = next();
+        } else if (arg == "--scheduler-ca") {
+            options.schedulerCA = next();
+        } else if (arg == "--advertise") {
+            options.advertise = next();
         } else if (arg == "--max-jobs") {
             auto jobs = parseInt<unsigned>(next());
-            if (!jobs || *jobs == 0) {
-                throw nix::Error("--max-jobs expects a positive integer");
+            if (!jobs || *jobs > static_cast<unsigned>(sched::FreeIndex::maxSlots)) {
+                throw nix::Error("--max-jobs expects an integer in 0..%d", sched::FreeIndex::maxSlots);
             }
-            options.farm.maxJobs = *jobs;
+            options.maxJobs = *jobs;
         } else if (arg == "--min-free") {
-            options.farm.minFree = nix::string2IntWithUnitPrefix<uint64_t>(next());
+            options.minFree = nix::string2IntWithUnitPrefix<uint64_t>(next());
         } else {
             throw nix::Error("unknown flag '%s'", arg);
         }
@@ -129,17 +148,31 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
     if (options.workerName.empty()) {
         options.workerName = localHostName();
     }
-    if (!options.farm.niks3Url.empty()) {
-        if (options.farm.niks3TokenFile.empty()) {
+    if (options.niks3.enabled()) {
+        if (options.niks3.tokenFile.empty()) {
             throw nix::Error("--niks3 needs --niks3-token-file");
         }
-        auto & argv = options.farm.pushArgv;
+        auto & argv = options.niks3.pushArgv;
         if (argv.empty()) {
             argv = {"niks3", "push"};
         }
         argv.insert(
-            argv.end(),
-            {"--stdin", "--server-url", options.farm.niks3Url, "--auth-token-path", options.farm.niks3TokenFile});
+            argv.end(), {"--stdin", "--server-url", options.niks3.url, "--auth-token-path", options.niks3.tokenFile});
+    }
+    if (!options.builder && !options.scheduler) {
+        throw nix::Error("--role: need at least one of builder, scheduler");
+    }
+    if (!options.builder) {
+        options.maxJobs = 0;
+    }
+    if (options.schedulerAddr.empty() && !options.scheduler) {
+        throw nix::Error("--role builder without --scheduler has nobody to take work from");
+    }
+    if (options.advertise.empty()) {
+        options.advertise = options.listen;
+    }
+    if (options.storeDir.empty()) {
+        options.storeDir = nix::getEnv("NIX_STORE_DIR").value_or("/nix/store");
     }
     if ((options.acl.active() || options.acl.anonymousRole()) && options.clientCA.empty() && options.oidcConfig.empty()) {
         throw nix::Error("--allow/--allow-anonymous requires --client-ca or --oidc-config");

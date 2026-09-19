@@ -33,11 +33,6 @@
 
 namespace nixgrpc {
 
-struct StaleClaim : nix::Error
-{
-    using nix::Error::Error;
-};
-
 // Polled about once a second by blocking waits so a gone client or a
 // daemon shutdown does not pin a handler thread forever.
 using Cancelled = std::function<bool()>;
@@ -54,9 +49,9 @@ inline auto never() -> bool
 }
 
 
-// One long-lived `niks3 push --stdin`. A build writes a request line naming
-// its outputs and claim token and blocks until every output was acked.
-// If the child dies all waiters fail and the next request respawns it.
+// One long-lived `niks3 push --stdin`. A request line names paths and blocks
+// until every one was acked. If the child dies all waiters fail and the next
+// request respawns it.
 class PushProcess
 {
 public:
@@ -83,8 +78,8 @@ public:
         }
     }
 
-    // Returns after niks3 committed all of `paths`. StaleClaim if superseded.
-    void pushWait(const std::vector<std::string> & paths, int64_t claimToken, const Cancelled & cancelled = never)
+    // Returns after niks3 committed all of `paths`.
+    void pushWait(const std::vector<std::string> & paths, const Cancelled & cancelled = never)
     {
         auto pending = std::make_shared<Pending>(paths.size());
         uint64_t reqId = 0;
@@ -98,7 +93,7 @@ public:
         }
         // Not under the State lock: a full stdin pipe must not keep readAcks
         // from draining the child's stdout.
-        nlohmann::json const req{{"id", reqId}, {"paths", paths}, {"claim_token", claimToken}};
+        nlohmann::json const req{{"id", reqId}, {"paths", paths}};
         try {
             std::scoped_lock const one(writeMutex);
             nix::writeFull(stdinFd->get(), req.dump() + "\n", false);
@@ -110,9 +105,6 @@ public:
         if (status == "cancelled") {
             state.lock()->waiting.erase(reqId);
             throw CancelledWait("niks3 push: %s", message);
-        }
-        if (status == "stale") {
-            throw StaleClaim("niks3 push: claim superseded, outputs not published");
         }
         if (status != "ok") {
             throw nix::Error("niks3 push: %s", message);
@@ -134,7 +126,7 @@ private:
         auto ack(const std::string & status, const std::string & message) -> bool
         {
             auto inner = sync.lock();
-            if (status != "ok" && inner->worst.first != "stale") {
+            if (status != "ok") {
                 inner->worst = {status, message};
             }
             if (inner->left > 0) {
