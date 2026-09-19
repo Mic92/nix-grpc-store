@@ -13,6 +13,7 @@
   curl,
   nlohmann_json,
   jwt-cpp,
+  jemalloc,
   python3,
   mold,
   # Nix component libraries. When building the client plugin these must be
@@ -43,6 +44,8 @@ stdenv.mkDerivation {
       ../../tests/oidc-test.sh
       ../../tests/xfcc-test.cc
       ../../tests/scheduler-test.cc
+      ../../tests/dispatcher-bench.cc
+      ../../tests/scheduler-grpc-bench.cc
     ];
   };
 
@@ -69,6 +72,7 @@ stdenv.mkDerivation {
     curl
     nlohmann_json
     jwt-cpp
+    jemalloc
   ];
 
   # Frame pointers for perf in the VM test. DWARF goes to the debug output,
