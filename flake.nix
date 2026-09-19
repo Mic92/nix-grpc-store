@@ -80,6 +80,8 @@
             fuzzers
             fuzzers-coverage
             ;
+          # The nix the default plugin is built against, for manual testing.
+          nix = nixGitFor nixpkgs.legacyPackages.${system};
         }
         // scope.versionPlugins
         // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
@@ -129,7 +131,10 @@
       devShells = forAllSystems (system: {
         default = nixpkgs.legacyPackages.${system}.mkShell {
           inputsFrom = [ self.packages.${system}.default ];
-          packages = [ nixpkgs.legacyPackages.${system}.llvmPackages_latest.clang-tools ];
+          packages = [
+            nixpkgs.legacyPackages.${system}.llvmPackages_latest.clang-tools
+            (nixGitFor nixpkgs.legacyPackages.${system})
+          ];
         };
       });
     };

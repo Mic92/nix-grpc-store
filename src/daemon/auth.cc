@@ -21,7 +21,7 @@ namespace nixgrpc {
 
 // Client certificate first, then bearer token, then anonymous. A trusted
 // proxy's own certificate stands in for whatever client it forwards.
-auto Auth::identify(const grpc::ServerContext & context) const -> Caller
+auto Auth::identify(const grpc::ServerContextBase & context) const -> Caller
 {
     auto cert = clientCommonName(context);
     if (proxies.matches(cert)) {

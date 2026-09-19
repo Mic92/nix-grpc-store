@@ -1,16 +1,19 @@
-// grpc:// Store: native BuildPaths/BuildDerivation and the build-farm fan-out.
+// grpc:// Store: builds through the Schedule stream and BuildDerivation.
 
 #include "store.hh"
 
 #include <algorithm>
-#include <array>
+#include <cassert>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -21,8 +24,8 @@
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
-#include <grpcpp/support/client_interceptor.h>
 #include <grpcpp/support/status.h>
+#include <grpcpp/support/sync_stream.h>
 
 #include <nix/store/build-result.hh>
 #include <nix/store/derivations.hh>
@@ -33,11 +36,10 @@
 #include <nix/store/store-open.hh>
 #include <nix/store/worker-protocol.hh>
 #include <nix/util/error.hh>
-#include <nix/util/file-system.hh>
+#include <nix/util/finally.hh>
+#include <nix/util/repair-flag.hh>
 #include <nix/util/fmt.hh>
 #include <nix/util/logging.hh>
-#include <nix/util/ref.hh>
-#include <nix/util/repair-flag.hh>
 #include <nix/util/serialise.hh>
 #include <nix/util/signals.hh>
 #include <nix/util/strings.hh>
@@ -48,48 +50,13 @@
 
 namespace nix {
 
-auto GrpcStore::alreadyValidResults(const std::vector<DerivedPath> & reqs)
-    -> std::optional<std::vector<KeyedBuildResult>> {
-  StorePathSet paths;
-  for (const auto & req : reqs) {
-    const auto * opaque = std::get_if<DerivedPath::Opaque>(&req.raw());
-    if (opaque == nullptr) {
-      return std::nullopt;
-    }
-    paths.insert(opaque->path);
+auto GrpcStore::routingFor(const BasicDerivation & drv, const std::string & workerAddr) -> Metadata {
+  Metadata meta{{"x-nix-system", drv.platform},
+                {"x-nix-features", concatStringsSep(",", nixcompat::requiredSystemFeatures(*this, drv))}};
+  if (!workerAddr.empty()) {
+    meta.emplace_back("x-nix-worker", workerAddr);
   }
-  if (queryValidPaths(paths, NoSubstitute).size() != paths.size()) {
-    return std::nullopt;
-  }
-  std::vector<KeyedBuildResult> results;
-  results.reserve(reqs.size());
-  for (const auto & req : reqs) {
-    KeyedBuildResult res{{}, req};
-    nixcompat::setAlreadyValid(res);
-    results.push_back(std::move(res));
-  }
-  return results;
-}
-
-auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
-                   const std::shared_ptr<Store> & evalStore)
-    -> std::optional<std::vector<KeyedBuildResult>> {
-  if (isFarm()) {
-    return farmBuildPaths(reqs, buildMode, evalStore.get());
-  }
-  if (buildMode == bmNormal) {
-    if (auto results = alreadyValidResults(reqs)) {
-      return results;
-    }
-  }
-  importDrvsFromEvalStore(reqs, evalStore);
-  return buildPathsWithResultsNative(reqs, buildMode);
-}
-
-auto GrpcStore::routingFor(const StorePath & drvPath, const BasicDerivation & drv) -> Metadata {
-  return {{"x-nix-drv", std::string(drvPath.hashPart())},
-          {"x-nix-system", drv.platform},
-          {"x-nix-features", concatStringsSep(",", nixcompat::requiredSystemFeatures(*this, drv))}};
+  return meta;
 }
 
 void GrpcStore::uploadDrvClosure(Store & evalStore, const StorePath & drvPath, const Metadata & headers) {
@@ -111,7 +78,6 @@ void GrpcStore::uploadDrvClosure(Store & evalStore, const StorePath & drvPath, c
                fmt("copying %d paths to '%s'", missing.size(), config->authority.to_string()));
   for (const auto & path : evalStore.topoSortPaths(missing) | std::views::reverse) {
     auto info = evalStore.queryPathInfo(path);
-    // Same per-path progress activity as Store::copyPaths.
     // NOLINTNEXTLINE(bugprone-exception-escape): libc++ coroutine frames trip this.
     sources.emplace_back(*info, sinkToSource([this, &evalStore, info, parent = act.id](Sink & sink) -> void {
       auto pathS = printStorePath(info->path);
@@ -139,8 +105,7 @@ auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & reques
   auto const onInterrupt = createInterruptCallback([&ctx]() -> void { ctx.TryCancel(); });
   auto reader = stub->BuildDerivation(&ctx, request);
 
-  // build-remote only forwards results of an actBuild activity to nix. Named
-  // like nix's own so log UIs merge them, opened lazily so the NOT_FOUND probe is silent.
+  // Named like nix's own actBuild so log UIs merge them, opened lazily so the NOT_FOUND probe is silent.
   auto drv = printStorePath(StorePath(request.drv_path()));
   BuildLogActivity act(fmt("building '%s' on %s", drv, config->authority.to_string()),
                        {drv, config->authority.to_string(), 1, 1});
@@ -151,68 +116,38 @@ auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & reques
   });
 }
 
-auto GrpcStore::buildDerivationNative(const StorePath & drvPath,
-                           const BasicDerivation & drv,
-                           BuildMode buildMode,
-                           Store * evalStore) -> BuildResult {
+auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore) -> std::optional<BuildResult> {
   remote::BuildDerivationRequest request;
-  request.set_drv_path(std::string(drvPath.to_string()));
+  request.set_drv_path(std::string(job.drvPath.to_string()));
   request.set_build_mode(static_cast<uint32_t>(buildMode));
   request.set_protocol(nixcompat::kBuildProtocolWire);
+  request.set_assign_id(job.assignId);
   {
     StringSink sink;
-    nixcompat::writeDrv(sink, *this, drv);
+    nixcompat::writeDrv(sink, *this, job.drv);
     *request.mutable_drv() = std::move(sink.s);
   }
-
-  auto headers = routingFor(drvPath, drv);
+  auto headers = routingFor(job.drv, job.workerAddr);
   std::optional<BuildResult> res;
-  grpc::Status status;
-  std::shared_ptr<Store> local;
-  for (unsigned attempt = 0;; attempt++) {
+  auto status = tryBuildDerivation(request, headers, res);
+  if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
+    uploadDrvClosure(evalStore, job.drvPath, headers);
     status = tryBuildDerivation(request, headers, res);
-    if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
-      if (evalStore == nullptr) {
-        local = localEvalStore({drvPath});
-        evalStore = local.get();
-      }
-      uploadDrvClosure(*evalStore, drvPath, headers);
-      status = tryBuildDerivation(request, headers, res);
-    }
-    // Salt the hash header so a consistent-hashing balancer picks another worker.
-    if (status.error_code() != grpc::StatusCode::UNAVAILABLE
-        || attempt >= config->unavailableRetries) {
-      break;
-    }
-    printError("%s, retrying elsewhere", firstLine(status.error_message()));
-    std::this_thread::sleep_for(std::chrono::seconds(attempt + 1));
-    headers.front().second = std::string(drvPath.hashPart()) + "-" + std::to_string(attempt + 1);
   }
-  checkStatus(status, "BuildDerivation");
+  switch (status.error_code()) {
+  case grpc::StatusCode::FAILED_PRECONDITION: // not expected there (any more)
+  case grpc::StatusCode::UNAVAILABLE:         // worker draining or gone
+  case grpc::StatusCode::UNKNOWN:             // worker died mid-stream ("Stream removed"),
+  case grpc::StatusCode::INTERNAL:            //   or RST_STREAM via the balancer
+    printError("%s: %s, asking the scheduler again", job.drvPath.to_string(), firstLine(status.error_message()));
+    return std::nullopt;
+  default:
+    checkStatus(status, "BuildDerivation");
+  }
   if (!res) {
     throw Error("gRPC BuildDerivation stream ended without a result");
   }
-  return std::move(*res);
-}
-
-auto GrpcStore::runFarmJob(FarmJob & job, BuildMode buildMode, Store & evalStore) -> BuildResult {
-  using nixcompat::FailureStatus;
-  if (job.failedInput) {
-    return nixcompat::failed(FailureStatus::DependencyFailed,
-                             fmt("dependency '%s' failed", job.failedInput->to_string()));
-  }
-  if (isInterrupted()) {
-    return nixcompat::failed(FailureStatus::MiscFailure, "interrupted");
-  }
-  try {
-    return buildDerivationNative(job.drvPath, job.drv, buildMode, &evalStore);
-  } catch (Interrupted &) {
-    return nixcompat::failed(FailureStatus::MiscFailure, "interrupted");
-  } catch (std::exception & err) {
-    // nix reports only the top-level result, so a failed leaf would just read "dependency failed".
-    printError("%s: %s", job.drvPath.to_string(), err.what());
-    return nixcompat::failed(FailureStatus::MiscFailure, err.what());
-  }
+  return res;
 }
 
 auto GrpcStore::localEvalStore(const StorePathSet & drvPaths) -> std::shared_ptr<Store> {
@@ -220,13 +155,353 @@ auto GrpcStore::localEvalStore(const StorePathSet & drvPaths) -> std::shared_ptr
   if (local.get() == this || !std::ranges::all_of(drvPaths, [&](const StorePath & drv) -> bool {
         return local->isValidPath(drv);
       })) {
-    throw Error("'%s' is a build farm\nhint: pass --eval-store auto", config->authority.to_string());
+    throw Error("'%s' builds from derivations in a local store\nhint: pass --eval-store auto",
+                config->authority.to_string());
   }
   return local;
 }
 
-auto GrpcStore::farmBuildPaths(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
-                    Store * evalStore) -> std::vector<KeyedBuildResult> {
+// Shared between the Schedule reader and the build threads.
+struct GrpcStore::Run {
+  GrpcStore & store;
+  BuildMode mode;
+  Store & evalStore;
+  std::map<StorePath, Job> & jobs;
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::deque<Job *> ready;    // assigned, cached, lost or dep-failed: a thread can finish it
+  std::deque<Job *> wantable; // inputs done, Want not yet sent
+  size_t remaining;
+  bool closed = false; // WritesDone sent
+  grpc::ClientReaderWriter<remote::ClientMsgs, remote::SchedMsgs> * stream = nullptr;
+  std::map<std::string, Job *, std::less<>> byName;
+
+  auto next() -> Job * {
+    std::unique_lock lock(mutex);
+    cv.wait(lock, [&]() -> bool { return !ready.empty() || remaining == 0; });
+    if (ready.empty()) {
+      return nullptr;
+    }
+    auto * job = ready.front();
+    ready.pop_front();
+    return job;
+  }
+
+  void fillWant(remote::Want * want, const Job & job) const {
+    want->set_drv_path(std::string(job.drvPath.to_string()));
+    for (const auto & [name, out] : job.drv.outputs) {
+      if (auto path = out.path(store, job.drv.name, name)) {
+        want->add_out_keys(std::string(path->hashPart()) + ".narinfo");
+      }
+    }
+    for (const auto & input : nixcompat::drvInputs(job.drv)) {
+      want->add_inputs(store.printStorePath(input));
+    }
+    for (const auto & feat : nixcompat::requiredSystemFeatures(store, job.drv)) {
+      want->add_required_features(feat);
+    }
+    want->set_cp_hint_ms(job.cpHintMs);
+    want->set_build_mode(static_cast<uint32_t>(mode));
+    want->set_system(job.drv.platform);
+    debug("grpc: want %s", job.drvPath.to_string());
+  }
+
+  // Under `mutex`. Everything wantable goes out as one stream message; with
+  // no stream it stays wantable until reconnect or give-up.
+  void flushWants() {
+    remote::ClientMsgs batch;
+    std::deque<Job *> keep;
+    for (auto * job : wantable) {
+      if (job->failedInput) {
+        ready.push_back(job);
+      } else if (stream == nullptr) {
+        keep.push_back(job);
+      } else {
+        fillWant(batch.add_msgs()->mutable_want(), *job);
+        keep.push_back(job); // dropped below once the Write succeeded
+      }
+    }
+    wantable.swap(keep);
+    if (batch.msgs_size() > 0) {
+      if (stream->Write(batch)) {
+        wantable.clear();
+      } else {
+        stream = nullptr;
+      }
+    }
+    if (remaining == 0 && stream != nullptr && !closed) {
+      closed = true;
+      stream->WritesDone();
+    }
+    cv.notify_all();
+  }
+
+  // Under `mutex`. Releases dependants: they become wantable (or dep-failed => ready).
+  void finishLocked(Job & job, BuildResult res) {
+    bool const succeeded = nixcompat::succeeded(res);
+    job.result = std::move(res);
+    assert(remaining > 0);
+    remaining--;
+    for (auto * dep : job.dependants) {
+      if (!succeeded && !dep->failedInput) {
+        dep->failedInput = job.drvPath;
+      }
+      assert(dep->waiting > 0);
+      if (--dep->waiting == 0) {
+        wantable.push_back(dep);
+      }
+    }
+    flushWants();
+  }
+
+  // Under `mutex`. Bounced by the worker: hand back to the scheduler.
+  void requeueLocked(Job & job) {
+    job.workerAddr.clear();
+    job.assignId = 0;
+    if (++job.bounced > store.config->rescheduleRetries) {
+      finishLocked(job, nixcompat::failed(nixcompat::FailureStatus::MiscFailure,
+                                          fmt("gave up after %d reschedules", job.bounced)));
+    } else {
+      wantable.push_back(&job);
+      flushWants();
+    }
+  }
+
+  auto resultFor(Job & job) -> std::optional<BuildResult> {
+    using nixcompat::FailureStatus;
+    if (job.failedInput) {
+      return nixcompat::failed(FailureStatus::DependencyFailed,
+                               fmt("dependency '%s' failed", job.failedInput->to_string()));
+    }
+    if (isInterrupted()) {
+      return nixcompat::failed(FailureStatus::MiscFailure, "interrupted");
+    }
+    if (job.lost) {
+      return nixcompat::failed(FailureStatus::MiscFailure, "scheduler connection lost");
+    }
+    if (job.result) { // Cached / Unplaceable
+      return std::exchange(job.result, std::nullopt);
+    }
+    return store.buildAssigned(job, mode, evalStore);
+  }
+
+  // Build thread body.
+  void work() {
+    while (auto * job = next()) {
+      std::optional<BuildResult> res;
+      try {
+        res = resultFor(*job);
+      } catch (Interrupted &) {
+        res = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, "interrupted");
+      } catch (std::exception & err) {
+        // nix reports only the top-level result, so a failed leaf would just read "dependency failed".
+        printError("%s: %s", job->drvPath.to_string(), err.what());
+        res = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, err.what());
+      }
+      std::scoped_lock const lock(mutex);
+      if (res) {
+        finishLocked(*job, std::move(*res));
+      } else {
+        requeueLocked(*job);
+      }
+    }
+  }
+
+  static auto drvOf(const remote::SchedMsg & msg) -> std::string {
+    switch (msg.msg_case()) {
+    case remote::SchedMsg::kAssigned:
+      return msg.assigned().drv_path();
+    case remote::SchedMsg::kCached:
+      return msg.cached().drv_path();
+    case remote::SchedMsg::kUnplaceable:
+      return msg.unplaceable().drv_path();
+    default:
+      return {};
+    }
+  }
+
+  // Input-addressed only (checked in buildPaths), so every output has a path.
+  [[nodiscard]] auto cachedResult(const Job & job) const -> BuildResult {
+    std::map<std::string, StorePath> outs;
+    for (const auto & [outName, out] : job.drv.outputs) {
+      if (auto path = out.path(store, job.drv.name, outName)) {
+        outs.emplace(outName, *path);
+      }
+    }
+    return nixcompat::alreadyValid(job.drvPath, std::move(outs));
+  }
+
+  // A scheduler decision; ignores anything stale or unknown.
+  void onMsgs(const remote::SchedMsgs & msgs) {
+    std::scoped_lock const lock(mutex);
+    for (const auto & msg : msgs.msgs()) {
+      onMsgLocked(msg);
+    }
+    cv.notify_all();
+  }
+
+  void onMsgLocked(const remote::SchedMsg & msg) {
+    auto name = drvOf(msg);
+    auto found = byName.find(name);
+    Job * job = found == byName.end() ? nullptr : found->second;
+    if (job == nullptr || job->result || !job->workerAddr.empty()) {
+      return;
+    }
+    if (msg.has_assigned()) {
+      debug("grpc: assigned %s -> %s", name, msg.assigned().worker_addr());
+      if (msg.assigned().worker_addr().empty()) {
+        return;
+      }
+      job->workerAddr = msg.assigned().worker_addr();
+      job->assignId = msg.assigned().assign_id();
+    } else if (msg.has_cached()) {
+      job->result = cachedResult(*job);
+    } else {
+      // nix reports only the top-level result; say why a leaf failed.
+      printError("%s: %s", job->drvPath.to_string(), msg.unplaceable().reason());
+      job->result = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, msg.unplaceable().reason());
+    }
+    ready.push_back(job);
+  }
+
+  // A fresh stream: everything not yet placed is Wanted again.
+  void attach(grpc::ClientReaderWriter<remote::ClientMsgs, remote::SchedMsgs> * fresh) {
+    std::scoped_lock const lock(mutex);
+    stream = fresh;
+    closed = false;
+    for (auto & [drvPath, job] : jobs) {
+      bool const pending = !job.result && !job.failedInput && !job.lost && job.workerAddr.empty() && job.waiting == 0;
+      if (pending && std::ranges::find(wantable, &job) == wantable.end()
+          && std::ranges::find(ready, &job) == ready.end()) {
+        wantable.push_back(&job);
+      }
+    }
+    flushWants();
+  }
+
+  auto detach() -> size_t {
+    std::scoped_lock const lock(mutex);
+    stream = nullptr;
+    return remaining;
+  }
+
+  // No scheduler any more: jobs a thread already holds finish, the rest fail.
+  void abandon() {
+    std::scoped_lock const lock(mutex);
+    for (auto & [drvPath, job] : jobs) {
+      if (job.result || job.failedInput || job.lost || !job.workerAddr.empty() || job.waiting > 0) {
+        continue;
+      }
+      job.lost = true;
+      std::erase(wantable, &job);
+      if (std::ranges::find(ready, &job) == ready.end()) {
+        ready.push_back(&job);
+      }
+    }
+    flushWants();
+  }
+};
+
+// A dead scheduler (or the balancer in front losing it) shows as UNAVAILABLE,
+// or as UNKNOWN/INTERNAL "Stream removed" when it dies mid-stream. Config
+// errors (auth, TLS, bad request) are not worth reconnecting for.
+namespace {
+auto schedulerGone(const grpc::Status & status) -> bool {
+  switch (status.error_code()) {
+  case grpc::StatusCode::UNAVAILABLE:
+  case grpc::StatusCode::UNKNOWN:
+  case grpc::StatusCode::INTERNAL:
+    return !status.error_message().contains("andshake") && !status.error_message().contains("certificate");
+  default:
+    return false;
+  }
+}
+} // namespace
+
+// The scheduler holds soft state only: on a broken stream reconnect and
+// re-Want everything not yet placed. Jobs already Assigned carry on.
+auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers,
+                                  const std::function<void(grpc::ClientContext *)> & setCtx) -> grpc::Status {
+  grpc::Status status;
+  auto giveUp = std::chrono::steady_clock::time_point::max();
+  auto pause = reconnectPause;
+  for (;;) {
+    grpc::ClientContext ctx;
+    addHeaders(ctx, headers);
+    setCtx(&ctx);
+    auto stream = sched->Schedule(&ctx);
+    run.attach(stream.get());
+    debug("grpc: Schedule stream open, %d jobs", run.jobs.size());
+    remote::SchedMsgs msgs;
+    bool answered = false;
+    while (stream->Read(&msgs)) {
+      answered = true;
+      run.onMsgs(msgs);
+    }
+    status = stream->Finish();
+    setCtx(nullptr);
+    if (run.detach() == 0 || isInterrupted() || !schedulerGone(status)) {
+      return status;
+    }
+    auto const now = std::chrono::steady_clock::now();
+    if (answered || giveUp == std::chrono::steady_clock::time_point::max()) {
+      giveUp = now + restartGrace;
+      pause = reconnectPause;
+    }
+    if (now + pause > giveUp) {
+      return status;
+    }
+    printError("scheduler at %s: %s, reconnecting", config->authority.to_string(), firstLine(status.error_message()));
+    std::this_thread::sleep_for(pause);
+    pause = std::min(pause * 2, maxReconnectPause);
+  }
+}
+
+void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, BuildMode buildMode, Store & evalStore) {
+  if (jobs.empty()) {
+    return;
+  }
+  Run run{.store = *this, .mode = buildMode, .evalStore = evalStore, .jobs = jobs, .remaining = jobs.size()};
+  for (auto & [drvPath, job] : jobs) {
+    run.byName.emplace(std::string(drvPath.to_string()), &job);
+    if (job.waiting == 0) {
+      run.wantable.push_back(&job);
+    }
+  }
+  auto headers = routingFor(jobs.begin()->second.drv);
+  std::mutex ctxMutex; // not run.mutex: the interrupt callback must not wait on stream I/O
+  grpc::ClientContext * liveCtx = nullptr;
+  auto setCtx = [&](grpc::ClientContext * ctx) -> void {
+    std::scoped_lock const lock(ctxMutex);
+    liveCtx = ctx;
+  };
+  auto const onInterrupt = createInterruptCallback([&]() -> void {
+    std::scoped_lock const lock(ctxMutex);
+    if (liveCtx != nullptr) {
+      liveCtx->TryCancel();
+    }
+  });
+
+  std::vector<std::jthread> threads(std::min<size_t>(config->maxBuilds, jobs.size()));
+  for (auto & thread : threads) {
+    thread = std::jthread([&run]() -> void { run.work(); });
+  }
+  // Also on unwind: lets the threads drain so the join in ~jthread returns.
+  Finally const abandon([&run]() -> void { run.abandon(); });
+
+  auto status = scheduleUntilDone(run, headers, setCtx);
+  run.abandon();
+  threads.clear(); // join
+  checkInterrupt();
+  if (!status.ok() && status.error_code() != grpc::StatusCode::CANCELLED && run.remaining > 0) {
+    throw statusError(status, "Schedule");
+  }
+}
+
+auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
+                   const std::shared_ptr<Store> & evalStoreIn) -> std::vector<KeyedBuildResult> {
+  Store * evalStore = evalStoreIn.get();
   std::shared_ptr<Store> local;
   if (evalStore == nullptr || evalStore == this) {
     StorePathSet drvs;
@@ -235,30 +510,25 @@ auto GrpcStore::farmBuildPaths(const std::vector<DerivedPath> & reqs, BuildMode 
         drvs.insert(built->drvPath->getBaseStorePath());
       }
     }
-    local = localEvalStore(drvs);
-    evalStore = local.get();
+    if (!drvs.empty()) {
+      local = localEvalStore(drvs);
+      evalStore = local.get();
+    }
   }
-  std::map<StorePath, FarmJob> jobs;
-  loadFarmJobs(reqs, *evalStore, jobs);
+  std::map<StorePath, Job> jobs;
+  if (evalStore != nullptr) {
+    loadJobs(reqs, *evalStore, jobs);
+    runJobs(jobs, buildMode, *evalStore);
+  }
 
-  FarmRun run{.remaining = jobs.size()};
-  for (auto & [drvPath, job] : jobs) {
-    if (job.waiting == 0) {
-      run.ready.push_back(&job);
+  // Opaque paths: "building" them means making them valid, i.e. substituting.
+  StorePathSet opaque;
+  for (const auto & req : reqs) {
+    if (const auto * opq = std::get_if<DerivedPath::Opaque>(&req.raw())) {
+      opaque.insert(opq->path);
     }
   }
-  auto worker = [&]() -> void {
-    while (auto * job = run.next()) {
-      run.finish(*job, runFarmJob(*job, buildMode, *evalStore));
-    }
-  };
-  {
-    std::vector<std::jthread> threads(std::min<size_t>(config->maxBuilds, jobs.size()));
-    for (auto & thread : threads) {
-      thread = std::jthread(worker);
-    }
-  }
-  checkInterrupt();
+  auto validOpaque = opaque.empty() ? StorePathSet{} : queryValidPaths(opaque, Substitute);
 
   std::vector<KeyedBuildResult> results;
   results.reserve(reqs.size());
@@ -267,14 +537,35 @@ auto GrpcStore::farmBuildPaths(const std::vector<DerivedPath> & reqs, BuildMode 
     if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
       auto & job = jobs.at(built->drvPath->getBaseStorePath());
       if (job.result) {
-        static_cast<BuildResult &>(res) = std::move(*job.result);
+        static_cast<BuildResult &>(res) = *job.result;
       }
-    } else {
+    } else if (validOpaque.contains(std::get<DerivedPath::Opaque>(req.raw()).path)) {
       nixcompat::setAlreadyValid(res);
+    } else {
+      static_cast<BuildResult &>(res) = nixcompat::failed(
+          nixcompat::FailureStatus::MiscFailure,
+          fmt("path '%s' does not exist and cannot be substituted", req.to_string(*this)));
     }
     results.push_back(std::move(res));
   }
   return results;
+}
+
+auto GrpcStore::buildOne(const StorePath & drvPath, const BasicDerivation & drv, BuildMode buildMode,
+              Store * evalStore) -> BuildResult {
+  std::shared_ptr<Store> local;
+  if (evalStore == nullptr || evalStore == this) {
+    local = localEvalStore({drvPath});
+    evalStore = local.get();
+  }
+  std::map<StorePath, Job> jobs;
+  jobs.emplace(drvPath, Job{.drvPath = drvPath, .drv = drv});
+  runJobs(jobs, buildMode, *evalStore);
+  auto & job = jobs.begin()->second;
+  if (!job.result) {
+    throw Error("'%s' was not built", printStorePath(drvPath));
+  }
+  return std::move(*job.result);
 }
 
 auto GrpcStore::basicForFarm(Store & evalStore, const StorePath & drvPath, const Derivation & full)
@@ -290,25 +581,27 @@ auto GrpcStore::basicForFarm(Store & evalStore, const StorePath & drvPath, const
   if (!basic || std::ranges::any_of(basic->outputs, [&](const auto & out) -> bool {
         return !out.second.path(*this, basic->name, out.first);
       })) {
-    throw Error("'%s': the build farm needs statically known input and output paths "
+    throw Error("'%s': needs statically known input and output paths "
                 "(no floating content-addressed or dynamic derivations)",
                 printStorePath(drvPath));
   }
   return std::move(*basic);
 }
 
-void GrpcStore::loadFarmJobs(const std::vector<DerivedPath> & reqs, Store & evalStore,
-                  std::map<StorePath, FarmJob> & jobs) {
-  std::function<FarmJob &(const StorePath &)> load = [&](const StorePath & drvPath) -> FarmJob & {
+void GrpcStore::loadJobs(const std::vector<DerivedPath> & reqs, Store & evalStore,
+                  std::map<StorePath, Job> & jobs) {
+  std::function<Job &(const StorePath &)> load = [&](const StorePath & drvPath) -> Job & {
     if (auto found = jobs.find(drvPath); found != jobs.end()) {
       return found->second;
     }
     auto full = evalStore.readDerivation(drvPath);
-    auto & job = jobs.emplace(drvPath, FarmJob{.drvPath = drvPath,
-                                               .drv = basicForFarm(evalStore, drvPath, full)})
+    auto & job = jobs.emplace(drvPath, Job{.drvPath = drvPath,
+                                           .drv = basicForFarm(evalStore, drvPath, full)})
                      .first->second;
     nixcompat::forInputDrvs(full, [&](const StorePath & input) -> void {
-      load(input).dependants.push_back(&job);
+      auto & dep = load(input);
+      dep.dependants.push_back(&job);
+      job.inputs.push_back(&dep);
       job.waiting++;
     });
     return job;
@@ -318,54 +611,24 @@ void GrpcStore::loadFarmJobs(const std::vector<DerivedPath> & reqs, Store & eval
       if (const auto * opaque = std::get_if<SingleDerivedPath::Opaque>(&built->drvPath->raw())) {
         load(opaque->path);
       } else {
-        throw Error("'%s': dynamic derivations are not supported by the build farm", req.to_string(*this));
+        throw Error("'%s': dynamic derivations are not supported", req.to_string(*this));
       }
     }
   }
-}
-
-auto GrpcStore::buildPathsWithResultsNative(
-    const std::vector<DerivedPath> & reqs, BuildMode buildMode)
-    -> std::optional<std::vector<KeyedBuildResult>> {
-  remote::BuildPathsRequest request;
-  for (const auto & req : reqs) {
-    request.add_targets(req.to_string(*this));
-  }
-  request.set_build_mode(static_cast<uint32_t>(buildMode));
-  request.set_protocol(nixcompat::kBuildProtocolWire);
-
-  grpc::ClientContext ctx;
-  auto reader = stub->BuildPaths(&ctx, request);
-
-  std::optional<std::vector<KeyedBuildResult>> results;
-  BuildLogActivity act(fmt("building %d paths on %s", reqs.size(), config->authority.to_string()), {});
-  auto status = readBuildStream(*reader, act, [&](const remote::BuildPathsDone & done) -> void {
-    StringSource source(done.results());
-    results = WorkerProto::Serialise<std::vector<KeyedBuildResult>>::read(
-        *this, WorkerProto::ReadConn{.from = source, .version = nixcompat::buildProtocolVersion()});
-  });
-  if (status.error_code() == grpc::StatusCode::UNIMPLEMENTED) {
-    return std::nullopt;
-  }
-  checkStatus(status, "BuildPaths");
-  if (!results) {
-    throw Error("gRPC BuildPaths stream ended without a result");
-  }
-  return results;
-}
-
-void GrpcStore::importDrvsFromEvalStore(const std::vector<DerivedPath> & paths,
-                           const std::shared_ptr<Store> & evalStore) {
-  if (evalStore && evalStore.get() != this) {
-    StorePathSet drvPaths;
-    for (const auto & req : paths) {
-      if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
-        drvPaths.insert(built->drvPath->getBaseStorePath());
-      }
+  // cp_hint: longest chain of dependants above each job, 1 s per drv.
+  constexpr uint64_t perDrvMs = 1000;
+  std::function<uint64_t(Job &)> height = [&](Job & job) -> uint64_t {
+    if (job.cpHintMs != 0) {
+      return job.cpHintMs;
     }
-    if (!drvPaths.empty()) {
-      copyClosure(*evalStore, *this, drvPaths);
+    uint64_t above = 0;
+    for (auto * dep : job.dependants) {
+      above = std::max(above, height(*dep));
     }
+    return job.cpHintMs = above + perDrvMs;
+  };
+  for (auto & [path, job] : jobs) {
+    height(job);
   }
 }
 

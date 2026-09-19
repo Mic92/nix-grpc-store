@@ -21,6 +21,7 @@
 
 #include <nix/store/build-result.hh>
 #include <nix/store/derivations.hh>
+#include <nix/store/globals.hh>
 #include <nix/store/realisation.hh>
 #include <nix/store/store-api.hh>
 #include <nix/store/worker-protocol.hh>
@@ -380,6 +381,19 @@ public:
   void finish() {}
 };
 #endif
+
+
+// 2.36 moved max-jobs and friends into a WorkerSettings base.
+inline auto maxBuildJobs() -> unsigned {
+  constexpr auto has = []<typename S>(S &settings) -> unsigned {
+    if constexpr (requires { settings.getWorkerSettings(); }) {
+      return settings.getWorkerSettings().maxBuildJobs;
+    } else {
+      return settings.maxBuildJobs;
+    }
+  };
+  return has(nix::settings);
+}
 
 } // namespace nixcompat
 // NOLINTEND(cppcoreguidelines-macro-usage)

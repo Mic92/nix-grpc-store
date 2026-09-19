@@ -85,7 +85,7 @@ inline void logLine(LogLevel level, std::initializer_list<LogField> fields)
 // TLS client identity (x509 CN), or nullopt when the client did not present
 // a certificate. Kept optional rather than a "-" sentinel so a certificate
 // whose CN is literally "-" (or absent, SAN-only) cannot pose as anonymous.
-inline auto clientCommonName(const grpc::ServerContext & context) -> std::optional<std::string>
+inline auto clientCommonName(const grpc::ServerContextBase & context) -> std::optional<std::string>
 {
     auto auth = context.auth_context();
     if (!auth || auth->FindPropertyValues(GRPC_X509_PEM_CERT_PROPERTY_NAME).empty()) {

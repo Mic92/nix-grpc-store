@@ -156,7 +156,6 @@ spec:
             {{- with $root.Values.niks3.pushFlags }}
             - --niks3-push=niks3 push {{ join " " . }}
             {{- end }}
-            - --max-jobs={{ $w.maxJobs }}
             - --min-free={{ $w.minFree }}
             {{- if $root.Values.tls.worker.existingSecret }}
             - --tls-cert=/secrets/tls/tls.crt

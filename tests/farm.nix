@@ -1,6 +1,6 @@
-# Farm end to end: niks3 + S3, two farm workers behind envoy (MAGLEV on
-# x-nix-drv, gRPC health, TLS with client certs or bearer tokens, mTLS to
-# workers), a CI client using the build hook and an OIDC developer.
+# Multi-node end to end: niks3 + S3, two builder nodes (worker1 also the
+# scheduler) behind envoy, a CI client using the build hook and an OIDC
+# developer.
 {
   pkgs,
   nixPkgs,
@@ -10,11 +10,21 @@
 }:
 
 let
+  inherit (pkgs) lib;
+  system = pkgs.stdenv.hostPlatform.system;
   apiToken = "farm-token-that-is-at-least-36-characters-long";
   tokenFile = pkgs.writeText "niks3-token" apiToken;
   signingPublicKey = "farm-test-1:RkClDwvfixdOwourBI4UD9hudE3xfU5EBQcMFUVuRV8=";
   niks3Url = "http://lb:5751";
-  niks3Pkgs = niks3.packages.${pkgs.stdenv.hostPlatform.system};
+  niks3Pkgs = niks3.packages.${system};
+
+  # nixos test framework: nodes get 192.168.1.<n> in attribute-name order.
+  ip = {
+    client = "192.168.1.1";
+    lb = "192.168.1.2";
+    worker1 = "192.168.1.3";
+    worker2 = "192.168.1.4";
+  };
 
   certs = pkgs.runCommand "farm-certs" { nativeBuildInputs = [ pkgs.openssl ]; } ''
     mkdir $out && cd $out
@@ -22,23 +32,21 @@ let
     issue() {
       openssl req -newkey rsa:2048 -nodes -keyout $1.key -out $1.csr -subj /CN=$2
       openssl x509 -req -in $1.csr -days 3650 -CA ca.pem -CAkey ca.key -set_serial 0x$(openssl rand -hex 8) \
-        -extfile <(printf "subjectAltName=DNS:$3") -out $1.pem
+        -extfile <(printf "subjectAltName=$3\nextendedKeyUsage=serverAuth,clientAuth") -out $1.pem
     }
-    issue lb lb lb
-    issue lb-client lb-1 lb
-    issue worker worker "worker1,DNS:worker2,DNS:lb"
-    issue ci ci-1 client
-    issue stranger stranger client
+    issue lb lb "DNS:lb"
+    issue lb-client lb-1 "DNS:lb"
+    issue worker worker-1 "DNS:worker1,DNS:worker2,DNS:lb,IP:${ip.worker1},IP:${ip.worker2}"
+    issue ci ci-1 "DNS:client"
+    issue stranger stranger "DNS:client"
     openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout foreign.key -out foreign.pem -subj /CN=foreign
   '';
 
-  # mock-oidc puts its listen address in the issuer.
-  lbAddr = "192.168.1.2";
   oidcAudience = "grpc://lb:50051";
   oidcConfig = {
     allow_insecure = true;
     providers.mock = {
-      issuer = "http://${lbAddr}:8080/oidc";
+      issuer = "http://${ip.lb}:8080/oidc";
       audience = oidcAudience;
       rules = [
         {
@@ -56,7 +64,8 @@ let
   };
 
   worker =
-    { config, lib, ... }:
+    name:
+    { config, ... }:
     {
       imports = [
         common
@@ -65,9 +74,13 @@ let
       services.nix-grpc-daemon = {
         enable = true;
         listen = "[::]:50051";
+        advertise = "${ip.${name}}:50051";
+        # WorkerSession goes through the balancer like a client would.
+        scheduler = "lb:50051";
         logLevel = "debug";
         idleTimeout = null;
         package = config.programs.nix-grpc-store.package;
+        metricsListen = "127.0.0.1:9464";
         tls = {
           certFile = "${certs}/worker.pem";
           keyFile = "${certs}/worker.key";
@@ -79,23 +92,26 @@ let
             cn = "ci-*";
             role = "trusted";
           }
+          {
+            # other nodes' WorkerSession, forwarded by the balancer
+            cn = "worker-*";
+            role = "trusted";
+          }
         ];
         oidc = oidcConfig;
-        farm = {
-          enable = true;
-          niks3Package = niks3Pkgs.niks3;
-          inherit niks3Url;
+        minFree = "200M";
+        niks3 = {
+          package = niks3Pkgs.niks3;
+          url = niks3Url;
           tokenFile = toString tokenFile;
           cacheUrl = niks3Url;
           publicKeys = [ signingPublicKey ];
-          minFree = "200M";
         };
       };
       programs.nix-grpc-store.enable = true;
       networking.firewall.allowedTCPPorts = [ 50051 ];
     };
 
-  # Distinct name per run so the cache never already has it.
   jobExpr = pkgs.writeText "job.nix" ''
     { tag, features ? [ ] }:
     let
@@ -141,7 +157,7 @@ let
       system = builtins.currentSystem;
       builder = "/bin/sh";
       # Inner sh so a test can pkill it to let the build succeed early.
-      args = [ "-c" "/bin/sh -c 'read -t 60 x < /dev/zero'; echo > $out" ];
+      args = [ "-c" "/bin/sh -c 'read -t 90 x < /dev/zero'; echo ''${tag} > $out" ];
     }
   '';
 in
@@ -151,13 +167,13 @@ pkgs.testers.runNixOSTest {
 
   nodes = {
     worker1 = {
-      imports = [ worker ];
+      imports = [ (worker "worker1") ];
       nix.settings.system-features = [ "vip" ];
       services.nix-grpc-daemon.workerName = "node-a";
-      services.nix-grpc-daemon.metricsListen = "127.0.0.1:9464";
     };
     worker2 = {
-      imports = [ worker ];
+      imports = [ (worker "worker2") ];
+      services.nix-grpc-daemon.roles = [ "builder" ];
       nix.settings.system-features = [ ];
       specialisation.next.configuration.services.nix-grpc-daemon.workerName = "worker2-next";
     };
@@ -165,12 +181,6 @@ pkgs.testers.runNixOSTest {
     lb =
       { config, ... }:
       {
-        assertions = [
-          {
-            assertion = config.networking.primaryIPAddress == lbAddr;
-            message = "lbAddr";
-          }
-        ];
         imports = [
           common
           module
@@ -182,11 +192,10 @@ pkgs.testers.runNixOSTest {
         services.nix-grpc-farm-lb = {
           accessLog = true;
           enable = true;
-          workers.${pkgs.stdenv.hostPlatform.system} = [
-            "worker1:50051"
-            "worker2:50051"
+          workers.${system} = [
+            "${ip.worker1}:50051"
+            "${ip.worker2}:50051"
           ];
-          features.${pkgs.stdenv.hostPlatform.system}.vip = [ "worker1:50051" ];
           healthCheckInterval = "1s";
           tls = {
             certFile = "${certs}/lb.pem";
@@ -204,7 +213,7 @@ pkgs.testers.runNixOSTest {
           after = [ "network-online.target" ];
           wants = [ "network-online.target" ];
           serviceConfig.Restart = "on-failure";
-          serviceConfig.ExecStart = "${pkgs.lib.getExe mockOidc} -addr ${lbAddr}:8080 -issue-addr 0.0.0.0:8081";
+          serviceConfig.ExecStart = "${lib.getExe mockOidc} -addr ${ip.lb}:8080 -issue-addr 0.0.0.0:8081";
         };
         networking.firewall.allowedTCPPorts = [
           8080
@@ -225,7 +234,7 @@ pkgs.testers.runNixOSTest {
           module
         ];
         programs.nix-grpc-store.enable = true;
-        nix.settings.substituters = pkgs.lib.mkForce [ ];
+        nix.settings.substituters = lib.mkForce [ ];
         # build-remote runs inside nix-daemon.service; prove the hook still
         # reaches the balancer with daemon egress filtering on.
         networking.nftables.enable = true;
@@ -238,48 +247,63 @@ pkgs.testers.runNixOSTest {
     import re
 
     start_all()
+    for n, a in [(client, "${ip.client}"), (lb, "${ip.lb}"), (worker1, "${ip.worker1}"), (worker2, "${ip.worker2}")]:
+        n.wait_for_unit("network-addresses-eth1.service")
+        n.succeed(f"ip -4 addr show | grep -qF {a}/ || {{ ip -4 addr >&2; false; }}")
     lb.wait_for_unit("niks3.service")
     lb.wait_for_open_port(5751)
-    for w in [worker1, worker2]:
-        w.wait_for_unit("nix-grpc-daemon.socket")
     lb.wait_for_unit("envoy.service")
     lb.wait_for_open_port(50051)
-    # Envoy only routes to endpoints that passed a gRPC health check.
-    probe_tls = "-tls -tls-ca-cert ${certs}/ca.pem -tls-client-cert ${certs}/lb-client.pem -tls-client-key ${certs}/lb-client.key"
-    for w in ["worker1", "worker2"]:
-        lb.wait_until_succeeds(f"grpc-health-probe -addr {w}:50051 {probe_tls} -tls-server-name {w}", timeout=180)
-    def unhealthy() -> set[str]:
-        # cluster::[addr]:port::hostname::NAME / cluster::[addr]:port::health_flags::FLAGS
-        name, down = {}, set()
-        for l in lb.succeed("curl -sf localhost:9901/clusters").splitlines():
-            if m := re.match(r"(.*)::hostname::(.*)", l):
-                name[m[1]] = m[2]
-            elif (m := re.match(r"(.*)::health_flags::(.*)", l)) and "failed_active_hc" in m[2]:
+    for w in [worker1, worker2]:
+        w.systemctl("start nix-grpc-daemon.service")
+
+    def cluster_lines() -> list[str]:
+        return lb.succeed("curl -sf localhost:9901/clusters").splitlines()
+
+    def unhealthy(cluster: str) -> set[str]:
+        down = set()
+        for l in cluster_lines():
+            if (m := re.match(rf"{re.escape(cluster)}::([0-9.]+):[0-9]+::health_flags::(.*)", l)) and "failed_active_hc" in m[2]:
                 down.add(m[1])
-        return {name[k] for k in down}
+        return down
 
-    def wait_unhealthy(*names: str) -> None:
-        want = set(names)
-        with lb.nested(f"waiting until exactly {sorted(want) or 'no'} workers are unhealthy"):
+    names = {"${ip.worker1}": "worker1", "${ip.worker2}": "worker2"}
+
+    def wait_health(cluster: str, *down: str) -> None:
+        want = set(down)
+        with lb.nested(f"waiting until exactly {sorted(want) or 'no'} endpoints of {cluster} are unhealthy"):
             def check(last: bool) -> bool:
-                got = unhealthy()
+                got = {names[a] for a in unhealthy(cluster)}
                 if last and got != want:
-                    raise AssertionError(f"unhealthy={sorted(got)} want={sorted(want)} \n" + lb.succeed("curl -sf localhost:9901/clusters | grep -E 'hostname|health_flags'"))
+                    raise AssertionError(f"unhealthy={sorted(got)} want={sorted(want)}\n" + "\n".join(l for l in cluster_lines() if "health_flags" in l))
                 return got == want
-            retry(check, timeout_seconds=60)
+            retry(check, timeout_seconds=90)
 
-    wait_unhealthy()
+    wait_health("${system}")
+    wait_health("sched")
+
+    def gauge(w, name: str) -> int:
+        out = w.succeed(f"curl -sf http://127.0.0.1:9464/metrics | grep -F '{name} ' || true").strip()
+        return int(float(out.split()[-1])) if out else 0
+    def sched_workers(w) -> int:
+        return gauge(w, 'nix_grpc_sched{kind="workers"}')
+    def events(w, kind: str) -> int:
+        return gauge(w, f'nix_grpc_events_total{{kind="{kind}"}}')
+
+    with subtest("both builders hold a WorkerSession on the scheduler"):
+        retry(lambda _: sched_workers(worker1) == 2, timeout_seconds=60)
 
     tls = "ca-cert=${certs}/ca.pem"
     ci = f"{tls}&client-cert=${certs}/ci.pem&client-key=${certs}/ci.key"
     envoy = f"grpc://lb:50051?{ci}"
+    hook = f"--max-jobs 0 --builders '{envoy}&system=${system} ${system} - 4'"
 
-    def build(store: str, tag: str) -> str:
-        client.succeed(f"nix build -L --store '{store}' --eval-store auto -f ${jobExpr} --argstr tag {tag} >&2")
-        return client.succeed(f"nix eval --raw -f ${jobExpr} --argstr tag {tag} outPath").strip()
+    def build(store: str, tag: str, extra: str = "") -> str:
+        client.succeed(f"nix build -L --store '{store}' --eval-store auto -f ${jobExpr} --argstr tag {tag} {extra} >&2")
+        return client.succeed(f"nix eval --raw -f ${jobExpr} --argstr tag {tag} {extra} outPath").strip()
 
-    def holders(path: str) -> int:
-        return sum(w.execute(f"test -e {path}")[0] == 0 for w in [worker1, worker2])
+    def holders(path: str) -> list[str]:
+        return [w.name for w in [worker1, worker2] if w.execute(f"test -e {path}")[0] == 0]
 
     def probe(query: str) -> str:
         rc, out = client.execute(f"nix path-info --store 'grpc://lb:50051?{tls}{query}' $(readlink -f /run/current-system) 2>&1")
@@ -289,7 +313,6 @@ pkgs.testers.runNixOSTest {
         out = probe("&client-cert=${certs}/ci.pem&client-key=${certs}/ci.key")
         assert out == "ok", out
         client.succeed("curl -sfG http://lb:8081/issue --data-urlencode 'aud=${oidcAudience}' --data-urlencode sub=dev:alice > /root/dev.jwt && test -s /root/dev.jwt")
-        # nix-daemon connects, so the default cert it would pick up lives in /var/lib.
         client.succeed("install -D ${certs}/foreign.pem /var/lib/nix-grpc-store/client.crt && install -D ${certs}/foreign.key /var/lib/nix-grpc-store/client.key")
         out = probe("&token-file=/root/dev.jwt")
         client.succeed("rm -r /var/lib/nix-grpc-store")
@@ -299,30 +322,44 @@ pkgs.testers.runNixOSTest {
         out = probe("&client-cert=${certs}/stranger.pem&client-key=${certs}/stranger.key")
         assert "no access rule matches 'stranger'" in out, out
 
-    with subtest("without --eval-store the farm refuses and hints"):
-        out = client.fail(f"nix build --store '{envoy}' -f ${jobExpr} --argstr tag t0 2>&1")
-        assert "--eval-store" in out, out
-
-    with subtest("fan-out build lands in the cache"):
+    with subtest("DAG build is scheduled across workers and lands in the cache"):
         top = build(envoy, "t1")
-        assert holders(top) == 1, "exactly one worker built it"
-        # The client store has nothing. The cache does.
+        assert len(holders(top)) == 1, holders(top)
         client.fail(f"test -e {top}")
         client.succeed(f"nix copy --from ${niks3Url} --no-check-sigs {top} && grep farm-top-t1 {top}")
 
-    with subtest("repeat is answered from the claim without building"):
+    with subtest("repeat is answered Cached by the scheduler without building"):
         for w in [worker1, worker2]:
             w.succeed(f"nix-store --delete {top}")
         build(envoy, "t1")
-        assert holders(top) == 0, "no worker rebuilt it"
+        assert holders(top) == [], holders(top)
+        worker1.succeed("curl -sf http://127.0.0.1:9464/metrics | grep -q 'nix_grpc_events_total{kind=\"cached\"}'")
+
+    builder = "pgrep -f 'read -t [9]0 x'"
+    def building() -> list[str]:
+        return [w.name for w in [worker1, worker2] if w.execute(builder)[0] == 0]
+    def release_slow() -> None:
+        for w in [worker1, worker2]:
+            w.execute("pkill -f 'read -t [9]0 x'")
+
+    with subtest("two clients wanting the same drv build it once"):
+        client.succeed(f"systemd-run --unit dedup1 nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag dedup")
+        client.succeed(f"sleep 1; systemd-run --unit dedup2 nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag dedup")
+        retry(lambda _: building() != [], timeout_seconds=60)
+        client.succeed("sleep 2")
+        release_slow()
+        client.wait_until_succeeds("! systemctl is-active dedup1 dedup2", timeout=60)
+        client.succeed("systemctl show -p Result dedup1 dedup2 | grep -c success | grep -qx 2 || { journalctl -u dedup1 -u dedup2 >&2; false; }")
+        # Both RPCs on one worker under one assign_id: the second attached.
+        ids = [w.succeed("journalctl -u nix-grpc-daemon -o cat | grep 'method=BuildDerivation.*slow-dedup' | grep -o 'assign_id=[0-9]*' || true").split() for w in [worker1, worker2]]
+        idle, busy = sorted(ids, key=len)
+        assert idle == [] and len(busy) == 2 and len(set(busy)) == 1, ids
+        assert sum(events(w, "attached") for w in [worker1, worker2]) == 1
 
     with subtest("build hook: nix-daemon with builders = grpc://lb"):
-        # NIX_REMOTE=daemon so build-remote is spawned by nix-daemon.service (egress-filtered), not by root's nix.
-        out = client.succeed(f"NIX_REMOTE=daemon nix build --log-format internal-json --max-jobs 0 --builders '{envoy}&system=${pkgs.stdenv.hostPlatform.system} ${pkgs.stdenv.hostPlatform.system} - 4' --print-out-paths --no-link -f ${jobExpr} --argstr tag hook 2>/tmp/hook.log").strip()
+        out = client.succeed(f"NIX_REMOTE=daemon nix build --log-format internal-json {hook} --print-out-paths --no-link -f ${jobExpr} --argstr tag hook 2>/tmp/hook.log").strip()
         client.succeed(f"grep farm-top-hook {out}")
-        # Worker build output and stdenv phases must reach nix through build-remote as activity results.
         client.succeed("grep -F 'LOG-farm-top-hook' /tmp/hook.log | grep -qF '\"type\":101' && grep -F 'farmPhase' /tmp/hook.log | grep -qF '\"type\":104' || { cat /tmp/hook.log >&2; false; }")
-        # The hook's actBuild must name the drv exactly like nix's own so log UIs key them together.
         client.succeed("grep -F '\"type\":105' /tmp/hook.log | grep -F lb:50051 | grep -qF '\"fields\":[\"/nix/store/' || { grep -F '\"type\":105' /tmp/hook.log >&2; false; }")
 
     with subtest("an input only one worker has still reaches the builder"):
@@ -330,8 +367,8 @@ pkgs.testers.runNixOSTest {
         client.succeed(f"nix-store --export {inp} > /tmp/shared/inp.closure")
         worker1.succeed("nix-store --import < /tmp/shared/inp.closure")
         worker2.fail(f"test -e {inp}")
-        for salt in ["a", "b"]:
-            client.succeed(f"NIX_REMOTE=daemon nix build -L --max-jobs 0 --builders '{envoy}&system=${pkgs.stdenv.hostPlatform.system} ${pkgs.stdenv.hostPlatform.system} - 4' --no-link -f ${depExpr} job --argstr tag w1only --argstr salt {salt} >&2")
+        for salt in ["a", "b", "c"]:
+            client.succeed(f"NIX_REMOTE=daemon nix build -L {hook} --no-link -f ${depExpr} job --argstr tag w1only --argstr salt {salt} >&2")
 
     with subtest("upload whose reference the worker lacks is completed from the cache"):
         ref = client.succeed("nix-build --no-out-link ${depExpr} -A input --argstr tag viacache").strip()
@@ -339,109 +376,79 @@ pkgs.testers.runNixOSTest {
         client.succeed(f"nix-store --export {ref} > /tmp/shared/ref.closure")
         worker1.succeed("nix-store --import < /tmp/shared/ref.closure")
         worker2.systemctl("stop nix-grpc-daemon.socket nix-grpc-daemon.service")
-        wait_unhealthy("worker2")
+        wait_health("${system}", "worker2")
         client.succeed(f"nix path-info --store '{envoy}' {ref} >&2")  # worker1 publishes ref
         worker2.fail(f"test -e {ref}")
         worker2.systemctl("start nix-grpc-daemon.socket")
         worker1.systemctl("stop nix-grpc-daemon.socket nix-grpc-daemon.service")
-        wait_unhealthy("worker1")
+        wait_health("${system}", "worker1")
         client.succeed(f"nix copy --no-check-sigs --to '{envoy}' {referrer} >&2")
         worker2.succeed(f"test -e {ref} && test -e {referrer}")
-        worker1.systemctl("start nix-grpc-daemon.socket")
-        wait_unhealthy()
+        worker1.systemctl("start nix-grpc-daemon.service")
+        wait_health("${system}")
 
-    with subtest("a drv uploaded to one worker is valid on and built by another via the cache"):
-        drv = client.succeed("nix-instantiate ${jobExpr} --argstr tag drvcache 2>/dev/null").strip()
+    with subtest("scheduler down: builds wait, then resume when it is back"):
         worker1.systemctl("stop nix-grpc-daemon.socket nix-grpc-daemon.service")
-        wait_unhealthy("worker1")
-        client.succeed(f"nix copy --no-check-sigs --to '{envoy}' {drv} >&2")
-        worker1.systemctl("start nix-grpc-daemon.socket")
-        wait_unhealthy()
-        worker2.systemctl("stop nix-grpc-daemon.socket nix-grpc-daemon.service")
-        wait_unhealthy("worker2")
-        worker1.fail(f"test -e {drv}")
-        # The farm answers as one store: worker1 reports the cached drv valid, so this copies nothing.
-        client.succeed(f"nix copy --no-check-sigs --to '{envoy}' {drv} >&2")
-        worker1.fail(f"test -e {drv}")
-        client.succeed(f"NIX_REMOTE=daemon nix build -L --max-jobs 0 --builders '{envoy}&system=${pkgs.stdenv.hostPlatform.system} ${pkgs.stdenv.hostPlatform.system} - 4' --no-link -f ${jobExpr} --argstr tag drvcache >&2")
-        uploads = worker1.succeed("journalctl -u nix-grpc-daemon -o cat _SYSTEMD_INVOCATION_ID=$(systemctl show -p InvocationID --value nix-grpc-daemon) | grep -c method=AddMultipleToStore || true").strip()
-        assert uploads == "0", f"worker1 took {uploads} uploads instead of substituting the drv closure from the cache"
-        worker2.systemctl("start nix-grpc-daemon.socket")
-        wait_unhealthy()
+        wait_health("sched", "worker1")
+        client.succeed(f"systemd-run --unit waits nix build --store '{envoy}' --eval-store auto -f ${jobExpr} --argstr tag schedback")
+        client.sleep(3)
+        client.succeed("systemctl is-active waits")
+        worker1.systemctl("start nix-grpc-daemon.service")
+        wait_health("sched")
+        client.wait_until_succeeds("! systemctl is-active waits", timeout=120)
+        client.succeed("systemctl show -p Result --value waits | grep -qx success || { journalctl -u waits >&2; false; }")
+        retry(lambda _: sched_workers(worker1) == 2, timeout_seconds=60)
 
-    with subtest("restarting workers mid-upload does not fail the client"):
-        client.succeed("{ echo big; head -c 40M /dev/urandom; } > /tmp/big && nix-store --add /tmp/big > /tmp/big.path")
-        big = client.succeed("cat /tmp/big.path").strip()
-        client.succeed(f"systemd-run --unit up -E NIX_REMOTE=daemon nix build -L --max-jobs 0 --builders '{envoy}&system=${pkgs.stdenv.hostPlatform.system} ${pkgs.stdenv.hostPlatform.system} - 4' --no-link -f ${depExpr} job --argstr tag big --argstr inputPath {big}")
-        client.wait_until_succeeds("journalctl -u up -o cat | grep -q 'copying path.*-big'", timeout=60)
-        for w in [worker1, worker2]:
-            w.succeed("systemctl restart nix-grpc-daemon.service")
-        client.wait_until_succeeds("systemctl show -p ActiveState --value up | grep -qx inactive", timeout=60)
-        client.succeed("systemctl show -p Result --value up | grep -qx success")
+    with subtest("scheduler restart mid-build: build finishes, no double build"):
+        client.succeed(f"systemd-run --unit mid nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag mid")
+        retry(lambda _: building() != [], timeout_seconds=60)
+        who = building()
+        assert len(who) == 1, who
+        # Scheduler state is lost. If the build ran on worker1 it dies with the
+        # daemon; either way no second copy may start while one is alive.
+        worker1.succeed("systemctl kill -s KILL nix-grpc-daemon.service; systemctl start nix-grpc-daemon.service")
+        client.sleep(5)
+        assert len(building()) <= 1, building()
+        release_slow()
+        client.wait_until_succeeds("! systemctl is-active mid", timeout=120)
+        client.succeed("systemctl show -p Result --value mid | grep -qx success || { journalctl -u mid >&2; false; }")
 
     with subtest("interrupting the client stops the build on the worker"):
-        # [6] keeps the probe from matching its own command line.
-        builder = "pgrep -f 'read -t [6]0 x'"
-
-        def building() -> bool:
-            return any(w.execute(builder)[0] == 0 for w in [worker1, worker2])
-
         client.succeed(f"systemd-run --unit intr nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag intr")
-        retry(lambda _: building(), timeout_seconds=60)
+        retry(lambda _: building() != [], timeout_seconds=60)
         client.succeed("systemctl kill -s INT intr")
-        retry(lambda _: not building(), timeout_seconds=20)
+        retry(lambda _: building() == [], timeout_seconds=20)
 
-    with subtest("a second SIGTERM cancels the build and the client retries elsewhere"):
-        client.succeed(f"systemd-run --unit stopme nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag stopme")
-        retry(lambda _: building(), timeout_seconds=60)
-        busy = worker1 if worker1.execute(builder)[0] == 0 else worker2
-        other = worker2 if busy is worker1 else worker1
-        busy.succeed("systemctl stop --no-block nix-grpc-daemon.socket nix-grpc-daemon.service && sleep 2")
-        busy.succeed(builder)  # first signal drains
-        busy.succeed("systemctl kill --kill-whom=main nix-grpc-daemon.service")
-        busy.wait_until_succeeds("systemctl show -p ActiveState --value nix-grpc-daemon.service | grep -qx inactive", timeout=30)
-        busy.fail(builder)
-        retry(lambda _: other.execute(builder)[0] == 0, timeout_seconds=90)
-        busy.succeed("systemctl start nix-grpc-daemon.socket")
-        client.succeed("systemctl kill -s INT stopme")
-        retry(lambda _: not building(), timeout_seconds=20)
-
-    with subtest("a deploy mid-build drains: the build finishes, new ones bounce, the new generation takes over"):
-        worker1.systemctl("stop nix-grpc-daemon.socket nix-grpc-daemon.service")
-        wait_unhealthy("worker1")
+    with subtest("a deploy mid-build drains: the build finishes, the new generation takes over"):
         client.succeed(f"systemd-run --unit sw nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag sw")
-        retry(lambda _: worker2.execute(builder)[0] == 0, timeout_seconds=60)
-        worker1.systemctl("start nix-grpc-daemon.socket")
-        worker2.succeed("timeout 20 /run/current-system/specialisation/next/bin/switch-to-configuration test >&2")
-        wait_unhealthy("worker2")
-        build(envoy, "during-drain")  # lands on worker1
-        worker2.succeed(builder)
-        worker2.succeed("pkill -f 'read -t [6]0 x'")
-        client.wait_until_succeeds("systemctl show -p ActiveState --value sw | grep -qx inactive", timeout=60)
-        client.succeed("systemctl show -p Result --value sw | grep -qx success")
-        # envoy's health check socket-activates the new generation
-        worker2.wait_until_succeeds("ps -o args= -C nix-grpc-daemon | grep -q worker2-next", timeout=30)
-        wait_unhealthy()
+        retry(lambda _: building() != [], timeout_seconds=60)
+        busy = worker1 if building() == ["worker1"] else worker2
+        if busy is worker2:
+            worker2.succeed("timeout 20 /run/current-system/specialisation/next/bin/switch-to-configuration test >&2")
+        else:
+            worker1.succeed("systemctl reload nix-grpc-daemon.service")
+        busy.succeed(builder)  # still running while draining
+        build(envoy, "during-drain")  # goes to the other one
+        busy.succeed("pkill -f 'read -t [9]0 x'")
+        client.wait_until_succeeds("! systemctl is-active sw", timeout=90)
+        client.succeed("systemctl show -p Result --value sw | grep -qx success || { journalctl -u sw >&2; false; }")
+        busy.wait_until_succeeds("systemctl is-active nix-grpc-daemon.service || systemctl start nix-grpc-daemon.service")
+        wait_health("${system}")
+        retry(lambda _: sched_workers(worker1) == 2, timeout_seconds=90)
 
-    with subtest("requiredSystemFeatures route to workers that have them"):
-        worker2.succeed("journalctl --rotate --vacuum-time=1s -u nix-grpc-daemon")
-        # Several graphs at once so MAGLEV would spread them if the vip cluster had worker2.
+    with subtest("requiredSystemFeatures: placed on the worker that has them, refused when none does"):
         out = client.succeed(f"nix build -L --store '{envoy}' --eval-store auto --expr 'map (tag: import ${jobExpr} {{ inherit tag; features = [\"vip\"]; }}) [\"f1\" \"f2\" \"f3\"]' --impure 2>&1")
-        # --worker-name replaces the hostname in what the client sees and in metrics.
-        assert "node-a: building " in out, out
+        assert "node-a: building " in out and "worker2: building" not in out, out
         worker1.succeed("curl -sf http://127.0.0.1:9464/metrics | grep -E 'nix_grpc_build_info\\{.*features=\"[^\"]*vip[^\"]*\".*worker=\"node-a\"\\} 1'")
-        worker2.fail("journalctl -u nix-grpc-daemon -o cat | grep -q 'event=rpc method=BuildDerivation'")
-        # Without the balancer's help the worker refuses and names the feature.
-        out = client.fail(f"nix build -L --store 'grpc://worker2:50051?{ci}&unavailable-retries=0' --eval-store auto -f ${jobExpr} --argstr tag f5 --arg features '[\"vip\"]' 2>&1")
-        assert "lacks system feature 'vip'" in out, out
+        out = client.fail(f"nix build -L --store '{envoy}' --eval-store auto -f ${jobExpr} --argstr tag f5 --arg features '[\"gpu\"]' 2>&1")
+        assert "features {gpu}" in out, out
 
     with subtest("low disk drains a worker and builds go to the other"):
-        # Leave less than minFree on worker1.
         worker1.succeed("fallocate -l $(( $(df --output=avail -B1 /nix/store | tail -1) - 100*1024*1024 )) /nix/.rw-store/fill")
-        wait_unhealthy("worker1")
+        worker1.wait_until_succeeds("journalctl -u nix-grpc-daemon -o cat | grep -q 'event=unhealthy reason=min_free'", timeout=30)
         top = build(envoy, "drain")
-        worker1.fail(f"test -e {top}")
+        assert holders(top) == ["worker2"], holders(top)
         worker1.succeed("rm /nix/.rw-store/fill")
-        wait_unhealthy()
+        worker1.wait_until_succeeds("journalctl -u nix-grpc-daemon -o cat | grep -q 'event=healthy reason=min_free'", timeout=30)
   '';
 }
