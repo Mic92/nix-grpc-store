@@ -65,7 +65,7 @@ void Backend::cancelWith(grpc::ServerContext & context)
 {
     canceller = std::jthread([&context, this](const std::stop_token & stop) -> void {
         constexpr std::chrono::milliseconds poll{200};
-        while (!stop.stop_requested() && !context.IsCancelled() && stopSignal == 0) {
+        while (!stop.stop_requested() && !context.IsCancelled() && stopSignal < kCancelBuilds) {
             std::this_thread::sleep_for(poll);
         }
         if (!stop.stop_requested()) {

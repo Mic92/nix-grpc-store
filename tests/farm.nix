@@ -140,7 +140,8 @@ let
       name = "slow-''${tag}";
       system = builtins.currentSystem;
       builder = "/bin/sh";
-      args = [ "-c" "read -t 60 x < /dev/zero; echo > $out" ];
+      # Inner sh so a test can pkill it to let the build succeed early.
+      args = [ "-c" "/bin/sh -c 'read -t 60 x < /dev/zero'; echo > $out" ];
     }
   '';
 in
@@ -158,6 +159,7 @@ pkgs.testers.runNixOSTest {
     worker2 = {
       imports = [ worker ];
       nix.settings.system-features = [ ];
+      specialisation.next.configuration.services.nix-grpc-daemon.workerName = "worker2-next";
     };
 
     lb =
@@ -367,7 +369,7 @@ pkgs.testers.runNixOSTest {
         worker2.systemctl("start nix-grpc-daemon.socket")
         wait_unhealthy()
 
-    with subtest("restarting a worker mid-upload is retried"):
+    with subtest("restarting workers mid-upload does not fail the client"):
         client.succeed("{ echo big; head -c 40M /dev/urandom; } > /tmp/big && nix-store --add /tmp/big > /tmp/big.path")
         big = client.succeed("cat /tmp/big.path").strip()
         client.succeed(f"systemd-run --unit up -E NIX_REMOTE=daemon nix build -L --max-jobs 0 --builders '{envoy}&system=${pkgs.stdenv.hostPlatform.system} ${pkgs.stdenv.hostPlatform.system} - 4' --no-link -f ${depExpr} job --argstr tag big --argstr inputPath {big}")
@@ -389,17 +391,37 @@ pkgs.testers.runNixOSTest {
         client.succeed("systemctl kill -s INT intr")
         retry(lambda _: not building(), timeout_seconds=20)
 
-    with subtest("stopping a worker mid-build is prompt and the client retries elsewhere"):
+    with subtest("a second SIGTERM cancels the build and the client retries elsewhere"):
         client.succeed(f"systemd-run --unit stopme nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag stopme")
         retry(lambda _: building(), timeout_seconds=60)
         busy = worker1 if worker1.execute(builder)[0] == 0 else worker2
         other = worker2 if busy is worker1 else worker1
-        busy.succeed("timeout 30 systemctl stop nix-grpc-daemon.socket nix-grpc-daemon.service")
+        busy.succeed("systemctl stop --no-block nix-grpc-daemon.socket nix-grpc-daemon.service && sleep 2")
+        busy.succeed(builder)  # first signal drains
+        busy.succeed("systemctl kill --kill-whom=main nix-grpc-daemon.service")
+        busy.wait_until_succeeds("systemctl show -p ActiveState --value nix-grpc-daemon.service | grep -qx inactive", timeout=30)
         busy.fail(builder)
         retry(lambda _: other.execute(builder)[0] == 0, timeout_seconds=90)
         busy.succeed("systemctl start nix-grpc-daemon.socket")
         client.succeed("systemctl kill -s INT stopme")
         retry(lambda _: not building(), timeout_seconds=20)
+
+    with subtest("a deploy mid-build drains: the build finishes, new ones bounce, the new generation takes over"):
+        worker1.systemctl("stop nix-grpc-daemon.socket nix-grpc-daemon.service")
+        wait_unhealthy("worker1")
+        client.succeed(f"systemd-run --unit sw nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag sw")
+        retry(lambda _: worker2.execute(builder)[0] == 0, timeout_seconds=60)
+        worker1.systemctl("start nix-grpc-daemon.socket")
+        worker2.succeed("timeout 20 /run/current-system/specialisation/next/bin/switch-to-configuration test >&2")
+        wait_unhealthy("worker2")
+        build(envoy, "during-drain")  # lands on worker1
+        worker2.succeed(builder)
+        worker2.succeed("pkill -f 'read -t [6]0 x'")
+        client.wait_until_succeeds("systemctl show -p ActiveState --value sw | grep -qx inactive", timeout=60)
+        client.succeed("systemctl show -p Result --value sw | grep -qx success")
+        # envoy's health check socket-activates the new generation
+        worker2.wait_until_succeeds("ps -o args= -C nix-grpc-daemon | grep -q worker2-next", timeout=30)
+        wait_unhealthy()
 
     with subtest("requiredSystemFeatures route to workers that have them"):
         worker2.succeed("journalctl --rotate --vacuum-time=1s -u nix-grpc-daemon")
