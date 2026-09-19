@@ -23,24 +23,24 @@
 
 stdenv.mkDerivation {
   pname = "nix-grpc-store";
-  version = lib.fileContents ./.version;
+  version = lib.fileContents ../../.version;
   src = lib.fileset.toSource {
-    root = ./.;
+    root = ../..;
     fileset = lib.fileset.unions [
-      ./.clang-tidy
-      ./.version
-      ./meson.build
-      ./meson.options
-      ./pch
-      ./proto
-      ./src
-      ./fuzz
-      ./tests/farm-mock.py
-      ./tests/farm-client-test.cc
-      ./tests/farm-client-test.sh
-      ./tests/oidc-test.cc
-      ./tests/oidc-test.sh
-      ./tests/xfcc-test.cc
+      ../../.clang-tidy
+      ../../.version
+      ../../meson.build
+      ../../meson.options
+      ../../pch
+      ../../proto
+      ../../src
+      ../../fuzz
+      ../../tests/farm-mock.py
+      ../../tests/farm-client-test.cc
+      ../../tests/farm-client-test.sh
+      ../../tests/oidc-test.cc
+      ../../tests/oidc-test.sh
+      ../../tests/xfcc-test.cc
     ];
   };
 

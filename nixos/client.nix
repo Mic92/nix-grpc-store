@@ -15,13 +15,13 @@ in
 
     packageSet = lib.mkOption {
       type = lib.types.raw;
-      default = pkgs.callPackage ../packages.nix {
+      default = pkgs.callPackage ../nix/packages {
         nixPackages = config.nix.package.libs;
       };
       defaultText = lib.literalExpression ''
-        pkgs.callPackage ./packages.nix { nixPackages = config.nix.package.libs; }
+        pkgs.callPackage ./nix/packages { nixPackages = config.nix.package.libs; }
       '';
-      description = "Package set from packages.nix providing the per-version plugins.";
+      description = "Package set from nix/packages providing the per-version plugins.";
     };
 
     package = lib.mkOption {
