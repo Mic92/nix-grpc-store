@@ -39,7 +39,9 @@ tls:
     existingSecret: ""
   # Workers and scheduler: server certificate towards the balancer; workers
   # also present it to the scheduler. Must carry a SAN for
-  # <release>-nix-grpc-farm-scheduler.<namespace>.svc.
+  # <release>-nix-grpc-farm-scheduler.<namespace>.svc (with
+  # scheduler.replicas > 1: …-scheduler-<i>.<namespace>.svc and the
+  # balancer's …-lb.<namespace>.svc).
   worker:
     existingSecret: ""
     # Name the balancer verifies on worker certificates. Empty: chain only.
@@ -96,6 +98,10 @@ defaultGroup: ""
 
 # The one scheduler pod (all systems). Holds only soft state.
 scheduler:
+  # >1 adds standby schedulers (one Deployment each) that take over, in
+  # order, while the ones before them are down. Workers then reach the
+  # scheduler through the balancer.
+  replicas: 1
   resources: {}
   nodeSelector: {}
   tolerations: []

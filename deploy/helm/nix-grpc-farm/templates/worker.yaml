@@ -149,7 +149,7 @@ spec:
             - --listen=[::]:50051
             # What envoy resolves the headless Service to, so x-nix-worker pins here.
             - --advertise=$(POD_IP):50051
-            - --scheduler={{ include "farm.schedulerService" $root }}.{{ $root.Release.Namespace }}.svc:50051
+            - --scheduler={{ include "farm.schedulerFor" $root }}
             {{- if $root.Values.tls.worker.existingSecret }}
             - --scheduler-ca=/secrets/ca/ca.crt
             {{- end }}

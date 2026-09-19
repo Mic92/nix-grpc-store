@@ -38,6 +38,7 @@ let
       };
     };
     defaultGroup = "x86";
+    scheduler.replicas = 2;
     lb.accessLog = true;
     grafanaDashboard.enabled = true;
     metrics.podMonitor.enabled = true;
@@ -84,7 +85,10 @@ let
                 x86_64-linux = [ "HOST-x86:50051" ];
                 aarch64-linux = [ "HOST-arm:50051" ];
               };
-              scheduler = "HOST-sched:50051";
+              scheduler = [
+                "HOST-sched0:50051"
+                "HOST-sched1:50051"
+              ];
               tls = {
                 certFile = "/etc/envoy/tls/lb/tls.crt";
                 keyFile = "/etc/envoy/tls/lb/tls.key";
@@ -113,7 +117,7 @@ let
     def ren: . as $n | (names[$n] // $n);
     .static_resources
     | .clusters |= (map(.name |= ren | .load_assignment.cluster_name |= ren
-                        | .load_assignment.endpoints[0].lb_endpoints |= map(.endpoint.address.socket_address.address = "X" | .endpoint.address.socket_address |= del(.ipv4_compat))
+                        | .load_assignment.endpoints |= map(.lb_endpoints |= map(.endpoint.address.socket_address.address = "X" | .endpoint.address.socket_address |= del(.ipv4_compat)))
                         | del(.dns_lookup_family))
                     | sort_by(.name))
     | .listeners[0].address.socket_address |= (del(.ipv4_compat) | .address = "X")

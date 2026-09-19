@@ -58,6 +58,37 @@ app.kubernetes.io/component: lb
 {{ include "farm.fullname" . }}-scheduler
 {{- end }}
 
+{{/* scheduler-<i> Service names, best first; one entry when replicas=1. */}}
+{{- define "farm.schedulerNames" -}}
+{{- $root := . }}
+{{- $n := int (.Values.scheduler.replicas | default 1) }}
+{{- $names := list }}
+{{- range $i := until $n }}
+{{- $names = append $names (ternary (include "farm.schedulerService" $root) (printf "%s-%d" (include "farm.schedulerService" $root) $i) (eq $n 1)) }}
+{{- end }}
+{{- join "," $names }}
+{{- end }}
+
+{{/* host:port list of all scheduler Services, for --scheduler-order and envoy. */}}
+{{- define "farm.schedulerAddrs" -}}
+{{- $root := . }}
+{{- $out := list }}
+{{- range splitList "," (include "farm.schedulerNames" .) }}
+{{- $out = append $out (printf "%s.%s.svc:50051" . $root.Release.Namespace) }}
+{{- end }}
+{{- join "," $out }}
+{{- end }}
+
+{{/* Where builders open their WorkerSession: the scheduler directly, or the
+     balancer when there is more than one so they follow the active one. */}}
+{{- define "farm.schedulerFor" -}}
+{{- if gt (int (.Values.scheduler.replicas | default 1)) 1 -}}
+{{ include "farm.fullname" . }}-lb.{{ .Release.Namespace }}.svc:{{ .Values.lb.service.port }}
+{{- else -}}
+{{ include "farm.schedulerService" . }}.{{ .Release.Namespace }}.svc:50051
+{{- end }}
+{{- end }}
+
 {{- define "farm.schedulerSelectorLabels" -}}
 {{ include "farm.selectorLabels" . }}
 app.kubernetes.io/component: scheduler

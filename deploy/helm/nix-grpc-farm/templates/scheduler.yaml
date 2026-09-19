@@ -1,10 +1,15 @@
-{{- /* One scheduler pod for all systems. Soft state: a restart loses the queue,
-     workers re-Hello with what they run and clients re-Want. */}}
+{{- /* One active scheduler for all systems. Soft state: a restart loses the
+     queue, workers re-Hello with what they run and clients re-Want.
+     scheduler.replicas > 1 renders one Deployment+Service per rank; rank i
+     serves only while every rank before it is down (--scheduler-order). Each
+     is its own Deployment so an upgrade still surges per rank. */}}
 {{- $root := . }}
 {{- $oidc := include "farm.oidcProviders" . }}
-{{- $svc := include "farm.schedulerService" . }}
-{{- $sel := include "farm.schedulerSelectorLabels" . }}
 {{- $s := .Values.scheduler }}
+{{- $order := include "farm.schedulerAddrs" . }}
+{{- range $i, $svc := splitList "," (include "farm.schedulerNames" $root) }}
+{{- $sel := printf "%s\napp.kubernetes.io/instance-rank: %s" (include "farm.schedulerSelectorLabels" $root) ($i | toString) }}
+{{- with $root }}
 ---
 apiVersion: v1
 kind: Service
@@ -66,6 +71,13 @@ spec:
           args:
             - --role=scheduler
             - --listen=[::]:50051
+            - --advertise={{ $svc }}.{{ $root.Release.Namespace }}.svc:50051
+            {{- if contains "," $order }}
+            - --scheduler-order={{ $order }}
+            {{- if $root.Values.tls.worker.existingSecret }}
+            - --scheduler-ca=/secrets/ca/ca.crt
+            {{- end }}
+            {{- end }}
             - --metrics-listen=0.0.0.0:9464
             - --worker-name=scheduler/$(POD_NAME)
             - --log-level={{ .Values.logLevel }}
@@ -154,3 +166,5 @@ spec:
           secret:
             secretName: {{ include "farm.fullname" . }}-oidc
         {{- end }}
+{{- end }}
+{{- end }}
