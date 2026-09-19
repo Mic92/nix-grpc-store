@@ -85,6 +85,7 @@ services.nix-grpc-daemon = {
 | `accessRules` | Maps forwarded CNs to roles. CI needs `trusted`. |
 | `farm.maxJobs` | Concurrent farm builds on this worker. Keep it at or below the local nix-daemon's `max-jobs`. |
 | `farm.minFree` | Below this much free disk the worker reports unhealthy and the balancer stops sending work until space returns. |
+| `workerName` | Name clients see in `worker: building …` lines and in `nix_grpc_build_info`. Defaults to the hostname. On Kubernetes the chart sets it to the node name. |
 
 Repeat for every worker. Workers for different systems use the same config.
 
@@ -246,7 +247,8 @@ services.grafana.provision.dashboards.settings.providers = [{
 ```
 
 The `prefix` and `instance` variables at the top cover pipelines that
-rename things (telegraf: prefix `prometheus_`, worker label `host`).
+rename things (telegraf: prefix `prometheus_`, worker label `host`. On
+Kubernetes set `instance` to `pod` or `node`).
 
 ## Troubleshooting
 

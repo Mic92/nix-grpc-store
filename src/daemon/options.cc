@@ -2,13 +2,18 @@
 
 #include "options.hh"
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <string_view>
 #include <vector>
+
+#include <unistd.h>
 
 #include <grpc/grpc_security_constants.h>
 #include <grpcpp/security/server_credentials.h>
@@ -36,6 +41,16 @@ auto parseLogLevel(std::string_view value) -> LogLevel
     }
     return LogLevel::info;
 }
+
+auto localHostName() -> std::string
+{
+    constexpr size_t maxLen = 256;
+    std::array<char, maxLen> buf{};
+    if (::gethostname(buf.data(), buf.size() - 1) != 0) {
+        return "?";
+    }
+    return buf.data();
+}
 } // namespace
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity): flat flag list.
@@ -43,8 +58,17 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
 {
     Options options;
     for (size_t idx = 1; idx < args.size(); ++idx) {
-        std::string_view const arg = args.at(idx);
+        // Also `--flag=value`, one list item in a container spec.
+        std::string_view arg = args.at(idx);
+        std::optional<std::string_view> inlineValue;
+        if (auto sep = arg.find('='); arg.starts_with("--") && sep != std::string_view::npos) {
+            inlineValue = arg.substr(sep + 1);
+            arg = arg.substr(0, sep);
+        }
         auto next = [&]() -> std::string_view {
+            if (inlineValue) {
+                return *std::exchange(inlineValue, std::nullopt);
+            }
             if (++idx >= args.size()) {
                 throw nix::Error("flag '%s' requires an argument", arg);
             }
@@ -68,6 +92,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.proxies.add(next());
         } else if (arg == "--allow-anonymous") {
             options.acl.allowAnonymous(parseRole(next()));
+        } else if (arg == "--worker-name") {
+            options.workerName = next();
         } else if (arg == "--metrics-listen") {
             options.metricsListen = next();
         } else if (arg == "--idle-timeout") {
@@ -99,6 +125,9 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
         } else {
             throw nix::Error("unknown flag '%s'", arg);
         }
+    }
+    if (options.workerName.empty()) {
+        options.workerName = localHostName();
     }
     if (!options.farm.niks3Url.empty()) {
         if (options.farm.niks3TokenFile.empty()) {

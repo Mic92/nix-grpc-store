@@ -7,7 +7,6 @@
 // avoids the tunnel's per-batch zstd flushes and per-path round trips.
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -33,7 +32,6 @@
 #include <vector>
 
 #include <sys/socket.h>
-#include <unistd.h>
 
 #include <grpc/impl/channel_arg_names.h>
 #include <grpcpp/grpcpp.h>
@@ -60,6 +58,7 @@
 #include <nix/util/ref.hh>
 #include <nix/util/repair-flag.hh>
 #include <nix/util/serialise.hh>
+#include <nix/util/strings.hh>
 #include <nix/util/unix-domain-socket.hh>
 #include <nix/util/util.hh>
 
@@ -96,20 +95,10 @@ volatile std::sig_atomic_t nixgrpc::stopSignal = 0;
 namespace {
 using nixgrpc::stopSignal;
 
-auto localHostName() -> std::string
-{
-    constexpr size_t maxLen = 256;
-    std::array<char, maxLen> buf{};
-    if (::gethostname(buf.data(), buf.size() - 1) != 0) {
-        return "?";
-    }
-    return buf.data();
-}
-
 class NixRemoteService final : public nix::remote::NixRemote::Service
 {
     std::string storeUri;
-    std::string hostName = localHostName();
+    std::string workerName;
     nixgrpc::Metrics & metrics;
     nixgrpc::IdleTracker & idle;
     nixgrpc::LogLevel logLevel;
@@ -212,6 +201,7 @@ public:
     NixRemoteService(
         std::string socketPath,
         std::string storeUri,
+        std::string workerName,
         nixgrpc::Metrics & metrics,
         nixgrpc::IdleTracker & idle,
         nixgrpc::LogLevel logLevel,
@@ -220,6 +210,7 @@ public:
         std::optional<nixgrpc::oidc::Verifier> & oidc,
         std::optional<nixgrpc::Farm> & farm)
         : storeUri(std::move(storeUri))
+        , workerName(std::move(workerName))
         , metrics(metrics)
         , idle(idle)
         , logLevel(logLevel)
@@ -462,7 +453,7 @@ public:
         } catch (nix::Error & err) {
             // Another worker may still hold it locally. UNAVAILABLE makes the client retry elsewhere.
             metrics.event("input_not_substitutable");
-            return {grpc::StatusCode::UNAVAILABLE, hostName + ": input not substitutable: " + err.what()};
+            return {grpc::StatusCode::UNAVAILABLE, workerName + ": input not substitutable: " + err.what()};
         }
         return grpc::Status::OK;
     }
@@ -539,7 +530,7 @@ public:
         if (claim->first(cancelled) == nixgrpc::Claim::Status::wait) {
             slot.reset();
             phase.next("claim_wait");
-            log({.text = hostName + ": waiting for another worker building " + std::string(drvPath.to_string())});
+            log({.text = workerName + ": waiting for another worker building " + std::string(drvPath.to_string())});
         }
         auto const verdict = claim->await(cancelled);
         phase.done();
@@ -574,7 +565,7 @@ public:
             roots->addTempRoot(path);
         }
 
-        log({.text = hostName + ": building " + std::string(drvPath.to_string())});
+        log({.text = workerName + ": building " + std::string(drvPath.to_string())});
         try {
             phase.next("build");
             nixgrpc::Metrics::Held const building(metrics, "build_slot");
@@ -655,7 +646,7 @@ public:
                     return {grpc::StatusCode::INVALID_ARGUMENT, "farm endpoint only does normal builds"};
                 }
                 if (auto status = farmBuild(*context, *farm, *localStore, drvPath, drv, sendLogLine, res); !status.ok()) {
-                    return {status.error_code(), hostName + ": " + status.error_message()};
+                    return {status.error_code(), workerName + ": " + status.error_message()};
                 }
             } else {
                 res = backends.proxyBuild(*context, *localStore, drvPath, drv, mode, sendLogLine);
@@ -807,6 +798,11 @@ try {
     }
 
     nixgrpc::Metrics metrics(options.metricsListen);
+    metrics.buildInfo(
+        NIX_GRPC_VERSION,
+        options.workerName,
+        nix::settings.thisSystem.get(),
+        nix::concatStringsSep(",", nix::settings.systemFeatures.get()));
     if (!options.farm.niks3Url.empty()) {
         metrics.buildSlots(options.farm.maxJobs);
     }
@@ -832,7 +828,7 @@ try {
             {{"event", "farm_mode"}, {"niks3", options.farm.niks3Url}, {"max_jobs", std::to_string(options.farm.maxJobs)}});
     }
     NixRemoteService service(
-        options.socketPath, options.storeUri, metrics, idle, options.logLevel, options.acl, options.proxies, oidc, farm);
+        options.socketPath, options.storeUri, options.workerName, metrics, idle, options.logLevel, options.acl, options.proxies, oidc, farm);
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;

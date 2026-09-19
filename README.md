@@ -328,6 +328,7 @@ which also requires `trustClients` (see above).
   * `--allow 'cn-pattern=role'`, `--allow-anonymous ROLE`, `--trusted-proxy CN-PATTERN` — see access control
   * `--oidc-config FILE` — accept OIDC bearer tokens, see access control
   * `--metrics-listen ADDR` — serve Prometheus metrics, disabled if unset
+  * `--worker-name NAME` — name in build-log prefixes and `nix_grpc_build_info`, default hostname
   * `--log-level info|debug` — access log verbosity, default `info`
 
 ## Monitoring
@@ -362,6 +363,7 @@ With `--metrics-listen 127.0.0.1:9464` (NixOS:
 | `nix_grpc_rpcs_total` | method, cn | RPCs handled |
 | `nix_grpc_tunnel_bytes_total` | direction, cn | uncompressed tunnel bytes |
 | `nix_grpc_nar_bytes_total` | direction, cn | uncompressed NAR bytes imported/exported |
+| `nix_grpc_build_info` | version, worker, system, features | constant 1, for joins and version skew |
 
 Only CA-issued CNs appear as labels, so cardinality stays bounded.
 

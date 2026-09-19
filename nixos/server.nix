@@ -15,8 +15,8 @@ in
     package = lib.mkOption {
       type = lib.types.package;
       # The daemon only links `nix-util`, so any recent Nix's libs will do.
-      default = (pkgs.callPackage ../packages.nix { nixPackages = pkgs.nix.libs; }).default;
-      defaultText = lib.literalExpression "(pkgs.callPackage ./packages.nix { nixPackages = pkgs.nix.libs; }).default";
+      default = (pkgs.callPackage ../nix/packages { nixPackages = pkgs.nix.libs; }).default;
+      defaultText = lib.literalExpression "(pkgs.callPackage ./nix/packages { nixPackages = pkgs.nix.libs; }).default";
       description = "Package providing {command}`nix-grpc-daemon`.";
     };
 
@@ -59,6 +59,15 @@ in
       description = ''
         Access log verbosity; `info` logs Connect sessions and bulk
         transfers, `debug` also logs path queries and session starts.
+      '';
+    };
+
+    workerName = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Name used in build-log prefixes, error messages and the
+        `nix_grpc_build_info` metric. Defaults to the hostname.
       '';
     };
 
@@ -365,6 +374,10 @@ in
           ++ lib.optionals (cfg.oidc != null) [
             "--oidc-config"
             ((pkgs.formats.json { }).generate "nix-grpc-daemon-oidc.json" cfg.oidc)
+          ]
+          ++ lib.optionals (cfg.workerName != null) [
+            "--worker-name"
+            cfg.workerName
           ]
           ++ lib.optionals (cfg.metricsListen != null) [
             "--metrics-listen"
