@@ -59,10 +59,9 @@ spec:
   replicas: {{ $w.replicas }}
   selector:
     matchLabels: {{- $sel | nindent 6 }}
-  # The hash ring reshuffles on any membership change, so surge buys nothing.
   strategy:
     type: RollingUpdate
-    rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
   template:
     metadata:
       annotations:
@@ -146,8 +145,12 @@ spec:
           imagePullPolicy: {{ $root.Values.image.pullPolicy }}
           command: [/bin/nix-grpc-daemon]
           args:
+            - --role=builder
             - --listen=[::]:50051
-            # civetweb binds [::] v6-only and pod IPs are mostly v4.
+            # What envoy resolves the headless Service to, so x-nix-worker pins here.
+            - --advertise=$(POD_IP):50051
+            - --scheduler={{ include "farm.schedulerService" $root }}.{{ $root.Release.Namespace }}.svc:50051
+            # civetweb binds [::] v6-only; pod IPs are v4 on most clusters.
             - --metrics-listen=0.0.0.0:9464
             - --worker-name=$(NODE_NAME)/$(POD_NAME)
             - --log-level={{ $root.Values.logLevel }}
@@ -181,6 +184,8 @@ spec:
               valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
             - name: POD_NAME
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
           securityContext:
             runAsUser: 990
             runAsGroup: 990

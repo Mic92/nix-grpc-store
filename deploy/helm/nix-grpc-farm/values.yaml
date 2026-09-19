@@ -9,10 +9,10 @@ lbImage:
 imagePullSecrets: []
 
 niks3:
-  # API the workers claim builds at and push to. May be cluster-internal.
+  # API the workers push to and the scheduler asks what is cached. May be cluster-internal.
   serverURL: ""
-  # Binary cache URL as the workers reach it, to substitute each other's
-  # outputs. Clients may know the same cache by another name.
+  # Binary cache URL as reachable from the workers; they substitute each
+  # other's outputs from it. Clients use the same cache, possibly by another name.
   cacheURL: ""
   publicKeys: []
   pushFlags: [] # extra `niks3 push` flags, e.g. [--max-concurrent-uploads, "8"]
@@ -26,18 +26,20 @@ niks3:
       audience: niks3
       expirationSeconds: 3600
 
-# TLS is optional. Secrets are kubernetes.io/tls (tls.crt, tls.key), the CA
+# TLS is optional. Secrets are kubernetes.io/tls (tls.crt, tls.key); the CA
 # Secret has key ca.crt. cert-manager Certificates produce this layout.
 tls:
-  # Verifies user client certificates at the balancer and the balancer's
-  # certificate at the workers.
+  # Verifies user client certificates at the balancer, the balancer's at
+  # the nodes, and worker and scheduler certificates against each other.
   clientCA:
     existingSecret: ""
   # Balancer: server certificate towards clients, also used as client
   # certificate towards workers (its CN must match auth.trustedProxies).
   lb:
     existingSecret: ""
-  # Workers: server certificate towards the balancer.
+  # Workers and scheduler: server certificate towards the balancer; workers
+  # also present it to the scheduler. Must carry a SAN for
+  # <release>-nix-grpc-farm-scheduler.<namespace>.svc.
   worker:
     existingSecret: ""
     # Name the balancer verifies on worker certificates. Empty: chain only.
@@ -50,6 +52,8 @@ auth:
   anonymousRole: null
   # CNs whose x-forwarded-client-cert header workers believe.
   trustedProxies: [lb]
+  # CN patterns of tls.worker certificates; the scheduler trusts these for WorkerSession.
+  workerCNs: [worker, "worker-*"]
   # Let pods use the farm with their service account token, see docs/farm.md.
   workloadIdentity:
     enabled: false
@@ -62,13 +66,14 @@ auth:
 
 # Defaults merged into every entry of `workers`.
 workerDefaults:
-  system: "" # nix `system`, empty for the node's. Required with several groups.
+  system: "" # nix `system`; empty uses the node's. Required with several groups.
   replicas: 1
-  # Advertised as system-features and routed on requiredSystemFeatures.
+  # nix system-features; the scheduler only assigns drvs whose
+  # requiredSystemFeatures a worker has.
   features: []
   maxJobs: 1
   cores: 0
-  # Below this the worker goes NOT_SERVING and builds bounce elsewhere.
+  # Below this the worker tells the scheduler to stop assigning to it.
   minFree: 20G
   store:
     sizeLimit: null # emptyDir sizeLimit for /nix
@@ -89,6 +94,15 @@ workers: {}
 # Group whose system serves requests without x-nix-system (queries, uploads).
 defaultGroup: ""
 
+# The one scheduler pod (all systems). Holds only soft state.
+scheduler:
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  extraArgs: []
+
 gc:
   # Keep this above every group's minFree so workers do not flap unhealthy.
   ensureFree: 40G
@@ -106,8 +120,8 @@ sandbox:
   enabled: true
 
 logLevel: info
-# A stopping worker leaves the balancer and exits once running builds have
-# published. kubelet kills what is left after this long.
+# On pod shutdown the worker tells the scheduler it is draining and exits once
+# running builds have published; kubelet kills what is left after this long.
 terminationGracePeriodSeconds: 3600
 
 lb:
