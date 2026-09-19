@@ -139,10 +139,12 @@ let
       name = "sched";
       type = "STRICT_DNS";
       connect_timeout = "5s";
+      # Only one node is ever SERVING, so never enter panic mode.
       health_checks = [ (healthCheck "nix.scheduler") ];
+      common_lb_config.healthy_panic_threshold.value = 0;
       load_assignment = {
         cluster_name = "sched";
-        endpoints = [ { lb_endpoints = [ (endpoint cfg.scheduler) ]; } ];
+        endpoints = [ { lb_endpoints = map endpoint (lib.toList cfg.scheduler); } ];
       };
     };
 
@@ -209,14 +211,17 @@ in
     };
 
     scheduler = lib.mkOption {
-      type = lib.types.str;
+      type = lib.types.either lib.types.str (lib.types.listOf lib.types.str);
       default = lib.head cfg.workers.${cfg.defaultSystem};
       defaultText = lib.literalMD "first worker of `defaultSystem`";
-      example = "10.0.0.5:50051";
+      example = [
+        "10.0.0.4:50051"
+        "10.0.0.5:50051"
+      ];
       description = ''
-        The worker with the `scheduler` role. It serves all systems and there
-        is exactly one. While it is down new builds wait and running ones
-        finish.
+        The worker(s) with the `scheduler` role. With more than one, they
+        take turns through niks3 and scheduler traffic goes to
+        whichever holds the lock. A single string is a list of one.
       '';
     };
 

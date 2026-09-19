@@ -38,6 +38,7 @@ let
       };
     };
     defaultGroup = "x86";
+    scheduler.replicas = 2;
     lb.accessLog = true;
     grafanaDashboard.enabled = true;
     metrics.podMonitor.enabled = true;
@@ -84,7 +85,10 @@ let
                 x86_64-linux = [ "HOST-x86:50051" ];
                 aarch64-linux = [ "HOST-arm:50051" ];
               };
-              scheduler = "HOST-sched:50051";
+              scheduler = [
+                "HOST-sched0:50051"
+                "HOST-sched1:50051"
+              ];
               tls = {
                 certFile = "/etc/envoy/tls/lb/tls.crt";
                 keyFile = "/etc/envoy/tls/lb/tls.key";
@@ -143,6 +147,7 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
       echo "envoy config from the chart drifted from nixos/lb.nix" >&2
       exit 1
     fi
+    jq -e '[.clusters[] | select(.name == "sched") | .common_lb_config.healthy_panic_threshold.value] == [0]' chart.json
 
     touch $out
   ''

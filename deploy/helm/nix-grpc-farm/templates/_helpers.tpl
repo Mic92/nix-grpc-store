@@ -58,6 +58,26 @@ app.kubernetes.io/component: lb
 {{ include "farm.fullname" . }}-scheduler
 {{- end }}
 
+{{/* scheduler-<i> Service names, best first. One entry when replicas=1. */}}
+{{- define "farm.schedulerNames" -}}
+{{- $root := . }}
+{{- $n := int (.Values.scheduler.replicas | default 1) }}
+{{- $names := list }}
+{{- range $i := until $n }}
+{{- $names = append $names (ternary (include "farm.schedulerService" $root) (printf "%s-%d" (include "farm.schedulerService" $root) $i) (eq $n 1)) }}
+{{- end }}
+{{- join "," $names }}
+{{- end }}
+
+{{/* --scheduler for builders: direct, or via the balancer with replicas > 1. */}}
+{{- define "farm.schedulerFor" -}}
+{{- if gt (int (.Values.scheduler.replicas | default 1)) 1 -}}
+{{ include "farm.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.lb.service.port }}
+{{- else -}}
+{{ include "farm.schedulerService" . }}.{{ .Release.Namespace }}.svc:50051
+{{- end }}
+{{- end }}
+
 {{- define "farm.schedulerSelectorLabels" -}}
 {{ include "farm.selectorLabels" . }}
 app.kubernetes.io/component: scheduler

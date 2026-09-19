@@ -1,5 +1,5 @@
-# Multi-node end to end: niks3 + S3, two builder nodes (worker1 also the
-# scheduler) behind envoy, a CI client using the build hook and an OIDC
+# Multi-node end to end: niks3 + S3, two builder nodes (both may
+# schedule, niks3 picks one) behind envoy, a CI client using the build hook and an OIDC
 # developer.
 {
   pkgs,
@@ -81,7 +81,7 @@ let
         enable = true;
         listen = "[::]:50051";
         advertise = "${ip.${name}}:50051";
-        # WorkerSession goes through the balancer like a client would.
+        # Through the balancer, so builders follow the active scheduler.
         scheduler = "lb:50051";
         logLevel = "debug";
         idleTimeout = null;
@@ -181,7 +181,6 @@ pkgs.testers.runNixOSTest {
     };
     worker2 = {
       imports = [ (worker "worker2") ];
-      services.nix-grpc-daemon.roles = [ "builder" ];
       nix.settings.system-features = [ ];
       services.nix-grpc-daemon.schedulerTokenFile = "/run/scheduler-token";
       systemd.services.scheduler-token = {
@@ -212,6 +211,10 @@ pkgs.testers.runNixOSTest {
           accessLog = true;
           enable = true;
           workers.${system} = [
+            "${ip.worker1}:50051"
+            "${ip.worker2}:50051"
+          ];
+          scheduler = [
             "${ip.worker1}:50051"
             "${ip.worker2}:50051"
           ];
@@ -299,7 +302,6 @@ pkgs.testers.runNixOSTest {
             retry(check, timeout_seconds=90)
 
     wait_health("${system}")
-    wait_health("sched")
 
     def metrics(w) -> list[str]:
         return w.succeed("curl -sf http://127.0.0.1:9464/metrics").splitlines()
@@ -308,13 +310,22 @@ pkgs.testers.runNixOSTest {
         return int(float(vals[0])) if vals else 0
     def sched_workers(w) -> int:
         return gauge(w, 'nix_grpc_sched{kind="workers"}')
+    def leader():
+        up = [w for w in [worker1, worker2] if w.name not in {names[a] for a in unhealthy("sched")}]
+        assert len(up) == 1, up
+        return up[0]
+    def standby():
+        return worker2 if leader() is worker1 else worker1
+    def settled(_=None) -> bool:
+        down = unhealthy("sched")
+        return len(down) == 1 and sched_workers(worker2 if names[down.pop()] == "worker1" else worker1) == 2
     def events(w, kind: str) -> int:
         return gauge(w, f'nix_grpc_events_total{{kind="{kind}"}}')
 
-    with subtest("both builders hold a WorkerSession on the scheduler, worker2 by OIDC token"):
-        retry(lambda _: sched_workers(worker1) == 2, timeout_seconds=60)
+    with subtest("one node schedules and both builders hold a WorkerSession on it"):
+        retry(settled, timeout_seconds=60)
         # worker1 gets in by certificate, worker2's CN has no rule and its token counts.
-        opened = worker1.succeed("journalctl -u nix-grpc-daemon -o cat | grep 'event=worker_session_open'")
+        opened = leader().succeed("journalctl -u nix-grpc-daemon -o cat | grep 'event=worker_session_open'")
         assert "cn=worker-1 " in opened and "cn=oidc:mock:node:worker2 " in opened, opened
 
     tls = "ca-cert=${certs}/ca.pem"
@@ -357,10 +368,10 @@ pkgs.testers.runNixOSTest {
             w.succeed(f"nix-store --delete {top}")
         build(envoy, "t1")
         assert holders(top) == [], holders(top)
-        assert events(worker1, "cached") >= 1
+        assert events(leader(), "cached") >= 1
 
     with subtest("inputs already in the cache are not sent to the scheduler"):
-        wants = lambda: int(worker1.succeed("journalctl -u nix-grpc-daemon -o cat | grep -c 'event=want ' || true"))
+        wants = lambda: int(leader().succeed("journalctl -u nix-grpc-daemon -o cat | grep -c 'event=want ' || true"))
         before = wants()
         build(envoy, "t1", "--argstr top t1b")
         assert wants() - before == 1, wants() - before
@@ -417,41 +428,43 @@ pkgs.testers.runNixOSTest {
         worker1.systemctl("start nix-grpc-daemon.service")
         wait_health("${system}")
 
-    with subtest("scheduler down: builds wait, then resume when it is back"):
-        worker1.systemctl("stop nix-grpc-daemon.socket nix-grpc-daemon.service")
-        wait_health("sched", "worker1")
-        client.succeed(f"systemd-run --unit waits nix build --store '{envoy}' --eval-store auto -f ${jobExpr} --argstr tag schedback")
-        client.sleep(3)
-        client.succeed("systemctl is-active waits")
-        worker1.systemctl("start nix-grpc-daemon.service")
-        wait_health("sched")
-        client.wait_until_succeeds("! systemctl is-active waits", timeout=120)
-        client.succeed("systemctl show -p Result --value waits | grep -qx success || { journalctl -u waits >&2; false; }")
-        retry(lambda _: sched_workers(worker1) == 2, timeout_seconds=60)
+    with subtest("scheduler down: the other node takes the lock and keeps it"):
+        was, nxt = leader(), standby()
+        was.systemctl("stop nix-grpc-daemon.socket nix-grpc-daemon.service")
+        nxt.wait_until_succeeds("journalctl -u nix-grpc-daemon | grep -q event=scheduler_take_over", timeout=30)
+        retry(lambda _: sched_workers(nxt) == 1, timeout_seconds=30)
+        build(envoy, "on-standby")
+        was.systemctl("start nix-grpc-daemon.service")
+        retry(settled, timeout_seconds=60)
+        assert leader() is nxt
+        assert sched_workers(was) == 0
 
-    with subtest("clean scheduler restart: peers are told, reconnect without error or backoff"):
+    with subtest("clean scheduler restart: peers are told, running builds survive, no reconnect noise"):
         client.succeed(f"systemd-run --unit rs nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag rs")
         retry(lambda _: building() != [], timeout_seconds=60)
-        worker2.succeed("journalctl --rotate --vacuum-time=1s -u nix-grpc-daemon >/dev/null 2>&1 || true")
-        # If the slow build landed on worker1 its first SIGTERM drains. Let
-        # that build go so the restart proceeds.
-        worker1.execute("pkill -f 'read -t [9]0 x'")
-        worker1.succeed("systemctl restart nix-grpc-daemon.service")
-        worker2.wait_until_succeeds("journalctl -u nix-grpc-daemon | grep -q event=scheduler_restarting", timeout=30)
-        retry(lambda _: sched_workers(worker1) == 2, timeout_seconds=30)
+        who = building()
+        was, nxt = leader(), standby()
+        nxt.succeed("journalctl --rotate --vacuum-time=1s -u nix-grpc-daemon >/dev/null 2>&1 || true")
+        # --no-block: if the build sits on the leader it drains first and the
+        # restart completes only after release_slow().
+        was.succeed("systemctl restart --no-block nix-grpc-daemon.service")
+        client.sleep(5)
+        assert building() == who, f"restart killed or moved the build: {who} -> {building()}"
         release_slow()
+        nxt.wait_until_succeeds("journalctl -u nix-grpc-daemon | grep -q 'event=scheduler_restarting addr='", timeout=60)
         client.wait_until_succeeds("! systemctl is-active rs", timeout=120)
         client.succeed("systemctl show -p Result --value rs | grep -qx success || { journalctl -u rs >&2; false; }")
         client.fail("journalctl -u rs | grep -q 'reconnecting'")
+        retry(settled, timeout_seconds=60)
 
     with subtest("scheduler restart mid-build: build finishes, no double build"):
         client.succeed(f"systemd-run --unit mid nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag mid")
         retry(lambda _: building() != [], timeout_seconds=60)
         who = building()
         assert len(who) == 1, who
-        # Scheduler state is lost. If the build ran on worker1 it dies with the
-        # daemon. Either way no second copy may start while one is alive.
-        worker1.succeed("systemctl kill -s KILL nix-grpc-daemon.service; systemctl start nix-grpc-daemon.service")
+        # Scheduler state is lost. If the build ran on the leader it dies with
+        # the daemon. Either way no second copy may start while one is alive.
+        leader().succeed("systemctl kill -s KILL nix-grpc-daemon.service; systemctl start nix-grpc-daemon.service")
         client.sleep(5)
         assert len(building()) <= 1, building()
         release_slow()
@@ -479,7 +492,7 @@ pkgs.testers.runNixOSTest {
         client.succeed("systemctl show -p Result --value sw | grep -qx success || { journalctl -u sw >&2; false; }")
         busy.wait_until_succeeds("systemctl is-active nix-grpc-daemon.service || systemctl start nix-grpc-daemon.service")
         wait_health("${system}")
-        retry(lambda _: sched_workers(worker1) == 2, timeout_seconds=90)
+        retry(settled, timeout_seconds=90)
 
     with subtest("requiredSystemFeatures: placed on the worker that has them, refused when none does"):
         out = client.succeed(f"nix build -L --store '{envoy}' --eval-store auto --expr 'map (tag: import ${jobExpr} {{ inherit tag; features = [\"vip\"]; }}) [\"f1\" \"f2\" \"f3\"]' --impure 2>&1")

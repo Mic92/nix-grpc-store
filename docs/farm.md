@@ -86,7 +86,9 @@ You need:
   client's identity on in a header, and the nodes only believe that
   header from a peer with a balancer cert (`trustedProxies`). The
   balancer's public listener uses a regular ACME certificate, so
-  clients don't need the private CA.
+  clients don't need the private CA. Nodes that reach the scheduler
+  through that listener accept it too, they check the scheduler against
+  the private CA and the system CA bundle.
 
 All modules below come from `nix-grpc-store.nixosModules.default`.
 

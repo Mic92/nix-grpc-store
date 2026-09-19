@@ -840,7 +840,7 @@ try {
     stopSignal = nixgrpc::kCancelBuilds;
     nixgrpc::sdNotify("STOPPING=1");
     server->GetHealthCheckService()->SetServingStatus(false);
-    coord.restarting(*server);
+    coord.restarting();
     // Shutdown() then waits for handlers stuck in nix. Clients already got CANCELLED.
     static constexpr std::chrono::seconds shutdownGrace{5};
     std::thread([]() -> void {

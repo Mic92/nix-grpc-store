@@ -85,9 +85,9 @@ public:
     // transport's write kick) to run right after it is released.
     void afterUnlock(std::function<void()> func);
 
-    // Tell every connected peer, and any that connects from now on, that the
-    // streams are about to close on purpose.
+    // Tell every connected peer the streams are about to close on purpose.
     void restarting();
+    void serving();
 
 private:
     // scoped_lock that runs the afterUnlock queue on release.
@@ -112,10 +112,10 @@ private:
     const Clock::time_point epoch = Clock::now();
     std::mutex mutex;
     std::vector<std::function<void()>> deferred; // under mutex
-    bool stopping = false;                                        // under mutex
     sched::Core core;                                             // under mutex
     std::unordered_map<sched::ClientId, ClientSend> clients;      // under mutex
     std::unordered_map<sched::WorkerId, WorkerSend> workers;      // under mutex
+    bool lettingGo = false; // under mutex
     std::atomic<sched::ClientId> nextClient{1};
 
     // Side pool for present() so gRPC threads never block on niks3.

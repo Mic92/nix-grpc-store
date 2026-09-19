@@ -143,6 +143,7 @@ dispatcher_dep = declare_dependency(
 daemon_sources = [
   'src/daemon/main.cc',
   'src/client/channel.cc',
+  'src/daemon/elector.cc',
   'src/daemon/auth.cc',
   'src/daemon/backend.cc',
   'src/daemon/coordinator.cc',

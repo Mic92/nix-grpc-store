@@ -1,10 +1,11 @@
-{{- /* One scheduler pod for all systems. Soft state: a restart loses the queue,
-     workers re-Hello with what they run and clients re-Want. */}}
+{{- /* One Deployment+Service per scheduler replica so envoy can health-check
+     each. Soft state: a restart loses the queue, peers reconnect and resend. */}}
 {{- $root := . }}
 {{- $oidc := include "farm.oidcProviders" . }}
-{{- $svc := include "farm.schedulerService" . }}
-{{- $sel := include "farm.schedulerSelectorLabels" . }}
 {{- $s := .Values.scheduler }}
+{{- range $i, $svc := splitList "," (include "farm.schedulerNames" $root) }}
+{{- $sel := printf "%s\napp.kubernetes.io/instance-rank: \"%d\"" (include "farm.schedulerSelectorLabels" $root) $i }}
+{{- with $root }}
 ---
 apiVersion: v1
 kind: Service
@@ -66,6 +67,7 @@ spec:
           args:
             - --role=scheduler
             - --listen=[::]:50051
+            - --advertise={{ $svc }}.{{ $root.Release.Namespace }}.svc:50051
             - --metrics-listen=0.0.0.0:9464
             - --worker-name=scheduler/$(POD_NAME)
             - --log-level={{ .Values.logLevel }}
@@ -154,3 +156,5 @@ spec:
           secret:
             secretName: {{ include "farm.fullname" . }}-oidc
         {{- end }}
+{{- end }}
+{{- end }}
