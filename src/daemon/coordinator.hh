@@ -31,6 +31,7 @@
 #include "auth.hh"
 #include "cache.hh"
 #include "dispatcher.hh"
+#include "elector.hh"
 #include "metrics.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
@@ -136,11 +137,20 @@ public:
     auto WorkerSession(grpc::CallbackServerContext * context)
         -> grpc::ServerBidiReactor<nix::remote::WorkerMsgs, nix::remote::SchedCmds> * override;
 
-    static void registerHealth(grpc::HealthCheckServiceInterface * health);
+    // Passive: refuse new streams so the balancer retries elsewhere.
+    void setActive(bool active)
+    {
+        active_ = active;
+    }
+    static auto passive() -> grpc::Status
+    {
+        return {grpc::StatusCode::UNAVAILABLE, "scheduler passive, another node serves"};
+    }
 
 private:
     Dispatcher * dispatcher;
     Auth * auth;
+    std::atomic<bool> active_{true};
 };
 
 // Owns the pieces and wires loopback vs. remote session.
@@ -167,12 +177,15 @@ public:
     void tick();
     // Before Shutdown(): peers of the scheduler are told to reconnect rather
     // than left to find a dead stream.
-    void restarting(grpc::Server & server);
+    void restarting();
 
 private:
     const Options & options;
     std::jthread sessionThread; // remote WorkerSession client
+    std::optional<Elector> elector;
+    grpc::HealthCheckServiceInterface * health = nullptr;
     std::atomic<bool> lastHealthy{true};
+    void setSchedulerActive(bool active);
     void runRemoteSession(Builder & bld, const std::stop_token & stop);
 };
 

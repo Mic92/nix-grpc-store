@@ -30,7 +30,7 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     # Meson generates a clang-tidy target from .clang-tidy. The generated
     # protobuf headers must exist before it runs.
     buildPhase = ''
-      ninja nix_remote.pb.h nix_remote.grpc.pb.h
+      ninja nix_remote.pb.h nix_remote.grpc.pb.h health.pb.h health.grpc.pb.h
       ninja clang-tidy
     '';
     installPhase = "touch $out";
@@ -47,6 +47,9 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     quint run scheduler.qnt --main schedNoFence --invariant=safety --max-steps=30 --max-samples=30000
     ! quint run scheduler.qnt --main schedNoPush --invariant=safety --max-steps=30 --max-samples=30000
     ! quint run scheduler.qnt --main schedNoReport --invariant=safety --max-steps=30 --max-samples=30000
+    quint typecheck failover.qnt
+    quint run failover.qnt --main foFixed --invariant=safety --max-steps=30 --max-samples=30000
+    ! quint run failover.qnt --main foNoStepDown --invariant=safety --max-steps=30 --max-samples=10000
     quint run hook.qnt --main hookFixed --invariant=safety --max-steps=15 --max-samples=20000
     ! quint run hook.qnt --main hookNoSubstituteRefs --invariant=safety --max-steps=15 --max-samples=20000
     ! quint run hook.qnt --main hookNoSubstituteDrv --invariant=safety --max-steps=15 --max-samples=20000

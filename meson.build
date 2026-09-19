@@ -71,6 +71,15 @@ gen = custom_target('nix_remote_proto',
   depend_files : 'proto/nix_remote.proto',
 )
 
+health_gen = custom_target('health_proto',
+  output : ['health.pb.cc', 'health.pb.h', 'health.grpc.pb.cc', 'health.grpc.pb.h'],
+  command : [
+    protoc, '--proto_path=' + proto_dir, '--cpp_out=@OUTDIR@', '--grpc_out=@OUTDIR@',
+    '--plugin=protoc-gen-grpc=' + grpc_cpp_plugin.full_path(), 'health.proto',
+  ],
+  depend_files : 'proto/health.proto',
+)
+
 gen_inc = include_directories('.')
 src_inc = include_directories('src')
 
@@ -140,7 +149,9 @@ dispatcher_dep = declare_dependency(
 )
 
 daemon_sources = [
+  health_gen,
   'src/daemon/main.cc',
+  'src/daemon/elector.cc',
   'src/daemon/auth.cc',
   'src/daemon/backend.cc',
   'src/daemon/coordinator.cc',

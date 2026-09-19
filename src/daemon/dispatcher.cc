@@ -228,6 +228,12 @@ auto Dispatcher::connectClient(ClientSend send) -> ClientPtr
     return client;
 }
 
+void Dispatcher::resume()
+{
+    const Lock lock(*this);
+    stopping = false;
+}
+
 void Dispatcher::restarting()
 {
     const Lock lock(*this);

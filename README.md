@@ -333,7 +333,7 @@ which also requires `trustClients` (see above).
   * `--oidc-config FILE` — accept OIDC bearer tokens, see access control
   * `--metrics-listen ADDR` — serve Prometheus metrics, disabled if unset
   * `--worker-name NAME` — name in build-log prefixes and `nix_grpc_build_info`, default hostname
-  * `--role builder,scheduler`, `--scheduler ADDR`, `--scheduler-ca FILE`, `--advertise IP:PORT`, `--max-jobs N`, `--min-free SIZE` — see [docs/farm.md](docs/farm.md). The defaults make a single node schedule onto itself
+  * `--role builder,scheduler`, `--scheduler ADDR`, `--scheduler-ca FILE`, `--advertise IP:PORT`, `--scheduler-order A,B,…`, `--max-jobs N`, `--min-free SIZE` — see [docs/farm.md](docs/farm.md). The defaults make a single node schedule onto itself
   * `--niks3 URL --niks3-token-file FILE [--niks3-push CMD]` — publish build outputs and uploads to a niks3 cache
   * `--log-level info|debug` — access log verbosity, default `info`
 

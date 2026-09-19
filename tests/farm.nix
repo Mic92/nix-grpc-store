@@ -75,8 +75,13 @@ let
         enable = true;
         listen = "[::]:50051";
         advertise = "${ip.${name}}:50051";
-        # WorkerSession goes through the balancer like a client would.
+        # WorkerSession goes through the balancer like a client would, so
+        # builders follow whichever scheduler node is active.
         scheduler = "lb:50051";
+        schedulerOrder = [
+          "${ip.worker1}:50051"
+          "${ip.worker2}:50051"
+        ];
         schedulerCaFile = "${certs}/ca.pem";
         logLevel = "debug";
         idleTimeout = null;
@@ -174,7 +179,6 @@ pkgs.testers.runNixOSTest {
     };
     worker2 = {
       imports = [ (worker "worker2") ];
-      services.nix-grpc-daemon.roles = [ "builder" ];
       nix.settings.system-features = [ ];
       specialisation.next.configuration.services.nix-grpc-daemon.workerName = "worker2-next";
     };
@@ -194,6 +198,11 @@ pkgs.testers.runNixOSTest {
           accessLog = true;
           enable = true;
           workers.${system} = [
+            "${ip.worker1}:50051"
+            "${ip.worker2}:50051"
+          ];
+          # worker2 takes over scheduling while worker1 is down.
+          scheduler = [
             "${ip.worker1}:50051"
             "${ip.worker2}:50051"
           ];
@@ -281,7 +290,8 @@ pkgs.testers.runNixOSTest {
             retry(check, timeout_seconds=90)
 
     wait_health("${system}")
-    wait_health("sched")
+    # worker2's scheduler is passive while worker1 serves.
+    wait_health("sched", "worker2")
 
     def gauge(w, name: str) -> int:
         out = w.succeed(f"curl -sf http://127.0.0.1:9464/metrics | grep -F '{name} ' || true").strip()
@@ -334,7 +344,7 @@ pkgs.testers.runNixOSTest {
             w.succeed(f"nix-store --delete {top}")
         build(envoy, "t1")
         assert holders(top) == [], holders(top)
-        worker1.succeed("curl -sf http://127.0.0.1:9464/metrics | grep -q 'nix_grpc_events_total{kind=\"cached\"}'")
+        assert events(worker1, "cached") >= 1
 
     builder = "pgrep -f 'read -t [9]0 x'"
     def building() -> list[str]:
@@ -388,17 +398,19 @@ pkgs.testers.runNixOSTest {
         worker1.systemctl("start nix-grpc-daemon.service")
         wait_health("${system}")
 
-    with subtest("scheduler down: builds wait, then resume when it is back"):
+    with subtest("scheduler down: the next node takes over, and yields when it is back"):
         worker1.systemctl("stop nix-grpc-daemon.socket nix-grpc-daemon.service")
+        # worker2 sees worker1 gone for a few polls, then serves.
         wait_health("sched", "worker1")
-        client.succeed(f"systemd-run --unit waits nix build --store '{envoy}' --eval-store auto -f ${jobExpr} --argstr tag schedback")
-        client.sleep(3)
-        client.succeed("systemctl is-active waits")
+        worker2.wait_until_succeeds("journalctl -u nix-grpc-daemon | grep -q event=scheduler_take_over", timeout=30)
+        retry(lambda _: sched_workers(worker2) == 1, timeout_seconds=30)
+        build(envoy, "on-standby")
         worker1.systemctl("start nix-grpc-daemon.service")
-        wait_health("sched")
-        client.wait_until_succeeds("! systemctl is-active waits", timeout=120)
-        client.succeed("systemctl show -p Result --value waits | grep -qx success || { journalctl -u waits >&2; false; }")
+        # worker1 serves at once; worker2 notices, tells its peers, goes passive.
+        worker2.wait_until_succeeds("journalctl -u nix-grpc-daemon | grep -q event=scheduler_yield", timeout=30)
+        wait_health("sched", "worker2")
         retry(lambda _: sched_workers(worker1) == 2, timeout_seconds=60)
+        retry(lambda _: sched_workers(worker2) == 0, timeout_seconds=30)
 
     with subtest("clean scheduler restart: peers are told, reconnect without error or backoff"):
         client.succeed(f"systemd-run --unit rs nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag rs")
@@ -408,7 +420,7 @@ pkgs.testers.runNixOSTest {
         # that build go so the restart proceeds.
         worker1.execute("pkill -f 'read -t [9]0 x'")
         worker1.succeed("systemctl restart nix-grpc-daemon.service")
-        worker2.wait_until_succeeds("journalctl -u nix-grpc-daemon | grep -q event=scheduler_restarting", timeout=30)
+        worker2.wait_until_succeeds("journalctl -u nix-grpc-daemon | grep -q 'event=scheduler_restarting addr='", timeout=30)
         retry(lambda _: sched_workers(worker1) == 2, timeout_seconds=30)
         release_slow()
         client.wait_until_succeeds("! systemctl is-active rs", timeout=120)

@@ -128,7 +128,12 @@ let
       health_checks = [ (healthCheck "") ];
       load_assignment = {
         cluster_name = name;
-        endpoints = [ { lb_endpoints = map endpoint workers; } ];
+        endpoints = [
+          {
+            priority = 0;
+            lb_endpoints = map endpoint workers;
+          }
+        ];
       };
     };
 
@@ -140,9 +145,13 @@ let
       type = "STRICT_DNS";
       connect_timeout = "5s";
       health_checks = [ (healthCheck "nix.scheduler") ];
+      # One priority level per node: envoy uses the first healthy one.
       load_assignment = {
         cluster_name = "sched";
-        endpoints = [ { lb_endpoints = [ (endpoint cfg.scheduler) ]; } ];
+        endpoints = lib.imap0 (priority: addr: {
+          inherit priority;
+          lb_endpoints = [ (endpoint addr) ];
+        }) (lib.toList cfg.scheduler);
       };
     };
 
@@ -209,14 +218,19 @@ in
     };
 
     scheduler = lib.mkOption {
-      type = lib.types.str;
+      type = lib.types.either lib.types.str (lib.types.listOf lib.types.str);
       default = lib.head cfg.workers.${cfg.defaultSystem};
       defaultText = lib.literalMD "first worker of `defaultSystem`";
-      example = "10.0.0.5:50051";
+      example = [
+        "10.0.0.4:50051"
+        "10.0.0.5:50051"
+      ];
       description = ''
-        The worker with the `scheduler` role. It serves all systems and there
-        is exactly one. While it is down new builds wait and running ones
-        finish.
+        The worker(s) with the `scheduler` role, in order of preference.
+        Scheduler traffic goes to the first one that is up. The later ones
+        stay passive until every node before them is down, see
+        `services.nix-grpc-daemon.schedulerOrder`. A single string is a
+        list of one.
       '';
     };
 

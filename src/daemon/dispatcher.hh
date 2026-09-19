@@ -99,6 +99,8 @@ public:
     // Tell every connected peer, and any that connects from now on, that the
     // streams are about to close on purpose.
     void restarting();
+    // Undo restarting(): accept peers normally again (scheduler took over).
+    void resume();
 
 private:
     // scoped_lock that runs the afterUnlock queue on release.

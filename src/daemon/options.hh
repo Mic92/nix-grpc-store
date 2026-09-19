@@ -41,6 +41,9 @@ struct Options
     // Empty: in-process scheduler. Else the balancer URL (host:port) to dial.
     std::string schedulerAddr;
     std::string schedulerCA; // server CA for schedulerAddr; client cert = tlsCert/tlsKey
+    // Nodes with the scheduler role that outrank this one, in order. While any
+    // of them serves, this one stays passive. Same TLS as schedulerAddr.
+    std::vector<std::string> yieldTo;
     // How the balancer reaches this worker; goes into Assigned.worker_addr.
     std::string advertise;
     unsigned maxJobs = 1;

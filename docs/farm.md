@@ -36,7 +36,11 @@ Nothing is stored on disk. Restart the scheduler and running builds
 finish, workers and clients reconnect, and clients ask again for what is
 still missing. A clean stop tells them first, so they come back at once
 and print nothing. After a crash they notice on their own and retry for
-up to two minutes. Restart a worker and its builds fail and are sent
+up to two minutes.
+
+To survive losing the scheduler machine, give the role to a second worker
+as well and list both in order. The second one only serves while the
+first is down, and hands everyone back when it returns. Restart a worker and its builds fail and are sent
 elsewhere. A single node with no `scheduler` setting is a farm of one.
 
 ## Before you begin
@@ -70,8 +74,8 @@ services.nix-grpc-daemon = {
   enable = true;
   listen = "[::]:50052";
   advertise = "10.0.0.5:50052";
-  roles = [ "builder" ];              # add "scheduler" on exactly one worker
-  scheduler = "10.0.0.4:50052";       # leave out on that worker
+  roles = [ "builder" ];              # add "scheduler" on one (or two, see schedulerOrder)
+  scheduler = "10.0.0.4:50052";       # leave out on a lone scheduler node
   schedulerCaFile = "/run/keys/farm-ca.crt";
   idleTimeout = null;
   maxJobs = 8;
@@ -97,8 +101,9 @@ services.nix-grpc-daemon = {
 
 | Option | What it does |
 |---|---|
-| `roles` | `builder`, `scheduler` or both (the default). Exactly one node per farm has `scheduler`. |
-| `scheduler` | Address of the scheduler node. Workers connect to it directly, not through the balancer. |
+| `roles` | `builder`, `scheduler` or both (the default). One node serves as scheduler at a time. |
+| `scheduler` | Where this worker reaches the scheduler: the scheduler node, or the balancer if more than one node can be scheduler. |
+| `schedulerOrder` | All scheduler-capable nodes, preferred first. Same list on every such node and in the balancer's `scheduler`. Leave empty with a single scheduler. |
 | `advertise` | The address the balancer knows this worker by. Must match its entry in the balancer's `workers`. |
 | `maxJobs` | Concurrent builds on this worker. Keep it at or below the local nix-daemon's `max-jobs`. |
 | `minFree` | Below this much free disk the worker takes no new builds until space returns. |
@@ -162,7 +167,7 @@ security.acme.certs."farm.example.com" = {
 | Option | What it does |
 |---|---|
 | `workers` | Worker addresses per system, as in their `advertise`. Requests for a system not listed go to `defaultSystem` (first entry by default). |
-| `scheduler` | The worker with the `scheduler` role. Defaults to the first worker of `defaultSystem`. |
+| `scheduler` | The worker(s) with the `scheduler` role, preferred first. Envoy uses the first healthy one. Defaults to the first worker of `defaultSystem`. |
 | `tls.certFile`/`keyFile` | Public server certificate. |
 | `tls.clientCaFile` | Verify client certificates against this CA and forward the subject to workers. Clients without a certificate are still accepted so tokens work. |
 | `tls.upstream.*` | The certificate envoy presents to workers, and the CA to verify them. |
@@ -355,7 +360,16 @@ switch` only signals the worker and the next connection starts the new
 generation.
 
 **Restart the scheduler.** Safe at any time, see [How it works](#how-it-works).
-New builds wait until it is back.
+New builds wait until it is back, or go to the next node in
+`schedulerOrder` after a few seconds.
+
+**Scheduler failover.** On two fixed workers set
+`roles = [ "builder" "scheduler" ]`, the same
+`schedulerOrder = [ "10.0.0.4:50052" "10.0.0.5:50052" ]`,
+`scheduler = "<balancer>:50051"`, and on the balancer
+`scheduler = [ "10.0.0.4:50052" "10.0.0.5:50052" ]`. The second node polls
+the first one's health and logs `scheduler_take_over` / `scheduler_yield`
+when it switches. Autoscaled workers stay `builder` only.
 
 **See what a worker did.** Each build is one journal line:
 

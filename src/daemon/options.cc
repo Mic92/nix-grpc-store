@@ -3,6 +3,7 @@
 #include "options.hh"
 
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -131,6 +132,9 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.schedulerAddr = next();
         } else if (arg == "--scheduler-ca") {
             options.schedulerCA = next();
+        } else if (arg == "--scheduler-order") {
+            // Full ordered list; everything before our own --advertise outranks us.
+            options.yieldTo = nix::tokenizeString<std::vector<std::string>>(next(), ",");
         } else if (arg == "--advertise") {
             options.advertise = next();
         } else if (arg == "--max-jobs") {
@@ -170,6 +174,19 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
     }
     if (options.advertise.empty()) {
         options.advertise = options.listen;
+    }
+    if (!options.yieldTo.empty()) {
+        auto self = std::ranges::find(options.yieldTo, options.advertise);
+        if (self == options.yieldTo.end()) {
+            throw nix::Error("--scheduler-order does not contain this node's --advertise '%s'", options.advertise);
+        }
+        if (!options.scheduler) {
+            throw nix::Error("--scheduler-order needs --role scheduler");
+        }
+        options.yieldTo.erase(self, options.yieldTo.end());
+        if (!options.yieldTo.empty() && options.builder && options.schedulerAddr.empty()) {
+            throw nix::Error("--scheduler-order: a builder that can yield needs --scheduler (the balancer) to find the active one");
+        }
     }
     if (options.storeDir.empty()) {
         options.storeDir = nix::getEnv("NIX_STORE_DIR").value_or("/nix/store");

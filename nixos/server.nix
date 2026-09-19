@@ -234,6 +234,22 @@ in
         balancer. `null` uses the in-process scheduler.
       '';
     };
+    schedulerOrder = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [
+        "10.0.0.4:50051"
+        "10.0.0.5:50051"
+      ];
+      description = ''
+        All nodes with the `scheduler` role, best first, same list as the
+        balancer's `scheduler`. This node finds itself by {option}`advertise`
+        and only serves scheduler streams while no node before it does. With
+        more than one entry, builders on these nodes must set
+        {option}`scheduler` to the balancer so they follow the active one.
+        Empty means this node is the only scheduler.
+      '';
+    };
     schedulerCaFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
@@ -456,6 +472,10 @@ in
           ++ lib.optionals (cfg.advertise != null) [
             "--advertise"
             cfg.advertise
+          ]
+          ++ lib.optionals (cfg.schedulerOrder != [ ]) [
+            "--scheduler-order"
+            (lib.concatStringsSep "," cfg.schedulerOrder)
           ]
           ++ lib.optionals (cfg.niks3 != null) [
             "--niks3"

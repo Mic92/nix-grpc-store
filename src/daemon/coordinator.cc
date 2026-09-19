@@ -229,20 +229,16 @@ SchedulerService::SchedulerService(Dispatcher & dispatcher, Auth & auth)
 {
 }
 
-void SchedulerService::registerHealth(grpc::HealthCheckServiceInterface * health)
-{
-    if (health == nullptr) {
-        return;
-    }
-    health->SetServingStatus("nix.scheduler", true);
-}
 
 auto SchedulerService::Schedule(grpc::CallbackServerContext * context)
     -> grpc::ServerBidiReactor<ClientMsgs, SchedMsgs> *
 {
+    if (!active_) {
+        return new RejectReactor<ClientMsgs, SchedMsgs>(passive()); // NOLINT(cppcoreguidelines-owning-memory): deletes itself in OnDone
+    }
     auto caller = auth->identify(*context);
     if (auto status = Auth::authorize(caller, "Schedule", Role::write); !status.ok()) {
-        return new RejectReactor<ClientMsgs, SchedMsgs>(status); // NOLINT(cppcoreguidelines-owning-memory): deletes itself in OnDone
+        return new RejectReactor<ClientMsgs, SchedMsgs>(status); // NOLINT(cppcoreguidelines-owning-memory)
     }
     return new ScheduleReactor(context, *dispatcher); // NOLINT(cppcoreguidelines-owning-memory)
 }
@@ -250,6 +246,9 @@ auto SchedulerService::Schedule(grpc::CallbackServerContext * context)
 auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
     -> grpc::ServerBidiReactor<WorkerMsgs, SchedCmds> *
 {
+    if (!active_) {
+        return new RejectReactor<WorkerMsgs, SchedCmds>(passive()); // NOLINT(cppcoreguidelines-owning-memory)
+    }
     auto caller = auth->identify(*context);
     if (auto status = Auth::authorize(caller, "WorkerSession", Role::trusted); !status.ok()) {
         return new RejectReactor<WorkerMsgs, SchedCmds>(status); // NOLINT(cppcoreguidelines-owning-memory)
@@ -259,15 +258,45 @@ auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
 
 // -------------------------------------------------------------- Coordinator
 
-void Coordinator::restarting(grpc::Server & server)
+namespace {
+// TLS to other scheduler nodes iff --scheduler-ca; our server cert doubles as
+// client cert.
+auto schedulerCreds(const Options & options) -> std::shared_ptr<grpc::ChannelCredentials>
+{
+    if (options.schedulerCA.empty()) {
+        return grpc::InsecureChannelCredentials();
+    }
+    grpc::SslCredentialsOptions ssl;
+    ssl.pem_root_certs = nix::readFile(options.schedulerCA);
+    if (!options.tlsCert.empty()) {
+        ssl.pem_cert_chain = nix::readFile(options.tlsCert);
+        ssl.pem_private_key = nix::readFile(options.tlsKey);
+    }
+    return grpc::SslCredentials(ssl);
+}
+} // namespace
+
+
+void Coordinator::setSchedulerActive(bool active)
+{
+    if (health != nullptr) {
+        health->SetServingStatus("nix.scheduler", active);
+    }
+    scheduler->setActive(active);
+    if (active) {
+        dispatcher->resume(); // NOLINT(bugprone-unchecked-optional-access): set iff scheduler
+    } else {
+        dispatcher->restarting(); // NOLINT(bugprone-unchecked-optional-access)
+    }
+}
+
+void Coordinator::restarting()
 {
     if (!dispatcher) {
         return;
     }
-    if (auto * health = server.GetHealthCheckService()) {
-        health->SetServingStatus("nix.scheduler", false);
-    }
-    dispatcher->restarting();
+    elector.reset(); // no take-over while going down
+    setSchedulerActive(false);
     logLine(LogLevel::info, {{"event", "scheduler_restarting"}});
     // Let the writes leave before Shutdown() cancels the streams.
     static constexpr std::chrono::milliseconds flush{200};
@@ -323,6 +352,7 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
 // dispatcher after the Builder they call into. Cut the edges first.
 Coordinator::~Coordinator()
 {
+    elector.reset();
     if (sessionThread.joinable()) {
         sessionThread.request_stop();
         sessionThread.join();
@@ -336,8 +366,15 @@ Coordinator::~Coordinator()
 
 void Coordinator::start(grpc::Server & server)
 {
+    health = server.GetHealthCheckService();
     if (scheduler) {
-        SchedulerService::registerHealth(server.GetHealthCheckService());
+        // With predecessors we start passive and the Elector flips us.
+        setSchedulerActive(options.yieldTo.empty());
+        if (!options.yieldTo.empty()) {
+            elector.emplace(options.yieldTo, schedulerCreds(options), [this](bool active) -> void {
+                setSchedulerActive(active);
+            });
+        }
     }
     if (!builder) {
         return;
@@ -352,20 +389,7 @@ void Coordinator::start(grpc::Server & server)
 
 void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
 {
-    // TLS to the scheduler iff --scheduler-ca; our server cert doubles as client
-    // cert.
-    std::shared_ptr<grpc::ChannelCredentials> creds;
-    if (options.schedulerCA.empty()) {
-        creds = grpc::InsecureChannelCredentials();
-    } else {
-        grpc::SslCredentialsOptions ssl;
-        ssl.pem_root_certs = nix::readFile(options.schedulerCA);
-        if (!options.tlsCert.empty()) {
-            ssl.pem_cert_chain = nix::readFile(options.tlsCert);
-            ssl.pem_private_key = nix::readFile(options.tlsKey);
-        }
-        creds = grpc::SslCredentials(ssl);
-    }
+    auto creds = schedulerCreds(options);
     grpc::ChannelArguments args;
     args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, keepaliveMs);
     auto channel = grpc::CreateCustomChannel(options.schedulerAddr, creds, args);
