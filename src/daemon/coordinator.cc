@@ -264,6 +264,20 @@ auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
 
 // -------------------------------------------------------------- Coordinator
 
+void Coordinator::restarting(grpc::Server & server)
+{
+    if (!dispatcher) {
+        return;
+    }
+    if (auto * health = server.GetHealthCheckService()) {
+        health->SetServingStatus("nix.scheduler", false);
+    }
+    dispatcher->restarting();
+    logLine(LogLevel::info, {{"event", "scheduler_restarting"}});
+    // No wait for the writes to flush: Shutdown() lets in-flight writes
+    // finish, and a peer that misses the message just reconnects the old way.
+}
+
 Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics)
     : cache(options.niks3)
     , options(options)
@@ -399,13 +413,20 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
         }
         const std::stop_callback onStop(stop, [&ctx]() -> void { ctx.TryCancel(); });
         SchedCmds cmds;
+        bool restarting = false;
         while (helloed && stream->Read(&cmds)) {
             for (const auto & cmd : cmds.msgs()) {
                 if (cmd.has_expect()) {
                     bld.onExpect(cmd.expect());
                 } else if (cmd.has_revoke()) {
                     bld.onRevoke(cmd.revoke());
+                } else if (cmd.has_restarting()) {
+                    restarting = true;
                 }
+            }
+            if (restarting) {
+                // Leave now. A yielding scheduler keeps the connection open.
+                ctx.TryCancel();
             }
         }
         *live = false;
@@ -413,9 +434,15 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
         if (stop.stop_requested()) {
             return;
         }
-        logLine(
-            LogLevel::info,
-            {{"event", "scheduler_disconnected"}, {"addr", options.schedulerAddr}, {"error", status.error_message()}});
+        if (restarting) {
+            // Announced: go straight back, the successor is (about to be) up.
+            logLine(LogLevel::info, {{"event", "scheduler_restarting"}, {"addr", options.schedulerAddr}});
+            backoff = minBackoff;
+        } else {
+            logLine(
+                LogLevel::info,
+                {{"event", "scheduler_disconnected"}, {"addr", options.schedulerAddr}, {"error", status.error_message()}});
+        }
         std::this_thread::sleep_for(backoff);
         backoff = std::min(backoff * 2, maxBackoff);
     }

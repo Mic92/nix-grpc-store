@@ -417,6 +417,37 @@ auto schedulerGone(const grpc::Status & status) -> bool {
     return false;
   }
 }
+
+struct StreamEnd {
+  bool answered = false;   // got at least one message
+  bool restarting = false; // the scheduler announced it and we closed the stream
+};
+
+// Pump one Schedule stream into `run` until it closes.
+template <typename Stream, typename Run>
+auto readSchedule(Stream & stream, Run & run, grpc::ClientContext & ctx) -> StreamEnd {
+  StreamEnd end;
+  remote::SchedMsgs msgs;
+  while (stream.Read(&msgs)) {
+    end.answered = true;
+    run.onMsgs(msgs);
+    if (std::ranges::any_of(msgs.msgs(), &remote::SchedMsg::has_restarting)) {
+      // Leave now. A scheduler that yields to another keeps the connection open.
+      end.restarting = true;
+      ctx.TryCancel();
+    }
+  }
+  return end;
+}
+
+void logReconnect(const std::string & where, const grpc::Status & status, bool restarting) {
+  if (restarting) {
+    // Announced restart: not worth a red line.
+    debug("grpc: scheduler at %s restarting, reconnecting", where);
+  } else {
+    printError("scheduler at %s: %s, reconnecting", where, GrpcStore::firstLine(status.error_message()));
+  }
+}
 } // namespace
 
 // The scheduler holds soft state only: on a broken stream reconnect and
@@ -433,15 +464,10 @@ auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers,
     auto stream = sched->Schedule(&ctx);
     run.attach(stream.get());
     debug("grpc: Schedule stream open, %d jobs", run.jobs.size());
-    remote::SchedMsgs msgs;
-    bool answered = false;
-    while (stream->Read(&msgs)) {
-      answered = true;
-      run.onMsgs(msgs);
-    }
+    auto const [answered, restarting] = readSchedule(*stream, run, ctx);
     status = stream->Finish();
     setCtx(nullptr);
-    if (run.detach() == 0 || isInterrupted() || !schedulerGone(status)) {
+    if (run.detach() == 0 || isInterrupted() || !(restarting || schedulerGone(status))) {
       return status;
     }
     auto const now = std::chrono::steady_clock::now();
@@ -452,7 +478,7 @@ auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers,
     if (now + pause > giveUp) {
       return status;
     }
-    printError("scheduler at %s: %s, reconnecting", config->authority.to_string(), firstLine(status.error_message()));
+    logReconnect(config->authority.to_string(), status, restarting);
     std::this_thread::sleep_for(pause);
     pause = std::min(pause * 2, maxReconnectPause);
   }

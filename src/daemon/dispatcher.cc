@@ -213,7 +213,29 @@ auto Dispatcher::connectClient(ClientSend send) -> ClientPtr
     auto client = std::make_shared<Client>();
     client->id = nextClient++;
     client->send = std::move(send);
+    const Lock lock(*this);
+    if (stopping) {
+        SchedMsg msg;
+        msg.mutable_restarting();
+        client->send(msg);
+    }
     return client;
+}
+
+void Dispatcher::restarting()
+{
+    const Lock lock(*this);
+    stopping = true;
+    SchedMsg msg;
+    msg.mutable_restarting();
+    SchedCmd cmd;
+    cmd.mutable_restarting();
+    for (auto & [cid, send] : clients) {
+        send(msg);
+    }
+    for (auto & [wid, send] : workers) {
+        send(cmd);
+    }
 }
 
 void Dispatcher::clientMsgs(const ClientPtr & client, const nix::remote::ClientMsgs & msgs)
@@ -325,7 +347,8 @@ void Dispatcher::clientGone(const ClientPtr & clientPtr)
     std::vector<std::pair<sched::DrvId, sched::WorkerId>> revokes;
     core.clientGone(client.id, revokes);
     for (auto [drv, wid] : revokes) {
-        if (const auto & ent = core.entry(drv)) {
+        // A client we sent away comes back for the same build. Keep it running.
+        if (const auto  & ent = core.entry(drv); ent && !stopping) {
             revokeOn(wid, ent->drvPath);
         }
     }
@@ -377,6 +400,11 @@ void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg &
              .maxJobs = hel.max_jobs(),
              .running = std::move(running)});
         workers[*worker.id] = worker.send;
+        if (stopping) {
+            SchedCmd cmd;
+            cmd.mutable_restarting();
+            worker.send(cmd);
+        }
         logLine(
             LogLevel::info,
             {{"event", "worker_hello"},
