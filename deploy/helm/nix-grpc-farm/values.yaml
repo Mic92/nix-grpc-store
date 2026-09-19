@@ -39,7 +39,8 @@ tls:
     existingSecret: ""
   # Workers and scheduler: server certificate towards the balancer. Workers
   # also present it to the scheduler. Must carry a SAN for
-  # <release>-nix-grpc-farm-scheduler.<namespace>.svc.
+  # <release>-nix-grpc-farm-scheduler[-<i>].<namespace>.svc and, with
+  # scheduler.replicas > 1, <release>-nix-grpc-farm.<namespace>.svc.
   worker:
     existingSecret: ""
     # Name the balancer verifies on worker certificates. Empty: chain only.
@@ -96,6 +97,8 @@ defaultGroup: ""
 
 # The one scheduler pod (all systems). Holds only soft state.
 scheduler:
+  # >1 adds standby schedulers. niks3 picks the active one, so this needs `niks3`.
+  replicas: 1
   resources: {}
   nodeSelector: {}
   tolerations: []

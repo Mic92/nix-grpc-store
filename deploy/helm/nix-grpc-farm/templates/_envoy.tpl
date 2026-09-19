@@ -20,15 +20,21 @@ health_checks:
     unhealthy_threshold: 2
     healthy_threshold: 1
     grpc_health_check: {{ if .healthService }}{service_name: {{ .healthService }}}{{ else }}{}{{ end }}
+{{- if .healthService }}
+common_lb_config:
+  healthy_panic_threshold: {value: 0}
+{{- end }}
 load_assignment:
   cluster_name: {{ .name | quote }}
   endpoints:
     - lb_endpoints:
+        {{- range $svc := splitList "," .service }}
         - endpoint:
             address:
               socket_address:
-                address: {{ printf "%s.%s.svc" .service $root.Release.Namespace }}
+                address: {{ printf "%s.%s.svc" $svc $root.Release.Namespace }}
                 port_value: 50051
+        {{- end }}
 {{- if $root.Values.tls.worker.existingSecret }}
 transport_socket:
   name: envoy.transport_sockets.tls
@@ -152,7 +158,7 @@ filter_chains:
 {{- $clusters = append $clusters (include "farm.envoy.workerCluster" (dict "root" $root "name" $g "service" $svc "healthService" "") | fromYaml) }}
 {{- $routes = append $routes (include "farm.envoy.route" (dict "prefix" "/" "cluster" $g "system" $w.system "isDefault" $isDefault) | fromYaml) }}
 {{- end }}
-{{- $clusters = append $clusters (include "farm.envoy.clusterCommon" (dict "root" $root "name" "sched" "service" (include "farm.schedulerService" $root) "healthService" "nix.scheduler") | fromYaml) }}
+{{- $clusters = append $clusters (include "farm.envoy.clusterCommon" (dict "root" $root "name" "sched" "service" (include "farm.schedulerNames" $root) "healthService" "nix.scheduler") | fromYaml) }}
 {{- $listener := include "farm.envoy.listener" (dict "Values" .Values "routes" $routes) | fromYaml }}
 {{- toJson (dict
   "admin" (dict "address" (dict "socket_address" (dict "address" "::" "port_value" 9901 "ipv4_compat" true)))

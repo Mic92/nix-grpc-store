@@ -213,19 +213,19 @@ auto Dispatcher::connectClient(ClientSend send) -> ClientPtr
     auto client = std::make_shared<Client>();
     client->id = nextClient++;
     client->send = std::move(send);
-    const Lock lock(*this);
-    if (stopping) {
-        SchedMsg msg;
-        msg.mutable_restarting();
-        client->send(msg);
-    }
     return client;
+}
+
+void Dispatcher::serving()
+{
+    const Lock lock(*this);
+    lettingGo = false;
 }
 
 void Dispatcher::restarting()
 {
     const Lock lock(*this);
-    stopping = true;
+    lettingGo = true;
     SchedMsg msg;
     msg.mutable_restarting();
     SchedCmd cmd;
@@ -348,7 +348,7 @@ void Dispatcher::clientGone(const ClientPtr & clientPtr)
     core.clientGone(client.id, revokes);
     for (auto [drv, wid] : revokes) {
         // A client we sent away comes back for the same build. Keep it running.
-        if (const auto  & ent = core.entry(drv); ent && !stopping) {
+        if (const auto  & ent = core.entry(drv); ent && !lettingGo) {
             revokeOn(wid, ent->drvPath);
         }
     }
@@ -400,11 +400,6 @@ void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg &
              .maxJobs = hel.max_jobs(),
              .running = std::move(running)});
         workers[*worker.id] = worker.send;
-        if (stopping) {
-            SchedCmd cmd;
-            cmd.mutable_restarting();
-            worker.send(cmd);
-        }
         logLine(
             LogLevel::info,
             {{"event", "worker_hello"},

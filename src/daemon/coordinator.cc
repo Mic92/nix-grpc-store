@@ -233,20 +233,16 @@ SchedulerService::SchedulerService(Dispatcher & dispatcher, Auth & auth)
 {
 }
 
-void SchedulerService::registerHealth(grpc::HealthCheckServiceInterface * health)
-{
-    if (health == nullptr) {
-        return;
-    }
-    health->SetServingStatus("nix.scheduler", true);
-}
 
 auto SchedulerService::Schedule(grpc::CallbackServerContext * context)
     -> grpc::ServerBidiReactor<ClientMsgs, SchedMsgs> *
 {
+    if (!active_) {
+        return new RejectReactor<ClientMsgs, SchedMsgs>(passive()); // NOLINT(cppcoreguidelines-owning-memory): deletes itself in OnDone
+    }
     auto caller = auth->identify(*context);
     if (auto status = Auth::authorize(caller, "Schedule", Role::write); !status.ok()) {
-        return new RejectReactor<ClientMsgs, SchedMsgs>(status); // NOLINT(cppcoreguidelines-owning-memory): deletes itself in OnDone
+        return new RejectReactor<ClientMsgs, SchedMsgs>(status); // NOLINT(cppcoreguidelines-owning-memory)
     }
     return new ScheduleReactor(context, *dispatcher); // NOLINT(cppcoreguidelines-owning-memory)
 }
@@ -254,6 +250,9 @@ auto SchedulerService::Schedule(grpc::CallbackServerContext * context)
 auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
     -> grpc::ServerBidiReactor<WorkerMsgs, SchedCmds> *
 {
+    if (!active_) {
+        return new RejectReactor<WorkerMsgs, SchedCmds>(passive()); // NOLINT(cppcoreguidelines-owning-memory)
+    }
     auto caller = auth->identify(*context);
     if (auto status = Auth::authorize(caller, "WorkerSession", Role::trusted); !status.ok()) {
         return new RejectReactor<WorkerMsgs, SchedCmds>(status); // NOLINT(cppcoreguidelines-owning-memory)
@@ -264,15 +263,56 @@ auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
 
 // -------------------------------------------------------------- Coordinator
 
-void Coordinator::restarting(grpc::Server & server)
+namespace {
+// TLS unless the URL says http://. Our server cert doubles as client cert,
+// --scheduler-token-file adds a bearer: either, both or neither. The address
+// is often the balancer with a public certificate, so trust the system
+// bundle as well as the farm CA.
+auto schedulerCreds(const Options & options) -> std::shared_ptr<grpc::ChannelCredentials>
+{
+    if (options.schedulerAddr.starts_with(plaintextScheme)) {
+        return grpc::InsecureChannelCredentials();
+    }
+    grpc::SslCredentialsOptions ssl;
+    ssl.pem_root_certs = defaultCaCert();
+    if (!options.clientCA.empty()) {
+        ssl.pem_root_certs += "\n" + nix::readFile(options.clientCA);
+    }
+    if (!options.tlsCert.empty()) {
+        ssl.pem_cert_chain = nix::readFile(options.tlsCert);
+        ssl.pem_private_key = nix::readFile(options.tlsKey);
+    }
+    std::shared_ptr<grpc::ChannelCredentials> creds = grpc::SslCredentials(ssl);
+    if (!options.schedulerTokenFile.empty()) {
+        creds = grpc::CompositeChannelCredentials(
+            creds,
+            grpc::MetadataCredentialsFromPlugin(std::make_unique<TokenFileCredentials>(options.schedulerTokenFile)));
+    }
+    return creds;
+}
+} // namespace
+
+
+void Coordinator::setSchedulerActive(bool active)
+{
+    if (health != nullptr) {
+        health->SetServingStatus("nix.scheduler", active);
+    }
+    scheduler->setActive(active);
+    if (active) {
+        dispatcher->serving(); // NOLINT(bugprone-unchecked-optional-access): set iff scheduler
+    } else {
+        dispatcher->restarting(); // NOLINT(bugprone-unchecked-optional-access)
+    }
+}
+
+void Coordinator::restarting()
 {
     if (!dispatcher) {
         return;
     }
-    if (auto * health = server.GetHealthCheckService()) {
-        health->SetServingStatus("nix.scheduler", false);
-    }
-    dispatcher->restarting();
+    elector.reset();
+    setSchedulerActive(false);
     logLine(LogLevel::info, {{"event", "scheduler_restarting"}});
     // No wait for the writes to flush: Shutdown() lets in-flight writes
     // finish, and a peer that misses the message just reconnects the old way.
@@ -327,6 +367,7 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
 // dispatcher after the Builder they call into. Cut the edges first.
 Coordinator::~Coordinator()
 {
+    elector.reset();
     if (sessionThread.joinable()) {
         sessionThread.request_stop();
         sessionThread.join();
@@ -340,8 +381,14 @@ Coordinator::~Coordinator()
 
 void Coordinator::start(grpc::Server & server)
 {
+    health = server.GetHealthCheckService();
     if (scheduler) {
-        SchedulerService::registerHealth(server.GetHealthCheckService());
+        // A node that schedules only onto itself has no peers to elect among.
+        const bool elect = options.niks3.enabled() && (!builder || !options.schedulerAddr.empty());
+        setSchedulerActive(!elect);
+        if (elect) {
+            elector.emplace(*cache.client(), [this](bool lead) -> void { setSchedulerActive(lead); });
+        }
     }
     if (!builder) {
         return;
@@ -353,35 +400,6 @@ void Coordinator::start(grpc::Server & server)
             [this, &bld = *builder](const std::stop_token & stop) -> void { runRemoteSession(bld, stop); });
     }
 }
-
-namespace {
-// TLS unless the URL says http://. Our server cert doubles as client cert,
-// --scheduler-token-file adds a bearer: either, both or neither. The address
-// is often the balancer with a public certificate, so trust the system
-// bundle as well as the farm CA.
-auto schedulerCreds(const Options & options) -> std::shared_ptr<grpc::ChannelCredentials>
-{
-    if (options.schedulerAddr.starts_with(plaintextScheme)) {
-        return grpc::InsecureChannelCredentials();
-    }
-    grpc::SslCredentialsOptions ssl;
-    ssl.pem_root_certs = defaultCaCert();
-    if (!options.clientCA.empty()) {
-        ssl.pem_root_certs += "\n" + nix::readFile(options.clientCA);
-    }
-    if (!options.tlsCert.empty()) {
-        ssl.pem_cert_chain = nix::readFile(options.tlsCert);
-        ssl.pem_private_key = nix::readFile(options.tlsKey);
-    }
-    std::shared_ptr<grpc::ChannelCredentials> creds = grpc::SslCredentials(ssl);
-    if (!options.schedulerTokenFile.empty()) {
-        creds = grpc::CompositeChannelCredentials(
-            creds,
-            grpc::MetadataCredentialsFromPlugin(std::make_unique<TokenFileCredentials>(options.schedulerTokenFile)));
-    }
-    return creds;
-}
-} // namespace
 
 void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
 {

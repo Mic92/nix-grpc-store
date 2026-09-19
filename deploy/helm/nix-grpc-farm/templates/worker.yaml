@@ -149,7 +149,7 @@ spec:
             - --listen=[::]:50051
             # What envoy resolves the headless Service to, so x-nix-worker pins here.
             - --advertise=$(POD_IP):50051
-            - --scheduler={{ if not $root.Values.tls.worker.existingSecret }}http://{{ end }}{{ include "farm.schedulerService" $root }}.{{ $root.Release.Namespace }}.svc:50051
+            - --scheduler={{ if not $root.Values.tls.worker.existingSecret }}http://{{ end }}{{ include "farm.schedulerFor" $root }}
             # civetweb binds [::] v6-only. Pod IPs are v4 on most clusters.
             - --metrics-listen=0.0.0.0:9464
             - --worker-name=$(NODE_NAME)/$(POD_NAME)

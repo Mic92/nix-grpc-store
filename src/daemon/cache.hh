@@ -52,6 +52,11 @@ public:
         return remote.has_value();
     }
 
+    [[nodiscard]] auto client() const -> const Niks3Client *
+    {
+        return remote ? &remote->client : nullptr;
+    }
+
     // Subset of `keys` ("<hash>.narinfo") the binary cache has. Empty without niks3.
     [[nodiscard]] auto present(const std::vector<std::string> & keys) -> std::unordered_set<std::string>
     {

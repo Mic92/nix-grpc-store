@@ -232,6 +232,8 @@ in
         Scheduler (or balancer) address for a builder. `null` means
         in-process. TLS unless `http://`, presenting {option}`tls.certFile`
         and trusting the system CAs plus {option}`tls.clientCaFile`.
+        Several scheduler-role nodes with this and {option}`niks3` set share
+        the role: only the one holding the lock in niks3's database serves.
       '';
     };
     schedulerTokenFile = lib.mkOption {
