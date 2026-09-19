@@ -9,6 +9,7 @@
 #include <memory>
 #include <initializer_list>
 #include <mutex>
+#include <unordered_set>
 #include <optional>
 #include <ratio>
 #include <string>
@@ -218,7 +219,34 @@ auto Dispatcher::connectClient(ClientSend send) -> ClientPtr
     auto client = std::make_shared<Client>();
     client->id = nextClient++;
     client->send = std::move(send);
+    const Lock lock(*this);
+    if (stopping) {
+        SchedMsg msg;
+        msg.mutable_restarting();
+        client->send(msg);
+    }
     return client;
+}
+
+void Dispatcher::restarting()
+{
+    const Lock lock(*this);
+    stopping = true;
+    SchedMsg msg;
+    msg.mutable_restarting();
+    SchedCmd cmd;
+    cmd.mutable_restarting();
+    std::unordered_set<sched::ClientId> told;
+    for (auto & [sys, shs] : shards) {
+        for (auto & [cid, send] : shs.clients) {
+            if (told.insert(cid).second) {
+                send(msg);
+            }
+        }
+        for (auto & [wid, send] : shs.workers) {
+            send(cmd);
+        }
+    }
 }
 
 void Dispatcher::clientMsgs(const ClientPtr & client, const nix::remote::ClientMsgs & msgs)
@@ -354,6 +382,11 @@ void Dispatcher::workerMsgs(Worker & worker, const nix::remote::WorkerMsgs & msg
         worker.shard = shardFor(msgs.msgs(0).hello().system());
         if (worker.shard == nullptr) {
             throw nix::Error("WorkerSession: bad system '%s'", msgs.msgs(0).hello().system());
+        }
+        if (stopping) {
+            SchedCmd cmd;
+            cmd.mutable_restarting();
+            worker.send(cmd);
         }
     }
     if (worker.shard == nullptr) {

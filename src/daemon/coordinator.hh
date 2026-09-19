@@ -165,6 +165,9 @@ public:
     void start(grpc::Server & server);
     // From the serve loop, ~1 Hz.
     void tick();
+    // Before Shutdown(): peers of the scheduler are told to reconnect rather
+    // than left to find a dead stream.
+    void restarting(grpc::Server & server);
 
 private:
     const Options & options;

@@ -185,11 +185,17 @@ message Unplaceable {
   string reason = 2;
 }
 
+// The scheduler stops serving on purpose (restart, or yielding to another
+// node). Close the stream, reconnect right away and say again what you
+// want / are running; not an error.
+message Restarting {}
+
 message SchedMsg {
   oneof msg {
     Assigned assigned = 1;
     Cached cached = 2;
     Unplaceable unplaceable = 3;
+    Restarting restarting = 4;
   }
 }
 
@@ -253,6 +259,7 @@ message SchedCmd {
   oneof cmd {
     Expect expect = 1;
     Revoke revoke = 2;
+    Restarting restarting = 3;
   }
 }
 

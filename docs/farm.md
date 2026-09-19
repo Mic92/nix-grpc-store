@@ -34,7 +34,9 @@ Every worker runs the same `nix-grpc-daemon`. One of them is also the
 
 Nothing is stored on disk. Restart the scheduler and running builds
 finish, workers and clients reconnect, and clients ask again for what is
-still missing. Restart a worker and its builds fail and are sent
+still missing. A clean stop tells them first, so they come back at once
+and print nothing. After a crash they notice on their own and retry for
+up to two minutes. Restart a worker and its builds fail and are sent
 elsewhere. A single node with no `scheduler` setting is a farm of one.
 
 ## Before you begin
@@ -243,7 +245,7 @@ Tip: wrap the token fetch (an OIDC device-code login is a few lines of
 ## On Kubernetes
 
 The Helm chart deploys the same pieces: a scheduler Deployment (one
-replica), a Deployment per worker group, envoy in front and a
+replica, the new pod is up before the old one leaves), a Deployment per worker group, envoy in front and a
 [harmonia-gc](https://github.com/nix-community/harmonia) sidecar per
 worker for disk space. niks3 is its own release, see its
 [Kubernetes page](https://github.com/Mic92/niks3/wiki/Kubernetes).

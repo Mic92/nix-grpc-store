@@ -96,6 +96,10 @@ public:
     // transport's write kick) to run right after it is released.
     void afterUnlock(std::function<void()> func);
 
+    // Tell every connected peer, and any that connects from now on, that the
+    // streams are about to close on purpose.
+    void restarting();
+
 private:
     // scoped_lock that runs the afterUnlock queue on release.
     class Lock
@@ -119,6 +123,7 @@ private:
     const Clock::time_point epoch = Clock::now();
     std::mutex mutex;
     std::vector<std::function<void()>> deferred; // under mutex
+    bool stopping = false;                        // under mutex
     std::map<std::string, ShardState, std::less<>> shards;
     std::atomic<sched::ClientId> nextClient{1};
 
