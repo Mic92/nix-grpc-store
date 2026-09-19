@@ -8,7 +8,6 @@
 #include <functional>
 #include <memory>
 #include <initializer_list>
-#include <mutex>
 #include <optional>
 #include <ratio>
 #include <string>
@@ -16,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include <absl/base/thread_annotations.h>
+#include <absl/synchronization/mutex.h>
 #include <nix/util/error.hh>
 #include <nix/util/strings.hh>
 #include <nix/util/types.hh>
@@ -49,10 +50,9 @@ Dispatcher::Dispatcher(Config config_, Metrics & metrics)
 Dispatcher::~Dispatcher()
 {
     {
-        const std::scoped_lock lock(lookupMutex);
+        const absl::MutexLock lock(lookupMutex);
         lookupStop = true;
     }
-    lookupCv.notify_all();
     for (auto & thr : lookupThreads) {
         thr.join();
     }
@@ -63,8 +63,11 @@ void Dispatcher::lookupLoop()
     for (;;) {
         LookupJob job;
         {
-            std::unique_lock lock(lookupMutex);
-            lookupCv.wait(lock, [this]() -> bool { return lookupStop || !lookupQueue.empty(); });
+            const absl::MutexLock lock(lookupMutex);
+            auto ready = [this]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(lookupMutex) -> bool {
+                return lookupStop || !lookupQueue.empty();
+            };
+            lookupMutex.Await(absl::Condition(&ready));
             if (lookupQueue.empty()) {
                 return;
             }
@@ -245,11 +248,8 @@ void Dispatcher::clientMsgs(const ClientPtr & client, const nix::remote::ClientM
             return msg.has_want() && wantsLookup(msg.want());
         });
     if (needs && !lookupThreads.empty()) {
-        {
-            const std::scoped_lock lock(lookupMutex);
-            lookupQueue.push_back({.client = client, .msgs = msgs});
-        }
-        lookupCv.notify_one();
+        const absl::MutexLock lock(lookupMutex);
+        lookupQueue.push_back({.client = client, .msgs = msgs});
         return;
     }
     applyClientMsgs(*client, msgs, lookup(msgs));

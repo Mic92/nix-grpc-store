@@ -1,16 +1,15 @@
 #pragma once
-// Callback-API pumps for the two Scheduler streams. One reactor per stream:
-// reads feed the Dispatcher, the Dispatcher's send() only enqueues, and the
-// reactor writes whatever has queued as one batched message when the previous
-// write completes. No thread per stream, no I/O under the Dispatcher mutex,
-// and a peer that stops reading fills its queue and is cancelled instead of
-// stalling everyone else.
+// Callback reactors for the Schedule and WorkerSession streams. Reads go to
+// the Dispatcher. Its send() only enqueues, and the reactor writes the queue
+// out in batches, so no I/O happens under the Dispatcher mutex and a peer
+// that stops reading is cancelled once its queue is full.
 
 #include <cstddef>
 #include <deque>
 #include <exception>
 #include <memory>
-#include <mutex>
+#include <absl/base/thread_annotations.h>
+#include <absl/synchronization/mutex.h>
 #include <string>
 #include <utility>
 
@@ -24,23 +23,22 @@
 
 namespace nixgrpc {
 
-// Send queue shared between a reactor and the Dispatcher's send closure; the
-// closure may outlive the reactor briefly (worker table), hence shared_ptr.
+// shared_ptr: the send closure in the Dispatcher may outlive the reactor.
 template<typename Msg, typename Batch>
 struct SendQueue
 {
-    // ~1 min of Expects at full tilt; a live peer never gets near it.
+    // About a minute of Expects at full rate. Beyond it the peer is stuck.
     static constexpr size_t limit = 1U << 16U;
-    // Per Write; bounds peer parse latency and message size.
+    // Messages per Write.
     static constexpr int maxBatch = 1024;
 
-    std::mutex mutex;
-    std::deque<Msg> queue;
-    bool writing = false; // a StartWrite is outstanding
-    bool closed = false;
+    // Leaf lock, may be taken inside Dispatcher::mutex.
+    absl::Mutex mutex;
+    std::deque<Msg> queue ABSL_GUARDED_BY(mutex);
+    bool writing ABSL_GUARDED_BY(mutex) = false; // a StartWrite is outstanding
+    bool closed ABSL_GUARDED_BY(mutex) = false;
 
-    // Under `mutex`: move up to maxBatch into `out`; true if there is anything to write.
-    auto fill(Batch & out) -> bool
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto fill(Batch & out) -> bool
     {
         out.clear_msgs();
         while (!queue.empty() && out.msgs_size() < maxBatch) {
@@ -63,14 +61,14 @@ public:
     {
     }
 
-    // For the Dispatcher: enqueue under its lock (keeps order), kick the
-    // write after it unlocks if none is in flight. False = treat peer as gone.
+    // Runs under the Dispatcher mutex (keeps order). Starts a Write after it
+    // unlocks if none is in flight. False means treat the peer as gone.
     auto sender(Dispatcher & disp) -> std::function<bool(const OutMsg &)>
     {
-        return [this, &disp, sendq = sendq](const OutMsg & msg) -> bool {
+        return [this, &disp, sendq = sendq](const OutMsg & msg) ABSL_EXCLUSIVE_LOCKS_REQUIRED(disp.sendLock()) -> bool {
             bool kick = false;
             {
-                const std::scoped_lock lock(sendq->mutex);
+                const absl::MutexLock lock(sendq->mutex);
                 if (sendq->closed || sendq->queue.size() >= Queue::limit) {
                     if (!sendq->closed) {
                         sendq->closed = true;
@@ -84,7 +82,7 @@ public:
                 }
             }
             if (kick) {
-                // `writing` is claimed, so OnDone cannot fire before this runs.
+                // `writing` is set, so OnDone cannot fire before this runs.
                 disp.afterUnlock([this]() -> void { writeNext(); });
             }
             return true;
@@ -115,7 +113,7 @@ public:
     {
         if (!isOk) {
             {
-                const std::scoped_lock lock(sendq->mutex);
+                const absl::MutexLock lock(sendq->mutex);
                 sendq->closed = true;
                 sendq->writing = false;
             }
@@ -128,7 +126,7 @@ public:
 
     void OnCancel() override
     {
-        const std::scoped_lock lock(sendq->mutex);
+        const absl::MutexLock lock(sendq->mutex);
         sendq->closed = true;
     }
 
@@ -140,6 +138,7 @@ public:
 protected:
     virtual void onMsgs(const In & msgs) = 0;
     virtual void gone() = 0;
+
     [[nodiscard]] auto context() const -> grpc::CallbackServerContext *
     {
         return ctx;
@@ -147,12 +146,13 @@ protected:
 
 private:
     grpc::CallbackServerContext * ctx;
-    // Called with `writing` already claimed.
+
+    // Caller has set `writing`.
     void writeNext()
     {
         bool have = false;
         {
-            const std::scoped_lock lock(sendq->mutex);
+            const absl::MutexLock lock(sendq->mutex);
             have = !sendq->closed && sendq->fill(out);
             if (!have) {
                 sendq->writing = false;
@@ -165,13 +165,13 @@ private:
         }
     }
 
-    // Reads ended: detach from the Dispatcher, then Finish once no write is in flight.
+    // Reads ended. Detach from the Dispatcher, Finish once no Write is in flight.
     void finish(grpc::Status fin)
     {
         gone();
         status = std::move(fin);
         {
-            const std::scoped_lock lock(sendq->mutex);
+            const absl::MutexLock lock(sendq->mutex);
             sendq->closed = true;
             readsDone = true;
         }
@@ -182,7 +182,7 @@ private:
     {
         bool fin = false;
         {
-            const std::scoped_lock lock(sendq->mutex);
+            const absl::MutexLock lock(sendq->mutex);
             fin = readsDone && !sendq->writing && !finished;
             finished |= fin;
         }
@@ -195,8 +195,8 @@ private:
     In in;
     Out out;
     grpc::Status status = grpc::Status::OK;
-    bool readsDone = false; // under sendq->mutex
-    bool finished = false;  // under sendq->mutex
+    bool readsDone ABSL_GUARDED_BY(sendq->mutex) = false;
+    bool finished ABSL_GUARDED_BY(sendq->mutex) = false;
 };
 
 class ScheduleReactor final
@@ -256,7 +256,7 @@ private:
     Dispatcher::Worker worker;
 };
 
-// Rejects before any reactor state exists.
+// Turns a stream away with a status, without touching the Dispatcher.
 template<typename In, typename Out>
 class RejectReactor final : public grpc::ServerBidiReactor<In, Out>
 {
