@@ -47,7 +47,12 @@ class Metrics
              .Help("Things currently held or awaited, by kind")
              .Register(*registry);
     prometheus::Family<prometheus::Counter> * events =
-        &prometheus::BuildCounter().Name("nix_grpc_events_total").Help("Farm events, by kind").Register(*registry);
+        &prometheus::BuildCounter().Name("nix_grpc_events_total").Help("Scheduling events, by kind").Register(*registry);
+    prometheus::Family<prometheus::Gauge> * sched =
+        &prometheus::BuildGauge().Name("nix_grpc_sched").Help("Scheduler state on this node, by kind").Register(*registry);
+    // Touched on every scheduler message; Family::Add hashes the label map each time.
+    prometheus::Gauge * schedQueuedGauge = &sched->Add({{"kind", "queued"}});
+    prometheus::Gauge * schedWorkersGauge = &sched->Add({{"kind", "workers"}});
 
     // NOLINTNEXTLINE(*-magic-numbers)
     prometheus::Histogram::BucketBoundaries buckets{0.05, 0.25, 1, 2, 5, 10, 30, 60, 120, 300, 900, 3600};
@@ -124,8 +129,13 @@ public:
     {
         events->Add({{"kind", kind}}).Increment();
     }
+    // For hot paths: resolve the label once, Increment() is then lock-free.
+    auto eventCounter(const std::string & kind) -> prometheus::Counter &
+    {
+        return events->Add({{"kind", kind}});
+    }
 
-    // Join target for dashboards. Pod names are not stable on Kubernetes.
+    // Join target for dashboards; pod names are not stable on Kubernetes.
     void buildInfo(
         const std::string & version, const std::string & worker, const std::string & system, const std::string & features)
     {
@@ -145,6 +155,28 @@ public:
             .Register(*registry)
             .Add({})
             .Set(count);
+    }
+
+    void schedQueued(size_t count) const
+    {
+        schedQueuedGauge->Set(static_cast<double>(count));
+    }
+    [[nodiscard]] auto schedQueuedNow() const -> double
+    {
+        return schedQueuedGauge->Value();
+    }
+    void schedWorkers(size_t count) const
+    {
+        schedWorkersGauge->Set(static_cast<double>(count));
+    }
+    [[nodiscard]] auto schedWorkersNow() const -> double
+    {
+        return schedWorkersGauge->Value();
+    }
+    void schedClients(int delta) const
+    {
+        auto & gauge = sched->Add({{"kind", "clients"}});
+        gauge.Set(gauge.Value() + delta);
     }
 
     // `listen` empty: keep counting but do not serve /metrics.
