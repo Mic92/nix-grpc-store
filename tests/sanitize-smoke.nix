@@ -6,7 +6,8 @@
   package,
   nix,
 }:
-pkgs.stdenv.mkDerivation {
+# Same compiler as the plugin so the preloaded runtime matches it.
+package.stdenv.mkDerivation {
   name = "nix-grpc-store-sanitize-smoke";
   nativeBuildInputs = [
     nix
@@ -37,7 +38,14 @@ pkgs.stdenv.mkDerivation {
     store="grpc://127.0.0.1:50051?insecure=1"
 
     plugin=$(echo ${package}/lib/nix/nix-grpc-store-versions/*/nix-grpc-store.so)
-    asan_rt=$($CC -print-file-name=libasan.so)
+    # GCC links libasan/libubsan into the .so; clang leaves the runtime to
+    # the executable, so preload its combined asan+ubsan DSO.
+    asan_rt=$($CC -print-file-name=${
+      if package.stdenv.cc.isClang then
+        "libclang_rt.asan-${package.stdenv.hostPlatform.parsed.cpu.name}.so"
+      else
+        "libasan.so"
+    })
     client() {
       LD_PRELOAD=$asan_rt nix --option plugin-files "$plugin" "$@"
     }

@@ -20,6 +20,10 @@ absl_dep = [dependency('absl_flat_hash_map'), dependency('absl_hash')]
 if get_option('b_sanitize').contains('address')
   add_project_arguments('-DNDEBUG_SANITIZER', language : 'cpp')
 endif
+# glibc malloc stalls the scheduler for 5-40 ms consolidating its heap after
+# ~10^6 small frees (dispatcher-bench firehose); jemalloc keeps every call
+# under 1 ms. Nix itself links it too.
+jemalloc_dep = dependency('jemalloc')
 
 nix_store_dep = dependency('nix-store')
 nix_util_dep  = dependency('nix-util')
@@ -123,6 +127,18 @@ shared_module('nix-grpc-store-loader',
 
 # --- server -----------------------------------------------------------------
 
+# The scheduler without gRPC: shared by the daemon and dispatcher-bench.
+dispatcher_lib = static_library('nix-grpc-dispatcher',
+  sources : ['src/daemon/dispatcher.cc', gen[0], gen[1]],
+  include_directories : [gen_inc, src_inc],
+  dependencies : [protobuf_dep, nix_util_dep] + prometheus_dep + absl_dep,
+)
+dispatcher_dep = declare_dependency(
+  link_with : dispatcher_lib,
+  include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
+  dependencies : [protobuf_dep, nix_util_dep] + prometheus_dep + absl_dep,
+)
+
 daemon_sources = [
   'src/daemon/main.cc',
   'src/daemon/auth.cc',
@@ -140,6 +156,19 @@ executable('nix-grpc-daemon',
   dependencies : common_deps + prometheus_dep + [nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep],
   install : true,
 )
+
+dispatcher_bench = executable('dispatcher-bench',
+  sources : ['tests/dispatcher-bench.cc'],
+  dependencies : [dispatcher_dep, jemalloc_dep],
+)
+benchmark('dispatcher', dispatcher_bench, args : ['large'], timeout : 300)
+
+# Same Dispatcher behind the real gRPC service on loopback.
+scheduler_grpc_bench = executable('scheduler-grpc-bench',
+  sources : ['tests/scheduler-grpc-bench.cc', gen[2], gen[3]],
+  dependencies : [dispatcher_dep, grpc_dep, jemalloc_dep],
+)
+benchmark('scheduler-grpc', scheduler_grpc_bench, args : ['seconds=3'], timeout : 60)
 
 # --- tests ------------------------------------------------------------------
 

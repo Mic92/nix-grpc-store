@@ -154,3 +154,139 @@ service NixRemote {
   rpc QueryMissing(QueryMissingRequest) returns (QueryMissingReply);
   rpc StoreInfo(StoreInfoRequest) returns (StoreInfoReply);
 }
+
+// ---- scheduling ----------------------------------------------------------
+//
+// A client opens one Schedule stream per build and sends a Want for every
+// derivation whose inputs exist. The scheduler answers Cached (outputs are in
+// the cache), Unplaceable, or Assigned once a worker has a free slot; the
+// client then calls BuildDerivation with `x-nix-worker: <worker_addr>`.
+// Workers hold one WorkerSession to the scheduler of their system (routed by
+// x-nix-system, like Schedule); the scheduler announces each
+// assignment with Expect before telling the client, and learns the outcome
+// from Done. All scheduler state is rebuilt from Hello after a restart.
+
+message Want {
+  string drv_path = 1;
+  // "<hash>.narinfo" of every output; all present in the cache => Cached.
+  repeated string out_keys = 2;
+  // Store paths of all inputs (sources and input drv outputs), for locality.
+  repeated string inputs = 3;
+  // Remaining critical path below this drv in the client's DAG, ms.
+  uint64 cp_hint_ms = 4;
+  uint32 build_mode = 5;
+  repeated string required_features = 6;
+  // drv.platform; empty means the scheduler's own system.
+  string system = 7;
+}
+
+message Cancel {
+  string drv_path = 1;
+}
+
+message ClientMsg {
+  oneof msg {
+    Want want = 1;
+    Cancel cancel = 2;
+  }
+}
+
+message Assigned {
+  string drv_path = 1;
+  // IP:port the balancer knows the worker by; goes into x-nix-worker.
+  string worker_addr = 2;
+  uint64 assign_id = 3;
+}
+
+message Cached {
+  string drv_path = 1;
+}
+
+// No connected worker can run it (system features); the client fails the drv.
+message Unplaceable {
+  string drv_path = 1;
+  string reason = 2;
+}
+
+message SchedMsg {
+  oneof msg {
+    Assigned assigned = 1;
+    Cached cached = 2;
+    Unplaceable unplaceable = 3;
+  }
+}
+
+message PathSize {
+  string path = 1;
+  uint64 nar_size = 2;
+}
+
+message RunningBuild {
+  string drv_path = 1;
+  uint64 assign_id = 2;
+}
+
+message Hello {
+  string addr = 1;
+  string system = 2;
+  repeated string features = 3;
+  uint32 max_jobs = 4;
+  // Builds in progress and Expects not yet claimed, so a restarted scheduler
+  // neither double-assigns them nor counts their slots as free.
+  repeated RunningBuild running = 5;
+  repeated RunningBuild expecting = 6;
+}
+
+message Done {
+  enum Outcome {
+    BUILT = 0;
+    FAILED = 1;
+    CANCELLED = 2;
+    // Expect expired without a BuildDerivation arriving.
+    NO_SHOW = 3;
+  }
+  string drv_path = 1;
+  uint64 assign_id = 2;
+  Outcome outcome = 3;
+  repeated PathSize outputs = 4;
+}
+
+message Load {
+  bool draining = 1;
+}
+
+message WorkerMsg {
+  oneof msg {
+    Hello hello = 1;
+    Done done = 2;
+    Load load = 3;
+  }
+}
+
+message Expect {
+  string drv_path = 1;
+  uint64 assign_id = 2;
+}
+
+message Revoke {
+  string drv_path = 1;
+}
+
+message SchedCmd {
+  oneof cmd {
+    Expect expect = 1;
+    Revoke revoke = 2;
+  }
+}
+
+// Each stream message carries a batch, applied in order; gRPC's per-message
+// cost dominates otherwise.
+message ClientMsgs { repeated ClientMsg msgs = 1; }
+message SchedMsgs { repeated SchedMsg msgs = 1; }
+message WorkerMsgs { repeated WorkerMsg msgs = 1; }
+message SchedCmds { repeated SchedCmd msgs = 1; }
+
+service Scheduler {
+  rpc Schedule(stream ClientMsgs) returns (stream SchedMsgs);
+  rpc WorkerSession(stream WorkerMsgs) returns (stream SchedCmds);
+}
