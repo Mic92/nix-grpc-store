@@ -115,6 +115,11 @@ public:
         }
     };
 
+    auto inflightNow(const std::string & kind) -> double
+    {
+        return inflight->Add({{"kind", kind}}).Value();
+    }
+
     void event(const std::string & kind)
     {
         events->Add({{"kind", kind}}).Increment();

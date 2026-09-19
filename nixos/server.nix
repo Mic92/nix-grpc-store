@@ -333,6 +333,10 @@ in
         "nix-daemon.socket"
       ];
       wants = [ "nix-daemon.socket" ];
+      # Reload means drain: leave the balancer, exit once running builds have
+      # published, let the socket start the new generation. A deploy never
+      # waits for or kills builds.
+      reloadIfChanged = cfg.farm.enable;
       serviceConfig = {
         Type = "notify";
         WatchdogSec = 30;
@@ -403,6 +407,12 @@ in
         );
         # Builds run in nix-daemon. This only bounds the proxy.
         MemoryMax = lib.mkDefault "2G";
+      }
+      // lib.optionalAttrs cfg.farm.enable {
+        ExecReload = "${pkgs.coreutils}/bin/kill -TERM $MAINPID";
+        # `systemctl stop` drains too and niks3 push must survive to publish.
+        KillMode = "mixed";
+        TimeoutStopSec = lib.mkDefault "1h";
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         ProtectHome = true;

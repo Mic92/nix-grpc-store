@@ -315,9 +315,12 @@ Things to know:
 **Add a worker.** Deploy it with the Step 1 config, add its address under
 `workers.<system>`, redeploy the balancer.
 
-**Drain a worker.** Run `systemctl stop nix-grpc-daemon.socket` on it.
-Envoy's health check ejects it, running builds finish, clients waiting on
-it retry on another worker.
+**Drain a worker.** `systemctl stop nix-grpc-daemon` takes it out of the
+balancer, sends new builds elsewhere and returns once running builds
+have published. After `TimeoutStopSec` (1h) the rest is killed and
+retried elsewhere. A second SIGTERM cancels right away. `nixos-rebuild
+switch` only signals the worker and the next connection starts the new
+generation.
 
 **See what a worker did.** Each build is one journal line:
 

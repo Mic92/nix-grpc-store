@@ -24,8 +24,10 @@
 
 namespace nixgrpc {
 
+// SIGTERM count: 1 drains (no new builds), 2 cancels running ones.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): signal handler, defined in main.
 extern volatile std::sig_atomic_t stopSignal;
+constexpr int kCancelBuilds = 2;
 
 // Relays the raw worker-protocol stderr stream of one build to the
 // client, which replays it through its own protocol code. Output path
