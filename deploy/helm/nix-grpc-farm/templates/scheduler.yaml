@@ -29,7 +29,10 @@ metadata:
     app.kubernetes.io/component: scheduler
 spec:
   replicas: 1
-  strategy: {type: Recreate} # never two
+  # The new pod is Ready before the old one gets SIGTERM and tells its peers
+  # to reconnect. The Service then only has the new one. The old pod has
+  # stopped placing by then, so the overlap cannot double-assign.
+  strategy: {type: RollingUpdate, rollingUpdate: {maxSurge: 1, maxUnavailable: 0}}
   selector:
     matchLabels: {{- $sel | nindent 6 }}
   template:

@@ -429,6 +429,21 @@ pkgs.testers.runNixOSTest {
         client.succeed("systemctl show -p Result --value waits | grep -qx success || { journalctl -u waits >&2; false; }")
         retry(lambda _: sched_workers(worker1) == 2, timeout_seconds=60)
 
+    with subtest("clean scheduler restart: peers are told, reconnect without error or backoff"):
+        client.succeed(f"systemd-run --unit rs nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag rs")
+        retry(lambda _: building() != [], timeout_seconds=60)
+        worker2.succeed("journalctl --rotate --vacuum-time=1s -u nix-grpc-daemon >/dev/null 2>&1 || true")
+        # If the slow build landed on worker1 its first SIGTERM drains. Let
+        # that build go so the restart proceeds.
+        worker1.execute("pkill -f 'read -t [9]0 x'")
+        worker1.succeed("systemctl restart nix-grpc-daemon.service")
+        worker2.wait_until_succeeds("journalctl -u nix-grpc-daemon | grep -q event=scheduler_restarting", timeout=30)
+        retry(lambda _: sched_workers(worker1) == 2, timeout_seconds=30)
+        release_slow()
+        client.wait_until_succeeds("! systemctl is-active rs", timeout=120)
+        client.succeed("systemctl show -p Result --value rs | grep -qx success || { journalctl -u rs >&2; false; }")
+        client.fail("journalctl -u rs | grep -q 'reconnecting'")
+
     with subtest("scheduler restart mid-build: build finishes, no double build"):
         client.succeed(f"systemd-run --unit mid nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag mid")
         retry(lambda _: building() != [], timeout_seconds=60)
