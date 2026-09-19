@@ -275,11 +275,13 @@ place works. TLS is required.
 
 NixOS: `services.nix-grpc-daemon.oidc = { providers.github = { … }; };`
 
-## Build farm
+## Scaling out
 
-Several workers behind one balancer with deduplicated builds and S3
-outputs: see [docs/farm.md](docs/farm.md). Comes with NixOS modules and
-a Helm chart (`oci://ghcr.io/mic92/charts/nix-grpc-farm`).
+One daemon is a farm of one: it schedules builds onto itself. More nodes
+behind a balancer, one of them the scheduler, with deduplicated builds and
+S3 outputs: see [docs/farm.md](docs/farm.md). NixOS modules and a Helm
+chart (`oci://ghcr.io/mic92/charts/nix-grpc-farm`, images built with Nix)
+are included.
 
 ## Remote builder
 
@@ -312,8 +314,9 @@ which also requires `trustClients` (see above).
   * `connect-timeout` (default 30) — seconds the first call keeps retrying
     "connection refused" and similar. Once the server has answered, a
     restart is ridden out for up to 120 s.
-  * `unavailable-retries` (default 5) — how often a build a worker bounced
-    (low disk, missing feature, lost claim) is retried on another.
+  * `reschedule-retries` (default 8) — how often a derivation whose
+    assigned worker went away is handed back to the scheduler.
+  * `max-builds` (default 64) — concurrent `BuildDerivation` streams.
   * `system` — send `x-nix-system` on every call, not just builds, so a
     balancer routes input uploads and substitution to a worker of that
     system. Use one `nix.buildMachines` entry per system.
@@ -330,6 +333,8 @@ which also requires `trustClients` (see above).
   * `--oidc-config FILE` — accept OIDC bearer tokens, see access control
   * `--metrics-listen ADDR` — serve Prometheus metrics, disabled if unset
   * `--worker-name NAME` — name in build-log prefixes and `nix_grpc_build_info`, default hostname
+  * `--role builder,scheduler`, `--scheduler ADDR`, `--scheduler-token-file FILE`, `--advertise IP:PORT`, `--max-jobs N`, `--min-free SIZE` — see [docs/farm.md](docs/farm.md). The defaults make a single node schedule onto itself
+  * `--niks3 URL [--niks3-token-file FILE] [--niks3-client-cert FILE --niks3-client-key FILE] [--niks3-push CMD]` — publish build outputs and uploads to a niks3 cache; authenticate with a bearer token, a client certificate (defaults to `--tls-cert/--tls-key`), or both
   * `--log-level info|debug` — access log verbosity, default `info`
 
 ## Monitoring
@@ -365,6 +370,8 @@ With `--metrics-listen 127.0.0.1:9464` (NixOS:
 | `nix_grpc_tunnel_bytes_total` | direction, cn | uncompressed tunnel bytes |
 | `nix_grpc_nar_bytes_total` | direction, cn | uncompressed NAR bytes imported/exported |
 | `nix_grpc_build_info` | version, worker, system, features | constant 1, for joins and version skew |
+| `nix_grpc_sched` | kind = queued, workers, clients | scheduler state |
+| `nix_grpc_events_total` | kind | assigned, cached, attached, expect_no_show, unexpected_build, … |
 
 Only CA-issued CNs appear as labels, so cardinality stays bounded.
 

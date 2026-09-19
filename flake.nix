@@ -102,7 +102,7 @@
         }
       );
 
-      dashboards.farm = ./nixos/grafana/farm.json;
+      dashboards.farm = ./deploy/helm/nix-grpc-farm/files/farm.json;
 
       nixosModules = {
         server = ./nixos/server.nix;

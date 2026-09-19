@@ -1,9 +1,9 @@
 # Set up a build farm
 
-A build farm is a group of interchangeable workers behind one address.
-Clients send builds to that address, each derivation is built once even if
-several clients ask for it, and outputs land in an S3 binary cache through
-[niks3](https://github.com/Mic92/niks3).
+A build farm is a group of workers behind one address. Clients send
+builds to that address, each derivation is built once even if several
+clients ask for it, work spreads over all workers, and outputs land in an
+S3 binary cache through [niks3](https://github.com/Mic92/niks3).
 
 ![build farm](farm.svg)
 
@@ -12,82 +12,148 @@ balancer, and two kinds of client: a CI host and a developer laptop.
 
 ## How it works
 
-There is no scheduler. Coordination comes from two places:
+Every node runs the same `nix-grpc-daemon` and has one or both of two
+roles:
 
-* **The balancer** (envoy) routes each request by the `x-nix-system` header
-  (and `x-nix-features` where workers differ, e.g. `kvm`) and picks a
-  worker by hashing `x-nix-drv`, so the same derivation tends to reach the
-  same worker. This is an optimisation only: every worker
-  publishes what it accepts or reports as valid to the cache before
-  answering, and substitutes from the cache whatever it lacks (uploaded
-  paths' references, the `.drv` closure, build inputs, outputs to serve).
-  Any request may land on any worker.
-* **The cache** (niks3) hands out *build claims*. Before building, a worker
-  claims the output paths and is told `built` (already cached), `wait`
-  (another worker has it) or `build`. Results are published with the claim
-  token, so a worker that lost its claim can't overwrite the winner.
+* A **builder** runs builds.
+* The **scheduler** keeps the queue and decides which builder runs
+  what. One scheduler is active at a time.
 
-Workers keep no state. You can add, remove or reboot them at any time.
+On a handful of fixed machines, give one or two of the builders the
+scheduler role as well. When builders come and go with an autoscaler,
+run the scheduler role on two or three small fixed nodes of its own
+instead. The defaults, both roles and no other nodes configured, give
+you a standalone machine that schedules onto itself.
+
+What happens on a build:
+
+* The client opens one connection to the scheduler and lists the
+  derivations it wants. For each one the scheduler answers *cached*
+  (outputs are already in the binary cache), *go to builder X*, or *no
+  builder can take this* (wrong system or missing feature). Derivations
+  on the longest chain go first, and among builders with a free slot
+  the one that already has the inputs wins.
+* Each builder keeps a connection to the scheduler open that says which
+  system and features it offers and how many builds it takes. The
+  scheduler tells it which derivation to expect before the client shows
+  up. A build nobody announced is turned away and the client asks the
+  scheduler again. A second client for a build that is already running
+  attaches to it.
+* The balancer (envoy) sends scheduler traffic to the active scheduler,
+  sends each build to the builder the scheduler named, and spreads
+  everything else (uploads, queries, downloads) over the builders of
+  the right system.
+
+The scheduler keeps nothing on disk. When it restarts, running builds
+carry on, builders and clients reconnect, and clients ask again for
+what is still missing. A clean stop tells them first, so they come back
+at once and print nothing. After a crash they notice on their own and
+keep trying for two minutes. Should a client ask again before the
+builder already working on its derivation has reconnected, a second
+builder may start it too. As soon as the first one reports in, the
+scheduler stops the second and points the clients at the first, so only
+one set of outputs ever exists.
+
+With several scheduler-role nodes, niks3 decides which one is active:
+the first to take a lock in its database, for as long as it stays
+connected. When it goes away another node has the lock within seconds.
+
+When a builder restarts, its builds fail and the scheduler sends them
+elsewhere.
 
 ## Before you begin
 
 You need:
 
-* A [niks3](https://github.com/Mic92/niks3) instance (any version with
-  [build claims](https://github.com/Mic92/niks3/wiki/Build-Claims)), an S3
-  bucket behind it, and its API token and public signing key.
-* One or more NixOS machines per system type to act as workers.
+* A [niks3](https://github.com/Mic92/niks3) instance, an S3 bucket behind
+  it, and its API token and public signing key. A single node can do
+  without. Outputs then stay in its store.
+* One or more NixOS machines per system type as builders, and the
+  scheduler role on one or two of them or on separate small machines.
 * One machine with a public DNS name for the balancer. It can also be a
   worker.
 * A small private CA. It signs three kinds of certificate:
 
   | Certificate | CN | Used by |
   |---|---|---|
-  | worker server cert | any, SAN = address envoy dials | each worker |
-  | balancer client cert | `lb-<host>` | envoy, towards workers |
-  | CI client cert | `ci-<host>` | each CI host, towards envoy |
+  | client cert | `ci-<host>` | each CI host, towards the balancer |
+  | node cert | `worker-<host>`, SAN = address envoy dials | each node as its server cert, and as its client cert towards the scheduler |
+  | balancer cert | `lb-<host>` | envoy, towards the nodes |
 
-  The balancer's public listener uses a regular ACME certificate, so
+  The client cert is the same as for a standalone `nix-grpc-daemon`,
+  so existing ones keep working. The other two cover the hops the
+  balancer adds: envoy terminates the client's TLS and passes the
+  client's identity on in a header, and the nodes only believe that
+  header from a peer with a balancer cert (`trustedProxies`). The
+  balancer's public listener uses a regular ACME certificate, so
   clients don't need the private CA.
 
 All modules below come from `nix-grpc-store.nixosModules.default`.
 
-## Step 1: Configure a worker
+## Step 1: Configure the nodes
 
 ```nix
 services.nix-grpc-daemon = {
   enable = true;
-  listen = "10.0.0.5:50052";
+  listen = "[::]:50052";
+  advertise = "10.0.0.5:50052";
+  roles = [ "builder" ];              # [ "builder" "scheduler" ] on the scheduler node
+  scheduler = "10.0.0.4:50052";       # leave out on the scheduler node itself
   idleTimeout = null;
+  minFree = "20G";
   tls = {
     certFile = "/run/keys/worker.crt";
     keyFile = "/run/keys/worker.key";
     clientCaFile = "/run/keys/farm-ca.crt";
   };
   trustedProxies = [ "lb-*" ];
-  accessRules = [ { cn = "ci-*"; role = "trusted"; } ];
-  farm = {
-    enable = true;
-    niks3Url = "https://niks3.example.com";
+  accessRules = [
+    { cn = "ci-*"; role = "trusted"; }
+    { cn = "worker-*"; role = "trusted"; }
+  ];
+  niks3 = {
+    url = "https://niks3.example.com";
     tokenFile = "/run/keys/niks3-token";
     cacheUrl = "https://cache.example.com";
     publicKeys = [ "cache.example.com-1:…" ];
-    maxJobs = 8;
-    minFree = "20G";
   };
 };
 ```
 
-| Option | What it does |
+| Option | Meaning |
 |---|---|
-| `listen` | Address the balancer connects to. Only the balancer needs to reach it. |
-| `trustedProxies` | Peers with a matching client cert are balancers. The worker takes the real client identity from the `x-forwarded-client-cert` header they set. Other peers can't set it. |
-| `accessRules` | Maps forwarded CNs to roles. CI needs `trusted`. |
-| `farm.maxJobs` | Concurrent farm builds on this worker. Keep it at or below the local nix-daemon's `max-jobs`. |
-| `farm.minFree` | Below this much free disk the worker reports unhealthy and the balancer stops sending work until space returns. |
-| `workerName` | Name clients see in `worker: building …` lines and in `nix_grpc_build_info`. Defaults to the hostname. On Kubernetes the chart sets it to the node name. |
+| `roles` | `builder`, `scheduler` or both (the default). Only fixed machines should have `scheduler`. |
+| `scheduler` | Where a builder finds the scheduler: that node's address, or the balancer's when several nodes have the role (see [failover](#managing-the-farm)). Unset on a node that is the only scheduler. |
+| `advertise` | The address the balancer knows this node by. Must match its entry in the balancer's `workers` or `scheduler`. |
+| `maxJobs` | Concurrent builds. Defaults to the local nix-daemon's `max-jobs`. |
+| `minFree` | Below this much free disk the node takes no new builds until space returns. |
+| `trustedProxies` | Peers with a matching client cert are balancers. The node takes the real client identity from the `x-forwarded-client-cert` header they set. Other peers can't set it. |
+| `accessRules` | Maps CNs to roles. CI needs `trusted`, and so do the other nodes for their connection to the scheduler. |
+| `schedulerTokenFile` | Bearer token for the connection to the scheduler, instead of or next to the client certificate. The scheduler node maps it to `trusted` through its `oidc` rules. |
+| `niks3.tokenFile`, `niks3.clientCertFile` | How the node authenticates to niks3: a bearer token, a client certificate (defaults to `tls.certFile`), or both. |
+| `workerName` | Name clients see in `worker: building …` lines and in `nix_grpc_build_info`. Defaults to the hostname. |
 
-Repeat for every worker. Workers for different systems use the same config.
+Repeat for every node. Builders for different systems use the same
+config. `nix.settings.system-features` decides which
+`requiredSystemFeatures` a builder accepts: a derivation that needs
+`kvm` only goes to builders that list it. A builder with
+`nix.settings.extra-platforms` (binfmt, Rosetta) takes those systems
+too. List it under each of them in the balancer's `workers`. A
+scheduler-only node is the same with `roles = [ "scheduler" ]` and no
+`scheduler`, `maxJobs` or `minFree`.
+
+A node has two outbound connections, to the scheduler and to niks3, and
+on each it can present its certificate, a bearer token, or both. With
+the config above it is the certificate on both, plus the niks3 API token.
+A farm without its own CA gives every node an OIDC token for each
+instead (`schedulerTokenFile`, `niks3.tokenFile`) and the scheduler node an
+`oidc` rule that grants those tokens `trusted`. When a certificate and a
+token are both presented, the certificate decides. `scheduler` uses TLS
+unless written as `http://host:port`.
+
+Builds run in `nix-daemon.service`, RPCs and downloads in
+`nix-grpc-daemon.service`. Give both a `CPUWeight`/`MemoryHigh` so a
+heavy build can't starve the daemon.
 
 ### Optional: accept developer tokens
 
@@ -115,9 +181,7 @@ services.nix-grpc-farm-lb = {
     x86_64-linux  = [ "10.0.0.4:50052" ];
     aarch64-linux = [ "10.0.0.5:50052" "10.0.0.6:50052" ];
   };
-  # Only 10.0.0.5 has /dev/kvm. Drvs with requiredSystemFeatures = [ "kvm" ]
-  # go there, a worker without the feature would bounce them.
-  features.aarch64-linux.kvm = [ "10.0.0.5:50052" ];
+  scheduler = "10.0.0.4:50052";
   tls = {
     certFile = "/var/lib/acme/farm.example.com/fullchain.pem";
     keyFile  = "/var/lib/acme/farm.example.com/key.pem";
@@ -135,9 +199,10 @@ security.acme.certs."farm.example.com" = {
 };
 ```
 
-| Option | What it does |
+| Option | Meaning |
 |---|---|
-| `workers` | Worker addresses per system. Requests for a system not listed go to `defaultSystem` (first entry by default). |
+| `workers` | Builder addresses per system, as in their `advertise`. Requests for a system not listed go to `defaultSystem` (first entry by default). |
+| `scheduler` | The node(s) with the `scheduler` role, as in their `advertise`. With several, envoy routes to the active one. Defaults to the first entry of `workers.<defaultSystem>`. |
 | `tls.certFile`/`keyFile` | Public server certificate. |
 | `tls.clientCaFile` | Verify client certificates against this CA and forward the subject to workers. Clients without a certificate are still accepted so tokens work. |
 | `tls.upstream.*` | The certificate envoy presents to workers, and the CA to verify them. |
@@ -148,6 +213,7 @@ To check that envoy sees your workers:
 $ curl -s localhost:9901/clusters | grep health_flags
 x86_64-linux::10.0.0.4:50052::health_flags::healthy
 aarch64-linux::10.0.0.5:50052::health_flags::healthy
+sched::10.0.0.4:50052::health_flags::healthy
 ```
 
 `accessLog = true` adds one journal line per connection with the client
@@ -169,23 +235,17 @@ nix.buildMachines = map (system: {
 }) [ "x86_64-linux" "aarch64-linux" ];
 ```
 
-One entry per system matters: the hook copies inputs before it says what
-it will build, and `system=` is how the balancer knows which cluster those
-uploads (and `builders-use-substitutes` fetches) belong to. It also gives
-each system its own upload lock on the client.
+Use one `buildMachines` entry per system. The `system=` parameter tells
+the balancer which builders should receive the inputs the hook uploads
+before the build, and which ones serve `builders-use-substitutes`
+downloads.
 
-The hook runs inside `nix-daemon.service`. If you filter its egress with
-`nix.firewall`, the module already allows port 50051; for another
-balancer port set `programs.nix-grpc-store.daemonEgressPorts`.
+The CI certificate needs the `trusted` role, since the hook uploads
+locally built, unsigned store paths.
 
-For each derivation the hook sends one `BuildDerivation` call. If the
-worker doesn't have the `.drv` closure, the plugin uploads it and retries.
-The worker streams the build log back and the hook copies the outputs from
-the worker when it's done. If another worker built them, the worker fetches
-them from the cache first.
-
-CI needs the `trusted` role because the build hook uploads locally built,
-unsigned inputs.
+If `nix.firewall` restricts what `nix-daemon.service` may connect to,
+port 50051 is already allowed. For a balancer on another port set
+`programs.nix-grpc-store.daemonEgressPorts`.
 
 To verify, build something that isn't cached:
 
@@ -197,31 +257,34 @@ worker-1: building …-farm-test.drv
 
 ## Step 4: Connect a developer laptop
 
-Developers use a token instead of a certificate and let the farm build
-from their local evaluation:
+Developers authenticate with a token instead of a certificate and
+evaluate locally:
 
 ```console
 $ nix build --store 'grpc://farm.example.com:50051?token-file=./jwt' --eval-store auto .#pkg
 ```
 
-`--eval-store auto` is required. The farm doesn't accept the worker-protocol
-tunnel, so derivations must exist locally and are uploaded per build.
+`--eval-store auto` keeps evaluation and the `.drv` files on the
+laptop. Nix hands the whole dependency graph to the farm in one go, so
+independent derivations build on different builders in parallel.
 
-The result is in the cache, not the local store. To fetch it:
+The outputs end up in the cache, not in the local store. To fetch them:
 
 ```console
 $ nix copy --from https://cache.example.com $(nix build … --print-out-paths)
 ```
 
-Tip: wrap the token fetch (an OIDC device-code login is a few lines of
-`curl`) and the `nix build` call in a script and expose it as
-`nix run .#nix-farm`.
+A small wrapper script that fetches the token (an OIDC device-code
+login is a few lines of `curl`) and runs `nix build` makes this a
+one-liner for the team, e.g. `nix run .#nix-farm`.
 
 ## On Kubernetes
 
-The Helm chart deploys the same pieces: a Deployment per worker group,
-envoy in front and a [harmonia-gc](https://github.com/nix-community/harmonia)
-sidecar per worker for disk space. niks3 is its own release, see its
+The Helm chart deploys the same pieces: dedicated scheduler pods
+(`scheduler.replicas`, one by default), a Deployment per builder group,
+envoy in front and a
+[harmonia-gc](https://github.com/nix-community/harmonia) sidecar per
+worker for disk space. niks3 is its own release, see its
 [Kubernetes page](https://github.com/Mic92/niks3/wiki/Kubernetes).
 
 ```console
@@ -231,7 +294,7 @@ $ helm install farm oci://ghcr.io/mic92/charts/nix-grpc-farm -n farm --create-na
 ```yaml
 # values.yaml
 niks3:
-  serverURL: http://niks3.niks3.svc      # where workers claim and push
+  serverURL: http://niks3.niks3.svc      # where workers push and the scheduler checks
   cacheURL: https://cache.example.com    # where everyone substitutes from
   publicKeys: ["cache.example.com-1:…"]
   auth:
@@ -262,7 +325,7 @@ lb:
 
 `helm install` prints the farm address and a `builders =` line.
 
-Things to know:
+Notes:
 
 * **Sandbox.** Builds are sandboxed, which needs the `nix-daemon`
   container to run privileged. Where that is forbidden set
@@ -273,10 +336,14 @@ Things to know:
   disk behind it, shared by all pods on the node (`sizeLimit` evicts, it
   is not a quota). Size them for that disk and keep `ensureFree` above
   `minFree`.
-* **Resources.** Builds run in the `nix-daemon` container, so
-  `workers.<group>.resources` is the one to size.
+* **Resources.** Builds run in the `nix-daemon` container, RPCs in
+  `nix-grpc-daemon`. Size `resources` and `daemonResources` separately.
+* **Worker certificate.** Workers reach the scheduler through its
+  Service, so the certificate in `tls.worker` must also cover
+  `<release>-nix-grpc-farm-scheduler.<namespace>.svc`, and its CN must
+  be in `auth.workerCNs`.
 * **Identity to niks3.** With `niks3.auth.serviceAccountToken.enabled` the
-  workers present a projected service account token (audience `niks3`).
+  pods present a projected service account token (audience `niks3`).
   Allow `<namespace>:<release>-nix-grpc-farm` with scope `write` in the
   niks3 chart's `auth.workloadIdentity.allowedServiceAccounts`. The two
   releases share no secret.
@@ -302,25 +369,40 @@ Things to know:
   then `nix build --store 'grpc://farm-nix-grpc-farm.farm.svc:50051?token-file=/var/run/secrets/farm/token&ca-cert=…' --eval-store auto`.
   Tokens need TLS on the balancer (`tls.lb`).
 * **Bring your own balancer.** `lb.enabled: false` drops envoy. Whatever
-  replaces it must hash on the `x-nix-drv` request header, route
-  `x-nix-system` to the matching group's headless Service, and health-check
-  `grpc.health.v1`.
-* **Monitoring.** `metrics.podMonitor.enabled` scrapes workers and envoy.
-  `grafanaDashboard.enabled` ships the dashboard as a ConfigMap for the
-  Grafana sidecar, with its `instance` variable set to `pod`. Workers show
-  up as `<node>/<pod>` in build logs and `nix_grpc_build_info`.
+  replaces it must send `/nix.remote.Scheduler/*` to the scheduler
+  Service, send a request with an `x-nix-worker: IP:port` header to that
+  pod, route the rest by `x-nix-system` to the matching group's headless
+  Service, and health-check `grpc.health.v1`.
+* **Monitoring.** `metrics.podMonitor.enabled` scrapes workers, scheduler
+  and envoy. `grafanaDashboard.enabled` ships the dashboard as a
+  ConfigMap for the Grafana sidecar, with its `instance` variable set to
+  `pod`.
 
 ## Managing the farm
 
-**Add a worker.** Deploy it with the Step 1 config, add its address under
-`workers.<system>`, redeploy the balancer.
+**Add a builder.** Deploy it with the Step 1 config, add its address
+under `workers.<system>`, redeploy the balancer. It takes queued builds
+as soon as it has connected to the scheduler.
 
-**Drain a worker.** `systemctl stop nix-grpc-daemon` takes it out of the
-balancer, sends new builds elsewhere and returns once running builds
-have published. After `TimeoutStopSec` (1h) the rest is killed and
-retried elsewhere. A second SIGTERM cancels right away. `nixos-rebuild
+**Drain a builder.** `systemctl stop nix-grpc-daemon` stops new builds
+arriving and returns once running builds have published. After
+`TimeoutStopSec` (1h) the rest is killed and the clients are sent to
+another worker. A second SIGTERM cancels right away. `nixos-rebuild
 switch` only signals the worker and the next connection starts the new
 generation.
+
+**Restart the scheduler.** Safe at any time, see [How it works](#how-it-works).
+New builds wait until it is back, or until another scheduler node has
+taken over.
+
+**Scheduler failover.** Give the `scheduler` role to two or three fixed
+nodes and list them all in the balancer's `scheduler`. If those nodes
+also build, set their `scheduler` to the balancer's address so their
+builder side follows whichever one is active. niks3 picks the active
+one, and each node logs `scheduler_take_over` / `scheduler_yield` when
+that changes. A niks3 or Postgres restart moves the lock too, at the
+cost of one scheduler restart. On Kubernetes, `scheduler.replicas: 2`
+does all of this.
 
 **See what a worker did.** Each build is one journal line:
 
@@ -328,12 +410,14 @@ generation.
 event=rpc method=BuildDerivation cn=ci-build01 duration_s=42 …
 ```
 
-Set `services.nix-grpc-daemon.logLevel = "debug"` to also log claim
-decisions.
+Set `logLevel = "debug"` on the scheduler to also log each request and
+assignment.
 
 **Metrics.** Set `services.nix-grpc-daemon.metricsListen` on workers and
-scrape envoy's admin port (`/stats/prometheus`). A Grafana dashboard for
-both ships as `nixos/grafana/farm.json` (flake: `nix-grpc-store.dashboards.farm`):
+scrape envoy's admin port (`/stats/prometheus`). The scheduler adds
+`nix_grpc_sched{kind="queued|workers|clients"}`. A Grafana dashboard for
+all of it ships as `nixos/grafana/farm.json` (flake:
+`nix-grpc-store.dashboards.farm`):
 
 ```nix
 services.grafana.provision.dashboards.settings.providers = [{
@@ -348,9 +432,9 @@ Kubernetes set `instance` to `pod` or `node`).
 
 ## Troubleshooting
 
-**`is a build farm, pass --eval-store auto`** — you ran `nix build --store
-grpc://…` without `--eval-store auto`, or something tried to open the
-worker-protocol tunnel (`nix store info`, `nix copy --to`).
+**`… pass --eval-store auto`** — you ran `nix build --store grpc://…`
+without `--eval-store auto`, so the derivations only exist in your local
+store.
 
 **`TLS handshake failed` / `could not reach the server`** — rerun with
 `NIX_GRPC_DEBUG=1` (for the build hook, put it in
@@ -366,10 +450,16 @@ envoy's `tls.clientCaFile` is set.
 **`no access rule matches '<cn>'`** — the certificate verified but its CN
 isn't in `accessRules`.
 
-**A worker shows `failed_active_hc`** — it's draining (low disk, socket
-stopped) or envoy can't complete mTLS to it. Check `journalctl -u
-nix-grpc-daemon` on the worker.
+**`no connected, non-draining worker for system … offers features {…}`** —
+no builder for that system (with those `system-features`) is connected
+to the scheduler, or all of them are low on disk or stopping. The client
+prints this as a warning and waits two minutes before giving up, because
+right after a scheduler restart the builders may still be reconnecting.
+Look for `event=scheduler_disconnected` in the builders' journal.
 
-**Builds queue but don't start** — `farm.maxJobs` slots are taken, or the
-worker's local nix-daemon is at `max-jobs`. The farm slot is held while
-waiting for the local one.
+**`asking the scheduler again` keeps repeating** — the client reaches a
+different worker than the scheduler picked. A worker's `advertise` does
+not match its entry in the balancer's `workers`.
+
+**A worker shows `failed_active_hc`** — it's stopping or envoy can't
+complete mTLS to it. Check `journalctl -u nix-grpc-daemon` on the worker.
