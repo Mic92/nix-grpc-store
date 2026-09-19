@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -358,11 +359,43 @@ struct GrpcStore::Run {
     } else if (msg.has_cached()) {
       job->result = cachedResult(*job);
     } else {
-      // nix reports only the top-level result. Say why a leaf failed.
-      printError("%s: %s", job->drvPath.to_string(), msg.unplaceable().reason());
-      job->result = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, msg.unplaceable().reason());
+      if (!job->unplaceableSince) {
+        warn("%s: %s, waiting up to %ds for a worker", job->drvPath.to_string(), msg.unplaceable().reason(),
+             store.restartGrace().count());
+        job->unplaceableSince = std::chrono::steady_clock::now();
+      }
+      job->unplaceableReason = msg.unplaceable().reason();
+      cv.notify_all();
+      return;
     }
+    job->unplaceableSince.reset();
     ready.push_back(job);
+  }
+
+  // Thread body: fail jobs whose Unplaceable outlived the grace.
+  void reapUnplaceable(const std::stop_token & stop) {
+    std::unique_lock lock(mutex);
+    while (!stop.stop_requested() && remaining > 0) {
+      auto const now = std::chrono::steady_clock::now();
+      auto wake = now + store.restartGrace();
+      for (auto & [drvPath, job] : jobs) {
+        if (!job.unplaceableSince || job.result || !job.workerAddr.empty()) {
+          continue;
+        }
+        auto const due = *job.unplaceableSince + store.restartGrace();
+        if (due <= now) {
+          // nix reports only the top-level result. Say why a leaf failed.
+          printError("%s: %s", job.drvPath.to_string(), job.unplaceableReason);
+          job.unplaceableSince.reset();
+          job.result = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, job.unplaceableReason);
+          ready.push_back(&job);
+          cv.notify_all();
+        } else {
+          wake = std::min(wake, due);
+        }
+      }
+      cv.wait_until(lock, wake);
+    }
   }
 
   // A fresh stream: everything not yet placed is Wanted again.
@@ -472,7 +505,7 @@ auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers,
     }
     auto const now = std::chrono::steady_clock::now();
     if (answered || giveUp == std::chrono::steady_clock::time_point::max()) {
-      giveUp = now + restartGrace;
+      giveUp = now + restartGrace();
       pause = reconnectPause;
     }
     if (now + pause > giveUp) {
@@ -513,11 +546,14 @@ void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, BuildMode buildMode, St
   for (auto & thread : threads) {
     thread = std::jthread([&run]() -> void { run.work(); });
   }
+  std::jthread reaper([&run](const std::stop_token & stop) -> void { run.reapUnplaceable(stop); });
+  std::stop_callback const wakeReaper(reaper.get_stop_token(), [&run]() -> void { run.cv.notify_all(); });
   // Also on unwind: lets the threads drain so the join in ~jthread returns.
   Finally const abandon([&run]() -> void { run.abandon(); });
 
   auto status = scheduleUntilDone(run, headers, setCtx);
   run.abandon();
+  reaper.request_stop();
   threads.clear(); // join
   checkInterrupt();
   if (!status.ok() && status.error_code() != grpc::StatusCode::CANCELLED && run.remaining > 0) {

@@ -318,8 +318,7 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
     }
     dispatchLocked();
     if (!core.placeable(res.drv)) {
-        // Say so instead of queueing forever.
-        core.cancel(client.id, res.drv);
+        // Keep the Want: right after a (re)start no worker has said Hello yet.
         reply.mutable_unplaceable()->set_drv_path(want.drv_path());
         reply.mutable_unplaceable()->set_reason(
             "no connected, non-draining worker for system '" + std::string(system) + "' offers features {"

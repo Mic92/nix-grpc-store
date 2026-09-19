@@ -106,6 +106,11 @@ private:
     Setting<unsigned int> connectTimeout{this, defaultConnectTimeout, "connect-timeout",
         "Seconds the first call waits for the server to become reachable before failing."};
 
+    static constexpr unsigned defaultRestartGrace = 120;
+    Setting<unsigned int> restartGrace{this, defaultRestartGrace, "restart-grace",
+        "Seconds to keep retrying once the server has answered before: across a worker or "
+        "scheduler restart, and while the scheduler says no worker can take a build."};
+
     Setting<std::string> routeSystem{this, "", "system",
         "Send `x-nix-system: VALUE` on every call, not only on builds. Use one "
         "`nix.buildMachines` entry per system behind a balancer so input uploads "
@@ -299,15 +304,17 @@ public:
     // also UNAVAILABLE but retrying those only delays the error.
     static auto goneAway(const grpc::Status & status) -> bool;
 
-    // connect-timeout until the service first answers, restartGrace after: a
+    // connect-timeout until the service first answers, restart-grace after: a
     // worker restart behind the balancer is expected, being offline is not.
-    static constexpr std::chrono::seconds restartGrace{120};
+    [[nodiscard]] auto restartGrace() const -> std::chrono::seconds {
+      return std::chrono::seconds(config->restartGrace.get());
+    }
     static constexpr std::chrono::milliseconds reconnectPause{500};
     static constexpr std::chrono::milliseconds maxReconnectPause{4000};
     template<typename F>
     void retrying(const char * what, const F & attempt) {
       auto giveUp = std::chrono::steady_clock::now()
-                    + (everConnected ? restartGrace : std::chrono::seconds(config->connectTimeout.get()));
+                    + (everConnected ? restartGrace() : std::chrono::seconds(config->connectTimeout.get()));
       auto pause = std::chrono::milliseconds(500); // NOLINT(*-magic-numbers)
       for (;;) {
         auto status = attempt();
@@ -467,6 +474,10 @@ public:
       std::string workerAddr;
       uint64_t assignId = 0;
       bool lost = false; // scheduler stream gone before assignment
+      // Set on Unplaceable, cleared on Assigned. reapUnplaceable fails the
+      // job once it is older than restart-grace.
+      std::optional<std::chrono::steady_clock::time_point> unplaceableSince;
+      std::string unplaceableReason;
     };
     struct Run;
 

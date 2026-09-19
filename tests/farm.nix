@@ -498,7 +498,7 @@ pkgs.testers.runNixOSTest {
         out = client.succeed(f"nix build -L --store '{envoy}' --eval-store auto --expr 'map (tag: import ${jobExpr} {{ inherit tag; features = [\"vip\"]; }}) [\"f1\" \"f2\" \"f3\"]' --impure 2>&1")
         assert "node-a: building " in out and "worker2: building" not in out, out
         assert any(re.match(r'nix_grpc_build_info\{.*features="[^"]*vip[^"]*".*worker="node-a"\} 1', line) for line in metrics(worker1)), metrics(worker1)
-        out = client.fail(f"nix build -L --store '{envoy}' --eval-store auto -f ${jobExpr} --argstr tag f5 --arg features '[\"gpu\"]' 2>&1")
+        out = client.fail(f"nix build -L --store '{envoy}&restart-grace=30' --eval-store auto -f ${jobExpr} --argstr tag f5 --arg features '[\"gpu\"]' 2>&1")
         assert "features {gpu}" in out, out
 
     with subtest("low disk drains a worker and builds go to the other"):

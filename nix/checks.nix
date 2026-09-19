@@ -44,9 +44,12 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     quint typecheck hook.qnt
     quint typecheck push.qnt
     quint run scheduler.qnt --main schedFixed --invariant=safety --max-steps=30 --max-samples=30000
-    quint run scheduler.qnt --main schedNoFence --invariant=safety --max-steps=30 --max-samples=30000
+    quint run scheduler.qnt --main schedFixed --step=stepNoSchedCrash --invariant=oneBuilder --max-steps=30 --max-samples=30000
+    ! quint run scheduler.qnt --main schedNoFence --invariant=safety --max-steps=30 --max-samples=30000
     ! quint run scheduler.qnt --main schedNoPush --invariant=safety --max-steps=30 --max-samples=30000
+    ! quint run scheduler.qnt --main schedNoPush --step=stepNoSchedCrash --invariant=oneBuilder --max-steps=30 --max-samples=30000
     ! quint run scheduler.qnt --main schedNoReport --invariant=safety --max-steps=30 --max-samples=30000
+    ! quint run scheduler.qnt --main schedTerminal --invariant=safety --max-steps=30 --max-samples=30000
     quint run hook.qnt --main hookFixed --invariant=safety --max-steps=15 --max-samples=20000
     ! quint run hook.qnt --main hookNoSubstituteRefs --invariant=safety --max-steps=15 --max-samples=20000
     ! quint run hook.qnt --main hookNoSubstituteDrv --invariant=safety --max-steps=15 --max-samples=20000
