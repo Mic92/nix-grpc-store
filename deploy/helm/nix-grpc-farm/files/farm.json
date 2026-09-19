@@ -56,7 +56,7 @@
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "${prefix}envoy_cluster_membership_healthy / ${prefix}envoy_cluster_membership_total",
+     "expr": "${prefix}envoy_cluster_membership_healthy{envoy_cluster_name!=\"sched\"} / ${prefix}envoy_cluster_membership_total{envoy_cluster_name!=\"sched\"}",
      "legendFormat": "{{envoy_cluster_name}}",
      "refId": "A"
     }
@@ -120,7 +120,7 @@
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "sum(${prefix}nix_grpc_inflight{kind=\"build_slot\"}) / sum(${prefix}nix_grpc_build_slots)",
+     "expr": "sum(${prefix}nix_grpc_inflight{kind=\"BuildDerivation\"}) / sum(${prefix}nix_grpc_build_slots)",
      "legendFormat": "farm",
      "refId": "A"
     }
@@ -330,7 +330,7 @@
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "sum by ($instance) (${prefix}nix_grpc_inflight{kind=\"build_slot\"}) / sum by ($instance) (${prefix}nix_grpc_build_slots)",
+     "expr": "sum by ($instance) (${prefix}nix_grpc_inflight{kind=\"BuildDerivation\"}) / sum by ($instance) (${prefix}nix_grpc_build_slots)",
      "legendFormat": "{{instance}}{{host}}",
      "refId": "A"
     }
@@ -343,7 +343,7 @@
     "type": "prometheus",
     "uid": "${DS}"
    },
-   "description": "Seconds added to every build besides the build itself. publish = upload outputs to the cache, substitute = fetch inputs, slot_wait = queued because all slots busy, claim = niks3 dedup round trip.",
+   "description": "Seconds added to every build besides the build itself. publish = upload outputs to the cache, substitute = fetch inputs.",
    "fieldConfig": {
     "defaults": {
      "custom": {
@@ -382,7 +382,7 @@
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "sum by (phase) (rate(${prefix}nix_grpc_phase_seconds_sum{method=\"BuildDerivation\",phase=~\"claim|substitute|publish|slot_wait\"}[$__rate_interval])) / ignoring(phase) group_left sum(rate(${prefix}nix_grpc_phase_seconds_count{method=\"BuildDerivation\",phase=\"claim\"}[$__rate_interval]))",
+     "expr": "sum by (phase) (rate(${prefix}nix_grpc_phase_seconds_sum{method=\"BuildDerivation\",phase=~\"substitute|publish\"}[$__rate_interval])) / ignoring(phase) group_left sum(rate(${prefix}nix_grpc_phase_seconds_count{method=\"BuildDerivation\",phase=\"build\"}[$__rate_interval]))",
      "legendFormat": "{{phase}}",
      "refId": "A"
     }
@@ -523,7 +523,7 @@
     "type": "prometheus",
     "uid": "${DS}"
    },
-   "description": "All of these should be ~0. claim_lost: niks3 lease expired mid-build. input_not_substitutable: a build input was in no cache and not uploaded by the client.",
+   "description": "All of these should be ~0. unexpected_build/expect_no_show: client and scheduler disagree on where a build goes (advertise address wrong, or a node restarted). input_not_substitutable: a build input was in no cache and not uploaded by the client.",
    "fieldConfig": {
     "defaults": {
      "custom": {}
@@ -556,7 +556,7 @@
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "sum by (${prefix}envoy_cluster_name) (rate(${prefix}envoy_cluster_upstream_rq_xx{envoy_response_code_class=\"5\"}[5m])) * 60",
+     "expr": "sum by (envoy_cluster_name) (rate(${prefix}envoy_cluster_upstream_rq_xx{envoy_response_code_class=\"5\",envoy_cluster_name!=\"sched\"}[5m])) * 60",
      "legendFormat": "5xx/min {{envoy_cluster_name}}",
      "refId": "A"
     },
@@ -565,7 +565,7 @@
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "sum by (${prefix}envoy_cluster_name) (rate(${prefix}envoy_cluster_upstream_cx_connect_fail[5m])) * 60",
+     "expr": "sum by (envoy_cluster_name) (rate(${prefix}envoy_cluster_upstream_cx_connect_fail{envoy_cluster_name!=\"sched\"}[5m])) * 60",
      "legendFormat": "connect fail/min {{envoy_cluster_name}}",
      "refId": "B"
     },
@@ -574,7 +574,7 @@
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "sum by (${prefix}envoy_cluster_name) (rate(${prefix}envoy_cluster_health_check_failure[5m])) * 60",
+     "expr": "sum by (envoy_cluster_name) (rate(${prefix}envoy_cluster_health_check_failure{envoy_cluster_name!=\"sched\"}[5m])) * 60",
      "legendFormat": "health check fail/min {{envoy_cluster_name}}",
      "refId": "C"
     },
@@ -583,12 +583,59 @@
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "sum by ($instance,kind) (rate(${prefix}nix_grpc_events_total{kind=~\"claim_lost|input_not_substitutable\"}[5m])) * 60",
+     "expr": "sum by ($instance,kind) (rate(${prefix}nix_grpc_events_total{kind=~\"unexpected_build|expect_no_show|expect_undeliverable|input_not_substitutable\"}[5m])) * 60",
      "legendFormat": "{{kind}}/min {{instance}}{{host}}",
      "refId": "D"
     }
    ],
    "title": "Errors",
+   "type": "timeseries"
+  },
+  {
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {},
+     "min": 0,
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 28
+   },
+   "id": 11,
+   "options": {
+    "legend": {
+     "calcs": [
+      "mean",
+      "lastNotNull"
+     ],
+     "displayMode": "table",
+     "placement": "right"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum by (kind) (${prefix}nix_grpc_sched)",
+     "legendFormat": "{{kind}}",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     }
+    }
+   ],
+   "title": "Scheduler: queued, workers, clients",
    "type": "timeseries"
   }
  ],
