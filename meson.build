@@ -12,6 +12,14 @@ threads_dep  = dependency('threads')
 openssl_dep  = dependency('libcrypto')
 
 prometheus_dep = [dependency('prometheus-cpp-core'), dependency('prometheus-cpp-pull')]
+# Already in the closure via protobuf/gRPC; used for the scheduler's hash maps.
+absl_dep = [dependency('absl_flat_hash_map'), dependency('absl_hash')]
+# Under ASan abseil's headers switch flat_hash_map to a different layout than
+# the prebuilt libabsl was compiled with; keep them in agreement. (UBSan
+# builds need clang: GCC rejects a constexpr in abseil's hash_policy_traits.h.)
+if get_option('b_sanitize').contains('address')
+  add_project_arguments('-DNDEBUG_SANITIZER', language : 'cpp')
+endif
 
 nix_store_dep = dependency('nix-store')
 nix_util_dep  = dependency('nix-util')
@@ -151,6 +159,13 @@ oidc_test = executable('oidc-test',
   dependencies : [nix_util_dep, curl_dep, json_dep, openssl_dep, grpc_dep, threads_dep],
 )
 test('oidc', find_program('tests/oidc-test.sh'), args : [oidc_test], timeout : 60)
+
+test('scheduler', executable('scheduler-test',
+  sources : ['tests/scheduler-test.cc'],
+  include_directories : [src_inc, include_directories('src/daemon')],
+  dependencies : [nix_util_dep] + absl_dep,
+  cpp_args : ['-UNDEBUG'],
+))
 
 test('xfcc', executable('xfcc-test',
   sources : ['tests/xfcc-test.cc'],
