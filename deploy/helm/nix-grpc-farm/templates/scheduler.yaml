@@ -1,0 +1,153 @@
+{{- /* One scheduler pod for all systems. Soft state: a restart loses the queue,
+     workers re-Hello with what they run and clients re-Want. */}}
+{{- $root := . }}
+{{- $oidc := include "farm.oidcProviders" . }}
+{{- $svc := include "farm.schedulerService" . }}
+{{- $sel := include "farm.schedulerSelectorLabels" . }}
+{{- $s := .Values.scheduler }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $svc }}
+  labels: {{- include "farm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: scheduler
+spec:
+  clusterIP: None
+  selector: {{- $sel | nindent 4 }}
+  ports:
+    - name: grpc
+      port: 50051
+    - name: metrics
+      port: 9464
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $svc }}
+  labels: {{- include "farm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: scheduler
+spec:
+  replicas: 1
+  strategy: {type: Recreate} # never two
+  selector:
+    matchLabels: {{- $sel | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ print $s $root.Values.tls $oidc | sha256sum }}
+        {{- with $s.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels: {{- $sel | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "farm.serviceAccountName" . }}
+      automountServiceAccountToken: {{ or .Values.auth.workloadIdentity.enabled .Values.niks3.auth.serviceAccountToken.enabled }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: nix-grpc-daemon
+          image: {{ include "farm.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [/bin/nix-grpc-daemon]
+          args:
+            - --role=scheduler
+            - --listen=[::]:50051
+            - --metrics-listen=0.0.0.0:9464
+            - --worker-name=scheduler/$(POD_NAME)
+            - --log-level={{ .Values.logLevel }}
+            # Cached replies need niks3; without it every Want is Assigned.
+            - --niks3={{ .Values.niks3.serverURL }}
+            - --niks3-token-file=/secrets/niks3/token
+            {{- if .Values.tls.worker.existingSecret }}
+            - --tls-cert=/secrets/tls/tls.crt
+            - --tls-key=/secrets/tls/tls.key
+            {{- end }}
+            {{- if .Values.tls.clientCA.existingSecret }}
+            - --client-ca=/secrets/ca/ca.crt
+            {{- range .Values.auth.trustedProxies }}
+            - --trusted-proxy={{ . }}
+            {{- end }}
+            # Workers dial in directly with their serving certificate.
+            {{- range .Values.auth.workerCNs }}
+            - --allow={{ . }}=trusted
+            {{- end }}
+            {{- end }}
+            {{- range .Values.auth.accessRules }}
+            - --allow={{ .cn }}={{ .role }}
+            {{- end }}
+            {{- with .Values.auth.anonymousRole }}
+            - --allow-anonymous={{ . }}
+            {{- end }}
+            {{- if $oidc }}
+            - --oidc-config=/secrets/oidc/oidc.json
+            {{- end }}
+            {{- with $s.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+          securityContext:
+            runAsUser: 990
+            runAsGroup: 990
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          ports:
+            - {name: grpc, containerPort: 50051}
+            - {name: metrics, containerPort: 9464}
+          {{- /* Ready = serving scheduler streams. Live = process answers. A draining or passive scheduler is live but not ready. */}}
+          {{- $tcp := not (empty .Values.tls.worker.existingSecret) }}
+          readinessProbe: {{- toYaml (merge (dict "periodSeconds" 5) (ternary (dict "tcpSocket" (dict "port" 50051)) (dict "grpc" (dict "port" 50051 "service" "nix.scheduler")) $tcp)) | nindent 12 }}
+          livenessProbe: {{- toYaml (merge (dict "periodSeconds" 30 "timeoutSeconds" 10) (ternary (dict "tcpSocket" (dict "port" 50051)) (dict "grpc" (dict "port" 50051)) $tcp)) | nindent 12 }}
+          volumeMounts:
+            - {name: niks3-token, mountPath: /secrets/niks3, readOnly: true}
+            {{- if .Values.tls.worker.existingSecret }}
+            - {name: tls, mountPath: /secrets/tls, readOnly: true}
+            {{- end }}
+            {{- if .Values.tls.clientCA.existingSecret }}
+            - {name: ca, mountPath: /secrets/ca, readOnly: true}
+            {{- end }}
+            {{- if $oidc }}
+            - {name: oidc, mountPath: /secrets/oidc, readOnly: true}
+            {{- end }}
+          {{- with $s.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: niks3-token
+          {{- if .Values.niks3.auth.serviceAccountToken.enabled }}
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: {{ .Values.niks3.auth.serviceAccountToken.audience }}
+                  expirationSeconds: {{ .Values.niks3.auth.serviceAccountToken.expirationSeconds }}
+          {{- else }}
+          secret:
+            secretName: {{ .Values.niks3.auth.existingSecret }}
+            items: [{key: token, path: token}]
+          {{- end }}
+        {{- with .Values.tls.worker.existingSecret }}
+        - name: tls
+          secret: {secretName: {{ . }}}
+        {{- end }}
+        {{- with .Values.tls.clientCA.existingSecret }}
+        - name: ca
+          secret: {secretName: {{ . }}}
+        {{- end }}
+        {{- if $oidc }}
+        - name: oidc
+          secret:
+            secretName: {{ include "farm.fullname" . }}-oidc
+        {{- end }}

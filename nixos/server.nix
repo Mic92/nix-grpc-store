@@ -7,6 +7,7 @@
 
 let
   cfg = config.services.nix-grpc-daemon;
+  builder = lib.elem "builder" cfg.roles;
 in
 {
   options.services.nix-grpc-daemon = {
@@ -215,56 +216,108 @@ in
       description = "Additional command-line flags.";
     };
 
-    farm = {
-      enable = lib.mkEnableOption ''
-        build farm worker mode. `BuildDerivation` claims outputs at niks3,
-        substitutes inputs from the cache and publishes results through a
-        long-lived `niks3 push --stdin`
+    roles = lib.mkOption {
+      type = lib.types.listOf (lib.types.enum [ "builder" "scheduler" ]);
+      default = [ "builder" "scheduler" ];
+      description = ''
+        `builder` runs assigned builds, `scheduler` keeps the queue. A
+        single node has both and schedules onto itself.
       '';
-      niks3Package = lib.mkOption {
-        type = lib.types.package;
-        example = lib.literalExpression "inputs.niks3.packages.\${system}.niks3";
-        description = "Package providing the `niks3` client.";
-      };
-      niks3Url = lib.mkOption {
-        type = lib.types.str;
-        example = "https://niks3.example.org";
-        description = "niks3 server URL.";
-      };
-      tokenFile = lib.mkOption {
-        type = lib.types.path;
-        example = "/run/secrets/niks3-token";
-        description = "File with the niks3 API bearer token.";
-      };
-      cacheUrl = lib.mkOption {
-        type = lib.types.str;
-        example = "https://cache.example.org";
-        description = "Binary cache the farm publishes to. Workers substitute inputs from it.";
-      };
-      publicKeys = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        description = "Signing keys of {option}`cacheUrl`.";
-      };
-      maxJobs = lib.mkOption {
-        type = lib.types.ints.positive;
-        default = 1;
-        description = "Concurrent builds on this worker.";
-      };
-      minFree = lib.mkOption {
-        type = lib.types.str;
-        default = "10G";
-        description = ''
-          Below this much free space under /nix the worker reports
-          NOT_SERVING to the balancer and bounces builds with UNAVAILABLE so
-          they run elsewhere. `0` disables.
-        '';
-      };
-      pushFlags = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        default = [ ];
-        example = [ "--max-concurrent-uploads" "8" ];
-        description = "Extra flags for `niks3 push --stdin`.";
-      };
+    };
+    scheduler = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "lb.example.org:443";
+      description = ''
+        Scheduler (or balancer) address for a builder. `null` means
+        in-process. TLS unless `http://`, presenting {option}`tls.certFile`
+        and trusting the system CAs plus {option}`tls.clientCaFile`.
+      '';
+    };
+    schedulerTokenFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/run/secrets/scheduler-token";
+      description = ''
+        Bearer token for {option}`scheduler`, instead of or next to the
+        client certificate. Re-read when the file changes.
+      '';
+    };
+    advertise = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "10.0.0.7:50051";
+      description = ''
+        `IP:port` the balancer reaches this node at, as listed in its
+        `workers`. Defaults to {option}`listen`.
+      '';
+    };
+    maxJobs = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 1 63);
+      default = null;
+      description = "Concurrent builds. Defaults to `nix.settings.max-jobs`.";
+    };
+    minFree = lib.mkOption {
+      type = lib.types.str;
+      default = "10G";
+      description = ''
+        Take no new builds below this much free space under /nix. `0` disables.
+      '';
+    };
+
+    niks3 = lib.mkOption {
+      default = null;
+      description = ''
+        Publish to and substitute from a niks3 binary cache. Required with
+        more than one node.
+      '';
+      type = lib.types.nullOr (
+        lib.types.submodule {
+          options = {
+            package = lib.mkOption {
+              type = lib.types.package;
+              example = lib.literalExpression "inputs.niks3.packages.\${system}.niks3";
+              description = "Package providing the `niks3` client.";
+            };
+            url = lib.mkOption {
+              type = lib.types.str;
+              example = "https://niks3.example.org";
+              description = "niks3 server URL.";
+            };
+            tokenFile = lib.mkOption {
+              type = lib.types.nullOr lib.types.path;
+              default = null;
+              example = "/run/secrets/niks3-token";
+              description = "Bearer token (API token or OIDC JWT). Re-read on change.";
+            };
+            clientCertFile = lib.mkOption {
+              type = lib.types.nullOr lib.types.path;
+              default = null;
+              description = "Client certificate for niks3. Defaults to {option}`tls.certFile`.";
+            };
+            clientKeyFile = lib.mkOption {
+              type = lib.types.nullOr lib.types.path;
+              default = null;
+              description = "Key for {option}`niks3.clientCertFile`. Defaults to {option}`tls.keyFile`.";
+            };
+            cacheUrl = lib.mkOption {
+              type = lib.types.str;
+              example = "https://cache.example.org";
+              description = "Binary cache niks3 publishes to and nodes substitute from.";
+            };
+            publicKeys = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              description = "Signing keys of {option}`cacheUrl`.";
+            };
+            pushFlags = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              example = [ "--max-concurrent-uploads" "8" ];
+              description = "Extra flags for `niks3 push --stdin`.";
+            };
+          };
+        }
+      );
     };
   };
 
@@ -295,17 +348,16 @@ in
 
     # Reach the local nix-daemon even when allowed-users is restricted.
     nix.settings.extra-allowed-users = [ "nix-grpc-daemon" ];
-    # In farm mode the gRPC access rules decide who may import unsigned
-    # paths, so the proxy itself has to be allowed to.
-    nix.settings.extra-trusted-users = lib.mkIf (cfg.trustClients || cfg.farm.enable) [ "nix-grpc-daemon" ];
+    # We submit builds by drv path, which needs a trusted user. Our own
+    # access rules decide who may.
+    nix.settings.extra-trusted-users = lib.mkIf (cfg.trustClients || builder) [ "nix-grpc-daemon" ];
 
     # The cache is the share between workers. A path another
     # worker just pushed must not be negatively cached here.
-    nix.settings.substituters = lib.mkIf cfg.farm.enable [ cfg.farm.cacheUrl ];
-    nix.settings.trusted-public-keys = lib.mkIf cfg.farm.enable cfg.farm.publicKeys;
-    nix.settings.narinfo-cache-negative-ttl = lib.mkIf cfg.farm.enable 0;
-    nix.settings.max-jobs = lib.mkIf cfg.farm.enable (lib.mkDefault cfg.farm.maxJobs);
-    nix.settings.keep-build-log = lib.mkIf cfg.farm.enable true;
+    nix.settings.substituters = lib.mkIf (cfg.niks3 != null) [ cfg.niks3.cacheUrl ];
+    nix.settings.trusted-public-keys = lib.mkIf (cfg.niks3 != null) cfg.niks3.publicKeys;
+    nix.settings.narinfo-cache-negative-ttl = lib.mkIf (cfg.niks3 != null) 0;
+    nix.settings.keep-build-log = lib.mkIf builder true;
 
     # gRPC clients inherit the store privileges of this uid via the proxied
     # nix-daemon connection, so default to a dedicated unprivileged user.
@@ -324,7 +376,7 @@ in
     systemd.services.nix-grpc-daemon = {
       description = "Nix worker-protocol over gRPC";
       # niks3 push shells out to `nix path-info`.
-      path = lib.optional cfg.farm.enable config.nix.package;
+      path = lib.optional (cfg.niks3 != null) config.nix.package;
       requires = [ "nix-grpc-daemon.socket" ];
       # nix-daemon is socket-activated; ordering after the socket is enough,
       # the first proxied connection will start it.
@@ -333,13 +385,14 @@ in
         "nix-daemon.socket"
       ];
       wants = [ "nix-daemon.socket" ];
-      # Reload means drain: leave the balancer, exit once running builds have
-      # published, let the socket start the new generation. A deploy never
-      # waits for or kills builds.
-      reloadIfChanged = cfg.farm.enable;
+      # Reload = drain: leave the balancer, finish and publish running
+      # builds, then exit. The socket starts the new generation.
+      reloadIfChanged = builder;
       serviceConfig = {
         Type = "notify";
         WatchdogSec = 30;
+        # Keep RPCs responsive next to builds in nix-daemon.service.
+        CPUWeight = lib.mkDefault 1000;
         User = "nix-grpc-daemon";
         Group = "nix-grpc-daemon";
         Restart = "on-failure";
@@ -391,26 +444,54 @@ in
             "--log-level"
             cfg.logLevel
           ]
-          ++ lib.optionals cfg.farm.enable [
-            "--niks3"
-            cfg.farm.niks3Url
-            "--niks3-token-file"
-            cfg.farm.tokenFile
-            "--niks3-push"
-            (lib.escapeShellArgs ([ (lib.getExe cfg.farm.niks3Package) "push" ] ++ cfg.farm.pushFlags))
-            "--max-jobs"
-            (toString cfg.farm.maxJobs)
+          ++ [
+            "--role"
+            (lib.concatStringsSep "," cfg.roles)
             "--min-free"
-            cfg.farm.minFree
+            cfg.minFree
           ]
+          ++ lib.optionals (cfg.maxJobs != null) [
+            "--max-jobs"
+            (toString cfg.maxJobs)
+          ]
+          ++ lib.optionals (cfg.scheduler != null) [
+            "--scheduler"
+            cfg.scheduler
+          ]
+          ++ lib.optionals (cfg.schedulerTokenFile != null) [
+            "--scheduler-token-file"
+            cfg.schedulerTokenFile
+          ]
+          ++ lib.optionals (cfg.advertise != null) [
+            "--advertise"
+            cfg.advertise
+          ]
+          ++ lib.optionals (cfg.niks3 != null) (
+            [
+              "--niks3"
+              cfg.niks3.url
+              "--niks3-push"
+              (lib.escapeShellArgs ([ (lib.getExe cfg.niks3.package) "push" ] ++ cfg.niks3.pushFlags))
+            ]
+            ++ lib.optionals (cfg.niks3.tokenFile != null) [
+              "--niks3-token-file"
+              cfg.niks3.tokenFile
+            ]
+            ++ lib.optionals (cfg.niks3.clientCertFile != null) [
+              "--niks3-client-cert"
+              cfg.niks3.clientCertFile
+              "--niks3-client-key"
+              cfg.niks3.clientKeyFile
+            ]
+          )
           ++ cfg.extraFlags
         );
         # Builds run in nix-daemon. This only bounds the proxy.
         MemoryMax = lib.mkDefault "2G";
       }
-      // lib.optionalAttrs cfg.farm.enable {
+      // lib.optionalAttrs builder {
         ExecReload = "${pkgs.coreutils}/bin/kill -TERM $MAINPID";
-        # `systemctl stop` drains too and niks3 push must survive to publish.
+        # stop drains too, and niks3 push must live on to publish.
         KillMode = "mixed";
         TimeoutStopSec = lib.mkDefault "1h";
         NoNewPrivileges = true;

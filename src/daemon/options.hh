@@ -12,7 +12,7 @@
 #include <grpcpp/security/server_credentials.h>
 
 #include "acl.hh"
-#include "farm.hh"
+#include "niks3-client.hh"
 #include "logfmt.hh"
 #include "xfcc.hh"
 
@@ -34,10 +34,24 @@ struct Options
     Acl acl;
     xfcc::TrustedProxies proxies;
     std::string oidcConfig;
-    FarmConfig farm; // active when niks3Url is set
+    Niks3Config niks3;
+
+    bool builder = true;
+    bool scheduler = true;
+    // Empty: in-process scheduler. Else the balancer URL (host:port) to dial.
+    std::string schedulerAddr;
+    std::string schedulerTokenFile; // bearer towards a remote scheduler, optional
+    // How the balancer reaches this worker. Goes into Assigned.worker_addr.
+    std::string advertise;
+    unsigned maxJobs = 0; // 0 = take nix's max-jobs
+    uint64_t minFree = 0;
+    std::string storeDir;
 };
 
 auto parseOptions(const std::vector<std::string_view> & args) -> Options;
+
+// --scheduler http://host:port is dialed without TLS.
+constexpr std::string_view plaintextScheme = "http://";
 auto makeServerCredentials(const Options & options) -> std::shared_ptr<grpc::ServerCredentials>;
 
 } // namespace nixgrpc

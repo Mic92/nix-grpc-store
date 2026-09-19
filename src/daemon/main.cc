@@ -13,7 +13,6 @@
 #include <signal.h> // NOLINT(modernize-deprecated-headers): sigaction is POSIX, not in <csignal>
 #include <cstddef>
 #include <initializer_list>
-#include <iterator>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -66,9 +65,9 @@
 #include "acl.hh"
 #include "auth.hh"
 #include "backend.hh"
-#include "farm.hh"
+#include "cache.hh"
+#include "coordinator.hh"
 #include "options.hh"
-#include "claim.hh"
 #include "push.hh"
 #include "idle.hh"
 #include "import-paths.hh"
@@ -81,13 +80,11 @@
 #include "nix_remote.pb.h"
 #include "pump.hh"
 #include "socket-activation.hh"
-#include "xfcc.hh"
 
 using GrpcStream = grpc::ServerReaderWriter<nix::remote::Chunk, nix::remote::Chunk>;
 using AddMultipleReader = grpc::ServerReader<nix::remote::AddMultipleChunk>;
 using NarFrameWriter = grpc::ServerWriter<nix::remote::NarFrame>;
 using BuildWriter = grpc::ServerWriter<nix::remote::BuildDerivationChunk>;
-using BuildPathsWriter = grpc::ServerWriter<nix::remote::BuildPathsChunk>;
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): signal handler.
 volatile std::sig_atomic_t nixgrpc::stopSignal = 0;
@@ -102,9 +99,9 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     nixgrpc::Metrics & metrics;
     nixgrpc::IdleTracker & idle;
     nixgrpc::LogLevel logLevel;
-    nixgrpc::Auth auth;
+    nixgrpc::Auth & auth;
     nixgrpc::Backends backends;
-    std::optional<nixgrpc::Farm> & farm;
+    nixgrpc::Coordinator & coord;
 
     std::mutex storeMutex;
     std::shared_ptr<nix::Store> store;
@@ -126,11 +123,14 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         return nix::openStore(storeUri);
     }
 
+public:
     // begin() throws this for callers the ACL refuses.
     struct Denied
     {
         grpc::Status status;
     };
+
+private:
 
     // gRPC aborts the process if a handler lets an exception escape.
     template<typename F>
@@ -205,28 +205,24 @@ public:
         nixgrpc::Metrics & metrics,
         nixgrpc::IdleTracker & idle,
         nixgrpc::LogLevel logLevel,
-        nixgrpc::Acl acl,
-        nixgrpc::xfcc::TrustedProxies proxies,
-        std::optional<nixgrpc::oidc::Verifier> & oidc,
-        std::optional<nixgrpc::Farm> & farm)
+        nixgrpc::Auth & auth,
+        nixgrpc::Coordinator & coord)
         : storeUri(std::move(storeUri))
         , workerName(std::move(workerName))
         , metrics(metrics)
         , idle(idle)
         , logLevel(logLevel)
-        , auth{.acl = std::move(acl), .proxies = std::move(proxies), .oidc = &oidc}
+        , auth(auth)
         , backends{.socketPath = std::move(socketPath)}
-        , farm(farm)
+        , coord(coord)
     {
     }
 
     auto Connect(grpc::ServerContext * context, GrpcStream * stream) -> grpc::Status override
     {
         return guarded([&]() -> grpc::Status {
-            if (farm) {
-                return {grpc::StatusCode::UNIMPLEMENTED, "farm endpoint: pass --eval-store auto and build via BuildDerivation"};
-            }
-            // The opaque worker protocol cannot be inspected here.
+            // The opaque worker protocol cannot be inspected here. Builds sent
+            // through it bypass the scheduler, hence trusted only.
             auto const rpc = begin(*context, "Connect", nixgrpc::Role::trusted);
 
             nix::AutoCloseFD sock;
@@ -281,16 +277,14 @@ public:
                 valid.push_back(localStore->printStorePath(path));
                 paths.erase(path);
             }
-            if (farm) {
-                // The farm answers as one store: what the cache has, every worker can serve.
+            if (coord.cache.hasRemote()) {
+                // Nodes answer as one store: what the cache has, every node can serve,
                 for (const auto & path : localStore->querySubstitutablePaths(paths)) {
                     reply->add_paths(std::string(path.to_string()));
                 }
-                // And what only we have must become so before the client relies on it.
-                if (!valid.empty()) {
-                    phase.next("publish");
-                    farm->push.pushWait(valid, 0, [&]() -> bool { return context->IsCancelled(); });
-                }
+                // and what only we have must become so before the client relies on it.
+                phase.next("publish");
+                coord.cache.publish(valid, [&]() -> bool { return context->IsCancelled(); });
             }
             return grpc::Status::OK;
         });
@@ -328,17 +322,13 @@ public:
             nixgrpc::Metrics::Phase phase(metrics, "AddMultipleToStore", "recv");
             auto stats = nixgrpc::importPaths(
                 *localStore, source, [&](const nix::ValidPathInfo & info, nix::Source & nar) -> void {
-                    if (farm) {
-                        substituteMissingReferences(*localStore, info);
-                    }
+                    coord.cache.completeRefs(*localStore, info);
                     localStore->addToStore(info, nar, repair, checkSigs);
                     imported.push_back(localStore->printStorePath(info.path));
                 });
+            phase.next("publish");
+            coord.cache.publish(imported, [&]() -> bool { return context->IsCancelled(); });
             phase.done();
-            if (farm && !imported.empty()) {
-                phase.next("publish");
-                farm->push.pushWait(imported, 0, [&]() -> bool { return context->IsCancelled(); });
-            }
             rpc.done({{"paths", std::to_string(stats.paths)}, {"nar_bytes_in", std::to_string(stats.narBytes)}});
             metrics.countNarBytes("in", rpc.caller.name, stats.narBytes);
             return grpc::Status::OK;
@@ -357,7 +347,7 @@ public:
                 nix::StorePath const path(name);
                 std::shared_ptr<const nix::ValidPathInfo> info;
                 try {
-                    substituteIfFarm(*localStore, path);
+                    substituteIfRemote(*localStore, path);
                     info = localStore->queryPathInfo(path).get_ptr();
                 } catch (nix::Error & err) {
                     // invalid here and not substitutable: omitted from the reply
@@ -401,25 +391,17 @@ public:
     {
         return guarded([&]() -> grpc::Status {
             auto const rpc = begin(*context, "StoreInfo", nixgrpc::Role::readOnly);
-            if (farm) {
-                // build-remote sends BuildDerivation and unsigned inputs only to stores that trust it.
-                reply->set_trusted(rpc.caller.role == nixgrpc::Role::trusted);
-                reply->set_farm(true);
-                return grpc::Status::OK;
-            }
-            auto backend = backends.connect(*getStore());
-            if (backend->info.remoteTrustsUs) {
-                reply->set_trusted(*backend->info.remoteTrustsUs == nix::Trusted);
-            }
+            // build-remote sends BuildDerivation and unsigned inputs only to stores that trust it.
+            reply->set_trusted(rpc.caller.role == nixgrpc::Role::trusted);
             return grpc::Status::OK;
         });
     }
 
-    // Farm outputs may live only in the cache. The build hook reads them back through us.
-    void substituteIfFarm(nix::Store & store, const nix::StorePath & path)
+    // Outputs built on another node live only in the cache. Clients read them back through us.
+    void substituteIfRemote(nix::Store & store, const nix::StorePath & path) const
     {
-        if (farm && !store.isValidPath(path)) {
-            nixcompat::ensurePath(store, path);
+        if (coord.cache.hasRemote()) {
+            nixgrpc::Cache::substitute(store, path);
         }
     }
 
@@ -433,18 +415,9 @@ public:
         return targets;
     }
 
-    // The drv closure and inputs may have been uploaded to, or built on, another worker.
-    auto gatherInputs(
-        nix::Store & localStore, const nix::StorePath & drvPath, const nix::BasicDerivation & drv, nix::Store & roots)
-        -> grpc::Status
+    // Inputs may have been uploaded to, or built on, another worker.
+    auto gatherInputs(nix::Store & localStore, const nix::BasicDerivation & drv, nix::Store & roots) -> grpc::Status
     {
-        if (!localStore.isValidPath(drvPath)) {
-            try {
-                nixcompat::ensurePath(localStore, drvPath);
-            } catch (nix::Error &) {
-                return {grpc::StatusCode::NOT_FOUND, "missing: " + localStore.printStorePath(drvPath)};
-            }
-        }
         try {
             for (const auto & input : nixcompat::drvInputs(drv)) {
                 roots.addTempRoot(input);
@@ -458,16 +431,6 @@ public:
         return grpc::Status::OK;
     }
 
-    // References the client skipped were reported present, hence published, by another worker.
-    static void substituteMissingReferences(nix::Store & store, const nix::ValidPathInfo & info)
-    {
-        for (const auto & ref : info.references) {
-            if (ref != info.path && !store.isValidPath(ref)) {
-                nixcompat::ensurePath(store, ref);
-            }
-        }
-    }
-
     static auto missingFeature(nix::Store & store, const nix::BasicDerivation & drv) -> std::optional<std::string>
     {
         for (const auto & feature : nixcompat::requiredSystemFeatures(store, drv)) {
@@ -476,16 +439,6 @@ public:
             }
         }
         return std::nullopt;
-    }
-
-    static auto narinfoKeys(const auto & paths) -> std::vector<std::string>
-    {
-        std::vector<std::string> keys;
-        keys.reserve(static_cast<size_t>(std::ranges::distance(paths)));
-        for (const nix::StorePath & path : paths) {
-            keys.push_back(std::string(path.hashPart()) + ".narinfo");
-        }
-        return keys;
     }
 
     static auto staticOutputs(nix::Store & store, const nix::BasicDerivation & drv)
@@ -500,124 +453,150 @@ public:
         return res;
     }
 
-    // gRPC errors mean "retry this RPC", build outcomes travel as BuildResult.
-    auto farmBuild(
+    // Second caller for a drv that already builds here: wait for its result.
+    static auto attach(grpc::ServerContext & context, nixgrpc::Expected::Shared & shared, const nixgrpc::BuildEventSink & log)
+        -> std::optional<std::string>
+    {
+        log({.text = "attached to the build already running on this worker"});
+        std::unique_lock lock(shared.mutex);
+        while (!shared.finished) {
+            if (context.IsCancelled() || stopSignal >= nixgrpc::kCancelBuilds) {
+                return std::nullopt;
+            }
+            shared.cv.wait_for(lock, nixgrpc::cancelPoll);
+        }
+        return shared.resultWire;
+    }
+
+    // gRPC errors mean "ask the scheduler again", build outcomes travel as BuildResult.
+    auto build(
         grpc::ServerContext & context,
-        nixgrpc::Farm & frm,
         nix::Store & localStore,
         const nix::StorePath & drvPath,
         const nix::BasicDerivation & drv,
+        nix::BuildMode mode,
         const nixgrpc::BuildEventSink & log,
-        nix::BuildResult & res) -> grpc::Status
+        nix::remote::BuildDerivationDone & done) -> grpc::Status
     {
+        if (!coord.builder) {
+            return {grpc::StatusCode::FAILED_PRECONDITION, "not a builder"};
+        }
+        auto & builder = *coord.builder;
         auto outPaths = staticOutputs(localStore, drv);
         if (outPaths.size() != drv.outputs.size()) {
-            return {grpc::StatusCode::UNIMPLEMENTED, "farm builds need statically known output paths"};
+            return {grpc::StatusCode::UNIMPLEMENTED, "builds need statically known output paths"};
         }
-        if (!frm.healthy) {
-            return {grpc::StatusCode::UNAVAILABLE, "worker low on disk space"};
-        }
-        // The balancer should route by x-nix-features. If it did not, let the client try another worker.
         if (auto feature = missingFeature(localStore, drv)) {
-            return {grpc::StatusCode::UNAVAILABLE, "lacks system feature '" + *feature + "'"};
+            return {grpc::StatusCode::FAILED_PRECONDITION, "lacks system feature '" + *feature + "'"};
         }
-        auto cancelled = [&]() -> bool { return context.IsCancelled() || stopSignal >= nixgrpc::kCancelBuilds; };
-        nixgrpc::Metrics::Held const held(metrics, "BuildDerivation");
-        if (stopSignal != 0) { // after `held` so the drain loop cannot miss us
-            return {grpc::StatusCode::UNAVAILABLE, "worker draining"};
+        // Before admit: NOT_FOUND makes the client upload the closure and retry, which must not consume the Expect.
+        if (!localStore.isValidPath(drvPath)) {
+            try {
+                nixcompat::ensurePath(localStore, drvPath);
+            } catch (nix::Error &) {
+                return {grpc::StatusCode::NOT_FOUND, "missing: " + localStore.printStorePath(drvPath)};
+            }
         }
-        nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "slot_wait");
-        auto slot = nixgrpc::acquireSlot(frm.slots);
-        phase.next("claim");
-        auto claim = frm.niks3.claim(narinfoKeys(outPaths | std::views::values), narinfoKeys(nixcompat::drvInputs(drv)));
-        if (claim->first(cancelled) == nixgrpc::Claim::Status::wait) {
-            slot.reset();
-            phase.next("claim_wait");
-            log({.text = workerName + ": waiting for another worker building " + std::string(drvPath.to_string())});
+        auto const drvName = std::string(drvPath.to_string());
+        auto adm = builder.admit(drvName);
+        if (!adm) {
+            metrics.event("unexpected_build");
+            return {grpc::StatusCode::FAILED_PRECONDITION, "not scheduled here: " + drvName};
         }
-        auto const verdict = claim->await(cancelled);
-        phase.done();
-        switch (verdict) {
-        case nixgrpc::Claim::Status::built:
-            metrics.event("deduplicated");
-            res = nixcompat::alreadyValid(drvPath, std::move(outPaths));
+        if (adm->attach) {
+            metrics.event("attached");
+            auto wire = attach(context, *adm->shared, log);
+            if (!wire) {
+                throw nixgrpc::CancelledWait("gave up waiting for the running build");
+            }
+            if (!done.ParseFromString(*wire)) {
+                return {grpc::StatusCode::INTERNAL, "corrupt shared result"};
+            }
             return grpc::Status::OK;
-        case nixgrpc::Claim::Status::failed:
-            metrics.event("deduplicated");
-            res = nixcompat::failed(
-                nixcompat::FailureStatus::PermanentFailure, "failed on another worker: " + claim->kind());
-            return grpc::Status::OK;
-        default:
-            break;
-        }
-        // Blocking would keep the claim alive while every other worker waits on us.
-        if (!slot) {
-            slot = nixgrpc::tryAcquireSlot(frm.slots);
-        }
-        if (!slot) {
-            return {grpc::StatusCode::UNAVAILABLE, "promoted to build but no free slot"};
         }
 
+        // From here on we own the Expect and must report Done exactly once.
+        auto outcome = nix::remote::Done::FAILED;
+        std::vector<std::pair<std::string, uint64_t>> outputs;
+        std::string wire;
+        auto report = [&]() -> void { builder.finished(drvName, outcome, outputs, wire); };
+        try {
+            auto status = buildExpected(context, localStore, drvPath, drv, mode, log, outPaths, done, outcome, outputs);
+            wire = done.SerializeAsString();
+            if (!status.ok()) {
+                outcome = nix::remote::Done::FAILED;
+            }
+            report();
+            return status;
+        } catch (nixgrpc::CancelledWait &) {
+            outcome = nix::remote::Done::CANCELLED;
+            report();
+            throw;
+        } catch (...) {
+            report();
+            throw;
+        }
+    }
+
+    auto buildExpected(
+        grpc::ServerContext & context,
+        nix::Store & localStore,
+        const nix::StorePath & drvPath,
+        const nix::BasicDerivation & drv,
+        nix::BuildMode mode,
+        const nixgrpc::BuildEventSink & log,
+        const std::map<std::string, nix::StorePath> & outPaths,
+        nix::remote::BuildDerivationDone & done,
+        nix::remote::Done::Outcome & outcome,
+        std::vector<std::pair<std::string, uint64_t>> & outputs) -> grpc::Status
+    {
+        auto cancelled = [&]() -> bool { return context.IsCancelled() || stopSignal >= nixgrpc::kCancelBuilds; };
+        nixgrpc::Metrics::Held const held(metrics, "BuildDerivation");
+        nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "substitute");
         // Roots inputs and outputs until publish is done.
         auto roots = openScopedStore();
-        phase.next("substitute");
-        if (auto status = gatherInputs(localStore, drvPath, drv, *roots); !status.ok()) {
+        if (auto status = gatherInputs(localStore, drv, *roots); !status.ok()) {
             return status;
         }
         for (const auto & [name, path] : outPaths) {
             roots->addTempRoot(path);
         }
-
+        nix::BuildResult res;
         log({.text = workerName + ": building " + std::string(drvPath.to_string())});
         try {
             phase.next("build");
             nixgrpc::Metrics::Held const building(metrics, "build_slot");
-            res = backends.storedBuild(context, localStore, drvPath, log);
+            res = backends.storedBuild(context, localStore, drvPath, mode, log);
             phase.done();
         } catch (nix::Error &) {
             if (cancelled()) {
-                throw nixgrpc::CancelledWait("worker shutting down, build interrupted");
+                throw nixgrpc::CancelledWait("build interrupted");
             }
             throw;
-        }
-
-        if (claim->lost()) {
-            metrics.event("claim_lost");
-            return {grpc::StatusCode::UNAVAILABLE, "lost niks3 claim during build"};
         }
         metrics.event(nixcompat::succeeded(res) ? "built" : "build_failed");
-        if (!nixcompat::succeeded(res)) {
-            // The client gets the result even if niks3 is down.
+        if (nixcompat::succeeded(res)) {
+            std::vector<std::string> built;
+            built.reserve(outPaths.size());
+            for (const auto & [name, path] : outPaths) {
+                built.push_back(localStore.printStorePath(path));
+                outputs.emplace_back(built.back(), localStore.queryPathInfo(path)->narSize);
+            }
             try {
-                claim->fail(nixcompat::deterministicFailureKind(res));
+                phase.next("publish");
+                coord.cache.publish(built, cancelled);
+                phase.done();
+            } catch (nixgrpc::CancelledWait &) {
+                throw;
             } catch (nix::Error & err) {
-                log({.text = std::string("reporting failure to niks3: ") + err.what()});
+                return {grpc::StatusCode::UNAVAILABLE, std::string("publish failed: ") + err.what()};
             }
-            // ENOSPC and the like: not the build's fault, retry elsewhere.
-            if (nixcompat::failureStatus(res) == nixcompat::FailureStatus::TransientFailure) {
-                return {grpc::StatusCode::UNAVAILABLE, nixcompat::buildFailureMsg(res).value_or("transient failure")};
-            }
-            return grpc::Status::OK;
+            outcome = nix::remote::Done::BUILT;
+        } else if (nixcompat::failureStatus(res) == nixcompat::FailureStatus::TransientFailure) {
+            // ENOSPC and the like: not the build's fault, let the scheduler place it again.
+            return {grpc::StatusCode::UNAVAILABLE, nixcompat::buildFailureMsg(res).value_or("transient failure")};
         }
-        std::vector<std::string> built;
-        built.reserve(outPaths.size());
-        for (const auto & [name, path] : outPaths) {
-            built.push_back(localStore.printStorePath(path));
-        }
-        try {
-            phase.next("publish");
-            frm.push.pushWait(built, claim->token(), cancelled);
-            phase.done();
-        } catch (nixgrpc::StaleClaim &) {
-            metrics.event("claim_lost");
-            claim->published();
-            return {grpc::StatusCode::UNAVAILABLE, "lost niks3 claim before publishing"};
-        } catch (nixgrpc::CancelledWait &) {
-            throw;
-        } catch (nix::Error & err) {
-            return {grpc::StatusCode::UNAVAILABLE, std::string("publish failed: ") + err.what()};
-        }
-        claim->published();
+        nixgrpc::encodeResult(localStore, res, &done);
         return grpc::Status::OK;
     }
 
@@ -632,6 +611,9 @@ public:
                 || request->build_mode() > static_cast<uint32_t>(nix::bmCheck)) {
                 return {grpc::StatusCode::INVALID_ARGUMENT, "unsupported build protocol or mode"};
             }
+            if (stopSignal != 0) {
+                return {grpc::StatusCode::UNAVAILABLE, "worker draining"};
+            }
             auto localStore = getStore();
             auto sendLogLine = [&](nixgrpc::BuildEvent event) -> void {
                 writer->Write(nixgrpc::toChunk<nix::remote::BuildDerivationChunk>(std::move(event)));
@@ -643,70 +625,15 @@ public:
             nixcompat::readDrv(drvSource, *localStore, drv, nix::Derivation::nameFromPath(drvPath));
             auto const mode = static_cast<nix::BuildMode>(request->build_mode());
 
-            nix::BuildResult res;
-            if (farm) {
-                if (mode != nix::bmNormal) {
-                    return {grpc::StatusCode::INVALID_ARGUMENT, "farm endpoint only does normal builds"};
-                }
-                if (auto status = farmBuild(*context, *farm, *localStore, drvPath, drv, sendLogLine, res); !status.ok()) {
-                    return {status.error_code(), workerName + ": " + status.error_message()};
-                }
-            } else {
-                res = backends.proxyBuild(*context, *localStore, drvPath, drv, mode, sendLogLine);
-            }
-
             nix::remote::BuildDerivationChunk chunk;
-            nixgrpc::encodeResult(*localStore, res, chunk.mutable_done());
-            writer->Write(chunk);
-
-            rpc.done({{"drv", std::string(drvPath.to_string())}, {"outputs", std::to_string(chunk.done().outputs_size())}});
-            return grpc::Status::OK;
-        });
-    }
-
-    // Builds run entirely server-side under the proxy user, so the write
-    // role suffices where the raw worker-protocol tunnel would not.
-    auto BuildPaths(
-        grpc::ServerContext * context,
-        const nix::remote::BuildPathsRequest * request,
-        BuildPathsWriter * writer) -> grpc::Status override
-    {
-        return guarded([&]() -> grpc::Status {
-            if (farm) {
-                return {grpc::StatusCode::UNIMPLEMENTED, "farm endpoint: build per derivation"};
-            }
-            auto const rpc = begin(*context, "BuildPaths", nixgrpc::Role::write, request->build_mode());
-            if (request->protocol() != nixcompat::kBuildProtocolWire
-                || request->build_mode() > static_cast<uint32_t>(nix::bmCheck)) {
-                return {grpc::StatusCode::INVALID_ARGUMENT, "unsupported build protocol or mode"};
-            }
-            auto localStore = getStore();
-            auto targets = parseTargets(*localStore, request->targets());
-            auto sendLogLine = [&](nixgrpc::BuildEvent event) -> void {
-                writer->Write(nixgrpc::toChunk<nix::remote::BuildPathsChunk>(std::move(event)));
-            };
-            auto backend = backends.forBuild(*context, *localStore);
-            auto results = nixgrpc::Backends::buildPathsVia(
-                *backend, *localStore, targets, static_cast<nix::BuildMode>(request->build_mode()), sendLogLine);
-
-            nix::remote::BuildPathsChunk chunk;
-            auto * done = chunk.mutable_done();
-            nix::StringSink sink;
-            nix::WorkerProto::Serialise<std::vector<nix::KeyedBuildResult>>::write(
-                *localStore,
-                nix::WorkerProto::WriteConn{.to = sink, .version = nixcompat::buildProtocolVersion()},
-                results);
-            *done->mutable_results() = std::move(sink.s);
-            nix::StorePathSet outputPaths;
-            for (auto & res : results) {
-                nixcompat::forBuiltOutputs(
-                    res, [&](const nix::StorePath & outPath) -> void { outputPaths.insert(outPath); });
-            }
-            for (const auto & outPath : outputPaths) {
-                nixgrpc::encodePathInfo(*localStore, *localStore->queryPathInfo(outPath), done->add_outputs());
+            if (auto status = build(*context, *localStore, drvPath, drv, mode, sendLogLine, *chunk.mutable_done()); !status.ok()) {
+                return {status.error_code(), workerName + ": " + status.error_message()};
             }
             writer->Write(chunk);
-            rpc.done({{"targets", std::to_string(targets.size())}, {"outputs", std::to_string(outputPaths.size())}});
+            rpc.done(
+                {{"drv", std::string(drvPath.to_string())},
+                 {"assign_id", std::to_string(request->assign_id())},
+                 {"outputs", std::to_string(chunk.done().outputs_size())}});
             return grpc::Status::OK;
         });
     }
@@ -755,7 +682,7 @@ public:
             for (int idx = 0; idx < request->paths_size(); ++idx) {
                 tagged.setPathIndex(static_cast<uint32_t>(idx));
                 nix::StorePath const path(request->paths(idx));
-                substituteIfFarm(*localStore, path);
+                substituteIfRemote(*localStore, path);
                 localStore->narFromPath(path, counting);
                 sink.flush();
                 nix::remote::NarFrame eofFrame;
@@ -775,14 +702,14 @@ public:
 } // namespace
 
 namespace {
-// Returns on idle timeout or SIGTERM. In farm mode the first SIGTERM only
-// stops taking builds and this returns once those in flight have published,
-// bounded by the supervisor's stop timeout or a second signal.
+// Returns on idle timeout or SIGTERM. A builder's first SIGTERM only stops
+// taking builds and this returns once those in flight have reported. The
+// supervisor's stop timeout or a second signal bounds that.
 void serve(
     grpc::Server & server,
     const nixgrpc::Options & options,
     nixgrpc::IdleTracker & idle,
-    std::optional<nixgrpc::Farm> & farm,
+    nixgrpc::Coordinator & coord,
     nixgrpc::Metrics & metrics)
 {
     auto const watchdog = nixgrpc::sdWatchdogInterval();
@@ -795,15 +722,14 @@ void serve(
             if (options.idleTimeout && idle.idleFor() >= *options.idleTimeout) {
                 return;
             }
-            if (farm) {
-                farm->updateHealth(server);
-            }
-        } else if (stopSignal >= nixgrpc::kCancelBuilds || !farm || metrics.inflightNow("BuildDerivation") == 0) {
+            coord.tick();
+        } else if (stopSignal >= nixgrpc::kCancelBuilds || !coord.builder || metrics.inflightNow("BuildDerivation") == 0) {
             return;
         } else if (!draining) {
             draining = true;
             nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "draining"}});
-            server.GetHealthCheckService()->SetServingStatus(false);
+            coord.builder->setDraining(true);
+            server.GetHealthCheckService()->SetServingStatus("", false);
         }
         if (watchdog.count() != 0) {
             nixgrpc::sdNotify("WATCHDOG=1");
@@ -845,9 +771,6 @@ try {
         options.workerName,
         nix::settings.thisSystem.get(),
         nix::concatStringsSep(",", nix::settings.systemFeatures.get()));
-    if (!options.farm.niks3Url.empty()) {
-        metrics.buildSlots(options.farm.maxJobs);
-    }
     nixgrpc::IdleTracker idle;
     if (options.storeUri.empty()) {
         options.storeUri = "unix://" + options.socketPath;
@@ -862,15 +785,19 @@ try {
         }
         oidc.emplace(std::move(cfg));
     }
-    std::optional<nixgrpc::Farm> farm;
-    if (!options.farm.niks3Url.empty()) {
-        farm.emplace(options.farm);
-        nixgrpc::logLine(
-            nixgrpc::LogLevel::info,
-            {{"event", "farm_mode"}, {"niks3", options.farm.niks3Url}, {"max_jobs", std::to_string(options.farm.maxJobs)}});
-    }
+    nixgrpc::Auth auth{.acl = options.acl, .proxies = options.proxies, .oidc = &oidc};
+    nixgrpc::Coordinator coord(options, auth, metrics);
+    nixgrpc::logLine(
+        nixgrpc::LogLevel::info,
+        {{"event", "roles"},
+         {"builder", coord.builder ? "1" : "0"},
+         {"scheduler", coord.scheduler ? "1" : "0"},
+         {"scheduler_addr", options.schedulerAddr},
+         {"advertise", options.advertise},
+         {"niks3", options.niks3.url},
+         {"max_jobs", std::to_string(options.maxJobs)}});
     NixRemoteService service(
-        options.socketPath, options.storeUri, options.workerName, metrics, idle, options.logLevel, options.acl, options.proxies, oidc, farm);
+        options.socketPath, options.storeUri, options.workerName, metrics, idle, options.logLevel, auth, coord);
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
@@ -890,6 +817,9 @@ try {
             grpc::ServerBuilder::experimental_type::ExternalConnectionType::FROM_FD, creds);
     }
     builder.RegisterService(&service);
+    if (coord.scheduler) {
+        builder.RegisterService(coord.scheduler.get());
+    }
 
     auto server = builder.BuildAndStart();
     if (!server) {
@@ -902,9 +832,10 @@ try {
     nixgrpc::logLine(
         nixgrpc::LogLevel::info,
         {{"event", "startup"}, {"listen", options.listen}, {"proxy_socket", options.socketPath}});
+    coord.start(*server);
     nixgrpc::sdNotify("READY=1");
 
-    serve(*server, options, idle, farm, metrics);
+    serve(*server, options, idle, coord, metrics);
     nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", stopSignal != 0 ? "signal_exit" : "idle_exit"}});
     stopSignal = nixgrpc::kCancelBuilds;
     nixgrpc::sdNotify("STOPPING=1");

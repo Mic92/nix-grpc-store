@@ -1,7 +1,9 @@
 // Command line of nix-grpc-daemon.
 
 #include "options.hh"
+#include "nix-compat.hh"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -22,10 +24,13 @@
 #include <nix/util/file-system.hh>
 #include <nix/util/strings.hh>
 #include <nix/util/util.hh>
+#include <nix/util/environment-variables.hh>
 
 #include "acl.hh"
 #include "logfmt.hh"
+#include "niks3-client.hh"
 #include "parse-int.hh"
+#include "scheduler.hh"
 #include "xfcc.hh"
 
 namespace nixgrpc {
@@ -50,6 +55,34 @@ auto localHostName() -> std::string
         return "?";
     }
     return buf.data();
+}
+} // namespace
+
+namespace {
+// Defaults and the `niks3 push` command line, once all flags are known.
+void finishNiks3(Niks3Config & niks3, const std::string & tlsCert, const std::string & tlsKey)
+{
+    if (niks3.clientCert.empty() && niks3.clientKey.empty()) {
+        niks3.clientCert = tlsCert;
+        niks3.clientKey = tlsKey;
+    }
+    if (niks3.clientCert.empty() != niks3.clientKey.empty()) {
+        throw nix::Error("--niks3-client-cert and --niks3-client-key go together");
+    }
+    if (niks3.url.starts_with("http://") && !niks3.tokenFile.empty()) {
+        logLine(LogLevel::info, {{"event", "warning"}, {"msg", "--niks3 http:// sends the bearer token in clear"}});
+    }
+    auto & argv = niks3.pushArgv;
+    if (argv.empty()) {
+        argv = {"niks3", "push"};
+    }
+    argv.insert(argv.end(), {"--stdin", "--server-url", niks3.url});
+    if (!niks3.tokenFile.empty()) {
+        argv.insert(argv.end(), {"--auth-token-path", niks3.tokenFile});
+    }
+    if (!niks3.clientCert.empty()) {
+        argv.insert(argv.end(), {"--client-cert", niks3.clientCert, "--client-key", niks3.clientKey});
+    }
 }
 } // namespace
 
@@ -107,21 +140,42 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
         } else if (arg == "--oidc-config") {
             options.oidcConfig = next();
         } else if (arg == "--niks3") {
-            options.farm.niks3Url = next();
+            options.niks3.url = next();
         } else if (arg == "--niks3-token-file") {
-            options.farm.niks3TokenFile = next();
+            options.niks3.tokenFile = next();
+        } else if (arg == "--niks3-client-cert") {
+            options.niks3.clientCert = next();
+        } else if (arg == "--niks3-client-key") {
+            options.niks3.clientKey = next();
         } else if (arg == "--niks3-push") {
             // The program plus extra flags, e.g. "niks3 push --max-concurrent-uploads 8".
             auto words = nix::shellSplitString(next());
-            options.farm.pushArgv = {words.begin(), words.end()};
+            options.niks3.pushArgv = {words.begin(), words.end()};
+        } else if (arg == "--role") {
+            options.builder = options.scheduler = false;
+            for (auto & role : nix::tokenizeString<std::vector<std::string>>(next(), ",")) {
+                if (role == "builder") {
+                    options.builder = true;
+                } else if (role == "scheduler") {
+                    options.scheduler = true;
+                } else {
+                    throw nix::Error("--role: unknown role '%s' (builder, scheduler)", role);
+                }
+            }
+        } else if (arg == "--scheduler") {
+            options.schedulerAddr = next();
+        } else if (arg == "--scheduler-token-file") {
+            options.schedulerTokenFile = next();
+        } else if (arg == "--advertise") {
+            options.advertise = next();
         } else if (arg == "--max-jobs") {
             auto jobs = parseInt<unsigned>(next());
-            if (!jobs || *jobs == 0) {
-                throw nix::Error("--max-jobs expects a positive integer");
+            if (!jobs || *jobs < 1 || *jobs > static_cast<unsigned>(sched::FreeIndex::maxSlots)) {
+                throw nix::Error("--max-jobs expects an integer in 1..%d", sched::FreeIndex::maxSlots);
             }
-            options.farm.maxJobs = *jobs;
+            options.maxJobs = *jobs;
         } else if (arg == "--min-free") {
-            options.farm.minFree = nix::string2IntWithUnitPrefix<uint64_t>(next());
+            options.minFree = nix::string2IntWithUnitPrefix<uint64_t>(next());
         } else {
             throw nix::Error("unknown flag '%s'", arg);
         }
@@ -129,17 +183,28 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
     if (options.workerName.empty()) {
         options.workerName = localHostName();
     }
-    if (!options.farm.niks3Url.empty()) {
-        if (options.farm.niks3TokenFile.empty()) {
-            throw nix::Error("--niks3 needs --niks3-token-file");
-        }
-        auto & argv = options.farm.pushArgv;
-        if (argv.empty()) {
-            argv = {"niks3", "push"};
-        }
-        argv.insert(
-            argv.end(),
-            {"--stdin", "--server-url", options.farm.niks3Url, "--auth-token-path", options.farm.niks3TokenFile});
+    if (options.niks3.enabled()) {
+        finishNiks3(options.niks3, options.tlsCert, options.tlsKey);
+    }
+    if (!options.schedulerTokenFile.empty() && options.schedulerAddr.starts_with(plaintextScheme)) {
+        throw nix::Error("--scheduler-token-file with --scheduler http:// would send the token in clear");
+    }
+    if (!options.builder && !options.scheduler) {
+        throw nix::Error("--role: need at least one of builder, scheduler");
+    }
+    if (!options.builder) {
+        options.maxJobs = 0;
+    } else if (options.maxJobs == 0) {
+        options.maxJobs = std::clamp(nixcompat::maxBuildJobs(), 1U, static_cast<unsigned>(sched::FreeIndex::maxSlots));
+    }
+    if (options.schedulerAddr.empty() && !options.scheduler) {
+        throw nix::Error("--role builder without --scheduler has nobody to take work from");
+    }
+    if (options.advertise.empty()) {
+        options.advertise = options.listen;
+    }
+    if (options.storeDir.empty()) {
+        options.storeDir = nix::getEnv("NIX_STORE_DIR").value_or("/nix/store");
     }
     if ((options.acl.active() || options.acl.anonymousRole()) && options.clientCA.empty() && options.oidcConfig.empty()) {
         throw nix::Error("--allow/--allow-anonymous requires --client-ca or --oidc-config");

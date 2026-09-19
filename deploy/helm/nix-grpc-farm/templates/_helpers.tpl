@@ -54,6 +54,15 @@ app.kubernetes.io/component: lb
 {{ include "farm.fullname" .root }}-worker-{{ .group }}
 {{- end }}
 
+{{- define "farm.schedulerService" -}}
+{{ include "farm.fullname" . }}-scheduler
+{{- end }}
+
+{{- define "farm.schedulerSelectorLabels" -}}
+{{ include "farm.selectorLabels" . }}
+app.kubernetes.io/component: scheduler
+{{- end }}
+
 {{/* Validate cross-field constraints once; included from the worker template. */}}
 {{- define "farm.validate" -}}
 {{- $_ := required "niks3.serverURL is required" .Values.niks3.serverURL }}
