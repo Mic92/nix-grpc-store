@@ -47,10 +47,23 @@ let
       allowedServiceAccounts = [ "ci:builder" ];
     };
   };
+  # Service account tokens both ways, no TLS.
+  valuesInCluster = lib.recursiveUpdate values {
+    niks3.auth = {
+      existingSecret = "";
+      serviceAccountToken.enabled = true;
+    };
+    tls = {
+      clientCA.existingSecret = "";
+      lb.existingSecret = "";
+      worker.existingSecret = "";
+    };
+    auth.accessRules = [ ];
+  };
   # formats.yaml emits a %YAML directive that helm rejects. JSON is YAML.
   json = pkgs.formats.json { };
   valuesFile = json.generate "values.json" values;
-  extraValuesFiles = map (json.generate "values.json") extraValues;
+  allValuesFiles = map (json.generate "values.json") ([ values valuesInCluster ] ++ extraValues);
 
   # Same topology through the NixOS module.
   nixosEnvoy =
@@ -118,10 +131,11 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
   }
   ''
     cp -r ${chart} chart && chmod -R u+w chart
-    helm lint --strict chart -f ${valuesFile}
+    for v in ${toString allValuesFiles}; do
+      helm lint --strict chart -f "$v"
+      helm template t chart -f "$v" | yq -e '.kind' > /dev/null
+    done
     helm template t chart -f ${valuesFile} > out.yaml
-    # Every document parses and has a kind.
-    yq -e '.kind' out.yaml > /dev/null
 
     yq -r 'select(.kind == "ConfigMap" and .metadata.name == "t-nix-grpc-farm-lb") | .data."envoy.json"' out.yaml \
       | jq -S -f ${normalize} > chart.json
@@ -131,13 +145,5 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
       exit 1
     fi
 
-    # sa-token mode and no TLS also render.
-    helm template t chart -f ${valuesFile} \
-      --set niks3.auth.existingSecret= --set niks3.auth.serviceAccountToken.enabled=true \
-      --set tls.clientCA.existingSecret= --set tls.lb.existingSecret= --set tls.worker.existingSecret= \
-      --set 'auth.accessRules=null' > /dev/null
-    for v in ${toString extraValuesFiles}; do
-      helm lint --strict chart -f "$v"
-    done
     touch $out
   ''

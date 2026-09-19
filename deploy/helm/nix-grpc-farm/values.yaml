@@ -81,19 +81,7 @@ workerDefaults:
   nodeSelector: {}
   tolerations: []
   affinity: {}
-  topologySpreadConstraints: [] # labelSelector is filled in
-  priorityClassName: ""
-  deploymentAnnotations: {}
   podAnnotations: {}
-  podLabels: {}
-  extraArgs: []
-  extraEnv: []
-  extraVolumes: []
-  extraVolumeMounts: []
-  podDisruptionBudget:
-    enabled: false
-    maxUnavailable: 1
-    minAvailable: null
 # One Deployment per entry, the key names the group. E.g.
 #   x86-64: {system: x86_64-linux, replicas: 4, nodeSelector: {kubernetes.io/arch: amd64}}
 #   aarch64: {system: aarch64-linux, replicas: 2, nodeSelector: {kubernetes.io/arch: arm64}}
@@ -102,7 +90,6 @@ workers: {}
 defaultGroup: ""
 
 gc:
-  enabled: true
   # Keep this above every group's minFree so workers do not flap unhealthy.
   ensureFree: 40G
   interval: 300
@@ -138,17 +125,7 @@ lb:
   nodeSelector: {}
   tolerations: []
   affinity: {}
-  topologySpreadConstraints: []
-  priorityClassName: ""
-  deploymentAnnotations: {}
   podAnnotations: {}
-  podLabels: {}
-  extraVolumes: []
-  extraVolumeMounts: []
-  podDisruptionBudget:
-    enabled: true
-    maxUnavailable: 1
-    minAvailable: null
 
 metrics:
   podMonitor:

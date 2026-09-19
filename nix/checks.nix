@@ -22,39 +22,35 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
   # Same clang as clang-tidy so compile_commands carry flags it understands.
   # No PCH: the cc-wrapper's hardening flags are not in compile_commands, so
   # clang-tidy could not load it.
-  clang-tidy =
-    (packages.default.override { stdenv = pkgs.llvmPackages_latest.stdenv; }).overrideAttrs
-      (old: {
-        pname = "nix-grpc-store-clang-tidy";
-        separateDebugInfo = false;
-        nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.llvmPackages_latest.clang-tools ];
-        mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Db_pch=false" ];
-        # Meson generates a clang-tidy target from .clang-tidy. The generated
-        # protobuf headers must exist before it runs.
-        buildPhase = ''
-          ninja nix_remote.pb.h nix_remote.grpc.pb.h
-          ninja clang-tidy
-        '';
-        installPhase = "touch $out";
-        doCheck = false;
-        dontFixup = true;
-      });
-  claims-spec =
-    pkgs.runCommand "nix-grpc-store-claims-spec" { nativeBuildInputs = [ pkgs.quint ]; }
-      ''
-        cd ${../spec}
-        export HOME=$TMPDIR
-        quint typecheck claims.qnt
-        quint typecheck hook.qnt
-        quint typecheck push.qnt
-        quint run claims.qnt --invariant=safety --max-steps=30 --max-samples=20000
-        quint run hook.qnt --main hookFixed --invariant=safety --max-steps=15 --max-samples=20000
-        ! quint run hook.qnt --main hookNoSubstituteRefs --invariant=safety --max-steps=15 --max-samples=20000
-        ! quint run hook.qnt --main hookNoSubstituteDrv --invariant=safety --max-steps=15 --max-samples=20000
-        quint run push.qnt --main pushFixed --invariant=safety --max-steps=12 --max-samples=20000
-        quint run claims.qnt --step=stepBlips --invariant=oneBuilder --max-steps=30 --max-samples=20000
-        touch $out
-      '';
+  clang-tidy = (packages.default.override { stdenv = pkgs.llvmPackages_latest.stdenv; }).overrideAttrs (old: {
+    pname = "nix-grpc-store-clang-tidy";
+    separateDebugInfo = false;
+    nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.llvmPackages_latest.clang-tools ];
+    mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Db_pch=false" ];
+    # Meson generates a clang-tidy target from .clang-tidy. The generated
+    # protobuf headers must exist before it runs.
+    buildPhase = ''
+      ninja nix_remote.pb.h nix_remote.grpc.pb.h
+      ninja clang-tidy
+    '';
+    installPhase = "touch $out";
+    doCheck = false;
+    dontFixup = true;
+  });
+  claims-spec = pkgs.runCommand "nix-grpc-store-claims-spec" { nativeBuildInputs = [ pkgs.quint ]; } ''
+    cd ${../spec}
+    export HOME=$TMPDIR
+    quint typecheck claims.qnt
+    quint typecheck hook.qnt
+    quint typecheck push.qnt
+    quint run claims.qnt --invariant=safety --max-steps=30 --max-samples=20000
+    quint run hook.qnt --main hookFixed --invariant=safety --max-steps=15 --max-samples=20000
+    ! quint run hook.qnt --main hookNoSubstituteRefs --invariant=safety --max-steps=15 --max-samples=20000
+    ! quint run hook.qnt --main hookNoSubstituteDrv --invariant=safety --max-steps=15 --max-samples=20000
+    quint run push.qnt --main pushFixed --invariant=safety --max-steps=12 --max-samples=20000
+    quint run claims.qnt --step=stepBlips --invariant=oneBuilder --max-steps=30 --max-samples=20000
+    touch $out
+  '';
   exit-stress = import ../tests/exit-stress.nix {
     inherit pkgs;
     nix = nixPackages.nix-everything;
