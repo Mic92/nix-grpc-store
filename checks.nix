@@ -16,6 +16,7 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
   # clang-tidy could not load it.
   clang-tidy = (packages.default.override { stdenv = pkgs.llvmPackages_latest.stdenv; }).overrideAttrs (old: {
     pname = "nix-grpc-store-clang-tidy";
+    separateDebugInfo = false;
     nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.llvmPackages_latest.clang-tools ];
     mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Db_pch=false" ];
     # Meson generates a clang-tidy target from .clang-tidy. The generated
