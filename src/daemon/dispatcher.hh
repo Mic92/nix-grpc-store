@@ -2,23 +2,27 @@
 // The scheduler as seen by its transports: one mutex around sched::Core,
 // connected clients and workers as send callbacks. No gRPC here so the
 // benchmark and the in-process worker drive the same code as the RPCs.
+//
+// Locking is annotated for clang -Wthread-safety: public entry points must be
+// called without `mutex`, *Locked helpers with it. Send closures run under it
+// and may only enqueue (see afterUnlock).
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <condition_variable>
 #include <deque>
 #include <functional>
 #include <thread>
 #include <unordered_set>
 #include <initializer_list>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 
+#include <absl/base/thread_annotations.h>
+#include <absl/synchronization/mutex.h>
 #include <prometheus/counter.h>
 
 #include "logfmt.hh"
@@ -59,8 +63,8 @@ public:
     {
         sched::ClientId id = 0;
         ClientSend send;
-        bool known = false; // under mutex: in `clients`
-        bool gone = false;  // under mutex
+        bool known = false; // under Dispatcher::mutex: in `clients`
+        bool gone = false;  // under Dispatcher::mutex
     };
 
     using ClientPtr = std::shared_ptr<Client>;
@@ -83,19 +87,25 @@ public:
 
     // For send closures, which run under the mutex: queue `fn` (e.g. the
     // transport's write kick) to run right after it is released.
-    void afterUnlock(std::function<void()> func);
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void afterUnlock(std::function<void()> func);
+
+    // Names the mutex for annotations on send closures. Never lock through it.
+    ABSL_LOCK_RETURNED(mutex) auto sendLock() const -> const absl::Mutex &
+    {
+        return mutex;
+    }
 
     // Tell every connected peer the streams are about to close on purpose.
     void restarting();
     void serving();
 
 private:
-    // scoped_lock that runs the afterUnlock queue on release.
-    class Lock
+    // Scoped lock that runs the afterUnlock queue on release.
+    class ABSL_SCOPED_LOCKABLE Lock
     {
     public:
-        explicit Lock(Dispatcher & disp);
-        ~Lock();
+        explicit Lock(Dispatcher & disp) ABSL_EXCLUSIVE_LOCK_FUNCTION(disp.mutex);
+        ~Lock() ABSL_UNLOCK_FUNCTION();
         Lock(const Lock &) = delete;
         auto operator=(const Lock &) -> Lock & = delete;
         Lock(Lock &&) = delete;
@@ -110,12 +120,12 @@ private:
     Metrics & metrics;
     prometheus::Counter & assignedCtr;
     const Clock::time_point epoch = Clock::now();
-    std::mutex mutex;
-    std::vector<std::function<void()>> deferred; // under mutex
-    sched::Core core;                                             // under mutex
-    std::unordered_map<sched::ClientId, ClientSend> clients;      // under mutex
-    std::unordered_map<sched::WorkerId, WorkerSend> workers;      // under mutex
-    bool lettingGo = false; // under mutex
+    absl::Mutex mutex;
+    std::vector<std::function<void()>> deferred ABSL_GUARDED_BY(mutex);
+    sched::Core core ABSL_GUARDED_BY(mutex);
+    std::unordered_map<sched::ClientId, ClientSend> clients ABSL_GUARDED_BY(mutex);
+    std::unordered_map<sched::WorkerId, WorkerSend> workers ABSL_GUARDED_BY(mutex);
+    bool lettingGo ABSL_GUARDED_BY(mutex) = false;
     std::atomic<sched::ClientId> nextClient{1};
 
     // Side pool for present() so gRPC threads never block on niks3.
@@ -125,10 +135,9 @@ private:
         nix::remote::ClientMsgs msgs;
     };
 
-    std::mutex lookupMutex;
-    std::condition_variable lookupCv;
-    std::deque<LookupJob> lookupQueue;
-    bool lookupStop = false;
+    absl::Mutex lookupMutex ABSL_ACQUIRED_AFTER(mutex);
+    std::deque<LookupJob> lookupQueue ABSL_GUARDED_BY(lookupMutex);
+    bool lookupStop ABSL_GUARDED_BY(lookupMutex) = false;
     std::vector<std::thread> lookupThreads;
 
     [[nodiscard]] auto nowMs() const -> double;
@@ -139,12 +148,12 @@ private:
     [[nodiscard]] auto lookup(const nix::remote::ClientMsgs & msgs) const -> std::vector<bool>;
     void applyClientMsgs(Client & client, const nix::remote::ClientMsgs & msgs, const std::vector<bool> & cached);
     void lookupLoop();
-    // Under `mutex`: run dispatch and deliver Expect (first) and Assigned.
-    void dispatchLocked();
-    void revokeOn(sched::WorkerId wid, const std::string & drvPath);
-    void workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg);
-    void onWant(Client & client, const nix::remote::Want & want, bool cached);
-    void onCancel(Client & client, const nix::remote::Cancel & cancel);
+    // Run dispatch and deliver Expect (first) and Assigned.
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void dispatchLocked();
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOn(sched::WorkerId wid, const std::string & drvPath);
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg);
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onWant(Client & client, const nix::remote::Want & want, bool cached);
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onCancel(Client & client, const nix::remote::Cancel & cancel);
 };
 
 } // namespace nixgrpc

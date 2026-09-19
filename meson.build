@@ -13,7 +13,10 @@ openssl_dep  = dependency('libcrypto')
 
 prometheus_dep = [dependency('prometheus-cpp-core'), dependency('prometheus-cpp-pull')]
 # Already in the closure via protobuf/gRPC; used for the scheduler's hash maps.
-absl_dep = [dependency('absl_flat_hash_map'), dependency('absl_hash')]
+absl_dep = [dependency('absl_flat_hash_map'), dependency('absl_hash'), dependency('absl_synchronization')]
+# Lock annotations (dispatcher.hh, sched-reactor.hh) are checked by clang,
+# i.e. in the clang-tidy and sanitize-smoke checks. GCC ignores them.
+add_project_arguments(meson.get_compiler('cpp').get_supported_arguments(['-Werror=thread-safety']), language : 'cpp')
 # Under ASan abseil's headers switch flat_hash_map to a different layout than
 # the prebuilt libabsl was compiled with; keep them in agreement. (UBSan
 # builds need clang: GCC rejects a constexpr in abseil's hash_policy_traits.h.)
