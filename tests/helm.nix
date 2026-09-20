@@ -47,6 +47,17 @@ let
       allowedServiceAccounts = [ "ci:builder" ];
     };
   };
+  # cert-manager PKI and VictoriaMetrics scraping.
+  valuesCertManager = lib.recursiveUpdate values {
+    tls = {
+      certManager.enabled = true;
+      clientCA.existingSecret = "";
+      lb.existingSecret = "";
+      worker.existingSecret = "";
+    };
+    metrics.podMonitor.enabled = false;
+    metrics.vmPodScrape.enabled = true;
+  };
   # Service account tokens both ways, no TLS.
   valuesInCluster = lib.recursiveUpdate values {
     niks3.auth = {
@@ -63,7 +74,7 @@ let
   # formats.yaml emits a %YAML directive that helm rejects. JSON is YAML.
   json = pkgs.formats.json { };
   valuesFile = json.generate "values.json" values;
-  allValuesFiles = map (json.generate "values.json") ([ values valuesInCluster ] ++ extraValues);
+  allValuesFiles = map (json.generate "values.json") ([ values valuesInCluster valuesCertManager ] ++ extraValues);
 
   # Same topology through the NixOS module.
   nixosEnvoy =
@@ -136,9 +147,9 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
     cp -r ${chart} chart && chmod -R u+w chart
     for v in ${toString allValuesFiles}; do
       helm lint --strict chart -f "$v"
-      helm template t chart -f "$v" | yq -e '.kind' > /dev/null
+      helm template t chart -f "$v" --api-versions monitoring.coreos.com/v1/PodMonitor | yq -e '.kind' > /dev/null
     done
-    helm template t chart -f ${valuesFile} > out.yaml
+    helm template t chart -f ${valuesFile} --api-versions monitoring.coreos.com/v1/PodMonitor > out.yaml
 
     yq -r 'select(.kind == "ConfigMap" and .metadata.name == "t-nix-grpc-farm-lb") | .data."envoy.json"' out.yaml \
       | jq -S -f ${normalize} > chart.json
@@ -148,6 +159,21 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
       exit 1
     fi
     jq -e '[.clusters[] | select(.name == "sched") | .common_lb_config.healthy_panic_threshold.value] == [0]' chart.json
+
+    # Default placement: workers spread, scheduler replicas on distinct nodes.
+    pick() { yq "select(.kind == \"$1\" and .metadata.name == \"$2\") | $3" "$4"; }
+    test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.topologySpreadConstraints[0].topologyKey' out.yaml)" = kubernetes.io/hostname
+    test "$(pick Deployment t-nix-grpc-farm-scheduler-0 '.spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].topologyKey' out.yaml)" = kubernetes.io/hostname
+
+    # cert-manager mode: chart-named Secrets everywhere, worker cert covers every scheduler Service.
+    helm template t chart -f ${json.generate "values.json" valuesCertManager} > cm.yaml
+    for n in t-nix-grpc-farm-scheduler-0.default.svc t-nix-grpc-farm-scheduler-1.default.svc t-nix-grpc-farm.default.svc; do
+      pick Certificate t-nix-grpc-farm-worker '.spec.dnsNames[]' cm.yaml | grep -qx "$n"
+    done
+    test "$(pick Certificate t-nix-grpc-farm-lb '.spec.commonName' cm.yaml)" = lb
+    test "$(pick Deployment t-nix-grpc-farm-scheduler-0 '.spec.template.spec.volumes[] | select(.name == "tls") | .secret.secretName' cm.yaml)" = t-nix-grpc-farm-worker-tls
+    grep -q "kind: VMPodScrape" cm.yaml
+    ! grep -q "kind: PodMonitor" cm.yaml
 
     touch $out
   ''

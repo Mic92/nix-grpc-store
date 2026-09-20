@@ -56,7 +56,7 @@
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "${prefix}envoy_cluster_membership_healthy{envoy_cluster_name!=\"sched\"} / ${prefix}envoy_cluster_membership_total{envoy_cluster_name!=\"sched\"}",
+     "expr": "min by (envoy_cluster_name) (${prefix}envoy_cluster_membership_healthy{envoy_cluster_name!=\"sched\"} / ${prefix}envoy_cluster_membership_total{envoy_cluster_name!=\"sched\"})",
      "legendFormat": "{{envoy_cluster_name}}",
      "refId": "A"
     }
