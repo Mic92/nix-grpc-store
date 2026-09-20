@@ -283,9 +283,8 @@ NixOS: `services.nix-grpc-daemon.oidc = { providers.github = { … }; };`
 
 One daemon is a farm of one: it schedules builds onto itself. More nodes
 behind a balancer, one of them the scheduler, with deduplicated builds and
-S3 outputs: see [docs/farm.md](docs/farm.md). NixOS modules and a Helm
-chart (`oci://ghcr.io/mic92/charts/nix-grpc-farm`, images built with Nix)
-are included.
+S3 outputs: see [docs/farm.md](docs/farm.md) for NixOS and
+[docs/kubernetes.md](docs/kubernetes.md) for the Helm chart.
 
 [![farm dashboard](https://github.com/Mic92/nix-grpc-store/releases/download/assets/farm-dashboard.png)](docs/farm.md#managing-the-farm)
 

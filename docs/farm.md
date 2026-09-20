@@ -8,7 +8,8 @@ S3 binary cache through [niks3](https://github.com/Mic92/niks3).
 ![build farm](farm.svg)
 
 This guide walks you through setting up the cache, the workers, the
-balancer, and two kinds of client: a CI host and a developer laptop.
+balancer, and two kinds of client: a CI host and a developer laptop, on
+NixOS. For the Helm chart see [kubernetes.md](kubernetes.md).
 
 ## How it works
 
@@ -280,112 +281,6 @@ A small wrapper script that fetches the token (an OIDC device-code
 login is a few lines of `curl`) and runs `nix build` makes this a
 one-liner for the team, e.g. `nix run .#nix-farm`.
 
-## On Kubernetes
-
-The Helm chart deploys the same pieces: dedicated scheduler pods
-(`scheduler.replicas`, one by default), a Deployment per builder group,
-envoy in front and a
-[harmonia-gc](https://github.com/nix-community/harmonia) sidecar per
-worker for disk space. niks3 is its own release, see its
-[Kubernetes page](https://github.com/Mic92/niks3/wiki/Kubernetes).
-
-```console
-$ helm install farm oci://ghcr.io/mic92/charts/nix-grpc-farm -n farm --create-namespace -f values.yaml
-```
-
-```yaml
-# values.yaml
-niks3:
-  serverURL: http://niks3.niks3.svc      # where workers push and the scheduler checks
-  cacheURL: https://cache.example.com    # where everyone substitutes from
-  publicKeys: ["cache.example.com-1:…"]
-  auth:
-    serviceAccountToken: {enabled: true} # or existingSecret with key `token`
-workers:
-  x86-64:
-    system: x86_64-linux
-    replicas: 4
-    maxJobs: 2
-    features: [big-parallel, kvm]
-    store: {sizeLimit: 200Gi}
-    nodeSelector: {kubernetes.io/arch: amd64}
-  aarch64:
-    system: aarch64-linux
-    replicas: 2
-    nodeSelector: {kubernetes.io/arch: arm64}
-gc:
-  ensureFree: 40G                        # above every group's minFree (20G)
-tls:
-  certManager: {enabled: true}           # or clientCA/lb/worker.existingSecret
-auth:
-  accessRules: [{cn: "ci-*", role: trusted}]
-lb:
-  service: {type: LoadBalancer}
-```
-
-`helm install` prints the farm address and a `builders =` line.
-
-Notes:
-
-* **Sandbox.** Builds are sandboxed, which needs the `nix-daemon`
-  container to run privileged. Where that is forbidden set
-  `sandbox.enabled: false` and builds run unsandboxed as root in the
-  container.
-* **Store volume.** `/nix` is an `emptyDir` seeded from the image at pod
-  start. `gc.ensureFree` and `minFree` see the free space of the node
-  disk behind it, shared by all pods on the node (`sizeLimit` evicts, it
-  is not a quota). Size them for that disk and keep `ensureFree` above
-  `minFree`.
-* **Resources.** Builds run in the `nix-daemon` container, RPCs in
-  `nix-grpc-daemon`. Size `resources` and `daemonResources` separately.
-* **Certificates.** With `tls.certManager.enabled` cert-manager keeps a
-  farm CA in the namespace and issues the balancer and worker
-  certificates from it. Client certificates come from the same Issuer:
-  a `Certificate` with `issuerRef: {name: <release>-nix-grpc-farm}`,
-  `usages: [client auth]` and a `commonName` matching `auth.accessRules`.
-  Without cert-manager, bring three Secrets (`tls.clientCA`, `tls.lb`,
-  `tls.worker`). The worker certificate must then cover
-  `<release>-nix-grpc-farm-scheduler[-<i>].<namespace>.svc` and its CN
-  be in `auth.workerCNs`.
-* **Placement.** Workers and balancer pods spread over nodes
-  (`spread: true`), scheduler replicas refuse to share a node.
-* **Identity to niks3.** With `niks3.auth.serviceAccountToken.enabled` the
-  pods present a projected service account token (audience `niks3`).
-  Allow `<namespace>:<release>-nix-grpc-farm` with scope `write` in the
-  niks3 chart's `auth.workloadIdentity.allowedServiceAccounts`. The two
-  releases share no secret.
-* **Identity of clients.** CI pods in the cluster can skip certificates:
-
-  ```yaml
-  auth:
-    workloadIdentity:
-      enabled: true
-      allowedServiceAccounts: ["ci:builder"]
-  ```
-
-  and mount a token for the farm:
-
-  ```yaml
-  volumes:
-    - name: farm-token
-      projected:
-        sources:
-          - serviceAccountToken: {audience: nix-grpc-farm, path: token}
-  ```
-
-  then `nix build --store 'grpc://farm-nix-grpc-farm.farm.svc:50051?token-file=/var/run/secrets/farm/token&ca-cert=…' --eval-store auto`.
-  Tokens need TLS on the balancer (`tls.lb`).
-* **Bring your own balancer.** `lb.enabled: false` drops envoy. Whatever
-  replaces it must send `/nix.remote.Scheduler/*` to the scheduler
-  Service, send a request with an `x-nix-worker: IP:port` header to that
-  pod, route the rest by `x-nix-system` to the matching group's headless
-  Service, and health-check `grpc.health.v1`.
-* **Monitoring.** `metrics.podMonitor.enabled` (prometheus-operator) or
-  `metrics.vmPodScrape.enabled` (VictoriaMetrics) scrapes workers,
-  scheduler and envoy. `grafanaDashboard.enabled` ships the dashboard as a
-  ConfigMap for the Grafana sidecar, with its `instance` variable set to
-  `pod`.
-
 ## Managing the farm
 
 **Add a builder.** Deploy it with the Step 1 config, add its address
@@ -401,19 +296,10 @@ their native system. So a plain x86_64 group scales on
 `{system="x86_64-linux",features=""}` and a kvm group on
 `{system="x86_64-linux",features="kvm"}` independently. `unplaceable`
 counts queued builds that no connected builder could take at all, so a
-group does not grow for builds it cannot run. Scale-down is a drain,
-see below. With KEDA:
-
-```yaml
-triggers:
-  - type: prometheus
-    metadata:
-      serverAddress: http://prometheus:9090
-      query: >-
-        max(nix_grpc_sched_system{system="x86_64-linux",features="kvm",kind="queued"})
-        - max(nix_grpc_sched_system{system="x86_64-linux",features="kvm",kind="unplaceable"})
-      threshold: "4"   # queued builds per added replica
-```
+group does not grow for builds it cannot run. The number to scale a
+group on is therefore `queued - unplaceable` for its label set.
+Scale-down is a drain, see below. [kubernetes.md](kubernetes.md#autoscale-a-worker-group)
+has a KEDA example.
 
 **Drain a builder.** `systemctl stop nix-grpc-daemon` stops new builds
 arriving and returns once running builds have published. After
@@ -432,8 +318,7 @@ also build, set their `scheduler` to the balancer's address so their
 builder side follows whichever one is active. niks3 picks the active
 one, and each node logs `scheduler_take_over` / `scheduler_yield` when
 that changes. A niks3 or Postgres restart moves the lock too, at the
-cost of one scheduler restart. On Kubernetes, `scheduler.replicas: 2`
-does all of this.
+cost of one scheduler restart.
 
 **See what a worker did.** Each build is one journal line:
 
