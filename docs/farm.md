@@ -386,6 +386,29 @@ Notes:
 under `workers.<system>`, redeploy the balancer. It takes queued builds
 as soon as it has connected to the scheduler.
 
+**Autoscale builders.** `nix_grpc_sched_system` has one series per
+system and feature set. `queued`, `unplaceable` and `running` are
+labelled with what the derivations require (`features=""` for none,
+otherwise sorted and comma-joined like `features="big-parallel,kvm"`).
+`slots` and `free` are labelled with what the builders offer, under
+their native system. So a plain x86_64 group scales on
+`{system="x86_64-linux",features=""}` and a kvm group on
+`{system="x86_64-linux",features="kvm"}` independently. `unplaceable`
+counts queued builds that no connected builder could take at all, so a
+group does not grow for builds it cannot run. Scale-down is a drain,
+see below. With KEDA:
+
+```yaml
+triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus:9090
+      query: >-
+        max(nix_grpc_sched_system{system="x86_64-linux",features="kvm",kind="queued"})
+        - max(nix_grpc_sched_system{system="x86_64-linux",features="kvm",kind="unplaceable"})
+      threshold: "4"   # queued builds per added replica
+```
+
 **Drain a builder.** `systemctl stop nix-grpc-daemon` stops new builds
 arriving and returns once running builds have published. After
 `TimeoutStopSec` (1h) the rest is killed and the clients are sent to
@@ -417,9 +440,13 @@ assignment.
 
 **Metrics.** Set `services.nix-grpc-daemon.metricsListen` on workers and
 scrape envoy's admin port (`/stats/prometheus`). The scheduler adds
-`nix_grpc_sched{kind="queued|workers|clients"}`. A Grafana dashboard for
-all of it ships as `nixos/grafana/farm.json` (flake:
-`nix-grpc-store.dashboards.farm`):
+`nix_grpc_sched{kind="queued|workers|clients|leader"}` and, per system
+and feature set,
+`nix_grpc_sched_system{system,features,kind="queued|unplaceable|running|slots|free"}`.
+Only the node holding the lock has `leader` 1 and non-zero values, so
+aggregate with `max by (system, kind)` over the scheduler nodes. A
+Grafana dashboard for all of it ships as `nixos/grafana/farm.json`
+(flake: `nix-grpc-store.dashboards.farm`):
 
 ```nix
 services.grafana.provision.dashboards.settings.providers = [{

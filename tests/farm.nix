@@ -311,6 +311,8 @@ pkgs.testers.runNixOSTest {
     def gauge(w, name: str) -> int:
         vals = [line.split()[-1] for line in metrics(w) if line.startswith(name + " ")]
         return int(float(vals[0])) if vals else 0
+    def gauge_sum(w, label: str) -> int:
+        return sum(int(float(line.split()[-1])) for line in metrics(w) if line.startswith("nix_grpc_sched_system") and label in line)
     def sched_workers(w) -> int:
         return gauge(w, 'nix_grpc_sched{kind="workers"}')
     def leader():
@@ -327,9 +329,17 @@ pkgs.testers.runNixOSTest {
 
     with subtest("one node schedules and both builders hold a WorkerSession on it"):
         retry(settled, timeout=sec(60))
+        ldr = leader()
         # worker1 gets in by certificate, worker2's CN has no rule and its token counts.
         opened = leader().succeed("journalctl -u nix-grpc-daemon -o cat | grep 'event=worker_session_open'")
         assert "cn=worker-1 " in opened and "cn=oidc:mock:node:worker2 " in opened, opened
+        assert gauge(ldr, 'nix_grpc_sched{kind="leader"}') == 1
+        assert gauge(standby(), 'nix_grpc_sched{kind="leader"}') == 0
+        # slots/free are keyed by offered features, which differ per worker here.
+        slots = gauge_sum(ldr, 'kind="slots"')
+        assert slots >= 2, slots
+        assert gauge_sum(ldr, 'kind="free"') == slots
+        assert gauge_sum(ldr, 'kind="queued"') == 0
 
     tls = "ca-cert=${certs}/ca.pem"
     ci = f"{tls}&client-cert=${certs}/ci.pem&client-key=${certs}/ci.key"
@@ -501,8 +511,13 @@ pkgs.testers.runNixOSTest {
         out = client.succeed(f"nix build -L --store '{envoy}' --eval-store auto --expr 'map (tag: import ${jobExpr} {{ inherit tag; features = [\"vip\"]; }}) [\"f1\" \"f2\" \"f3\"]' --impure 2>&1")
         assert "node-a: building " in out and "worker2: building" not in out, out
         assert any(re.match(r'nix_grpc_build_info\{.*features="[^"]*vip[^"]*".*worker="node-a"\} 1', line) for line in metrics(worker1)), metrics(worker1)
-        out = client.fail(f"nix build -L --store '{envoy}&restart-grace=30' --eval-store auto -f ${jobExpr} --argstr tag f5 --arg features '[\"gpu\"]' 2>&1")
+        client.succeed(f"systemd-run --unit gpu nix build -L --store '{envoy}&restart-grace=30' --eval-store auto -f ${jobExpr} --argstr tag f5 --arg features '[\"gpu\"]'")
+        unp = 'nix_grpc_sched_system{features="gpu",kind="unplaceable",system="${system}"}'
+        retry(lambda _: gauge(leader(), unp) == 1, timeout=sec(60))
+        client.wait_until_succeeds("systemctl show -p Result gpu | grep -q exit-code", timeout=sec(60))
+        out = client.succeed("journalctl -u gpu -o cat")
         assert "features {gpu}" in out, out
+        retry(lambda _: gauge(leader(), unp) == 0, timeout=sec(30))
 
     with subtest("low disk drains a worker and builds go to the other"):
         worker1.succeed("fallocate -l $(( $(df --output=avail -B1 /nix/store | tail -1) - 100*1024*1024 )) /nix/.rw-store/fill")

@@ -7,6 +7,7 @@
 // called without `mutex`, *Locked helpers with it. Send closures run under it
 // and may only enqueue (see afterUnlock).
 
+#include <map>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -24,6 +25,7 @@
 #include <absl/base/thread_annotations.h>
 #include <absl/synchronization/mutex.h>
 #include <prometheus/counter.h>
+#include <prometheus/gauge.h>
 
 #include "logfmt.hh"
 #include "metrics.hh"
@@ -126,6 +128,8 @@ private:
     std::unordered_map<sched::ClientId, ClientSend> clients ABSL_GUARDED_BY(mutex);
     std::unordered_map<sched::WorkerId, WorkerSend> workers ABSL_GUARDED_BY(mutex);
     bool lettingGo ABSL_GUARDED_BY(mutex) = false;
+    std::optional<double> statsAtMs ABSL_GUARDED_BY(mutex);
+    std::map<sched::Core::StatsKey, std::vector<prometheus::Gauge *>> statGauges ABSL_GUARDED_BY(mutex);
     std::atomic<sched::ClientId> nextClient{1};
 
     // Side pool for present() so gRPC threads never block on niks3.
@@ -150,6 +154,8 @@ private:
     void lookupLoop();
     // Run dispatch and deliver Expect (first) and Assigned.
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void dispatchLocked();
+    // Per-system gauges. O(entries), so at most once a second unless forced.
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void exportStats(bool force);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOn(sched::WorkerId wid, const std::string & drvPath);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void supersede(sched::DrvId drv, sched::WorkerId loser);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg);
