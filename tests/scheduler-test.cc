@@ -256,6 +256,24 @@ void testFeatures()
     assert(out.size() == 4 && shard.entry(out[3].drv)->drvPath == "gpu.drv");
 }
 
+// Stats of the testSystems fixture after its first dispatch.
+void checkStats(Core & shard)
+{
+    auto sts = shard.stats();
+    auto stat = [&](const char * sys, const char * feats = "") -> Core::Stats { return sts[{.system = sys, .features = feats}]; };
+    assert(stat("aarch64").slots == 2 && stat("aarch64").free == 1 && stat("aarch64").running == 1);
+    assert(stat("x86_64").slots == 1 && stat("x86_64").free == 0 && stat("i686").slots == 0);
+    assert(stat("x86_64").queued + stat("i686").queued == 1 && stat("x86_64").running + stat("i686").running == 1);
+    assert(stat("x86_64").unplaceable + stat("i686").unplaceable == 0);
+    assert(stat("riscv").queued == 1 && stat("riscv").unplaceable == 1);
+    // Required features are their own series.
+    shard.want(1, {.drvPath = "e.drv", .inputs = {}, .system = "aarch64", .features = {"kvm", "big"}, .cpHintMs = 0}, 0);
+    sts = shard.stats();
+    assert(stat("aarch64", "big,kvm").queued == 1 && stat("aarch64", "big,kvm").unplaceable == 1);
+    assert(stat("aarch64").queued == 0);
+    shard.cancel(1, "e.drv");
+}
+
 void testSystems()
 {
     Core shard;
@@ -283,6 +301,7 @@ void testSystems()
     assert(onBoth == 1);
     assert(!shard.placeable(shard.drvId("d.drv")));
     assert(shard.queued() == 2);
+    checkStats(shard);
     // Slot on `both` frees: the other x86-ish drv goes there.
     shard.done(both, shard.entry(out[0].worker == both ? out[0].drv : out[1].drv)->drvPath, {});
     out.clear();

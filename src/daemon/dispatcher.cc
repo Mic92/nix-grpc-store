@@ -196,7 +196,39 @@ void Dispatcher::dispatchLocked()
              {"worker", wkr.addr},
              {"clients", std::to_string(asg.clients.size())}});
     }
-    metrics.schedQueued(core.queued());
+    exportStats(false);
+}
+
+void Dispatcher::exportStats(bool force)
+{
+    constexpr double everyMs = 1000;
+    auto now = nowMs();
+    if (!force && statsAtMs && now - *statsAtMs < everyMs) {
+        return;
+    }
+    statsAtMs = now;
+    auto previous = std::exchange(statGauges, {});
+    size_t queued = 0;
+    for (const auto & [key, sst] : core.stats()) {
+        queued += sst.queued;
+        auto & live = statGauges[key];
+        live = {
+            metrics.schedSystem(key.system, key.features, "queued", sst.queued),
+            metrics.schedSystem(key.system, key.features, "unplaceable", sst.unplaceable),
+            metrics.schedSystem(key.system, key.features, "running", sst.running),
+            metrics.schedSystem(key.system, key.features, "slots", sst.slots),
+            metrics.schedSystem(key.system, key.features, "free", sst.free),
+        };
+        previous.erase(key);
+    }
+    metrics.schedQueued(queued);
+    // A feature set nobody asks for or offers any more: drop the series
+    // instead of leaving a stale value.
+    for (auto & [key, gauges] : previous) {
+        for (auto * gauge : gauges) {
+            metrics.schedSystemRemove(gauge);
+        }
+    }
 }
 
 // The entry moved to a reconnecting worker that was already building it.
@@ -251,12 +283,14 @@ void Dispatcher::serving()
 {
     const Lock lock(*this);
     lettingGo = false;
+    metrics.schedLeader(true);
 }
 
 void Dispatcher::restarting()
 {
     const Lock lock(*this);
     lettingGo = true;
+    metrics.schedLeader(false);
     SchedMsg msg;
     msg.mutable_restarting();
     SchedCmd cmd;
@@ -353,6 +387,7 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
             + nix::concatStringsSep(",", nix::Strings(want.required_features().begin(), want.required_features().end()))
             + "}");
         client.send(reply);
+        exportStats(true); // rare, and nothing else may happen for a while
     }
 }
 
@@ -362,7 +397,6 @@ void Dispatcher::onCancel(Client & client, const nix::remote::Cancel & cancel)
     if (auto wid = core.cancel(client.id, cancel.drv_path())) {
         revokeOn(*wid, cancel.drv_path());
     }
-    metrics.schedQueued(core.queued());
 }
 
 void Dispatcher::clientGone(const ClientPtr & clientPtr)
@@ -379,8 +413,8 @@ void Dispatcher::clientGone(const ClientPtr & clientPtr)
             revokeOn(wid, ent->drvPath);
         }
     }
-    metrics.schedQueued(core.queued());
     metrics.schedClients(-1);
+    exportStats(true);
 }
 
 // ------------------------------------------------------------------ workers
@@ -399,6 +433,7 @@ void Dispatcher::workerMsgs(Worker & worker, const nix::remote::WorkerMsgs & msg
     }
     dispatchLocked();
     metrics.schedWorkers(core.workersUp());
+    exportStats(true);
 }
 
 void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg)
@@ -467,6 +502,7 @@ void Dispatcher::workerGone(Worker & worker)
     workers.erase(*worker.id);
     dispatchLocked();
     metrics.schedWorkers(core.workersUp());
+    exportStats(true);
     worker.id.reset();
 }
 

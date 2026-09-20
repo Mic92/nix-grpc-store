@@ -50,9 +50,15 @@ class Metrics
         &prometheus::BuildCounter().Name("nix_grpc_events_total").Help("Scheduling events, by kind").Register(*registry);
     prometheus::Family<prometheus::Gauge> * sched =
         &prometheus::BuildGauge().Name("nix_grpc_sched").Help("Scheduler state on this node, by kind").Register(*registry);
+    prometheus::Family<prometheus::Gauge> * schedSystemFam =
+        &prometheus::BuildGauge()
+             .Name("nix_grpc_sched_system")
+             .Help("Scheduler state per system and feature set: queued, unplaceable, running, slots, free")
+             .Register(*registry);
     // Touched on every scheduler message; Family::Add hashes the label map each time.
     prometheus::Gauge * schedQueuedGauge = &sched->Add({{"kind", "queued"}});
     prometheus::Gauge * schedWorkersGauge = &sched->Add({{"kind", "workers"}});
+    prometheus::Gauge * schedLeaderGauge = &sched->Add({{"kind", "leader"}});
 
     // NOLINTNEXTLINE(*-magic-numbers)
     prometheus::Histogram::BucketBoundaries buckets{0.05, 0.25, 1, 2, 5, 10, 30, 60, 120, 300, 900, 3600};
@@ -173,6 +179,22 @@ public:
     {
         return schedWorkersGauge->Value();
     }
+    void schedLeader(bool leader) const
+    {
+        schedLeaderGauge->Set(leader ? 1 : 0);
+    }
+    [[nodiscard]] auto schedSystem(const std::string & system, const std::string & features, const std::string & kind, size_t count) const
+        -> prometheus::Gauge *
+    {
+        auto * gauge = &schedSystemFam->Add({{"system", system}, {"features", features}, {"kind", kind}});
+        gauge->Set(static_cast<double>(count));
+        return gauge;
+    }
+    void schedSystemRemove(prometheus::Gauge * gauge) const
+    {
+        schedSystemFam->Remove(gauge);
+    }
+
     void schedClients(int delta) const
     {
         auto & gauge = sched->Add({{"kind", "clients"}});

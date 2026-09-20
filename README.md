@@ -372,7 +372,8 @@ With `--metrics-listen 127.0.0.1:9464` (NixOS:
 | `nix_grpc_tunnel_bytes_total` | direction, cn | uncompressed tunnel bytes |
 | `nix_grpc_nar_bytes_total` | direction, cn | uncompressed NAR bytes imported/exported |
 | `nix_grpc_build_info` | version, worker, system, features | constant 1, for joins and version skew |
-| `nix_grpc_sched` | kind = queued, workers, clients | scheduler state |
+| `nix_grpc_sched` | kind = queued, workers, clients, leader | scheduler state |
+| `nix_grpc_sched_system` | system, features, kind = queued, unplaceable, running, slots, free | queue (by required features) and capacity (by offered features), for autoscaling |
 | `nix_grpc_events_total` | kind | assigned, cached, attached, expect_no_show, unexpected_build, … |
 
 Only CA-issued CNs appear as labels, so cardinality stays bounded.

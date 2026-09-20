@@ -35,7 +35,7 @@
    },
    "gridPos": {
     "h": 4,
-    "w": 6,
+    "w": 4,
     "x": 0,
     "y": 0
    },
@@ -99,8 +99,8 @@
    },
    "gridPos": {
     "h": 4,
-    "w": 6,
-    "x": 6,
+    "w": 4,
+    "x": 4,
     "y": 0
    },
    "id": 2,
@@ -149,12 +149,28 @@
       ]
      }
     },
-    "overrides": []
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "failed"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "red"
+        }
+       }
+      ]
+     }
+    ]
    },
    "gridPos": {
     "h": 4,
-    "w": 6,
-    "x": 12,
+    "w": 4,
+    "x": 8,
     "y": 0
    },
    "id": 3,
@@ -170,13 +186,22 @@
    },
    "targets": [
     {
+     "refId": "A",
      "datasource": {
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "sum(rate(${prefix}nix_grpc_events_total{kind=\"built\"}[5m])) * 60",
      "legendFormat": "built",
-     "refId": "A"
+     "expr": "sum(rate(${prefix}nix_grpc_events_total{kind=\"built\"}[5m])) * 60"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "legendFormat": "failed",
+     "expr": "sum(rate(${prefix}nix_grpc_events_total{kind=\"build_failed\"}[5m])) * 60 > 0"
     }
    ],
    "title": "Builds / min",
@@ -187,13 +212,13 @@
     "type": "prometheus",
     "uid": "${DS}"
    },
-   "description": "Derivations whose builder failed. Usually the package, not the farm.",
+   "description": "Derivations waiting for a free slot on the serving scheduler. unplaceable: no connected worker offers the system or features.",
    "fieldConfig": {
     "defaults": {
+     "unit": "short",
      "color": {
       "mode": "thresholds"
      },
-     "custom": {},
      "thresholds": {
       "mode": "absolute",
       "steps": [
@@ -202,22 +227,38 @@
         "value": null
        },
        {
-        "color": "orange",
-        "value": 0.2
+        "color": "yellow",
+        "value": 20
        },
        {
         "color": "red",
-        "value": 1
+        "value": 200
        }
       ]
      }
     },
-    "overrides": []
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "unplaceable"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "red"
+        }
+       }
+      ]
+     }
+    ]
    },
    "gridPos": {
     "h": 4,
-    "w": 6,
-    "x": 18,
+    "w": 4,
+    "x": 12,
     "y": 0
    },
    "id": 4,
@@ -233,16 +274,29 @@
    },
    "targets": [
     {
+     "refId": "A",
      "datasource": {
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "sum(rate(${prefix}nix_grpc_events_total{kind=\"build_failed\"}[5m])) * 60",
-     "legendFormat": "failed",
-     "refId": "A"
+     "legendFormat": "queued",
+     "expr": "max(${prefix}nix_grpc_sched{kind=\"queued\"})",
+     "instant": true,
+     "range": false
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "legendFormat": "unplaceable",
+     "expr": "sum(max by (system, features) (${prefix}nix_grpc_sched_system{kind=\"unplaceable\"})) > 0",
+     "instant": true,
+     "range": false
     }
    ],
-   "title": "Failed builds / min",
+   "title": "Queued",
    "type": "stat"
   },
   {
@@ -260,7 +314,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 4
+    "y": 12
    },
    "id": 5,
    "options": {
@@ -308,7 +362,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 4
+    "y": 12
    },
    "id": 6,
    "options": {
@@ -352,7 +406,8 @@
        "mode": "normal"
       }
      },
-     "unit": "s"
+     "unit": "s",
+     "noValue": "no builds in range"
     },
     "overrides": []
    },
@@ -360,7 +415,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 12
+    "y": 20
    },
    "id": 7,
    "options": {
@@ -407,7 +462,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 12
+    "y": 20
    },
    "id": 8,
    "options": {
@@ -460,7 +515,7 @@
      {
       "matcher": {
        "id": "byRegexp",
-       "options": "active.*"
+       "options": "open.*"
       },
       "properties": [
        {
@@ -479,7 +534,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 20
+    "y": 28
    },
    "id": 9,
    "options": {
@@ -501,7 +556,7 @@
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "histogram_quantile(0.95, sum by (le,${prefix}envoy_cluster_name) (rate(${prefix}envoy_cluster_upstream_rq_time_bucket[$__rate_interval])))",
+     "expr": "histogram_quantile(0.95, sum by (le, envoy_cluster_name) (rate(${prefix}envoy_cluster_upstream_rq_time_bucket{envoy_cluster_name!=\"sched\"}[$__rate_interval])))",
      "legendFormat": "p95 {{envoy_cluster_name}}",
      "refId": "A"
     },
@@ -510,12 +565,12 @@
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "sum by (${prefix}envoy_cluster_name) (${prefix}envoy_cluster_upstream_rq_active)",
-     "legendFormat": "active {{envoy_cluster_name}}",
+     "expr": "sum by (envoy_cluster_name) (${prefix}envoy_cluster_upstream_rq_active)",
+     "legendFormat": "open {{envoy_cluster_name}}",
      "refId": "B"
     }
    ],
-   "title": "Load balancer: p95 request time and active requests",
+   "title": "Load balancer: p95 request time per worker cluster, open streams",
    "type": "timeseries"
   },
   {
@@ -526,7 +581,8 @@
    "description": "All of these should be ~0. unexpected_build/expect_no_show: client and scheduler disagree on where a build goes (advertise address wrong, or a node restarted). input_not_substitutable: a build input was in no cache and not uploaded by the client.",
    "fieldConfig": {
     "defaults": {
-     "custom": {}
+     "custom": {},
+     "noValue": "none"
     },
     "overrides": []
    },
@@ -534,7 +590,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 20
+    "y": 28
    },
    "id": 10,
    "options": {
@@ -556,7 +612,7 @@
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "sum by (envoy_cluster_name) (rate(${prefix}envoy_cluster_upstream_rq_xx{envoy_response_code_class=\"5\",envoy_cluster_name!=\"sched\"}[5m])) * 60",
+     "expr": "sum by (envoy_cluster_name) (rate(${prefix}envoy_cluster_upstream_rq_xx{envoy_response_code_class=\"5\",envoy_cluster_name!=\"sched\"}[5m])) * 60 > 0",
      "legendFormat": "5xx/min {{envoy_cluster_name}}",
      "refId": "A"
     },
@@ -565,7 +621,7 @@
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "sum by (envoy_cluster_name) (rate(${prefix}envoy_cluster_upstream_cx_connect_fail{envoy_cluster_name!=\"sched\"}[5m])) * 60",
+     "expr": "sum by (envoy_cluster_name) (rate(${prefix}envoy_cluster_upstream_cx_connect_fail{envoy_cluster_name!=\"sched\"}[5m])) * 60 > 0",
      "legendFormat": "connect fail/min {{envoy_cluster_name}}",
      "refId": "B"
     },
@@ -574,7 +630,7 @@
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "sum by (envoy_cluster_name) (rate(${prefix}envoy_cluster_health_check_failure{envoy_cluster_name!=\"sched\"}[5m])) * 60",
+     "expr": "sum by (envoy_cluster_name) (rate(${prefix}envoy_cluster_health_check_failure{envoy_cluster_name!=\"sched\"}[5m])) * 60 > 0",
      "legendFormat": "health check fail/min {{envoy_cluster_name}}",
      "refId": "C"
     },
@@ -583,7 +639,7 @@
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "sum by ($instance,kind) (rate(${prefix}nix_grpc_events_total{kind=~\"unexpected_build|expect_no_show|expect_undeliverable|input_not_substitutable\"}[5m])) * 60",
+     "expr": "sum by ($instance,kind) (rate(${prefix}nix_grpc_events_total{kind=~\"unexpected_build|expect_no_show|expect_undeliverable|input_not_substitutable\"}[5m])) * 60 > 0",
      "legendFormat": "{{kind}}/min {{instance}}{{host}}",
      "refId": "D"
     }
@@ -606,9 +662,81 @@
    },
    "gridPos": {
     "h": 8,
-    "w": 24,
+    "w": 12,
     "x": 0,
-    "y": 28
+    "y": 4
+   },
+   "id": 12,
+   "options": {
+    "legend": {
+     "calcs": [],
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "legendFormat": "{{system}} queued",
+     "expr": "sum by (system) (max by (system, features) (${prefix}nix_grpc_sched_system{kind=\"queued\"})) > 0"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "legendFormat": "{{system}} unplaceable",
+     "expr": "sum by (system) (max by (system, features) (${prefix}nix_grpc_sched_system{kind=\"unplaceable\"})) > 0"
+    },
+    {
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "legendFormat": "{{system}} running",
+     "expr": "sum by (system) (max by (system, features) (${prefix}nix_grpc_sched_system{kind=\"running\"})) > 0"
+    },
+    {
+     "refId": "D",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "legendFormat": "{{system}} free",
+     "expr": "sum by (system) (max by (system, features) (${prefix}nix_grpc_sched_system{kind=\"free\"})) > 0"
+    }
+   ],
+   "title": "Queue and free slots by system",
+   "type": "timeseries",
+   "description": "Summed over feature sets on the serving scheduler. Systems with nothing queued, running or free are hidden. Per feature set: nix_grpc_sched_system in Explore."
+  },
+  {
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {},
+     "min": 0,
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 4
    },
    "id": 11,
    "options": {
@@ -627,16 +755,146 @@
    "targets": [
     {
      "refId": "A",
-     "expr": "sum by (kind) (${prefix}nix_grpc_sched)",
-     "legendFormat": "{{kind}}",
      "datasource": {
       "type": "prometheus",
       "uid": "${DS}"
-     }
+     },
+     "legendFormat": "{{kind}}",
+     "expr": "max by (kind) (${prefix}nix_grpc_sched{kind=~\"workers|clients\"} and on ($instance) (${prefix}nix_grpc_sched{kind=\"leader\"} == 1))"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "legendFormat": "leader {{instance}}{{host}}",
+     "expr": "max by ($instance) (${prefix}nix_grpc_sched{kind=\"leader\"}) == 1"
     }
    ],
-   "title": "Scheduler: queued, workers, clients",
+   "title": "Scheduler: workers and clients on the leader",
    "type": "timeseries"
+  },
+  {
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "description": "Build slots no build occupies, per system, as the serving scheduler sees them.",
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "red",
+        "value": null
+       },
+       {
+        "color": "green",
+        "value": 1
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 16,
+    "y": 0
+   },
+   "id": 13,
+   "options": {
+    "colorMode": "background",
+    "graphMode": "none",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "textMode": "value_and_name"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "legendFormat": "{{system}}",
+     "expr": "sum by (system) (max by (system, features) (${prefix}nix_grpc_sched_system{kind=\"free\"})) > 0 or sum by (system) (max by (system, features) (${prefix}nix_grpc_sched_system{kind=\"running\"}) > 0) * 0",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "title": "Free slots",
+   "type": "stat"
+  },
+  {
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "description": "The node holding the scheduler lock. No leader: builds wait up to restart-grace.",
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "green"
+     },
+     "noValue": "no leader",
+     "mappings": [
+      {
+       "type": "value",
+       "options": {
+        "1": {
+         "text": "leader"
+        }
+       }
+      }
+     ]
+    },
+    "overrides": []
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 20,
+    "y": 0
+   },
+   "id": 14,
+   "options": {
+    "colorMode": "background",
+    "graphMode": "none",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "textMode": "value_and_name"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "instant": true,
+     "range": false,
+     "legendFormat": "{{instance}}{{host}}",
+     "expr": "max by ($instance) (${prefix}nix_grpc_sched{kind=\"leader\"}) == 1"
+    }
+   ],
+   "title": "Scheduler",
+   "type": "stat"
   }
  ],
  "refresh": "30s",

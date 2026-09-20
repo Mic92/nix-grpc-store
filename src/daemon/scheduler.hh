@@ -8,9 +8,11 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -593,12 +595,84 @@ public:
     }
 
     // Some connected, non-draining worker could ever run it.
+    [[nodiscard]] auto placeable(const Entry & ent) const -> bool
+    {
+        return std::ranges::any_of(
+            workers, [&](const Worker & wkr) -> bool { return wkr.up && !wkr.draining && offers(wkr, ent); });
+    }
+
     [[nodiscard]] auto placeable(DrvId drv) const -> bool
     {
         const auto & slot = entries.at(drv);
-        return slot && std::ranges::any_of(workers, [&](const Worker & wkr) -> bool {
-                   return wkr.up && !wkr.draining && offers(wkr, *slot);
-               });
+        return slot && placeable(*slot);
+    }
+
+    struct StatsKey
+    {
+        std::string system;
+        std::string features; // sorted, comma-joined
+        auto operator<=>(const StatsKey &) const = default;
+    };
+
+    struct Stats
+    {
+        // Keyed by what the derivation requires.
+        size_t queued = 0;      // wanted, not placed
+        size_t unplaceable = 0; // of those, no connected worker could ever run it
+        size_t running = 0;
+        // Keyed by what the worker offers (native system).
+        size_t slots = 0; // maxJobs of up, non-draining workers
+        size_t free = 0;
+    };
+
+    [[nodiscard]] static auto featureKey(std::vector<std::string> feats) -> std::string
+    {
+        std::ranges::sort(feats);
+        std::string key;
+        for (const auto & feat : feats) {
+            key += key.empty() ? "" : ",";
+            key += feat;
+        }
+        return key;
+    }
+
+    // O(entries + workers), for metrics.
+    [[nodiscard]] auto stats() const -> std::map<StatsKey, Stats>
+    {
+        std::map<StatsKey, Stats> out;
+        for (const auto & [name, state] : systems) {
+            out[{.system = name, .features = ""}];
+        }
+        for (const auto & wkr : workers) {
+            if (!wkr.up || wkr.draining || wkr.systems.empty()) {
+                continue;
+            }
+            auto & sst = out[{.system = wkr.systems.front(), .features = featureKey(wkr.features)}];
+            sst.slots += static_cast<size_t>(wkr.maxJobs);
+            sst.free += static_cast<size_t>(std::max(0, wkr.maxJobs - static_cast<int32_t>(wkr.running.size())));
+        }
+        // placeable() is O(workers). Entries sharing system+features share the answer.
+        std::map<StatsKey, bool> memo;
+        for (const auto & slot : entries) {
+            if (!slot || slot->followers.empty()) {
+                continue;
+            }
+            const StatsKey key{.system = slot->system, .features = featureKey(slot->features)};
+            auto & sst = out[key];
+            if (slot->worker != noWorker) {
+                sst.running++;
+                continue;
+            }
+            sst.queued++;
+            auto [iter, fresh] = memo.try_emplace(key, false);
+            if (fresh) {
+                iter->second = placeable(*slot);
+            }
+            if (!iter->second) {
+                sst.unplaceable++;
+            }
+        }
+        return out;
     }
 
     // Bounds on soft state; inputs come from the network.
