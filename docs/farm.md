@@ -455,6 +455,8 @@ services.grafana.provision.dashboards.settings.providers = [{
 }];
 ```
 
+![farm dashboard: two aarch64 workers draining a queue, bld1 leading](https://github.com/Mic92/nix-grpc-store/releases/download/assets/farm-dashboard.png)
+
 The `prefix` and `instance` variables at the top cover pipelines that
 rename things (telegraf: prefix `prometheus_`, worker label `host`. On
 Kubernetes set `instance` to `pod` or `node`).
