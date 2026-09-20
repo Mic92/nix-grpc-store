@@ -77,7 +77,6 @@ let
           nix
           nix-eval-jobs
           nix-fast-build
-          niks3
           gitMinimal
           openssh
           jq

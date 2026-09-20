@@ -42,11 +42,10 @@ auth.workloadIdentity.allowedServiceAccounts:
   containers:
     - image: {{ .Values.image.repository }}-client:{{ .Values.image.tag | default .Chart.AppVersion }}
       env:
+        - name: FARM
+          value: grpc://{{ $svc }}.{{ .Release.Namespace }}.svc:{{ .Values.lb.service.port }}?token-file=/var/run/secrets/nix-grpc-farm/token{{ if $tls }}&ca-cert=/var/run/secrets/nix-grpc-farm/ca.crt{{ end }}
         - name: NIX_CONFIG
           value: |
-            builders = grpc://{{ $svc }}.{{ .Release.Namespace }}.svc:{{ .Values.lb.service.port }}?token-file=/var/run/secrets/nix-grpc-farm/token{{ if $tls }}&ca-cert=/var/run/secrets/nix-grpc-farm/ca.crt{{ end }} {{ $d.system | default "x86_64-linux" }} - {{ mul ($d.maxJobs | int) ($d.replicas | int) }}
-            max-jobs = 0
-            builders-use-substitutes = true
             substituters = {{ .Values.niks3.cacheURL }} https://cache.nixos.org
             trusted-public-keys = {{ join " " .Values.niks3.publicKeys }} cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
       volumeMounts:
@@ -63,6 +62,7 @@ auth.workloadIdentity.allowedServiceAccounts:
     | kubectl -n <runner-namespace> create configmap nix-grpc-farm-ca --from-file=ca.crt=/dev/stdin
 {{- end }}
 
+In the job: nix-fast-build --store "$FARM" --no-download --skip-cached
 {{- end }}
 {{- if .Values.niks3.auth.serviceAccountToken.enabled }}
 
