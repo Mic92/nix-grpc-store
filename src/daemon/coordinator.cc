@@ -280,7 +280,9 @@ auto schedulerCreds(const Options & options) -> std::shared_ptr<grpc::ChannelCre
         return grpc::InsecureChannelCredentials();
     }
     grpc::SslCredentialsOptions ssl;
-    ssl.pem_root_certs = defaultCaCert();
+    if (auto bundle = defaultCaCert(); !bundle.empty()) {
+        ssl.pem_root_certs = nix::readFile(bundle);
+    }
     if (!options.clientCA.empty()) {
         ssl.pem_root_certs += "\n" + nix::readFile(options.clientCA);
     }
