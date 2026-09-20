@@ -69,7 +69,7 @@
     "type": "prometheus",
     "uid": "${DS}"
    },
-   "description": "Sustained ~100% means builds queue (see slot_wait). Add workers or raise maxJobs.",
+   "description": "Running builds over build slots per system, as the active scheduler sees it.",
    "fieldConfig": {
     "defaults": {
      "color": {
@@ -120,9 +120,10 @@
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "sum(${prefix}nix_grpc_inflight{kind=\"BuildDerivation\"}) / sum(${prefix}nix_grpc_build_slots)",
-     "legendFormat": "farm",
-     "refId": "A"
+     "expr": "sum by (system) (max by (system, features) (${prefix}nix_grpc_sched_system{kind=\"running\"})) / (sum by (system) (max by (system, features) (${prefix}nix_grpc_sched_system{kind=\"slots\"})) > 0)",
+     "legendFormat": "{{system}}",
+     "refId": "A",
+     "instant": true
     }
    ],
    "title": "Build slots busy",
@@ -147,7 +148,8 @@
         "value": null
        }
       ]
-     }
+     },
+     "decimals": 0
     },
     "overrides": [
      {
@@ -192,7 +194,8 @@
       "uid": "${DS}"
      },
      "legendFormat": "built",
-     "expr": "sum(rate(${prefix}nix_grpc_events_total{kind=\"built\"}[5m])) * 60"
+     "expr": "sum(increase(${prefix}nix_grpc_events_total{kind=\"built\"}[1h]))",
+     "instant": true
     },
     {
      "refId": "B",
@@ -201,10 +204,11 @@
       "uid": "${DS}"
      },
      "legendFormat": "failed",
-     "expr": "sum(rate(${prefix}nix_grpc_events_total{kind=\"build_failed\"}[5m])) * 60 > 0"
+     "expr": "sum(increase(${prefix}nix_grpc_events_total{kind=\"build_failed\"}[1h])) > 0",
+     "instant": true
     }
    ],
-   "title": "Builds / min",
+   "title": "Builds (last hour)",
    "type": "stat"
   },
   {
