@@ -35,9 +35,34 @@ Client certificate from the farm CA (CN must match auth.accessRules):
 {{- end }}
 {{- if .Values.auth.workloadIdentity.enabled }}
 
-Pods authenticate with a projected service account token (audience {{ .Values.auth.workloadIdentity.audience }}):
+Pods authenticate with a projected service account token (audience {{ .Values.auth.workloadIdentity.audience }}).
+CI runner or Job pod spec, in any namespace whose service account is in
+auth.workloadIdentity.allowedServiceAccounts:
 
-  grpc://{{ $svc }}.{{ .Release.Namespace }}.svc:{{ .Values.lb.service.port }}?token-file=/var/run/secrets/nix-grpc-farm/token
+  containers:
+    - image: {{ .Values.image.repository }}-client:{{ .Values.image.tag | default .Chart.AppVersion }}
+      env:
+        - name: NIX_CONFIG
+          value: |
+            builders = grpc://{{ $svc }}.{{ .Release.Namespace }}.svc:{{ .Values.lb.service.port }}?token-file=/var/run/secrets/nix-grpc-farm/token{{ if $tls }}&ca-cert=/var/run/secrets/nix-grpc-farm/ca.crt{{ end }} {{ $d.system | default "x86_64-linux" }} - {{ mul ($d.maxJobs | int) ($d.replicas | int) }}
+            max-jobs = 0
+            builders-use-substitutes = true
+            substituters = {{ .Values.niks3.cacheURL }} https://cache.nixos.org
+            trusted-public-keys = {{ join " " .Values.niks3.publicKeys }} cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+      volumeMounts:
+        - {name: nix-grpc-farm, mountPath: /var/run/secrets/nix-grpc-farm, readOnly: true}
+  volumes:
+    - name: nix-grpc-farm
+      projected:
+        sources:
+          - serviceAccountToken: {audience: {{ .Values.auth.workloadIdentity.audience }}, path: token}
+{{- if $tls }}
+          - configMap: {name: nix-grpc-farm-ca, items: [{key: ca.crt, path: ca.crt}]}
+
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "farm.tlsSecret" (list . "lb") }} -o go-template='{{ "{{" }}index .data "ca.crt" | base64decode}}' \
+    | kubectl -n <runner-namespace> create configmap nix-grpc-farm-ca --from-file=ca.crt=/dev/stdin
+{{- end }}
+
 {{- end }}
 {{- if .Values.niks3.auth.serviceAccountToken.enabled }}
 

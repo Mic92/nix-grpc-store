@@ -27,7 +27,9 @@ jobs:
       - run: |
           nix build -L .#packages.${{ matrix.system }}.docker -o worker
           nix build -L .#packages.${{ matrix.system }}.docker-lb -o lb
-          mkdir out && cp -L worker out/worker-${{ matrix.system }}.tar && cp -L lb out/lb-${{ matrix.system }}.tar
+          nix build -L .#packages.${{ matrix.system }}.docker-client -o client
+          mkdir out
+          for kind in worker lb client; do cp -L $kind out/$kind-${{ matrix.system }}.tar; done
       - uses: actions/upload-artifact@v4
         with:
           name: images-${{ matrix.system }}
@@ -61,16 +63,16 @@ jobs:
           set -euo pipefail
           PATH="$(nix build --inputs-from . nixpkgs#regctl --print-out-paths --no-link)/bin:$PATH"
           regctl registry login "$REGISTRY" -u "${{ github.actor }}" --pass-stdin <<< "$REGCTL_PASSWORD"
-          for kind in worker lb; do
+          for kind in worker lb client; do
             refs=()
             for sys in x86_64-linux aarch64-linux; do
               regctl image import "ocidir://$kind:$sys" "images/$kind-$sys.tar"
               refs+=(--ref "ocidir://$kind:$sys")
             done
             regctl index create "ocidir://$kind:merged" "${refs[@]}"
-            # lb tags are the worker tags with the -lb image name.
+            # lb and client tags are the worker tags with a suffixed image name.
             for tag in $TAGS; do
-              [ "$kind" = lb ] && tag="${tag/nix-grpc-farm:/nix-grpc-farm-lb:}"
+              [ "$kind" = worker ] || tag="${tag/nix-grpc-farm:/nix-grpc-farm-$kind:}"
               regctl image copy "ocidir://$kind:merged" "$tag"
             done
           done

@@ -12,6 +12,7 @@ let
     chart = ../deploy/helm/nix-grpc-farm;
     dockerWorker = packages.docker;
     dockerLb = packages.docker-lb;
+    dockerClient = packages.docker-client;
     nixPkgs = nixPackages;
     clientModule = nixosModule;
   };
