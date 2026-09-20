@@ -91,8 +91,14 @@ void Builder::onRevoke(const nix::remote::Revoke & rev)
     {
         auto lck = state.lock();
         auto found = lck->expected.find(rev.drv_path());
-        if (found == lck->expected.end() || found->second.running) {
-            return; // running builds finish, the client stream cancel stops them
+        if (found == lck->expected.end()) {
+            return;
+        }
+        if (found->second.running) {
+            // The build RPC notices, kills the build and reports Done itself.
+            found->second.shared->revoked = true;
+            logLine(LogLevel::info, {{"event", "revoked_running"}, {"drv", rev.drv_path()}});
+            return;
         }
         assignId = found->second.assignId;
         lck->expected.erase(found);

@@ -479,10 +479,19 @@ public:
         std::vector<std::string> systems; // first is the native one
         std::vector<std::string> features;
         uint32_t maxJobs = 0;
-        std::vector<std::string_view> running; // running + expecting
+        std::vector<std::pair<std::string_view, uint64_t>> running; // running + expecting, with assignId
     };
 
-    auto hello(const HelloInfo & info) -> WorkerId
+    // A reported drv that this scheduler had meanwhile placed on `loser`:
+    // the reporter keeps it, the caller revokes `loser` and re-points the
+    // followers with a fresh Assigned.
+    struct Superseded
+    {
+        DrvId drv;
+        WorkerId loser;
+    };
+
+    auto hello(const HelloInfo & info, std::vector<Superseded> & superseded) -> WorkerId
     {
         if (info.addr.empty()) {
             throw nix::Error("scheduler: Hello without addr");
@@ -501,16 +510,20 @@ public:
         }
         wkr.features = info.features;
         wkr.maxJobs = static_cast<int32_t>(std::min<uint32_t>(info.maxJobs, FreeIndex::maxSlots));
-        for (auto path : info.running) {
+        for (auto [path, assignId] : info.running) {
             auto drv = drvId(path);
             auto & slot = entries.at(drv);
             if (!slot) {
                 slot = Entry{.drvPath = std::string(path)};
             }
             if (slot->worker != noWorker && slot->worker != wid) {
-                continue; // double assignment across a restart: first publish wins
+                // Placed since our restart, seconds old. The reporter is further along.
+                superseded.push_back({.drv = drv, .loser = slot->worker});
+                std::erase(workers.at(slot->worker).running, drv);
+                refreshFree(slot->worker);
             }
             slot->worker = wid;
+            slot->assignId = assignId;
             sys(slot->system).queue.erase(drv);
             if (std::ranges::find(wkr.running, drv) == wkr.running.end()) {
                 wkr.running.push_back(drv);

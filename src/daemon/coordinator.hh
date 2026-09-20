@@ -53,6 +53,7 @@ struct Expected
     {
         std::mutex mutex;
         std::condition_variable cv;
+        std::atomic<bool> revoked{false}; // scheduler moved the drv to a worker further along
         bool finished = false;
         std::string resultWire; // BuildDerivationDone serialised
     };

@@ -16,7 +16,6 @@
 
 #include <sys/socket.h>
 
-#include <grpcpp/server_context.h>
 
 #include <nix/store/build-result.hh>
 #include <nix/store/derivations.hh>
@@ -61,11 +60,11 @@ void buildLocally(Backend::Conn & conn)
 }
 } // namespace
 
-void Backend::cancelWith(grpc::ServerContext & context)
+void Backend::cancelWith(Cancelled cancelled)
 {
-    canceller = std::jthread([&context, this](const std::stop_token & stop) -> void {
+    canceller = std::jthread([cancelled = std::move(cancelled), this](const std::stop_token & stop) -> void {
         constexpr std::chrono::milliseconds poll{200};
-        while (!stop.stop_requested() && !context.IsCancelled() && stopSignal < kCancelBuilds) {
+        while (!stop.stop_requested() && !cancelled()) {
             std::this_thread::sleep_for(poll);
         }
         if (!stop.stop_requested()) {
@@ -85,10 +84,10 @@ auto Backends::connect(nix::Store & store) const -> std::unique_ptr<Backend>
     return backend;
 }
 
-auto Backends::forBuild(grpc::ServerContext & context, nix::Store & localStore) const -> std::unique_ptr<Backend>
+auto Backends::forBuild(Cancelled cancelled, nix::Store & localStore) const -> std::unique_ptr<Backend>
 {
     auto backend = connect(localStore);
-    backend->cancelWith(context);
+    backend->cancelWith(std::move(cancelled));
     if (nixcompat::protocolWire(backend->conn.protoVersion) != nixcompat::kBuildProtocolWire) {
         throw nix::Error("backend daemon is too old");
     }
@@ -118,13 +117,13 @@ auto buildPathsVia(
 } // namespace
 
 auto Backends::storedBuild(
-    grpc::ServerContext & context,
+    Cancelled cancelled,
     nix::Store & localStore,
     const nix::StorePath & drvPath,
     nix::BuildMode mode,
     const BuildEventSink & sendLogLine) const -> nix::BuildResult
 {
-    auto backend = forBuild(context, localStore);
+    auto backend = forBuild(std::move(cancelled), localStore);
     buildLocally(backend->conn);
     std::vector<nix::DerivedPath> const targets{nix::DerivedPath::Built{
         .drvPath = nix::makeConstantStorePathRef(drvPath), .outputs = nix::OutputsSpec::All{}}};

@@ -9,7 +9,6 @@
 #include <utility>
 #include <vector>
 
-#include <grpcpp/server_context.h>
 
 #include <nix/store/build-result.hh>
 #include <nix/store/derivations.hh>
@@ -23,6 +22,8 @@
 #include "nix_remote.pb.h"
 
 namespace nixgrpc {
+
+using Cancelled = std::function<bool()>;
 
 // SIGTERM count: 1 drains (no new builds), 2 cancels running ones.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): signal handler, defined in main.
@@ -46,7 +47,7 @@ struct Backend
 
     // A silent build sends nothing to notice a cancelled RPC on, so poll
     // and drop the connection, which makes nix-daemon kill the build.
-    void cancelWith(grpc::ServerContext & context);
+    void cancelWith(Cancelled cancelled);
 };
 
 struct Backends
@@ -55,13 +56,12 @@ struct Backends
 
     [[nodiscard]] auto connect(nix::Store & store) const -> std::unique_ptr<Backend>;
     // Build-capable connection: cancellable, protocol checked.
-    [[nodiscard]] auto forBuild(grpc::ServerContext & context, nix::Store & localStore) const
-        -> std::unique_ptr<Backend>;
+    [[nodiscard]] auto forBuild(Cancelled cancelled, nix::Store & localStore) const -> std::unique_ptr<Backend>;
 
     // By path, not inline: nix-daemon recomputes output paths from the stored
     // closure, so a forged drv cannot claim foreign paths. No build hook.
     [[nodiscard]] auto storedBuild(
-        grpc::ServerContext & context,
+        Cancelled cancelled,
         nix::Store & localStore,
         const nix::StorePath & drvPath,
         nix::BuildMode mode,

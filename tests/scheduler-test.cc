@@ -72,9 +72,15 @@ void testFreeIndex()
     assert(fi.get(4) == 100 && *fi.emptiest() == 4);
 }
 
-auto hello(Core & shard, std::string_view addr, uint32_t jobs, std::vector<std::string_view> running = {}, std::vector<std::string> features = {}) -> WorkerId
+auto hello(Core & shard, std::string_view addr, uint32_t jobs, const std::vector<std::string_view> & running = {}, std::vector<std::string> features = {}, std::vector<Core::Superseded> * superseded = nullptr) -> WorkerId
 {
-    return shard.hello({.addr = addr, .systems = {"x"}, .features = std::move(features), .maxJobs = jobs, .running = std::move(running)});
+    std::vector<std::pair<std::string_view, uint64_t>> runs;
+    runs.reserve(running.size());
+    for (auto drv : running) {
+        runs.emplace_back(drv, 7);
+    }
+    std::vector<Core::Superseded> ignored;
+    return shard.hello({.addr = addr, .systems = {"x"}, .features = std::move(features), .maxJobs = jobs, .running = std::move(runs)}, superseded != nullptr ? *superseded : ignored);
 }
 
 void testAssignAndDedup()
@@ -163,6 +169,31 @@ void testHelloReconciles()
     assert(out.size() == 2);
 }
 
+// Scheduler restarted while w1 built a.drv. A client re-Wants before w1 is
+// back, so it goes to w0. Then w1 says Hello: w1 keeps it, w0 is superseded
+// and the client is a follower of w1's build.
+void testHelloSupersedes()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto w0 = hello(shard, "w0", 1);
+    shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 1 && out[0].worker == w0);
+    std::vector<Core::Superseded> sup;
+    auto w1 = hello(shard, "w1", 1, {"a.drv"}, {}, &sup);
+    assert(sup.size() == 1 && sup[0].loser == w0);
+    const auto & ent = shard.entry(sup[0].drv);
+    assert(ent && ent->worker == w1 && ent->assignId == 7);
+    assert(ent->followers.size() == 1 && ent->followers[0] == 1);
+    assert(shard.worker(w0).running.empty());
+    // w0's slot is free again for something else.
+    shard.want(2, {.drvPath = "b.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    out.clear();
+    shard.dispatch(out);
+    assert(out.size() == 1 && out[0].worker == w0);
+}
+
 void testCancelAndClientGone()
 {
     Core shard;
@@ -229,8 +260,9 @@ void testSystems()
 {
     Core shard;
     std::vector<Assign> out;
-    auto arm = shard.hello({.addr = "arm", .systems = {"aarch64"}, .features = {}, .maxJobs = 2, .running = {}});
-    auto both = shard.hello({.addr = "both", .systems = {"x86_64", "i686"}, .features = {}, .maxJobs = 1, .running = {}});
+    std::vector<Core::Superseded> sup;
+    auto arm = shard.hello({.addr = "arm", .systems = {"aarch64"}, .features = {}, .maxJobs = 2, .running = {}}, sup);
+    auto both = shard.hello({.addr = "both", .systems = {"x86_64", "i686"}, .features = {}, .maxJobs = 1, .running = {}}, sup);
     shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "i686", .features = {}, .cpHintMs = 0}, 0);
     shard.want(1, {.drvPath = "b.drv", .inputs = {}, .system = "aarch64", .features = {}, .cpHintMs = 0}, 0);
     shard.want(1, {.drvPath = "c.drv", .inputs = {}, .system = "x86_64", .features = {}, .cpHintMs = 0}, 0);
@@ -271,7 +303,7 @@ void testStaleDoneAndUnknown()
     assert(shard.workersUp() == 1);
     bool threw = false;
     try {
-        shard.hello({.addr = "", .features = {}, .maxJobs = 1, .running = {}});
+        hello(shard, "", 1);
     } catch (nix::Error &) {
         threw = true;
     }
@@ -290,6 +322,7 @@ try {
     testPriority();
     testWorkerGoneRequeues();
     testHelloReconciles();
+    testHelloSupersedes();
     testCancelAndClientGone();
     testDraining();
     testFeatures();

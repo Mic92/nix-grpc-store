@@ -136,6 +136,8 @@ auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore)
     status = tryBuildDerivation(request, headers, res);
   }
   switch (status.error_code()) {
+  case grpc::StatusCode::ABORTED: // superseded: the scheduler already sent where to go
+    return std::nullopt;
   case grpc::StatusCode::FAILED_PRECONDITION: // not expected there (any more)
   case grpc::StatusCode::UNAVAILABLE:         // worker draining or gone
   case grpc::StatusCode::UNKNOWN:             // worker died mid-stream ("Stream removed"),
@@ -256,10 +258,16 @@ struct GrpcStore::Run {
     flushWants();
   }
 
-  // Under `mutex`. Bounced by the worker: hand back to the scheduler.
+  // Under `mutex`. Bounced by the worker: hand back to the scheduler, or
+  // follow a redirect it already sent.
   void requeueLocked(Job & job) {
-    job.workerAddr.clear();
-    job.assignId = 0;
+    job.workerAddr = std::exchange(job.redirectAddr, {});
+    job.assignId = std::exchange(job.redirectId, 0);
+    if (!job.workerAddr.empty()) {
+      ready.push_back(&job);
+      cv.notify_all();
+      return;
+    }
     if (++job.bounced > store.config->rescheduleRetries) {
       finishLocked(job, nixcompat::failed(nixcompat::FailureStatus::MiscFailure,
                                           fmt("gave up after %d reschedules", job.bounced)));
@@ -346,7 +354,14 @@ struct GrpcStore::Run {
     auto name = drvOf(msg);
     auto found = byName.find(name);
     Job * job = found == byName.end() ? nullptr : found->second;
-    if (job == nullptr || job->result || !job->workerAddr.empty()) {
+    if (job == nullptr || job->result) {
+      return;
+    }
+    if (!job->workerAddr.empty()) {
+      if (msg.has_assigned() && msg.assigned().worker_addr() != job->workerAddr) {
+        job->redirectAddr = msg.assigned().worker_addr();
+        job->redirectId = msg.assigned().assign_id();
+      }
       return;
     }
     if (msg.has_assigned()) {
