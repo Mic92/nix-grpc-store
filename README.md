@@ -27,6 +27,10 @@ Why gRPC instead of `ssh-ng://`?
     paths shares a single zstd stream (one compression window across all
     NARs), unlike ssh's optional zlib, which made the benchmark below
     slower instead of faster.
+  * **Scales to a build farm.** Point `builders =` or `--store` at one
+    `grpc://` address and the daemons behind it spread the derivations
+    over all nodes, like Hydra's queue runner but for any Nix client and
+    without a database. See [docs/farm.md](docs/farm.md).
 
 Everything that works over `ssh-ng://` works here: remote builds,
 `nix copy`, path queries, GC. The gRPC layer is a thin tunnel to the
