@@ -1,0 +1,81 @@
+{{- /* Farm-internal PKI from cert-manager: a self-signed root kept in the
+     namespace, an Issuer on it, and the two leaf certificates the chart
+     otherwise expects as existingSecret. Client certificates for users come
+     from the same Issuer, see NOTES. */}}
+{{- with .Values.tls.certManager }}
+{{- if .enabled }}
+{{- $root := $ }}
+{{- $name := include "farm.fullname" $root }}
+{{- $ns := $root.Release.Namespace }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ $name }}-selfsigned
+  labels: {{- include "farm.labels" $root | nindent 4 }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $name }}-ca
+  labels: {{- include "farm.labels" $root | nindent 4 }}
+spec:
+  isCA: true
+  commonName: {{ $name }}-ca
+  secretName: {{ $name }}-ca
+  duration: {{ .caDuration }}
+  privateKey: {algorithm: ECDSA, size: 256}
+  issuerRef: {name: {{ $name }}-selfsigned, kind: Issuer}
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ $name }}
+  labels: {{- include "farm.labels" $root | nindent 4 }}
+spec:
+  ca: {secretName: {{ $name }}-ca}
+---
+{{- /* Balancer: server certificate towards clients and client certificate
+     (CN = first trustedProxies entry) towards the nodes. */}}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $name }}-lb
+  labels: {{- include "farm.labels" $root | nindent 4 }}
+spec:
+  secretName: {{ $name }}-lb-tls
+  commonName: {{ first $root.Values.auth.trustedProxies }}
+  dnsNames:
+    - {{ $name }}
+    - {{ $name }}.{{ $ns }}
+    - {{ $name }}.{{ $ns }}.svc
+    {{- range .lb.extraDnsNames }}
+    - {{ . }}
+    {{- end }}
+  usages: [server auth, client auth]
+  duration: {{ .duration }}
+  privateKey: {algorithm: ECDSA, size: 256, rotationPolicy: Always}
+  issuerRef: {name: {{ $name }}, kind: Issuer}
+---
+{{- /* Workers and scheduler: server certificate towards the balancer, client
+     certificate (CN = first workerCNs entry) towards the scheduler. */}}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $name }}-worker
+  labels: {{- include "farm.labels" $root | nindent 4 }}
+spec:
+  secretName: {{ $name }}-worker-tls
+  commonName: {{ first $root.Values.auth.workerCNs }}
+  dnsNames:
+    - {{ $name }}.{{ $ns }}.svc
+    {{- range splitList "," (include "farm.schedulerNames" $root) }}
+    - {{ . }}.{{ $ns }}.svc
+    {{- end }}
+  usages: [server auth, client auth]
+  duration: {{ .duration }}
+  privateKey: {algorithm: ECDSA, size: 256, rotationPolicy: Always}
+  issuerRef: {name: {{ $name }}, kind: Issuer}
+{{- end }}
+{{- end }}

@@ -1,4 +1,18 @@
+{{- /* Scrape targets: nix_grpc_* from workers and schedulers, envoy_* from
+     the balancer admin listener. One template body, two operator flavours. */}}
+{{- define "farm.scrapeSpec" -}}
+selector:
+  matchLabels: {{- include "farm.selectorLabels" . | nindent 4 }}
+podMetricsEndpoints:
+  - port: metrics
+    interval: {{ .Values.metrics.interval }}
+  - port: admin
+    path: /stats/prometheus
+    interval: {{ .Values.metrics.interval }}
+podTargetLabels: [nix-grpc-farm/group, nix-grpc-farm/system, app.kubernetes.io/component]
+{{- end }}
 {{- if .Values.metrics.podMonitor.enabled }}
+{{- if not (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/PodMonitor") }}{{ fail "metrics.podMonitor needs the prometheus-operator CRDs (try metrics.vmPodScrape for VictoriaMetrics)" }}{{ end }}
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
@@ -7,15 +21,14 @@ metadata:
     {{- with .Values.metrics.podMonitor.labels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
-spec:
-  selector:
-    matchLabels: {{- include "farm.selectorLabels" . | nindent 6 }}
-  podMetricsEndpoints:
-    # nix_grpc_* from workers, envoy_* from the lb admin listener
-    - port: metrics
-      interval: {{ .Values.metrics.podMonitor.interval }}
-    - port: admin
-      path: /stats/prometheus
-      interval: {{ .Values.metrics.podMonitor.interval }}
-  podTargetLabels: [nix-grpc-farm/group, nix-grpc-farm/system, app.kubernetes.io/component]
+spec: {{- include "farm.scrapeSpec" . | nindent 2 }}
+{{- end }}
+{{- if .Values.metrics.vmPodScrape.enabled }}
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: {{ include "farm.fullname" . }}
+  labels: {{- include "farm.labels" . | nindent 4 }}
+spec: {{- include "farm.scrapeSpec" . | nindent 2 }}
 {{- end }}

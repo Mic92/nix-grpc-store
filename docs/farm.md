@@ -316,9 +316,7 @@ workers:
 gc:
   ensureFree: 40G                        # above every group's minFree (20G)
 tls:
-  clientCA: {existingSecret: farm-ca}    # ca.crt
-  lb: {existingSecret: farm-lb-tls}      # kubernetes.io/tls, e.g. from cert-manager
-  worker: {existingSecret: farm-worker-tls, serverName: worker}
+  certManager: {enabled: true}           # or clientCA/lb/worker.existingSecret
 auth:
   accessRules: [{cn: "ci-*", role: trusted}]
 lb:
@@ -340,10 +338,17 @@ Notes:
   `minFree`.
 * **Resources.** Builds run in the `nix-daemon` container, RPCs in
   `nix-grpc-daemon`. Size `resources` and `daemonResources` separately.
-* **Worker certificate.** Workers reach the scheduler through its
-  Service, so the certificate in `tls.worker` must also cover
-  `<release>-nix-grpc-farm-scheduler.<namespace>.svc`, and its CN must
+* **Certificates.** With `tls.certManager.enabled` cert-manager keeps a
+  farm CA in the namespace and issues the balancer and worker
+  certificates from it. Client certificates come from the same Issuer:
+  a `Certificate` with `issuerRef: {name: <release>-nix-grpc-farm}`,
+  `usages: [client auth]` and a `commonName` matching `auth.accessRules`.
+  Without cert-manager, bring three Secrets (`tls.clientCA`, `tls.lb`,
+  `tls.worker`). The worker certificate must then cover
+  `<release>-nix-grpc-farm-scheduler[-<i>].<namespace>.svc` and its CN
   be in `auth.workerCNs`.
+* **Placement.** Workers and balancer pods spread over nodes
+  (`spread: true`), scheduler replicas refuse to share a node.
 * **Identity to niks3.** With `niks3.auth.serviceAccountToken.enabled` the
   pods present a projected service account token (audience `niks3`).
   Allow `<namespace>:<release>-nix-grpc-farm` with scope `write` in the
@@ -375,8 +380,9 @@ Notes:
   Service, send a request with an `x-nix-worker: IP:port` header to that
   pod, route the rest by `x-nix-system` to the matching group's headless
   Service, and health-check `grpc.health.v1`.
-* **Monitoring.** `metrics.podMonitor.enabled` scrapes workers, scheduler
-  and envoy. `grafanaDashboard.enabled` ships the dashboard as a
+* **Monitoring.** `metrics.podMonitor.enabled` (prometheus-operator) or
+  `metrics.vmPodScrape.enabled` (VictoriaMetrics) scrapes workers,
+  scheduler and envoy. `grafanaDashboard.enabled` ships the dashboard as a
   ConfigMap for the Grafana sidecar, with its `instance` variable set to
   `pod`.
 

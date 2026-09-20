@@ -95,6 +95,14 @@ spec:
       {{- with $w.affinity }}
       affinity: {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if $w.spread }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {{- $sel | nindent 14 }}
+      {{- end }}
       initContainers:
         # /nix is an emptyDir so the store is writable and sized. Seed it
         # from the image. The image's DB registration comes along.
@@ -149,7 +157,7 @@ spec:
             - --listen=[::]:50051
             # What envoy resolves the headless Service to, so x-nix-worker pins here.
             - --advertise=$(POD_IP):50051
-            - --scheduler={{ if not $root.Values.tls.worker.existingSecret }}http://{{ end }}{{ include "farm.schedulerFor" $root }}
+            - --scheduler={{ if not (include "farm.tlsSecret" (list $root "worker")) }}http://{{ end }}{{ include "farm.schedulerFor" $root }}
             # civetweb binds [::] v6-only. Pod IPs are v4 on most clusters.
             - --metrics-listen=0.0.0.0:9464
             - --worker-name=$(NODE_NAME)/$(POD_NAME)
@@ -160,11 +168,11 @@ spec:
             - --niks3-push=niks3 push {{ join " " . }}
             {{- end }}
             - --min-free={{ $w.minFree }}
-            {{- if $root.Values.tls.worker.existingSecret }}
+            {{- if (include "farm.tlsSecret" (list $root "worker")) }}
             - --tls-cert=/secrets/tls/tls.crt
             - --tls-key=/secrets/tls/tls.key
             {{- end }}
-            {{- if $root.Values.tls.clientCA.existingSecret }}
+            {{- if (include "farm.tlsSecret" (list $root "clientCA")) }}
             - --client-ca=/secrets/ca/ca.crt
             {{- range $root.Values.auth.trustedProxies }}
             - --trusted-proxy={{ . }}
@@ -195,7 +203,7 @@ spec:
             - {name: grpc, containerPort: 50051}
             - {name: metrics, containerPort: 9464}
           {{- /* kubelet gRPC probes are plaintext; with TLS fall back to TCP and let envoy judge health. */}}
-          {{- $probe := ternary (dict "tcpSocket" (dict "port" 50051)) (dict "grpc" (dict "port" 50051)) (not (empty $root.Values.tls.worker.existingSecret)) }}
+          {{- $probe := ternary (dict "tcpSocket" (dict "port" 50051)) (dict "grpc" (dict "port" 50051)) (not (empty (include "farm.tlsSecret" (list $root "worker")))) }}
           # Covers the store seed and niks3 becoming reachable.
           startupProbe: {{- toYaml (merge (dict "periodSeconds" 5 "failureThreshold" 120) $probe) | nindent 12 }}
           readinessProbe: {{- toYaml (merge (dict "periodSeconds" 5) $probe) | nindent 12 }}
@@ -204,10 +212,10 @@ spec:
             - {name: nix, mountPath: /nix, subPath: nix}
             - {name: nixconf, mountPath: /etc/nix/nix.conf.d}
             - {name: niks3-token, mountPath: /secrets/niks3, readOnly: true}
-            {{- if $root.Values.tls.worker.existingSecret }}
+            {{- if (include "farm.tlsSecret" (list $root "worker")) }}
             - {name: tls, mountPath: /secrets/tls, readOnly: true}
             {{- end }}
-            {{- if $root.Values.tls.clientCA.existingSecret }}
+            {{- if (include "farm.tlsSecret" (list $root "clientCA")) }}
             - {name: ca, mountPath: /secrets/ca, readOnly: true}
             {{- end }}
             {{- if $oidc }}
@@ -266,11 +274,11 @@ spec:
             secretName: {{ $root.Values.niks3.auth.existingSecret }}
             items: [{key: token, path: token}]
           {{- end }}
-        {{- with $root.Values.tls.worker.existingSecret }}
+        {{- with (include "farm.tlsSecret" (list $root "worker")) }}
         - name: tls
           secret: {secretName: {{ . }}}
         {{- end }}
-        {{- with $root.Values.tls.clientCA.existingSecret }}
+        {{- with (include "farm.tlsSecret" (list $root "clientCA")) }}
         - name: ca
           secret: {secretName: {{ . }}}
         {{- end }}

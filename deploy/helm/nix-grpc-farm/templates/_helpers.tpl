@@ -92,9 +92,9 @@ app.kubernetes.io/component: scheduler
 {{- if and $tok.existingSecret $tok.serviceAccountToken.enabled }}{{ fail "set only one of niks3.auth.existingSecret and niks3.auth.serviceAccountToken.enabled" }}{{ end }}
 {{- if not (or $tok.existingSecret $tok.serviceAccountToken.enabled) }}{{ fail "set niks3.auth.existingSecret or niks3.auth.serviceAccountToken.enabled" }}{{ end }}
 {{- if empty .Values.workers }}{{ fail "workers is empty, add e.g. workers.x86-64: {system: x86_64-linux, replicas: 2}" }}{{ end }}
-{{- if and (or .Values.auth.accessRules .Values.auth.anonymousRole) (not (or .Values.tls.clientCA.existingSecret (include "farm.oidcProviders" .))) }}{{ fail "auth.accessRules/anonymousRole need tls.clientCA or an OIDC provider" }}{{ end }}
-{{- if and .Values.tls.clientCA.existingSecret (not .Values.tls.worker.existingSecret) }}{{ fail "tls.clientCA requires tls.worker (workers verify the balancer over TLS)" }}{{ end }}
-{{- if and .Values.lb.enabled .Values.tls.clientCA.existingSecret (not .Values.tls.lb.existingSecret) }}{{ fail "tls.clientCA requires tls.lb (the balancer presents it to clients and workers)" }}{{ end }}
+{{- if and (or .Values.auth.accessRules .Values.auth.anonymousRole) (not (or (include "farm.tlsSecret" (list . "clientCA")) (include "farm.oidcProviders" .))) }}{{ fail "auth.accessRules/anonymousRole need tls.clientCA or an OIDC provider" }}{{ end }}
+{{- if and (include "farm.tlsSecret" (list . "clientCA")) (not (include "farm.tlsSecret" (list . "worker"))) }}{{ fail "tls.clientCA requires tls.worker (workers verify the balancer over TLS)" }}{{ end }}
+{{- if and .Values.lb.enabled (include "farm.tlsSecret" (list . "clientCA")) (not (include "farm.tlsSecret" (list . "lb"))) }}{{ fail "tls.clientCA requires tls.lb (the balancer presents it to clients and workers)" }}{{ end }}
 {{- with .Values.defaultGroup }}{{ if not (hasKey $.Values.workers .) }}{{ fail (printf "defaultGroup %q is not a key of workers" .) }}{{ end }}{{ end }}
 {{- end }}
 
@@ -123,4 +123,15 @@ app.kubernetes.io/component: scheduler
 {{- end }}
 {{- end }}
 {{- if $providers }}{{ toJson (dict "providers" $providers) }}{{- end }}
+{{- end }}
+
+{{/* Secret name for tls.<part> (lb | worker | clientCA): the cert-manager
+     managed one when tls.certManager.enabled, else existingSecret. */}}
+{{- define "farm.tlsSecret" -}}
+{{- $root := index . 0 }}{{ $part := index . 1 }}
+{{- if $root.Values.tls.certManager.enabled -}}
+{{ include "farm.fullname" $root }}-{{ get (dict "lb" "lb-tls" "worker" "worker-tls" "clientCA" "ca") $part }}
+{{- else -}}
+{{ (get $root.Values.tls $part).existingSecret }}
+{{- end }}
 {{- end }}

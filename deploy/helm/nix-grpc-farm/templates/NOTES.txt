@@ -1,6 +1,6 @@
 {{- $svc := include "farm.fullname" . -}}
 {{- $tls := "" -}}
-{{- if .Values.tls.lb.existingSecret }}{{ $tls = "?ca-cert=/path/ca.crt&client-cert=/path/client.crt&client-key=/path/client.key" }}{{ end -}}
+{{- if (include "farm.tlsSecret" (list . "lb")) }}{{ $tls = "?ca-cert=/path/ca.crt&client-cert=/path/client.crt&client-key=/path/client.key" }}{{ end -}}
 Farm address inside the cluster:
 
   grpc://{{ $svc }}.{{ .Release.Namespace }}.svc:{{ .Values.lb.service.port }}{{ $tls }}
@@ -21,6 +21,18 @@ Or as a remote builder in nix.conf on a CI host:
   builders = grpc://…?system={{ $d.system | default "x86_64-linux" }} - - {{ mul ($d.maxJobs | int) ($d.replicas | int) }}
   substituters = {{ .Values.niks3.cacheURL }} https://cache.nixos.org
   trusted-public-keys = {{ join " " .Values.niks3.publicKeys }} cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+{{- if .Values.tls.certManager.enabled }}
+
+Client certificate from the farm CA (CN must match auth.accessRules):
+
+  kubectl -n {{ .Release.Namespace }} apply -f - <<EOF
+  apiVersion: cert-manager.io/v1
+  kind: Certificate
+  metadata: {name: ci}
+  spec: {secretName: ci-tls, commonName: ci-1, usages: [client auth], issuerRef: {name: {{ $svc }}}}
+  EOF
+  for f in ca.crt tls.crt tls.key; do kubectl -n {{ .Release.Namespace }} get secret ci-tls -o go-template="{{ "{{" }}index .data \"$f\" | base64decode}}" > $f; done
+{{- end }}
 {{- if .Values.auth.workloadIdentity.enabled }}
 
 Pods authenticate with a projected service account token (audience {{ .Values.auth.workloadIdentity.audience }}):
