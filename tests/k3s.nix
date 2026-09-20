@@ -2,7 +2,7 @@
 # and postgres as NixOS services on the node. Workers authenticate to niks3
 # with their service account token, and the client uses one for the farm.
 # The test builds through the balancer, fills a store to trigger
-# harmonia-gc, and kills a worker mid-build.
+# harmonia-gc, and deletes a worker pod mid-build.
 {
   pkgs,
   niks3,
@@ -113,7 +113,8 @@ let
       };
     };
     logLevel = "debug";
-    terminationGracePeriodSeconds = 30;
+    # Above the slow build (60 s) so a pod delete can drain it.
+    terminationGracePeriodSeconds = 180;
   };
 in
 pkgs.testers.runNixOSTest {
@@ -311,15 +312,19 @@ pkgs.testers.runNixOSTest {
         assert ready == "True", ready
         sh("gc", "command -v nix-daemon && command -v niks3")  # tools survived gc
 
-    with subtest("killing a worker mid-build bounces the build to the other"):
+    with subtest("deleting a worker pod mid-build drains it: the build finishes there and publishes"):
         machine.succeed(f"systemd-run --unit slow nix build -L --store '{store}' --eval-store auto -f ${slowExpr} --argstr tag s1")
         def holder() -> str | None:
             # [6] keeps the probe from matching itself.
             return next((p for p in pods if machine.execute(f"kubectl -n farm exec {p} -c nix-daemon -- pgrep -f 'read -t [6]0 x'")[0] == 0), None)
         retry(lambda _: holder() is not None, timeout=sec(120))
-        kubectl(f"delete pod {holder()} --wait=false")
+        busy = holder()
+        kubectl(f"delete pod {busy} --wait=false")
+        machine.sleep(duration=sec(5))
+        assert holder() == busy, "pod delete killed the build instead of draining"
         machine.wait_until_succeeds("! systemctl is-active slow", timeout=sec(300))
         machine.succeed("systemctl show -p Result --value slow | grep -qx success || { journalctl -u slow >&2; false; }")
+        machine.fail("journalctl -u slow | grep -q 'asking the scheduler again'")
         narinfo = out_path("${slowExpr}", "s1").removeprefix("/nix/store/").split("-")[0] + ".narinfo"
         machine.succeed(f"curl -sf ${niks3Url}/{narinfo} > /dev/null")
   '';
