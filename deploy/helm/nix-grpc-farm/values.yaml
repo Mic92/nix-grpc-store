@@ -64,7 +64,7 @@ auth:
   trustedProxies: [lb]
   # CN patterns of tls.worker certificates. The scheduler trusts these for WorkerSession.
   workerCNs: [worker, "worker-*"]
-  # Let pods use the farm with their service account token, see docs/farm.md.
+  # Let pods use the farm with their service account token, see docs/kubernetes.md.
   workloadIdentity:
     enabled: false
     allowedServiceAccounts: [] # "<namespace>:<name>", globs allowed
