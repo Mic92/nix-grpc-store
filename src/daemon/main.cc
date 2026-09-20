@@ -506,6 +506,9 @@ public:
         if (adm->attach) {
             metrics.event("attached");
             auto wire = attach(context, *adm->shared, log);
+            if (adm->shared->revoked) {
+                return {grpc::StatusCode::ABORTED, "superseded, another worker was already building this"};
+            }
             if (!wire) {
                 throw nixgrpc::CancelledWait("gave up waiting for the running build");
             }
@@ -521,7 +524,8 @@ public:
         std::string wire;
         auto report = [&]() -> void { builder.finished(drvName, outcome, outputs, wire); };
         try {
-            auto status = buildExpected(context, localStore, drvPath, drv, mode, log, outPaths, done, outcome, outputs);
+            auto status =
+                buildExpected(context, *adm->shared, localStore, drvPath, drv, mode, log, outPaths, done, outcome, outputs);
             wire = done.SerializeAsString();
             if (!status.ok()) {
                 outcome = nix::remote::Done::FAILED;
@@ -531,6 +535,10 @@ public:
         } catch (nixgrpc::CancelledWait &) {
             outcome = nix::remote::Done::CANCELLED;
             report();
+            if (adm->shared->revoked) {
+                metrics.event("revoked");
+                return {grpc::StatusCode::ABORTED, "superseded, another worker was already building this"};
+            }
             throw;
         } catch (...) {
             report();
@@ -540,6 +548,7 @@ public:
 
     auto buildExpected(
         grpc::ServerContext & context,
+        nixgrpc::Expected::Shared & shared,
         nix::Store & localStore,
         const nix::StorePath & drvPath,
         const nix::BasicDerivation & drv,
@@ -550,7 +559,9 @@ public:
         nix::remote::Done::Outcome & outcome,
         std::vector<std::pair<std::string, uint64_t>> & outputs) -> grpc::Status
     {
-        auto cancelled = [&]() -> bool { return context.IsCancelled() || stopSignal >= nixgrpc::kCancelBuilds; };
+        auto cancelled = [&]() -> bool {
+            return context.IsCancelled() || shared.revoked || stopSignal >= nixgrpc::kCancelBuilds;
+        };
         nixgrpc::Metrics::Held const held(metrics, "BuildDerivation");
         nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "substitute");
         // Roots inputs and outputs until publish is done.
@@ -566,13 +577,18 @@ public:
         try {
             phase.next("build");
             nixgrpc::Metrics::Held const building(metrics, "build_slot");
-            res = backends.storedBuild(context, localStore, drvPath, mode, log);
+            res = backends.storedBuild(cancelled, localStore, drvPath, mode, log);
             phase.done();
         } catch (nix::Error &) {
             if (cancelled()) {
                 throw nixgrpc::CancelledWait("build interrupted");
             }
             throw;
+        }
+        if (!nixcompat::succeeded(res) && cancelled()) {
+            // nix-daemon killed the builder when we hung up and still got its
+            // "failed: signal 9" result out before the socket closed.
+            throw nixgrpc::CancelledWait("build interrupted");
         }
         metrics.event(nixcompat::succeeded(res) ? "built" : "build_failed");
         if (nixcompat::succeeded(res)) {

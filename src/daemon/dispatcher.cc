@@ -199,6 +199,34 @@ void Dispatcher::dispatchLocked()
     metrics.schedQueued(core.queued());
 }
 
+// The entry moved to a reconnecting worker that was already building it.
+// Stop the copy we started and send its clients after the original.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+void Dispatcher::supersede(sched::DrvId drv, sched::WorkerId loser)
+{
+    const auto & ent = core.entry(drv);
+    if (!ent) {
+        return;
+    }
+    revokeOn(loser, ent->drvPath);
+    SchedMsg msg;
+    msg.mutable_assigned()->set_drv_path(ent->drvPath);
+    msg.mutable_assigned()->set_worker_addr(core.worker(ent->worker).addr);
+    msg.mutable_assigned()->set_assign_id(ent->assignId);
+    for (auto cid : ent->followers) {
+        if (auto cit = clients.find(cid); cit != clients.end()) {
+            cit->second(msg);
+        }
+    }
+    metrics.event("superseded");
+    logLine(
+        LogLevel::info,
+        {{"event", "superseded"},
+         {"drv", ent->drvPath},
+         {"keep", core.worker(ent->worker).addr},
+         {"revoke", core.worker(loser).addr}});
+}
+
 void Dispatcher::revokeOn(sched::WorkerId wid, const std::string & drvPath)
 {
     if (auto wit = workers.find(wid); wit != workers.end()) {
@@ -377,10 +405,10 @@ void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg &
 {
     if (msg.has_hello()) {
         const auto & hel = msg.hello();
-        std::vector<std::string_view> running;
+        std::vector<std::pair<std::string_view, uint64_t>> running;
         running.reserve(static_cast<size_t>(hel.running_size()));
         for (const auto & run : hel.running()) {
-            running.emplace_back(run.drv_path());
+            running.emplace_back(run.drv_path(), run.assign_id());
         }
         if (hel.systems().empty()) {
             throw nix::Error("worker %s offers no system", hel.addr());
@@ -392,13 +420,18 @@ void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg &
             }
             systems.emplace_back(systemFor(name));
         }
+        std::vector<sched::Core::Superseded> superseded;
         worker.id = core.hello(
-            {.addr = hel.addr(),
-             .systems = std::move(systems),
-             .features = {hel.features().begin(), hel.features().end()},
-             .maxJobs = hel.max_jobs(),
-             .running = std::move(running)});
+        {.addr = hel.addr(),
+         .systems = std::move(systems),
+         .features = {hel.features().begin(), hel.features().end()},
+         .maxJobs = hel.max_jobs(),
+         .running = std::move(running)},
+        superseded);
         workers[*worker.id] = worker.send;
+        for (auto sup : superseded) {
+            supersede(sup.drv, sup.loser);
+        }
         logLine(
             LogLevel::info,
             {{"event", "worker_hello"},

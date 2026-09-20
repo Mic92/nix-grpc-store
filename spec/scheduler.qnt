@@ -17,6 +17,10 @@ module scheduler {
   // drops it and the client fails (old behaviour). false: it stays queued
   // until a worker session is back and Unplaceable is only a warning.
   const UNPLACEABLE_TERMINAL: bool
+  // A reconnecting worker reports a drv the restarted scheduler meanwhile
+  // placed elsewhere: true = keep the reporter and Revoke the other (kills
+  // its build), false = leave both running (old behaviour).
+  const REVOKE_DUP: bool
 
   type CPhase = CIdle | CQueued | CAssigned(str) | CSent(str) | CDone | CFailed
   type Entry = { worker: str, followers: Set[str], leased: bool }
@@ -35,6 +39,7 @@ module scheduler {
   var mResult: Set[str]               // worker -> client
   var mDone: Set[str]                 // worker -> scheduler
   var mRetry: Set[str]                // -> client: UNAVAILABLE
+  var mRevoke: Set[str]               // scheduler -> worker: stop building
   var crashes: int
 
   pure def w0: WState = { up: true, running: false, expecting: false, attached: Set(), built: false, session: true }
@@ -47,13 +52,13 @@ module scheduler {
     published' = 0,
     publishedBy' = Set(),
     mSchedule' = Set(), mAssigned' = Set(), mExpect' = Set(), mBuild' = Set(),
-    mResult' = Set(), mDone' = Set(), mRetry' = Set(),
+    mResult' = Set(), mDone' = Set(), mRetry' = Set(), mRevoke' = Set(),
     crashes' = 0,
   }
 
   action keepMsgs = all {
     mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild,
-    mResult' = mResult, mDone' = mDone, mRetry' = mRetry,
+    mResult' = mResult, mDone' = mDone, mRetry' = mRetry, mRevoke' = mRevoke,
   }
   action keepCache = all { published' = published, publishedBy' = publishedBy }
   action keepSched = all { entry' = entry, free' = free }
@@ -64,7 +69,7 @@ module scheduler {
     cl.get(c) == CIdle,
     cl' = cl.set(c, CQueued),
     mSchedule' = mSchedule.union(Set(c)),
-    mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRetry' = mRetry,
+    mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRetry' = mRetry, mRevoke' = mRevoke,
     keepSched, keepCache, ws' = ws, crashes' = crashes,
   }
 
@@ -74,7 +79,7 @@ module scheduler {
     cl' = cl.set(c, CSent(w)),
     mAssigned' = mAssigned.exclude(Set((c, w))),
     mBuild' = mBuild.union(Set((c, w))),
-    mSchedule' = mSchedule, mExpect' = mExpect, mResult' = mResult, mDone' = mDone, mRetry' = mRetry,
+    mSchedule' = mSchedule, mExpect' = mExpect, mResult' = mResult, mDone' = mDone, mRetry' = mRetry, mRevoke' = mRevoke,
     keepSched, keepCache, ws' = ws, crashes' = crashes,
   }
 
@@ -82,7 +87,7 @@ module scheduler {
     mResult.contains(c),
     cl' = cl.set(c, CDone),
     mResult' = mResult.exclude(Set(c)),
-    mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mDone' = mDone, mRetry' = mRetry,
+    mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mDone' = mDone, mRetry' = mRetry, mRevoke' = mRevoke,
     keepSched, keepCache, ws' = ws, crashes' = crashes,
   }
 
@@ -93,7 +98,7 @@ module scheduler {
     mRetry' = mRetry.exclude(Set(c)),
     mSchedule' = mSchedule.union(Set(c)),
     mAssigned' = mAssigned.filter(p => p._1 != c),
-    mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone,
+    mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRevoke' = mRevoke,
     keepSched, keepCache, ws' = ws, crashes' = crashes,
   }
 
@@ -128,7 +133,7 @@ module scheduler {
         mResult' = mResult,
       }
     },
-    mBuild' = mBuild, mDone' = mDone, mRetry' = mRetry,
+    mBuild' = mBuild, mDone' = mDone, mRetry' = mRetry, mRevoke' = mRevoke,
     keepCache, ws' = ws, cl' = cl, crashes' = crashes,
   }
 
@@ -139,7 +144,7 @@ module scheduler {
     WORKERS.filter(k => free.get(k) > 0 and ws.get(k).session).size() == 0,
     mSchedule' = mSchedule.exclude(Set(c)),
     cl' = cl.set(c, CFailed),
-    mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRetry' = mRetry,
+    mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRetry' = mRetry, mRevoke' = mRevoke,
     keepSched, keepCache, ws' = ws, crashes' = crashes,
   }
 
@@ -148,7 +153,7 @@ module scheduler {
     mDone' = mDone.exclude(Set(w)),
     free' = if (entry.length() == 1 and entry[0].worker == w) free.set(w, free.get(w) + 1) else free,
     entry' = if (entry.length() == 1 and entry[0].worker == w) [] else entry,
-    mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mRetry' = mRetry,
+    mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mRetry' = mRetry, mRevoke' = mRevoke,
     keepCache, ws' = ws, cl' = cl, crashes' = crashes,
   }
 
@@ -158,7 +163,7 @@ module scheduler {
     entry' = [],
     free' = free.set(w, SLOTS),
     mRetry' = mRetry.union(entry[0].followers),
-    mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone,
+    mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRevoke' = mRevoke,
     keepCache, ws' = ws, cl' = cl, crashes' = crashes,
   }
 
@@ -171,23 +176,42 @@ module scheduler {
     free' = WORKERS.mapBy(_ => SLOTS),
     mAssigned' = Set(), mExpect' = Set(), mDone' = Set(),
     mRetry' = mRetry.union(CLIENTS.filter(c => cl.get(c) == CQueued)),
-    mSchedule' = Set(), mBuild' = mBuild, mResult' = mResult,
+    mSchedule' = Set(), mBuild' = mBuild, mResult' = mResult, mRevoke' = Set(),
     keepCache, ws' = WORKERS.mapBy(k => { ...ws.get(k), session: false }), cl' = cl,
   }
 
-  // Up workers re-open their sessions and report what they run.
-  action sessionsBack: bool = all {
-    WORKERS.exists(k => ws.get(k).up and not(ws.get(k).session)),
-    ws' = WORKERS.mapBy(k => { ...ws.get(k), session: ws.get(k).up }),
-    val running = WORKERS.filter(k => ws.get(k).up and not(ws.get(k).session) and (ws.get(k).running or ws.get(k).expecting))
+  // One worker re-opens its session and reports what it runs. If the
+  // scheduler placed the drv elsewhere in the meantime, the reporter keeps
+  // it and the other one is revoked: its clients are retried and attach to
+  // the reporter.
+  action sessionBack(w: str): bool = all {
+    ws.get(w).up and not(ws.get(w).session),
+    ws' = ws.set(w, { ...ws.get(w), session: true }),
+    val runs = REPORT_ON_RECONNECT and (ws.get(w).running or ws.get(w).expecting)
+    val other = entry.length() == 1 and entry[0].worker != w
     all {
-      entry' = if (REPORT_ON_RECONNECT and entry.length() == 0 and running.size() > 0) {
-                 val w = running.fold("", (a, k) => if (a == "") k else a)
-                 [{ worker: w, followers: ws.get(w).attached, leased: true }]
-               } else entry,
-      free' = WORKERS.mapBy(k => if (REPORT_ON_RECONNECT and running.contains(k)) SLOTS - 1 else free.get(k)),
+      entry' = if (runs and (entry.length() == 0 or (other and REVOKE_DUP)))
+                 [{ worker: w, followers: ws.get(w).attached.union(if (other) entry[0].followers else Set()), leased: true }]
+               else entry,
+      free' = free.set(w, if (runs) SLOTS - 1 else SLOTS),
+      mRevoke' = if (runs and other and REVOKE_DUP) mRevoke.union(Set(entry[0].worker)) else mRevoke,
+      mAssigned' = if (runs and other and REVOKE_DUP) mAssigned.union(entry[0].followers.map(c => (c, w))) else mAssigned,
     },
-    keepMsgs, keepCache, cl' = cl, crashes' = crashes,
+    mSchedule' = mSchedule, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRetry' = mRetry,
+    keepCache, cl' = cl, crashes' = crashes,
+  }
+
+  // Kills the build. Attached clients get UNAVAILABLE and re-ask. The worker
+  // stream is ordered, so an earlier Expect has arrived first.
+  action recvRevoke(w: str): bool = all {
+    mRevoke.contains(w), not(mExpect.contains(w)),
+    mRevoke' = mRevoke.exclude(Set(w)),
+    ws' = ws.set(w, { ...ws.get(w), running: false, expecting: false, attached: Set() }),
+    mRetry' = mRetry.union(ws.get(w).attached),
+    free' = if (entry.length() == 1 and entry[0].worker == w) free else free.set(w, SLOTS),
+    entry' = entry,
+    mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone,
+    keepCache, cl' = cl, crashes' = crashes,
   }
 
   // ---- worker ----
@@ -198,7 +222,7 @@ module scheduler {
     mExpect.contains(w),
     mExpect' = mExpect.exclude(Set(w)),
     ws' = ws.set(w, if (ws.get(w).up and not(ws.get(w).built)) { ...startOn(w, Set()), expecting: true } else ws.get(w)),
-    mSchedule' = mSchedule, mAssigned' = mAssigned, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRetry' = mRetry,
+    mSchedule' = mSchedule, mAssigned' = mAssigned, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRetry' = mRetry, mRevoke' = mRevoke,
     keepSched, keepCache, cl' = cl, crashes' = crashes,
   }
 
@@ -216,7 +240,7 @@ module scheduler {
     } else all {
       ws' = ws, mResult' = mResult, mRetry' = mRetry.union(Set(c)),
     },
-    mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mDone' = mDone,
+    mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mDone' = mDone, mRevoke' = mRevoke,
     keepSched, keepCache, cl' = cl, crashes' = crashes,
   }
 
@@ -230,7 +254,7 @@ module scheduler {
       mResult' = mResult.union(ws.get(w).attached),
       mDone' = if (ws.get(w).session) mDone.union(Set(w)) else mDone,
     },
-    mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mRetry' = mRetry,
+    mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mRetry' = mRetry, mRevoke' = mRevoke,
     keepSched, cl' = cl, crashes' = crashes,
   }
 
@@ -240,7 +264,7 @@ module scheduler {
     ws' = ws.set(w, { ...ws.get(w), up: false, running: false, expecting: false, attached: Set(), session: false }),
     mRetry' = mRetry.union(ws.get(w).attached),
     mExpect' = mExpect.exclude(Set(w)),
-    mSchedule' = mSchedule, mAssigned' = mAssigned, mBuild' = mBuild, mResult' = mResult, mDone' = mDone,
+    mSchedule' = mSchedule, mAssigned' = mAssigned, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRevoke' = mRevoke.exclude(Set(w)),
     keepSched, keepCache, cl' = cl,
   }
 
@@ -253,7 +277,7 @@ module scheduler {
       free' = free.set(w, SLOTS),
       mRetry' = if (stale) mRetry.union(entry[0].followers) else mRetry,
     },
-    mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone,
+    mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRevoke' = mRevoke,
     keepCache, cl' = cl, crashes' = crashes,
   }
 
@@ -262,19 +286,8 @@ module scheduler {
     nondet w = WORKERS.oneOf()
     any {
       schedule(c), recvAssigned(c, w), recvResult(c), recvRetry(c),
-      recvSchedule(c), rejectUnplaceable(c), recvDone(w), sessionLost(w), schedCrash, sessionsBack,
-      recvExpect(w), recvBuild(c, w), finish(w), workerCrash(w), workerBack(w),
-    }
-  }
-
-  // Everything but scheduler restarts: worker crashes, bounces, reordering.
-  action stepNoSchedCrash = {
-    nondet c = CLIENTS.oneOf()
-    nondet w = WORKERS.oneOf()
-    any {
-      schedule(c), recvAssigned(c, w), recvResult(c), recvRetry(c),
-      recvSchedule(c), rejectUnplaceable(c), recvDone(w), sessionLost(w),
-      recvExpect(w), recvBuild(c, w), finish(w), workerCrash(w), workerBack(w),
+      recvSchedule(c), rejectUnplaceable(c), recvDone(w), sessionLost(w), schedCrash, sessionBack(w),
+      recvRevoke(w), recvExpect(w), recvBuild(c, w), finish(w), workerCrash(w), workerBack(w),
     }
   }
 
@@ -314,25 +327,29 @@ module scheduler {
     or WORKERS.exists(w => ws.get(w).attached.contains(c))
     or (entry.length() == 1 and entry[0].followers.contains(c)))
 
-  // Not in `safety`: a restarted scheduler places a re-Want on whoever has
-  // reconnected while a worker that has not is still building the same drv.
-  // The duplicate is wasted work, not a wrong result: singlePublish holds.
-  // Checked under stepNoSchedCrash, where Expect-before-Build does keep it.
-  val oneBuilder = WORKERS.filter(w => ws.get(w).running).size() <= 1
+  // A restarted scheduler may place a re-Want before the worker already
+  // building it has reconnected. That second build lives only until the
+  // first worker's Hello, then a Revoke is on its way. So: among workers the
+  // scheduler has heard from, at most one builds and is not being revoked.
+  val oneBuilder = WORKERS.filter(w => ws.get(w).running and ws.get(w).session and not(mRevoke.contains(w))).size() <= 1
+  // What must never happen: two finished output sets of one drv.
+  val oneResult = publishedBy.size() <= 1
 
   // Every worker here can build the drv and crashed ones come back, so a
   // client told "unplaceable" for good was told wrong: it only saw the
   // scheduler before its workers had reconnected.
   val noSpuriousFail = CLIENTS.forall(c => cl.get(c) != CFailed)
 
-  val safety = all { doneImpliesPublished, slotsSane, singlePublish, noStrandedClient, noOversubscribe, entryLive, noSpuriousFail }
+  val safety = all { doneImpliesPublished, slotsSane, singlePublish, noStrandedClient, noOversubscribe, entryLive, noSpuriousFail, oneBuilder, oneResult }
 }
 
-module schedFixed    { import scheduler(PUSH = true,  FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false).* }
+module schedFixed    { import scheduler(PUSH = true,  FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false, REVOKE_DUP = true).* }
 // each drops one mechanism; `safety` must find the hole
-module schedNoPush   { import scheduler(PUSH = false, FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false).* }
-module schedNoReport { import scheduler(PUSH = true,  FENCED_PUBLISH = false, REPORT_ON_RECONNECT = false, UNPLACEABLE_TERMINAL = false).* }
+module schedNoPush   { import scheduler(PUSH = false, FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false, REVOKE_DUP = true).* }
+module schedNoReport { import scheduler(PUSH = true,  FENCED_PUBLISH = false, REPORT_ON_RECONNECT = false, UNPLACEABLE_TERMINAL = false, REVOKE_DUP = true).* }
 // without fencing the duplicate build after a scheduler restart publishes twice
-module schedNoFence  { import scheduler(PUSH = true,  FENCED_PUBLISH = false, REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false).* }
+module schedNoFence  { import scheduler(PUSH = true,  FENCED_PUBLISH = false, REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false, REVOKE_DUP = true).* }
 // scheduler answers "no worker" right after a restart and drops the Want
-module schedTerminal { import scheduler(PUSH = true,  FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = true).* }
+module schedTerminal { import scheduler(PUSH = true,  FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = true, REVOKE_DUP = true).* }
+// reconnect reports a duplicate and the scheduler lets both run
+module schedNoRevoke { import scheduler(PUSH = true,  FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false, REVOKE_DUP = false).* }

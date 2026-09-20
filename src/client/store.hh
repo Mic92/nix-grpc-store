@@ -473,6 +473,10 @@ public:
       // Set by the reader thread, consumed by a build thread.
       std::string workerAddr;
       uint64_t assignId = 0;
+      // A second Assigned while building: the scheduler moved the drv to a
+      // worker that was already at it. Followed when the current one bounces.
+      std::string redirectAddr;
+      uint64_t redirectId = 0;
       bool lost = false; // scheduler stream gone before assignment
       // Set on Unplaceable, cleared on Assigned. reapUnplaceable fails the
       // job once it is older than restart-grace.
