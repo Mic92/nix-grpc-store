@@ -53,7 +53,19 @@ lib.makeScope newScope (
       self.callPackage ./docker.nix {
         variant = "client";
         nix = clientNix;
-        inherit niks3 nix-eval-jobs nix-fast-build;
+        inherit nix-eval-jobs;
+        # 2.0.3 adds --store/--no-download. Drop once nixpkgs has it.
+        nix-fast-build =
+          if lib.versionAtLeast nix-fast-build.version "2.0.3" then
+            nix-fast-build
+          else
+            nix-fast-build.overrideAttrs (old: rec {
+              version = "2.0.3";
+              src = old.src.override {
+                tag = version;
+                hash = "sha256-L4HfADUq4Imq1LnvmjBPFBEAZAIKD9Pnj6ExRkVqHC4=";
+              };
+            });
         nix-grpc-daemon = self.callPackage ./plugin.nix { inherit (clientNix.libs) nix-store nix-util; };
       };
     docker-multiarch = self.callPackage ./docker-multiarch.nix {

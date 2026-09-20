@@ -60,6 +60,18 @@ let
     in
     mk "k3s-top" [ a b ]
   '';
+  nfbFlake = pkgs.writeText "flake.nix" ''
+    {
+      outputs = _: {
+        checks.${system}.t = derivation {
+          name = "nfb-ci";
+          system = "${system}";
+          builder = "/bin/sh";
+          args = [ "-c" "echo > $out" ];
+        };
+      };
+    }
+  '';
   slowExpr = pkgs.writeText "slow.nix" ''
     { tag }:
     derivation {
@@ -89,11 +101,12 @@ let
             image = "${dockerClient.imageName}:${dockerClient.imageTag}";
             env = [
               {
+                name = "FARM";
+                value = "grpc://nix-grpc-farm.farm.svc:50051?token-file=/var/run/secrets/nix-grpc-farm/token&ca-cert=/var/run/secrets/nix-grpc-farm/ca.crt";
+              }
+              {
                 name = "NIX_CONFIG";
                 value = ''
-                  builders = grpc://nix-grpc-farm.farm.svc:50051?token-file=/var/run/secrets/nix-grpc-farm/token&ca-cert=/var/run/secrets/nix-grpc-farm/ca.crt ${system} - 4
-                  max-jobs = 0
-                  builders-use-substitutes = true
                   substituters = ${niks3Url}
                   trusted-public-keys = ${signingPublicKey}
                 '';
@@ -102,7 +115,13 @@ let
             command = [
               "bash"
               "-euc"
-              "cat $(nix build -L --no-link --print-out-paths -f /job/job.nix --argstr tag ci) && nix-eval-jobs --help >/dev/null && git --version"
+              ''
+                nix build -L --store "$FARM" --eval-store auto -f /job/job.nix --argstr tag ci
+                cp /job/flake.nix /tmp && cd /tmp && git init -q && git add flake.nix
+                nix-fast-build --store "$FARM" --no-download --skip-cached
+                out=$(nix eval --raw .#checks.${system}.t.outPath)
+                if test -e "$out"; then echo "$out was downloaded" >&2; exit 1; fi
+              ''
             ];
             volumeMounts = [
               {
@@ -376,12 +395,12 @@ pkgs.testers.runNixOSTest {
 
     with subtest("a Job with the client image builds through the farm with its service account"):
         machine.succeed("kubectl -n ci create configmap nix-grpc-farm-ca --from-file=ca.crt=${certs}/ca.crt")
-        machine.succeed("kubectl -n ci create configmap job --from-file=job.nix=${jobExpr}")
+        machine.succeed("kubectl -n ci create configmap job --from-file=job.nix=${jobExpr} --from-file=flake.nix=${nfbFlake}")
         machine.succeed("kubectl apply -f ${ciJob}")
         try:
             # Complete or Failed, whichever comes first.
             machine.wait_until_succeeds("kubectl -n ci get job ci -o jsonpath='{.status.conditions[*].type}' | grep -qE 'Complete|Failed'", timeout=sec(180))
-            machine.succeed("kubectl -n ci logs job/ci | grep -q k3s-top-ci")
+            machine.succeed("kubectl -n ci get job ci -o jsonpath='{.status.succeeded}' | grep -qx 1")
         finally:
             machine.execute("kubectl -n ci logs job/ci >&2")
         machine.succeed(f"curl -sf ${niks3Url}/{out_path('${jobExpr}', 'ci').removeprefix('/nix/store/').split('-')[0]}.narinfo > /dev/null")
