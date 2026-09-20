@@ -210,6 +210,9 @@ pkgs.testers.runNixOSTest {
     };
 
   testScript = ''
+    from datetime import timedelta
+    def sec(n: int) -> timedelta:
+        return timedelta(seconds=n)
     machine.wait_for_unit("nix-daemon.socket")
     machine.wait_for_unit("nix-grpc-daemon.socket")
 
@@ -227,8 +230,8 @@ pkgs.testers.runNixOSTest {
         assert '"url":"grpc://127.0.0.1:50051' in out, out
         # Type=notify: only READY=1 from the daemon makes it "active".
         machine.require_unit_state("nix-grpc-daemon.service", "active")
-        machine.wait_until_succeeds("journalctl -u nix-grpc-daemon --since=-1min | grep -q event=idle_exit", timeout=30)
-        machine.wait_until_succeeds("systemctl show -P ActiveState nix-grpc-daemon.service | grep -qx inactive", timeout=30)
+        machine.wait_until_succeeds("journalctl -u nix-grpc-daemon --since=-1min | grep -q event=idle_exit", timeout=sec(30))
+        machine.wait_until_succeeds("systemctl show -P ActiveState nix-grpc-daemon.service | grep -qx inactive", timeout=sec(30))
         machine.succeed(f"nix store info --store '{store}'")
 
     with subtest("add path over gRPC and read it back locally"):
