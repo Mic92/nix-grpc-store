@@ -78,7 +78,7 @@ spec:
       # For OIDC discovery against the API server and the projected niks3 token.
       automountServiceAccountToken: {{ or $root.Values.auth.workloadIdentity.enabled $root.Values.niks3.auth.serviceAccountToken.enabled }}
       terminationGracePeriodSeconds: {{ $root.Values.terminationGracePeriodSeconds }}
-      # preStop hooks below find nix-grpc-daemon by name.
+      # preStop hooks below wait for nix-grpc-daemon to exit.
       shareProcessNamespace: true
       {{- with $root.Values.imagePullSecrets }}
       imagePullSecrets: {{- toYaml . | nindent 8 }}
@@ -127,7 +127,7 @@ spec:
           lifecycle:
             preStop:
               exec:
-                command: [/bin/sh, -c, "while pgrep -x nix-grpc-daemon >/dev/null; do sleep 1; done"]
+                command: [/bin/sh, -c, "while pgrep -f ^/bin/nix-grpc-daemon >/dev/null; do sleep 1; done"]
           securityContext:
             {{- if $root.Values.sandbox.enabled }}
             privileged: true
