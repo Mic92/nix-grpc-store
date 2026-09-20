@@ -1,5 +1,6 @@
-# Farm worker image. The chart runs nix-daemon, nix-grpc-daemon and the
-# harmonia-gc loop from it as separate containers.
+# Farm images. `worker` runs nix-daemon, nix-grpc-daemon and the harmonia-gc
+# loop as separate containers. `client` is a CI job image whose nix has the
+# grpc:// plugin loaded, see docs/farm.md.
 {
   lib,
   dockerTools,
@@ -8,16 +9,25 @@
   buildEnv,
   busybox,
   busybox-sandbox-shell,
+  bashInteractive,
+  coreutils,
   cacert,
   iana-etc,
+  gitMinimal,
+  openssh,
+  jq,
   nix,
   nix-grpc-daemon,
+  nix-eval-jobs ? null,
+  nix-fast-build ? null,
   niks3,
   harmonia-gc,
-  imageName ? "nix-grpc-farm",
+  variant ? "worker",
+  imageName ? { worker = "nix-grpc-farm"; client = "nix-grpc-farm-client"; }.${variant},
   tag ? nix-grpc-daemon.version,
 }:
 let
+  client = variant == "client";
   # auto-allocate-uids: no nixbld users to maintain in /etc/passwd.
   passwd = writeTextDir "etc/passwd" ''
     root:x:0:0:root:/root:/bin/sh
@@ -31,38 +41,71 @@ let
     nogroup:x:65534:
   '';
   # The chart mounts nix.conf.d/farm.conf. A missing include is ignored.
-  nixConf = writeTextDir "etc/nix/nix.conf" ''
-    build-users-group = nixbld
-    auto-allocate-uids = true
-    experimental-features = nix-command auto-allocate-uids cgroups
-    sandbox = true
-    sandbox-fallback = false
-    sandbox-paths = /bin/sh=${busybox-sandbox-shell}/bin/busybox
-    keep-build-log = true
-    narinfo-cache-negative-ttl = 0
-    trusted-users = root nix-grpc-daemon
-    allowed-users = *
-    !include /etc/nix/nix.conf.d/farm.conf
-  '';
+  nixConf = writeTextDir "etc/nix/nix.conf" (
+    if client then
+      ''
+        # Single-user nix as root. Builds run on the farm, so no sandbox
+        # and no build users. NIX_CONFIG or nix.conf.d/farm.conf point at it.
+        build-users-group =
+        sandbox = false
+        experimental-features = nix-command flakes
+        plugin-files = ${nix-grpc-daemon}/lib/nix/plugins
+        accept-flake-config = false
+        !include /etc/nix/nix.conf.d/farm.conf
+      ''
+    else
+      ''
+        build-users-group = nixbld
+        auto-allocate-uids = true
+        experimental-features = nix-command auto-allocate-uids cgroups
+        sandbox = true
+        sandbox-fallback = false
+        sandbox-paths = /bin/sh=${busybox-sandbox-shell}/bin/busybox
+        keep-build-log = true
+        narinfo-cache-negative-ttl = 0
+        trusted-users = root nix-grpc-daemon
+        allowed-users = *
+        !include /etc/nix/nix.conf.d/farm.conf
+      ''
+  );
 
   path = buildEnv {
-    name = "nix-grpc-farm-path";
-    paths = [
-      nix
-      nix-grpc-daemon
-      niks3
-      harmonia-gc
-      busybox
-    ];
+    name = "${imageName}-path";
+    paths =
+      if client then
+        [
+          nix
+          nix-eval-jobs
+          nix-fast-build
+          niks3
+          gitMinimal
+          openssh
+          jq
+          # CI scripts expect bash and GNU coreutils. busybox fills the rest.
+          bashInteractive
+          coreutils
+          busybox
+        ]
+      else
+        [
+          nix
+          nix-grpc-daemon
+          niks3
+          harmonia-gc
+          busybox
+        ];
     pathsToLink = [ "/bin" ];
+    ignoreCollisions = client; # coreutils and bash before busybox
   };
 
-  # Keeps harmonia-gc from deleting the tools once /nix lives on the pod volume.
-  gcRoot = runCommand "nix-grpc-farm-gcroot" { } ''
+  # Keeps gc from deleting the tools once /nix lives on a volume.
+  gcRoot = runCommand "${imageName}-gcroot" { } ''
     mkdir -p $out/nix/var/nix/gcroots
     ln -s ${path} $out/nix/var/nix/gcroots/image
+    ${lib.optionalString client "ln -s ${nix-grpc-daemon} $out/nix/var/nix/gcroots/plugin"}
   '';
 in
+assert client -> nix-eval-jobs != null && nix-fast-build != null;
 dockerTools.buildLayeredImage {
   name = imageName;
   inherit tag;
@@ -88,11 +131,18 @@ dockerTools.buildLayeredImage {
       "PATH=/bin"
       "NIX_SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
       "SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
+    ]
+    ++ lib.optionals client [
+      "HOME=/root"
+      "USER=root"
+      "GIT_SSL_CAINFO=${cacert}/etc/ssl/certs/ca-bundle.crt"
     ];
     Labels = {
       "org.opencontainers.image.source" = "https://github.com/Mic92/nix-grpc-store";
-      "org.opencontainers.image.description" = "nix-grpc-store build farm worker";
+      "org.opencontainers.image.description" =
+        if client then "CI job image with nix and the grpc:// store plugin" else "nix-grpc-store build farm worker";
     };
-  };
+  }
+  // lib.optionalAttrs client { Cmd = [ "/bin/bash" ]; };
   passthru = { inherit path nixConf; };
 }

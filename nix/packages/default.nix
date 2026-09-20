@@ -9,6 +9,8 @@
   nixPackages,
   # Nix the images ship: nixpkgs' release, not the master pin the tests track.
   nix,
+  nix-eval-jobs,
+  nix-fast-build,
   niks3 ? null,
   scopeFor ? null,
 }:
@@ -41,6 +43,19 @@ lib.makeScope newScope (
       nix-grpc-daemon = self.imagePlugin;
     };
     docker-lb = self.callPackage ./docker-lb.nix { tag = self.imagePlugin.version; };
+    # nix, plugin and nix-eval-jobs must share one libnixstore, so follow
+    # the release nix-eval-jobs links.
+    docker-client =
+      let
+        v = lib.replaceStrings [ "." ] [ "_" ] (lib.versions.majorMinor nix-eval-jobs.passthru.nix.version);
+        clientNix = nixVersions."nix_${v}";
+      in
+      self.callPackage ./docker.nix {
+        variant = "client";
+        nix = clientNix;
+        inherit niks3 nix-eval-jobs nix-fast-build;
+        nix-grpc-daemon = self.callPackage ./plugin.nix { inherit (clientNix.libs) nix-store nix-util; };
+      };
     docker-multiarch = self.callPackage ./docker-multiarch.nix {
       name = "nix-grpc-farm-docker";
       imageName = "nix-grpc-farm:latest";
@@ -50,6 +65,11 @@ lib.makeScope newScope (
       name = "nix-grpc-farm-lb-docker";
       imageName = "nix-grpc-farm-lb:latest";
       perArch = lib.genAttrs linuxSystems (s: (scopeFor s).docker-lb);
+    };
+    docker-client-multiarch = self.callPackage ./docker-multiarch.nix {
+      name = "nix-grpc-farm-client-docker";
+      imageName = "nix-grpc-farm-client:latest";
+      perArch = lib.genAttrs linuxSystems (s: (scopeFor s).docker-client);
     };
 
     default = self.callPackage ./plugin.nix {

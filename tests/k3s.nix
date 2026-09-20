@@ -1,14 +1,15 @@
 # Helm chart in k3s. Workers and envoy run from our images, niks3, rustfs
 # and postgres as NixOS services on the node. Workers authenticate to niks3
 # with their service account token, and the client uses one for the farm.
-# The test builds through the balancer, fills a store to trigger
-# harmonia-gc, and deletes a worker pod mid-build.
+# The test builds through the balancer, runs a Job with the client image,
+# fills a store to trigger harmonia-gc, and deletes a worker pod mid-build.
 {
   pkgs,
   niks3,
   chart,
   dockerWorker,
   dockerLb,
+  dockerClient,
   nixPkgs,
   clientModule,
 }:
@@ -65,10 +66,88 @@ let
       name = "slow-''${tag}";
       system = builtins.currentSystem;
       builder = "/bin/sh";
-      args = [ "-c" "read -t 60 x < /dev/zero; echo > $out" ];
+      args = [ "-c" "read -t 20 x < /dev/zero; echo > $out" ];
     }
   '';
   groupName = lib.replaceStrings [ "_" ] [ "-" ] system;
+  # The pod spec from docs/kubernetes.md "Connect CI jobs in the cluster".
+  ciJob = (pkgs.formats.json { }).generate "ci-job.json" {
+    apiVersion = "batch/v1";
+    kind = "Job";
+    metadata = {
+      name = "ci";
+      namespace = "ci";
+    };
+    spec = {
+      backoffLimit = 0;
+      template.spec = {
+        serviceAccountName = "builder";
+        restartPolicy = "Never";
+        containers = [
+          {
+            name = "build";
+            image = "${dockerClient.imageName}:${dockerClient.imageTag}";
+            env = [
+              {
+                name = "NIX_CONFIG";
+                value = ''
+                  builders = grpc://nix-grpc-farm.farm.svc:50051?token-file=/var/run/secrets/nix-grpc-farm/token&ca-cert=/var/run/secrets/nix-grpc-farm/ca.crt ${system} - 4
+                  max-jobs = 0
+                  builders-use-substitutes = true
+                  substituters = ${niks3Url}
+                  trusted-public-keys = ${signingPublicKey}
+                '';
+              }
+            ];
+            command = [
+              "bash"
+              "-euc"
+              "cat $(nix build -L --no-link --print-out-paths -f /job/job.nix --argstr tag ci) && nix-eval-jobs --help >/dev/null && git --version"
+            ];
+            volumeMounts = [
+              {
+                name = "nix-grpc-farm";
+                mountPath = "/var/run/secrets/nix-grpc-farm";
+                readOnly = true;
+              }
+              {
+                name = "job";
+                mountPath = "/job";
+              }
+            ];
+          }
+        ];
+        volumes = [
+          {
+            name = "nix-grpc-farm";
+            projected.sources = [
+              {
+                serviceAccountToken = {
+                  audience = "nix-grpc-farm";
+                  path = "token";
+                };
+              }
+              {
+                configMap = {
+                  name = "nix-grpc-farm-ca";
+                  items = [
+                    {
+                      key = "ca.crt";
+                      path = "ca.crt";
+                    }
+                  ];
+                };
+              }
+            ];
+          }
+          {
+            name = "job";
+            configMap.name = "job";
+          }
+        ];
+      };
+    };
+  };
   chartValues = {
     image = {
       repository = dockerWorker.imageName;
@@ -113,8 +192,8 @@ let
       };
     };
     logLevel = "debug";
-    # Above the slow build (60 s) so a pod delete can drain it.
-    terminationGracePeriodSeconds = 180;
+    # Above the slow build (20 s) so a pod delete can drain it.
+    terminationGracePeriodSeconds = 60;
   };
 in
 pkgs.testers.runNixOSTest {
@@ -205,6 +284,7 @@ pkgs.testers.runNixOSTest {
           config.services.k3s.package.airgap-images
           dockerWorker
           dockerLb
+          dockerClient
         ];
         manifests.ci.content = [
           {
@@ -294,6 +374,18 @@ pkgs.testers.runNixOSTest {
         out = build("${jobExpr}", "t2")
         assert "machine/nix-grpc-farm-worker-" in out, out
 
+    with subtest("a Job with the client image builds through the farm with its service account"):
+        machine.succeed("kubectl -n ci create configmap nix-grpc-farm-ca --from-file=ca.crt=${certs}/ca.crt")
+        machine.succeed("kubectl -n ci create configmap job --from-file=job.nix=${jobExpr}")
+        machine.succeed("kubectl apply -f ${ciJob}")
+        try:
+            # Complete or Failed, whichever comes first.
+            machine.wait_until_succeeds("kubectl -n ci get job ci -o jsonpath='{.status.conditions[*].type}' | grep -qE 'Complete|Failed'", timeout=sec(180))
+            machine.succeed("kubectl -n ci logs job/ci | grep -q k3s-top-ci")
+        finally:
+            machine.execute("kubectl -n ci logs job/ci >&2")
+        machine.succeed(f"curl -sf ${niks3Url}/{out_path('${jobExpr}', 'ci').removeprefix('/nix/store/').split('-')[0]}.narinfo > /dev/null")
+
     with subtest("metrics carry build_info"):
         machine.succeed(f"curl -sf http://{pod_ip(pods[0])}:9464/metrics | grep -E 'nix_grpc_build_info\\{{.*worker=\"machine/{pods[0]}\"'")
 
@@ -315,8 +407,8 @@ pkgs.testers.runNixOSTest {
     with subtest("deleting a worker pod mid-build drains it: the build finishes there and publishes"):
         machine.succeed(f"systemd-run --unit slow nix build -L --store '{store}' --eval-store auto -f ${slowExpr} --argstr tag s1")
         def holder() -> str | None:
-            # [6] keeps the probe from matching itself.
-            return next((p for p in pods if machine.execute(f"kubectl -n farm exec {p} -c nix-daemon -- pgrep -f 'read -t [6]0 x'")[0] == 0), None)
+            # [2] keeps the probe from matching itself.
+            return next((p for p in pods if machine.execute(f"kubectl -n farm exec {p} -c nix-daemon -- pgrep -f 'read -t [2]0 x'")[0] == 0), None)
         retry(lambda _: holder() is not None, timeout=sec(120))
         busy = holder()
         kubectl(f"delete pod {busy} --wait=false")

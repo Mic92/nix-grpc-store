@@ -89,8 +89,10 @@
             harmonia-gc
             docker
             docker-lb
+            docker-client
             docker-multiarch
             docker-lb-multiarch
+            docker-client-multiarch
             ;
           # Benchmarks, intentionally not in `checks` so CI skips them.
           bench-closure = nixpkgs.legacyPackages.${system}.callPackage ./tests/bench-closure.nix { };
