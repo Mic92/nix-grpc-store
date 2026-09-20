@@ -56,8 +56,15 @@ spec:
       {{- with $s.tolerations }}
       tolerations: {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with $s.affinity }}
-      affinity: {{- toYaml . | nindent 8 }}
+      {{- if $s.affinity }}
+      affinity: {{- toYaml $s.affinity | nindent 8 }}
+      {{- else if gt (int ($s.replicas | default 1)) 1 }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: {{- include "farm.schedulerSelectorLabels" $root | nindent 18 }}
       {{- end }}
       containers:
         - name: nix-grpc-daemon
@@ -74,11 +81,11 @@ spec:
             # Cached replies need niks3; without it every Want is Assigned.
             - --niks3={{ .Values.niks3.serverURL }}
             - --niks3-token-file=/secrets/niks3/token
-            {{- if .Values.tls.worker.existingSecret }}
+            {{- if (include "farm.tlsSecret" (list . "worker")) }}
             - --tls-cert=/secrets/tls/tls.crt
             - --tls-key=/secrets/tls/tls.key
             {{- end }}
-            {{- if .Values.tls.clientCA.existingSecret }}
+            {{- if (include "farm.tlsSecret" (list . "clientCA")) }}
             - --client-ca=/secrets/ca/ca.crt
             {{- range .Values.auth.trustedProxies }}
             - --trusted-proxy={{ . }}
@@ -112,15 +119,15 @@ spec:
             - {name: grpc, containerPort: 50051}
             - {name: metrics, containerPort: 9464}
           {{- /* Ready = serving scheduler streams. Live = process answers. A draining or passive scheduler is live but not ready. */}}
-          {{- $tcp := not (empty .Values.tls.worker.existingSecret) }}
+          {{- $tcp := not (empty (include "farm.tlsSecret" (list . "worker"))) }}
           readinessProbe: {{- toYaml (merge (dict "periodSeconds" 5) (ternary (dict "tcpSocket" (dict "port" 50051)) (dict "grpc" (dict "port" 50051 "service" "nix.scheduler")) $tcp)) | nindent 12 }}
           livenessProbe: {{- toYaml (merge (dict "periodSeconds" 30 "timeoutSeconds" 10) (ternary (dict "tcpSocket" (dict "port" 50051)) (dict "grpc" (dict "port" 50051)) $tcp)) | nindent 12 }}
           volumeMounts:
             - {name: niks3-token, mountPath: /secrets/niks3, readOnly: true}
-            {{- if .Values.tls.worker.existingSecret }}
+            {{- if (include "farm.tlsSecret" (list . "worker")) }}
             - {name: tls, mountPath: /secrets/tls, readOnly: true}
             {{- end }}
-            {{- if .Values.tls.clientCA.existingSecret }}
+            {{- if (include "farm.tlsSecret" (list . "clientCA")) }}
             - {name: ca, mountPath: /secrets/ca, readOnly: true}
             {{- end }}
             {{- if $oidc }}
@@ -143,11 +150,11 @@ spec:
             secretName: {{ .Values.niks3.auth.existingSecret }}
             items: [{key: token, path: token}]
           {{- end }}
-        {{- with .Values.tls.worker.existingSecret }}
+        {{- with (include "farm.tlsSecret" (list . "worker")) }}
         - name: tls
           secret: {secretName: {{ . }}}
         {{- end }}
-        {{- with .Values.tls.clientCA.existingSecret }}
+        {{- with (include "farm.tlsSecret" (list . "clientCA")) }}
         - name: ca
           secret: {secretName: {{ . }}}
         {{- end }}

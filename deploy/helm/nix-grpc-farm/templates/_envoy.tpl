@@ -35,7 +35,7 @@ load_assignment:
                 address: {{ printf "%s.%s.svc" $svc $root.Release.Namespace }}
                 port_value: 50051
         {{- end }}
-{{- if $root.Values.tls.worker.existingSecret }}
+{{- if (include "farm.tlsSecret" (list $root "worker")) }}
 transport_socket:
   name: envoy.transport_sockets.tls
   typed_config:
@@ -45,12 +45,12 @@ transport_socket:
     {{- end }}
     common_tls_context:
       alpn_protocols: [h2]
-      {{- if $root.Values.tls.lb.existingSecret }}
+      {{- if (include "farm.tlsSecret" (list $root "lb")) }}
       tls_certificates:
         - certificate_chain: {filename: /etc/envoy/tls/lb/tls.crt}
           private_key: {filename: /etc/envoy/tls/lb/tls.key}
       {{- end }}
-      {{- if $root.Values.tls.clientCA.existingSecret }}
+      {{- if (include "farm.tlsSecret" (list $root "clientCA")) }}
       validation_context:
         trusted_ca: {filename: /etc/envoy/tls/ca/ca.crt}
       {{- end }}
@@ -123,12 +123,12 @@ filter_chains:
             - name: envoy.filters.http.router
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
-    {{- if .Values.tls.lb.existingSecret }}
+    {{- if (include "farm.tlsSecret" (list . "lb")) }}
     transport_socket:
       name: envoy.transport_sockets.tls
       typed_config:
         "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
-        {{- if .Values.tls.clientCA.existingSecret }}
+        {{- if (include "farm.tlsSecret" (list . "clientCA")) }}
         require_client_certificate: false # tokens keep working
         {{- end }}
         common_tls_context:
@@ -136,7 +136,7 @@ filter_chains:
           tls_certificates:
             - certificate_chain: {filename: /etc/envoy/tls/lb/tls.crt}
               private_key: {filename: /etc/envoy/tls/lb/tls.key}
-          {{- if .Values.tls.clientCA.existingSecret }}
+          {{- if (include "farm.tlsSecret" (list . "clientCA")) }}
           validation_context:
             trusted_ca: {filename: /etc/envoy/tls/ca/ca.crt}
           {{- end }}
@@ -159,7 +159,7 @@ filter_chains:
 {{- $routes = append $routes (include "farm.envoy.route" (dict "prefix" "/" "cluster" $g "system" $w.system "isDefault" $isDefault) | fromYaml) }}
 {{- end }}
 {{- $clusters = append $clusters (include "farm.envoy.clusterCommon" (dict "root" $root "name" "sched" "service" (include "farm.schedulerNames" $root) "healthService" "nix.scheduler") | fromYaml) }}
-{{- $listener := include "farm.envoy.listener" (dict "Values" .Values "routes" $routes) | fromYaml }}
+{{- $listener := include "farm.envoy.listener" (dict "Values" .Values "Chart" .Chart "Release" .Release "routes" $routes) | fromYaml }}
 {{- toJson (dict
   "admin" (dict "address" (dict "socket_address" (dict "address" "::" "port_value" 9901 "ipv4_compat" true)))
   "static_resources" (dict "listeners" (list $listener) "clusters" $clusters)

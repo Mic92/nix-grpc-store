@@ -29,6 +29,15 @@ niks3:
 # TLS is optional. Secrets are kubernetes.io/tls (tls.crt, tls.key). The CA
 # Secret has key ca.crt. cert-manager Certificates produce this layout.
 tls:
+  # Let cert-manager create the farm CA, an Issuer and the lb/worker
+  # certificates in this namespace. Replaces the three existingSecrets below.
+  # Issue client certificates from Issuer <release>-nix-grpc-farm.
+  certManager:
+    enabled: false
+    duration: 2160h # leaf certificates, renewed by cert-manager
+    caDuration: 87600h
+    lb:
+      extraDnsNames: [] # names clients outside the cluster use for the balancer
   # Verifies user client certificates at the balancer, the balancer's at
   # the nodes, and worker and scheduler certificates against each other.
   clientCA:
@@ -87,6 +96,7 @@ workerDefaults:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  spread: true # prefer one pod per node
   podAnnotations: {}
 # One Deployment per entry, the key names the group. E.g.
 #   x86-64: {system: x86_64-linux, replicas: 4, nodeSelector: {kubernetes.io/arch: amd64}}
@@ -97,12 +107,14 @@ defaultGroup: ""
 
 # The one scheduler pod (all systems). Holds only soft state.
 scheduler:
-  # >1 adds standby schedulers. niks3 picks the active one, so this needs `niks3`.
+  # >1 adds standby schedulers on separate nodes. niks3 picks the active one
+  # through a lock in its database, so this needs a `niks3` no other farm
+  # elects against.
   replicas: 1
   resources: {}
   nodeSelector: {}
   tolerations: []
-  affinity: {}
+  affinity: {} # replaces the default anti-affinity between replicas
   podAnnotations: {}
   extraArgs: []
 
@@ -142,13 +154,18 @@ lb:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  spread: true
   podAnnotations: {}
 
 metrics:
+  interval: 30s
+  # prometheus-operator
   podMonitor:
     enabled: false
-    interval: 30s
     labels: {}
+  # VictoriaMetrics operator
+  vmPodScrape:
+    enabled: false
 
 grafanaDashboard:
   enabled: false

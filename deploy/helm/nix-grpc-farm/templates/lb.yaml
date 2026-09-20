@@ -66,6 +66,14 @@ spec:
       {{- with .Values.lb.affinity }}
       affinity: {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if .Values.lb.spread }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {{- $sel | nindent 14 }}
+      {{- end }}
       containers:
         - name: envoy
           image: {{ include "farm.lbImage" . }}
@@ -87,10 +95,10 @@ spec:
           volumeMounts:
             - {name: config, mountPath: /etc/envoy/envoy.json, subPath: envoy.json, readOnly: true}
             - {name: tmp, mountPath: /tmp}
-            {{- if .Values.tls.lb.existingSecret }}
+            {{- if (include "farm.tlsSecret" (list . "lb")) }}
             - {name: tls-lb, mountPath: /etc/envoy/tls/lb, readOnly: true}
             {{- end }}
-            {{- if .Values.tls.clientCA.existingSecret }}
+            {{- if (include "farm.tlsSecret" (list . "clientCA")) }}
             - {name: tls-ca, mountPath: /etc/envoy/tls/ca, readOnly: true}
             {{- end }}
           {{- with .Values.lb.resources }}
@@ -103,11 +111,11 @@ spec:
         # envoy wants a writable /tmp and /dev/shm (--base-id) with readOnlyRootFilesystem.
         - name: tmp
           emptyDir: {medium: Memory}
-        {{- with .Values.tls.lb.existingSecret }}
+        {{- with (include "farm.tlsSecret" (list . "lb")) }}
         - name: tls-lb
           secret: {secretName: {{ . }}}
         {{- end }}
-        {{- with .Values.tls.clientCA.existingSecret }}
+        {{- with (include "farm.tlsSecret" (list . "clientCA")) }}
         - name: tls-ca
           secret: {secretName: {{ . }}}
         {{- end }}
