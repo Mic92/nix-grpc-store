@@ -101,7 +101,7 @@ jobs:
       packages: write
     strategy:
       matrix:
-        package: [nix-grpc-farm, nix-grpc-farm-lb]
+        package: [nix-grpc-farm, nix-grpc-farm-lb, nix-grpc-farm-client]
     steps:
       # Deletes per-arch children only together with their last index (see niks3#291).
       - uses: dataaxiom/ghcr-cleanup-action@v1

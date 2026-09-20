@@ -11,12 +11,16 @@ if [[ -z $version ]]; then
   exit 1
 fi
 
-# version must be plain semver without "v" prefix; tag gets "v" added below
-if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "version must match X.Y.Z without 'v' prefix, got: ${version}" >&2
+# X.Y.Z or X.Y.Z-beta.N, without "v" prefix; the tag gets "v" added below
+if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-z]+\.[0-9]+)?$ ]]; then
+  echo "version must match X.Y.Z[-pre.N] without 'v' prefix, got: ${version}" >&2
   exit 1
 fi
 tag="v${version}"
+prerelease=()
+if [[ $version == *-* ]]; then
+  prerelease=(--prerelease)
+fi
 
 if [[ "$(git symbolic-ref --short HEAD)" != "main" ]]; then
   echo "must be on main branch" >&2
@@ -72,4 +76,4 @@ git checkout main
 
 waitForPr "release-${version}"
 git pull git@github.com:Mic92/nix-grpc-store main
-gh release create "${tag}" --draft --title "${tag}" --notes ""
+gh release create "${tag}" --title "${tag}" --generate-notes "${prerelease[@]}"
