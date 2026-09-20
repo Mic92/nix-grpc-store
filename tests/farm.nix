@@ -29,17 +29,20 @@ let
   certs = pkgs.runCommand "farm-certs" { nativeBuildInputs = [ pkgs.openssl ]; } ''
     mkdir $out && cd $out
     openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout ca.key -out ca.pem -subj /CN=farm-ca
+    # The balancer's server cert comes from a "public" CA that nodes and
+    # clients only know through the system trust store, like Let's Encrypt.
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout public-ca.key -out public-ca.pem -subj /CN=public-ca
     issue() {
       openssl req -newkey rsa:2048 -nodes -keyout $1.key -out $1.csr -subj /CN=$2
-      openssl x509 -req -in $1.csr -days 3650 -CA ca.pem -CAkey ca.key -set_serial 0x$(openssl rand -hex 8) \
+      openssl x509 -req -in $1.csr -days 3650 -CA $4.pem -CAkey $4.key -set_serial 0x$(openssl rand -hex 8) \
         -extfile <(printf "subjectAltName=$3\nextendedKeyUsage=serverAuth,clientAuth") -out $1.pem
     }
-    issue lb lb "DNS:lb"
-    issue lb-client lb-1 "DNS:lb"
-    issue worker1 worker-1 "DNS:worker1,DNS:lb,IP:${ip.worker1}"
-    issue worker2 worker-2 "DNS:worker2,DNS:lb,IP:${ip.worker2}"
-    issue ci ci-1 "DNS:client"
-    issue stranger stranger "DNS:client"
+    issue lb lb "DNS:lb" public-ca
+    issue lb-client lb-1 "DNS:lb" ca
+    issue worker1 worker-1 "DNS:worker1,DNS:lb,IP:${ip.worker1}" ca
+    issue worker2 worker-2 "DNS:worker2,DNS:lb,IP:${ip.worker2}" ca
+    issue ci ci-1 "DNS:client" ca
+    issue stranger stranger "DNS:client" ca
     openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout foreign.key -out foreign.pem -subj /CN=foreign
   '';
 
@@ -65,6 +68,7 @@ let
 
   common = {
     virtualisation.memorySize = 1536;
+    security.pki.certificateFiles = [ "${certs}/public-ca.pem" ];
     nix.package = nixPkgs.nix-everything;
     nix.settings.experimental-features = [ "nix-command" ];
   };
@@ -341,8 +345,7 @@ pkgs.testers.runNixOSTest {
         assert gauge_sum(ldr, 'kind="free"') == slots
         assert gauge_sum(ldr, 'kind="queued"') == 0
 
-    tls = "ca-cert=${certs}/ca.pem"
-    ci = f"{tls}&client-cert=${certs}/ci.pem&client-key=${certs}/ci.key"
+    ci = "client-cert=${certs}/ci.pem&client-key=${certs}/ci.key"
     envoy = f"grpc://lb:50051?{ci}"
     hook = f"--max-jobs 0 --builders '{envoy}&system=${system} ${system} - 4'"
 
@@ -354,20 +357,20 @@ pkgs.testers.runNixOSTest {
         return [w.name for w in [worker1, worker2] if w.execute(f"test -e {path}")[0] == 0]
 
     def probe(query: str) -> str:
-        rc, out = client.execute(f"nix path-info --store 'grpc://lb:50051?{tls}{query}' $(readlink -f /run/current-system) 2>&1")
+        rc, out = client.execute(f"nix path-info --store 'grpc://lb:50051?{query}' $(readlink -f /run/current-system) 2>&1")
         return "ok" if rc == 0 or "is not valid" in out else out
 
     with subtest("balancer auth: client cert, bearer token, nothing, unknown CN"):
-        out = probe("&client-cert=${certs}/ci.pem&client-key=${certs}/ci.key")
+        out = probe(ci)
         assert out == "ok", out
         client.succeed("curl -sfG http://lb:8081/issue --data-urlencode 'aud=${oidcAudience}' --data-urlencode sub=dev:alice > /root/dev.jwt && test -s /root/dev.jwt")
         client.succeed("install -D ${certs}/foreign.pem /var/lib/nix-grpc-store/client.crt && install -D ${certs}/foreign.key /var/lib/nix-grpc-store/client.key")
-        out = probe("&token-file=/root/dev.jwt")
+        out = probe("token-file=/root/dev.jwt")
         client.succeed("rm -r /var/lib/nix-grpc-store")
         assert out == "ok", out
         out = probe("")
         assert "client certificate or bearer token" in out, out
-        out = probe("&client-cert=${certs}/stranger.pem&client-key=${certs}/stranger.key")
+        out = probe("client-cert=${certs}/stranger.pem&client-key=${certs}/stranger.key")
         assert "no access rule matches 'stranger'" in out, out
 
     with subtest("DAG build is scheduled across workers and lands in the cache"):
