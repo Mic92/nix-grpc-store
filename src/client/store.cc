@@ -79,6 +79,8 @@ auto GrpcStore::makeChannel(bool ownConnection) -> std::shared_ptr<grpc::Channel
   grpc::ChannelArguments args;
   // The worker protocol streams NARs; do not cap message size.
   args.SetMaxReceiveMessageSize(-1);
+  // A replaced balancer pod blackholes the first SYN; do not sit out gRPC's 20s.
+  args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, minReconnectBackoffMs);
   args.SetMaxSendMessageSize(-1);
   if (ownConnection) {
     // Private subchannel pool = own TCP connection.
@@ -129,7 +131,8 @@ GrpcStore::GrpcStore(const ref<const Config> &config)
 
 auto GrpcStore::transportError(std::string_view msg) -> bool {
   return std::ranges::any_of(
-      std::array{"Connection refused", "Connection reset", "No route", "unreachable", "timed out", "DNS", "GOAWAY"},
+      std::array{"Connection refused", "Connection reset", "No route", "unreachable", "timed out",
+                 "tcp handshaker shutdown", "DNS", "GOAWAY"},
       [&](const char * needle) -> bool { return msg.contains(needle); });
 }
 
@@ -140,7 +143,7 @@ auto GrpcStore::connectHint(const std::string & msg) const -> std::string
   if (transportError(msg)) {
     return "\nhint: could not reach the server (TCP/DNS), not a certificate problem." + more;
   }
-  if (has("handshaker shutdown") || has("Handshake") || has("SSL") || has("TLS") ||
+  if (has("Handshake") || has("SSL") || has("TLS") ||
       has("certificate") || has("Socket closed")) {
     if (!haveClientCert) {
       return "\nhint: TLS handshake failed and no client certificate was presented. If the "

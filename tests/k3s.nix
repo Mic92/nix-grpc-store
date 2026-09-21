@@ -437,6 +437,14 @@ pkgs.testers.runNixOSTest {
         assert ready == "True", ready
         sh("gc", "command -v nix-daemon && command -v niks3")  # tools survived gc
 
+    with subtest("losing the balancer mid-build: the client reconnects and the build succeeds"):
+        machine.succeed(f"systemd-run --unit vialb nix build -L --store '{store}' --eval-store auto -f ${slowExpr} --argstr tag lb1")
+        machine.wait_until_succeeds("journalctl -u vialb | grep -q \"building '/nix/store/.*-slow-lb1.drv'\"", timeout=sec(120))
+        kubectl("delete pod -l app.kubernetes.io/component=lb --wait=false")
+        machine.wait_until_succeeds("! systemctl is-active vialb", timeout=sec(180))
+        machine.succeed("systemctl show -p Result --value vialb | grep -qx success || { journalctl -u vialb >&2; false; }")
+        rollout("nix-grpc-farm-lb")
+
     with subtest("deleting a worker pod mid-build drains it: the build finishes there and publishes"):
         machine.succeed(f"systemd-run --unit slow nix build -L --store '{store}' --eval-store auto -f ${slowExpr} --argstr tag s1")
         def holder() -> str | None:
