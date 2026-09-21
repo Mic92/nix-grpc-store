@@ -121,6 +121,9 @@ let
     timeout = "2s";
     interval = cfg.healthCheckInterval;
     no_traffic_interval = cfg.healthCheckInterval;
+    # A standby that just took over should get traffic within a second.
+    unhealthy_interval = "1s";
+    unhealthy_edge_interval = "1s";
     unhealthy_threshold = 2;
     healthy_threshold = 1;
     grpc_health_check = lib.optionalAttrs (service != "") { service_name = service; };
@@ -195,7 +198,23 @@ let
     route = {
       cluster = "sched";
       timeout = "0s";
+      retry_policy = retryDeadHost;
     };
+  };
+
+  # An evicted or restarted backend stays resolvable and healthy for two
+  # probe intervals. Nothing reached it, so try the next host instead.
+  retryDeadHost = {
+    retry_on = "connect-failure,refused-stream";
+    num_retries = 2;
+    retry_host_predicate = [
+      {
+        name = "envoy.retry_host_predicates.previous_hosts";
+        typed_config."@type" =
+          "type.googleapis.com/envoy.extensions.retry.host.previous_hosts.v3.PreviousHostsPredicate";
+      }
+    ];
+    host_selection_retry_max_attempts = 3;
   };
 
   routesFor = system: [
@@ -208,6 +227,7 @@ let
       route = {
         cluster = system;
         timeout = "0s";
+        retry_policy = retryDeadHost;
       };
     }
   ];
