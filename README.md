@@ -86,6 +86,11 @@ This produces `result/bin/nix-grpc-daemon` for the server and
 `result/lib/nix/plugins/nix-grpc-store-loader.so` for the client, which
 dispatches to the plugin build matching the running Nix version.
 
+For a client outside NixOS, `nix build .#nix-with-plugin` gives a `nix`
+(and `nix-build`, `nix-store`, …) with the plugin already loaded. In
+another flake, `nix-grpc-store.lib.wrapNix pkgs pkgs.nix` does the same
+for any nixpkgs `nix`, for example to put into a CI image.
+
 ## Quick start (NixOS)
 
 Add the flake and enable the modules:
@@ -114,11 +119,9 @@ On the builder:
 
     nix-grpc-daemon --listen 0.0.0.0:50051
 
-On the client, add to `nix.conf`:
-
-    plugin-files = /path/to/lib/nix/plugins
-
-and use it like any other store URI:
+On the client, use `nix-with-plugin` (or add
+`plugin-files = /path/to/lib/nix/plugins` to `nix.conf`) and use it like
+any other store URI:
 
     nix store info --store 'grpc://builder:50051?insecure=1'
     nix build nixpkgs#hello --store 'grpc://builder:50051?insecure=1'

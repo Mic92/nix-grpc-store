@@ -20,6 +20,13 @@ in
 # Every per-version plugin package doubles as a compile check.
 lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
 // {
+  # A grpc:// URL is only understood when the plugin registered the scheme.
+  nix-with-plugin = pkgs.runCommand "nix-with-plugin-check" { } ''
+    HOME=$TMPDIR ${packages.nix-with-plugin}/bin/nix --extra-experimental-features nix-command \
+      store info --store 'grpc://127.0.0.1:1?insecure=1' 2>log || true
+    grep -q "gRPC StoreInfo" log
+    touch $out
+  '';
   # Same clang as clang-tidy so compile_commands carry flags it understands.
   # No PCH: the cc-wrapper's hardening flags are not in compile_commands, so
   # clang-tidy could not load it.

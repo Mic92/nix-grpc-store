@@ -359,10 +359,22 @@ max-jobs = 0
 builders-use-substitutes = true
 ```
 
-The client image is optional. Any image with nix works once the plugin
-is installed, for example with
-`nix profile install github:Mic92/nix-grpc-store` and
-`plugin-files = /root/.nix-profile/lib/nix/plugins` in `NIX_CONFIG`.
+The client image is optional. To use another image, put a nix in it
+that has the plugin loaded. The flake builds one from any nixpkgs `nix`:
+
+```nix
+# flake.nix of the image
+inputs.nix-grpc-store.url = "github:Mic92/nix-grpc-store";
+
+# wherever the image contents are listed, instead of pkgs.nix:
+(nix-grpc-store.lib.wrapNix pkgs pkgs.nix)
+```
+
+`wrapNix` compiles the plugin against exactly that nix and wraps `nix`,
+`nix-build`, `nix-store` and the other commands with `plugin-files`
+set, so nothing has to be added to `nix.conf`.
+`nix-grpc-store.packages.${system}.nix-with-plugin` is the same for the
+flake's own nixpkgs.
 
 ## Step 3: Connect machines outside the cluster
 
