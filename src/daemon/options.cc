@@ -19,6 +19,8 @@
 
 #include <grpc/grpc_security_constants.h>
 #include <grpcpp/security/server_credentials.h>
+#include <grpcpp/security/tls_certificate_provider.h>
+#include <grpcpp/security/tls_credentials_options.h>
 
 #include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
@@ -230,17 +232,26 @@ auto makeServerCredentials(const Options & options) -> std::shared_ptr<grpc::Ser
         }
         return grpc::InsecureServerCredentials();
     }
+    (void) nix::readFile(options.tlsKey);
+    (void) nix::readFile(options.tlsCert);
+    if (!options.clientCA.empty()) {
+        (void) nix::readFile(options.clientCA);
+    }
+    // Re-read periodically: cert-manager/ACME renew the files in place.
+    using grpc::experimental::FileWatcherCertificateProvider;
+    auto tls = grpc::experimental::TlsServerCredentialsOptions::Create(
+                   std::make_shared<FileWatcherCertificateProvider>(options.tlsKey, options.tlsCert, certRefreshSeconds))
+                   .value();
+    if (!options.clientCA.empty()) {
+        tls.set_root_certificate_provider(
+            std::make_shared<FileWatcherCertificateProvider>(options.clientCA, certRefreshSeconds));
+    }
     // Cert-less clients pass the handshake and are denied by the ACL with a
     // readable UNAUTHENTICATED instead of an opaque "Socket closed".
-    auto const clientCertRequest = options.clientCA.empty() ? GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE
-                                                             : GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY;
-    grpc::SslServerCredentialsOptions ssl(clientCertRequest);
-    ssl.pem_key_cert_pairs.push_back(
-        {.private_key = nix::readFile(options.tlsKey), .cert_chain = nix::readFile(options.tlsCert)});
-    if (!options.clientCA.empty()) {
-        ssl.pem_root_certs = nix::readFile(options.clientCA);
-    }
-    return grpc::SslServerCredentials(ssl);
+    tls.set_cert_request_type(
+        options.clientCA.empty() ? GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE
+                                 : GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY);
+    return grpc::experimental::TlsServerCredentials(tls);
 }
 
 

@@ -82,6 +82,7 @@ pkgs.testers.runNixOSTest {
       environment.systemPackages = [
         pkgs.perf
         pkgs.curl
+        pkgs.openssl
       ];
       # Allow perf to resolve kernel symbols and record system-wide as root.
       boot.kernel.sysctl."kernel.kptr_restrict" = 0;
@@ -284,6 +285,21 @@ pkgs.testers.runNixOSTest {
             f"nix build --store '{store_mtls}' --impure -f /etc/hello.nix "
             "--no-link --print-out-paths"
         )
+
+    with subtest("a renewed server certificate is served without restart"):
+        machine.succeed(
+            "cd ${certDir} && "
+            "openssl req -newkey rsa:2048 -nodes -keyout new.key -out new.csr -subj /CN=localhost 2>/dev/null && "
+            "openssl x509 -req -in new.csr -days 1 -CA ca.pem -CAkey ca.key -set_serial 0x$RANDOM "
+            "-extfile <(printf 'subjectAltName=DNS:localhost,DNS:renewed.example') -out new.pem && "
+            "mv new.key server.key && mv new.pem server.pem"
+        )
+        machine.wait_until_succeeds(
+            "openssl s_client -connect localhost:50052 </dev/null 2>/dev/null "
+            "| openssl x509 -noout -ext subjectAltName | grep -q renewed.example",
+            timeout=30,
+        )
+        machine.succeed(f"nix store info --json --store '{store_mtls}'")
 
     with subtest("missing client cert yields a readable error"):
         machine.wait_for_unit("nix-grpc-daemon-strict.service")

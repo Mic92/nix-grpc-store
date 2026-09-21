@@ -25,6 +25,8 @@
 #include <grpcpp/create_channel.h>
 #include <grpcpp/health_check_service_interface.h>
 #include <grpcpp/security/credentials.h>
+#include <grpcpp/security/tls_certificate_provider.h>
+#include <grpcpp/security/tls_credentials_options.h>
 #include <grpcpp/server.h>
 #include <grpcpp/server_context.h>
 #include <grpcpp/support/server_callback.h>
@@ -279,18 +281,26 @@ auto schedulerCreds(const Options & options) -> std::shared_ptr<grpc::ChannelCre
     if (options.schedulerAddr.starts_with(plaintextScheme)) {
         return grpc::InsecureChannelCredentials();
     }
-    grpc::SslCredentialsOptions ssl;
+    std::string roots;
     if (auto bundle = defaultCaCert(); !bundle.empty()) {
-        ssl.pem_root_certs = nix::readFile(bundle);
+        roots = nix::readFile(bundle);
     }
     if (!options.clientCA.empty()) {
-        ssl.pem_root_certs += "\n" + nix::readFile(options.clientCA);
+        roots += "\n" + nix::readFile(options.clientCA);
+    }
+    grpc::experimental::TlsChannelCredentialsOptions tls;
+    if (!roots.empty()) {
+        auto rootProvider = std::make_shared<grpc::experimental::InMemoryCertificateProvider>();
+        if (auto status = rootProvider->UpdateRoot(roots); !status.ok()) {
+            throw nix::Error("loading CA certificates: %s", status.ToString());
+        }
+        tls.set_root_certificate_provider(rootProvider);
     }
     if (!options.tlsCert.empty()) {
-        ssl.pem_cert_chain = nix::readFile(options.tlsCert);
-        ssl.pem_private_key = nix::readFile(options.tlsKey);
+        tls.set_identity_certificate_provider(std::make_shared<grpc::experimental::FileWatcherCertificateProvider>(
+            options.tlsKey, options.tlsCert, certRefreshSeconds));
     }
-    std::shared_ptr<grpc::ChannelCredentials> creds = grpc::SslCredentials(ssl);
+    std::shared_ptr<grpc::ChannelCredentials> creds = grpc::experimental::TlsCredentials(tls);
     if (!options.schedulerTokenFile.empty()) {
         creds = grpc::CompositeChannelCredentials(
             creds,
