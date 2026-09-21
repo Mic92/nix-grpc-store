@@ -75,6 +75,7 @@
         {
           inherit (scope)
             default
+            nix-with-plugin
             jwt-cpp
             plugin-dispatcher
             fuzzers
@@ -105,6 +106,9 @@
       );
 
       dashboards.farm = ./deploy/helm/nix-grpc-farm/files/farm.json;
+
+      # nix-grpc-store.lib.wrapNix pkgs pkgs.nix: that nix with the plugin loaded.
+      lib.wrapNix = pkgs: (packageSetFor pkgs).wrapNix;
 
       nixosModules = {
         server = ./nixos/server.nix;

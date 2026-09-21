@@ -34,6 +34,8 @@ lib.makeScope newScope (
   in
   {
     jwt-cpp = self.callPackage ./jwt-cpp.nix { };
+    wrapNix = self.callPackage ./wrap-nix.nix { };
+    nix-with-plugin = self.wrapNix nix;
     harmonia-gc = self.callPackage ./harmonia-gc.nix { };
 
     # Kubernetes images, see deploy/helm. Built against `nix`, not nixPackages.
