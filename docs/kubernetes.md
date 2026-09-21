@@ -162,6 +162,7 @@ tls:
 cert-manager then creates a private CA for the farm and issues the
 balancer and worker certificates from it. It also creates an Issuer,
 `farm-nix-grpc-farm`, that signs the client certificates in step 3.
+Renewals are picked up by the running pods without a restart.
 
 The balancer certificate is valid for the Service name,
 `farm-nix-grpc-farm.farm.svc`. Clients that connect from outside the

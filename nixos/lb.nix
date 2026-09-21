@@ -12,10 +12,41 @@ let
   cfg = config.services.nix-grpc-farm-lb;
 
   file = path: { filename = toString path; };
-  tlsCert = {
-    certificate_chain = file cfg.tls.certFile;
-    private_key = file cfg.tls.keyFile;
+  json = pkgs.formats.json { };
+
+  # Filesystem SDS so certs renewed in place (ACME) are reloaded.
+  sdsFile =
+    name: body:
+    json.generate "envoy-sds-${name}.json" {
+      resources = [
+        (
+          {
+            "@type" = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret";
+            inherit name;
+          }
+          // body
+        )
+      ];
+    };
+  sds = name: dir: body: {
+    inherit name;
+    sds_config = {
+      resource_api_version = "V3";
+      path_config_source = {
+        path = toString (sdsFile name body);
+        watched_directory.path = dir;
+      };
+    };
   };
+  certSds =
+    name: certFile: keyFile:
+    sds name (builtins.dirOf (toString certFile)) {
+      tls_certificate = {
+        certificate_chain = file certFile;
+        private_key = file keyFile;
+      };
+    };
+  caSds = name: caFile: sds name (builtins.dirOf (toString caFile)) { validation_context.trusted_ca = file caFile; };
 
   upstreamTls = lib.optionalAttrs (cfg.tls.upstream.certFile != null) {
     transport_socket = {
@@ -24,13 +55,10 @@ let
         "@type" = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
         common_tls_context = {
           alpn_protocols = [ "h2" ];
-          tls_certificates = [
-            {
-              certificate_chain = file cfg.tls.upstream.certFile;
-              private_key = file cfg.tls.upstream.keyFile;
-            }
+          tls_certificate_sds_secret_configs = [
+            (certSds "lb" cfg.tls.upstream.certFile cfg.tls.upstream.keyFile)
           ];
-          validation_context.trusted_ca = file cfg.tls.upstream.caFile;
+          validation_context_sds_secret_config = caSds "ca" cfg.tls.upstream.caFile;
         };
       }
       // lib.optionalAttrs (cfg.tls.upstream.sni != null) { inherit (cfg.tls.upstream) sni; };
@@ -52,10 +80,10 @@ let
         "@type" = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext";
         common_tls_context = {
           alpn_protocols = [ "h2" ];
-          tls_certificates = [ tlsCert ];
+          tls_certificate_sds_secret_configs = [ (certSds "lb" cfg.tls.certFile cfg.tls.keyFile) ];
         }
         // lib.optionalAttrs (cfg.tls.clientCaFile != null) {
-          validation_context.trusted_ca = file cfg.tls.clientCaFile;
+          validation_context_sds_secret_config = caSds "ca" cfg.tls.clientCaFile;
         };
       }
       // lib.optionalAttrs (cfg.tls.clientCaFile != null) {
@@ -335,6 +363,10 @@ in
       # Validation resolves STRICT_DNS names, which the build sandbox cannot.
       requireValidConfig = false;
       settings = {
+        node = {
+          id = "nix-grpc-farm-lb";
+          cluster = "nix-grpc-farm";
+        };
         admin = lib.mkIf (cfg.admin != null) { address = (endpoint cfg.admin).endpoint.address; };
         static_resources = {
           listeners = [

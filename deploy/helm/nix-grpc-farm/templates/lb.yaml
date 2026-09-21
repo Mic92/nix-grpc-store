@@ -7,6 +7,8 @@ metadata:
   labels: {{- include "farm.labels" . | nindent 4 }}
 data:
   envoy.json: {{ include "farm.envoy.config" . | quote }}
+  sds-lb.yaml: {{ include "farm.envoy.sdsFile" "lb" | quote }}
+  sds-ca.yaml: {{ include "farm.envoy.sdsFile" "ca" | quote }}
 ---
 apiVersion: v1
 kind: Service
@@ -94,6 +96,8 @@ spec:
             periodSeconds: 30
           volumeMounts:
             - {name: config, mountPath: /etc/envoy/envoy.json, subPath: envoy.json, readOnly: true}
+            - {name: config, mountPath: /etc/envoy/sds-lb.yaml, subPath: sds-lb.yaml, readOnly: true}
+            - {name: config, mountPath: /etc/envoy/sds-ca.yaml, subPath: sds-ca.yaml, readOnly: true}
             - {name: tmp, mountPath: /tmp}
             {{- if (include "farm.tlsSecret" (list . "lb")) }}
             - {name: tls-lb, mountPath: /etc/envoy/tls/lb, readOnly: true}

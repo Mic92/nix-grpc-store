@@ -1,5 +1,24 @@
 {{/* Envoy bootstrap, mirrors nixos/lb.nix. checks.helm diffs the two. */}}
 
+{{/* Filesystem SDS so certs renewed in place by cert-manager are reloaded. */}}
+{{- define "farm.envoy.sds" -}}
+{name: {{ . }}, sds_config: {resource_api_version: V3, path_config_source: {path: /etc/envoy/sds-{{ . }}.yaml, watched_directory: {path: /etc/envoy/tls/{{ . }}}}}}
+{{- end }}
+
+{{- define "farm.envoy.sdsFile" -}}
+resources:
+  - "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret
+    name: {{ . }}
+    {{- if eq . "lb" }}
+    tls_certificate:
+      certificate_chain: {filename: /etc/envoy/tls/lb/tls.crt}
+      private_key: {filename: /etc/envoy/tls/lb/tls.key}
+    {{- else }}
+    validation_context:
+      trusted_ca: {filename: /etc/envoy/tls/ca/ca.crt}
+    {{- end }}
+{{- end }}
+
 {{- define "farm.envoy.clusterCommon" -}}
 {{- $root := .root }}
 name: {{ .name | quote }}
@@ -46,13 +65,10 @@ transport_socket:
     common_tls_context:
       alpn_protocols: [h2]
       {{- if (include "farm.tlsSecret" (list $root "lb")) }}
-      tls_certificates:
-        - certificate_chain: {filename: /etc/envoy/tls/lb/tls.crt}
-          private_key: {filename: /etc/envoy/tls/lb/tls.key}
+      tls_certificate_sds_secret_configs: [{{ include "farm.envoy.sds" "lb" }}]
       {{- end }}
       {{- if (include "farm.tlsSecret" (list $root "clientCA")) }}
-      validation_context:
-        trusted_ca: {filename: /etc/envoy/tls/ca/ca.crt}
+      validation_context_sds_secret_config: {{ include "farm.envoy.sds" "ca" }}
       {{- end }}
 {{- end }}
 {{- end }}
@@ -133,12 +149,9 @@ filter_chains:
         {{- end }}
         common_tls_context:
           alpn_protocols: [h2]
-          tls_certificates:
-            - certificate_chain: {filename: /etc/envoy/tls/lb/tls.crt}
-              private_key: {filename: /etc/envoy/tls/lb/tls.key}
+          tls_certificate_sds_secret_configs: [{{ include "farm.envoy.sds" "lb" }}]
           {{- if (include "farm.tlsSecret" (list . "clientCA")) }}
-          validation_context:
-            trusted_ca: {filename: /etc/envoy/tls/ca/ca.crt}
+          validation_context_sds_secret_config: {{ include "farm.envoy.sds" "ca" }}
           {{- end }}
     {{- end }}
 {{- end }}
@@ -161,6 +174,7 @@ filter_chains:
 {{- $clusters = append $clusters (include "farm.envoy.clusterCommon" (dict "root" $root "name" "sched" "service" (include "farm.schedulerNames" $root) "healthService" "nix.scheduler") | fromYaml) }}
 {{- $listener := include "farm.envoy.listener" (dict "Values" .Values "Chart" .Chart "Release" .Release "routes" $routes) | fromYaml }}
 {{- toJson (dict
+  "node" (dict "id" "nix-grpc-farm-lb" "cluster" "nix-grpc-farm")
   "admin" (dict "address" (dict "socket_address" (dict "address" "::" "port_value" 9901 "ipv4_compat" true)))
   "static_resources" (dict "listeners" (list $listener) "clusters" $clusters)
 ) }}
