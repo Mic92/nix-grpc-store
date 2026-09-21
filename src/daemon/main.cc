@@ -476,13 +476,16 @@ public:
         -> std::optional<std::string>
     {
         log({.text = "attached to the build already running on this worker"});
+        shared.attached++;
         std::unique_lock lock(shared.mutex);
         while (!shared.finished) {
             if (context.IsCancelled() || stopSignal >= nixgrpc::kCancelBuilds) {
+                shared.attached--;
                 return std::nullopt;
             }
             shared.cv.wait_for(lock, nixgrpc::cancelPoll);
         }
+        shared.attached--;
         return shared.resultWire;
     }
 
@@ -578,7 +581,7 @@ public:
         std::vector<std::pair<std::string, uint64_t>> & outputs) -> grpc::Status
     {
         auto cancelled = [&]() -> bool {
-            return context.IsCancelled() || shared.revoked || stopSignal >= nixgrpc::kCancelBuilds;
+            return (context.IsCancelled() && shared.attached == 0) || shared.revoked || stopSignal >= nixgrpc::kCancelBuilds;
         };
         nixgrpc::Metrics::Held const held(metrics, "BuildDerivation");
         nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "substitute");
