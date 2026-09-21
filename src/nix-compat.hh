@@ -399,5 +399,27 @@ inline auto maxBuildJobs() -> unsigned {
   return has(nix::settings);
 }
 
+inline auto buildTimeout() -> time_t {
+  constexpr auto get = []<typename S>(S &settings) -> time_t {
+    if constexpr (requires { settings.getWorkerSettings(); }) {
+      return settings.getWorkerSettings().buildTimeout;
+    } else {
+      return settings.buildTimeout;
+    }
+  };
+  return get(nix::settings);
+}
+
+inline auto maxSilentTime() -> time_t {
+  constexpr auto get = []<typename S>(S &settings) -> time_t {
+    if constexpr (requires { settings.getWorkerSettings(); }) {
+      return settings.getWorkerSettings().maxSilentTime;
+    } else {
+      return settings.maxSilentTime;
+    }
+  };
+  return get(nix::settings);
+}
+
 } // namespace nixcompat
 // NOLINTEND(cppcoreguidelines-macro-usage)

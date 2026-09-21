@@ -496,6 +496,7 @@ public:
         const nix::StorePath & drvPath,
         const nix::BasicDerivation & drv,
         nix::BuildMode mode,
+        nixgrpc::Backends::Limits limits,
         const nixgrpc::BuildEventSink & log,
         nix::remote::BuildDerivationDone & done) -> grpc::Status
     {
@@ -546,7 +547,7 @@ public:
         auto report = [&]() -> void { builder.finished(drvName, outcome, outputs, wire); };
         try {
             auto status =
-                buildExpected(context, *adm->shared, localStore, drvPath, drv, mode, log, outPaths, done, outcome, outputs);
+                buildExpected(context, *adm->shared, localStore, drvPath, drv, mode, limits, log, outPaths, done, outcome, outputs);
             wire = done.SerializeAsString();
             if (!status.ok()) {
                 outcome = nix::remote::Done::FAILED;
@@ -574,6 +575,7 @@ public:
         const nix::StorePath & drvPath,
         const nix::BasicDerivation & drv,
         nix::BuildMode mode,
+        nixgrpc::Backends::Limits limits,
         const nixgrpc::BuildEventSink & log,
         const std::map<std::string, nix::StorePath> & outPaths,
         nix::remote::BuildDerivationDone & done,
@@ -598,7 +600,7 @@ public:
         try {
             phase.next("build");
             nixgrpc::Metrics::Held const building(metrics, "build_slot");
-            res = backends.storedBuild(cancelled, localStore, drvPath, mode, log);
+            res = backends.storedBuild(cancelled, localStore, drvPath, mode, limits, log);
             phase.done();
         } catch (nix::Error &) {
             if (cancelled()) {
@@ -661,9 +663,12 @@ public:
             nix::BasicDerivation drv;
             nixcompat::readDrv(drvSource, *localStore, drv, nix::Derivation::nameFromPath(drvPath));
             auto const mode = static_cast<nix::BuildMode>(request->build_mode());
+            nixgrpc::Backends::Limits const limits{
+                .buildTimeout = request->build_timeout(), .maxSilentTime = request->max_silent_time()};
 
             nix::remote::BuildDerivationChunk chunk;
-            if (auto status = build(*context, *localStore, drvPath, drv, mode, sendLogLine, *chunk.mutable_done()); !status.ok()) {
+            if (auto status = build(*context, *localStore, drvPath, drv, mode, limits, sendLogLine, *chunk.mutable_done());
+                !status.ok()) {
                 return {status.error_code(), workerName + ": " + status.error_message()};
             }
             writer->Write(chunk);

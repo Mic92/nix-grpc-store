@@ -41,15 +41,16 @@ namespace nixgrpc {
 
 namespace {
 // No build hook: it would bypass the scheduler.
-void buildLocally(Backend::Conn & conn)
+void buildLocally(Backend::Conn & conn, Backends::Limits limits)
 {
     constexpr uint64_t off = 0;
     constexpr uint64_t yes = 1;
     conn.to << nix::WorkerProto::Op::SetOptions << off /* keepFailed */ << off /* keepGoing */
             << off /* tryFallback */ << off /* verbosity */ << yes /* maxBuildJobs */
-            << off /* maxSilentTime */ << yes << off /* verbosity */ << off << off << off /* buildCores */
+            << limits.maxSilentTime << yes << off /* verbosity */ << off << off << off /* buildCores */
             << yes /* useSubstitutes */;
-    std::map<std::string, std::string> const overrides{{"builders", ""}};
+    std::map<std::string, std::string> const overrides{
+        {"builders", ""}, {"timeout", std::to_string(limits.buildTimeout)}};
     conn.to << overrides.size();
     for (const auto & [name, value] : overrides) {
         conn.to << name << value;
@@ -121,10 +122,11 @@ auto Backends::storedBuild(
     nix::Store & localStore,
     const nix::StorePath & drvPath,
     nix::BuildMode mode,
+    Limits limits,
     const BuildEventSink & sendLogLine) const -> nix::BuildResult
 {
     auto backend = forBuild(std::move(cancelled), localStore);
-    buildLocally(backend->conn);
+    buildLocally(backend->conn, limits);
     std::vector<nix::DerivedPath> const targets{nix::DerivedPath::Built{
         .drvPath = nix::makeConstantStorePathRef(drvPath), .outputs = nix::OutputsSpec::All{}}};
     auto results = buildPathsVia(*backend, localStore, targets, mode, sendLogLine);

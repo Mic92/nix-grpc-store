@@ -60,11 +60,18 @@ struct Backends
 
     // By path, not inline: nix-daemon recomputes output paths from the stored
     // closure, so a forged drv cannot claim foreign paths. No build hook.
+    struct Limits
+    {
+        uint64_t buildTimeout = 0;
+        uint64_t maxSilentTime = 0;
+    };
+
     [[nodiscard]] auto storedBuild(
         Cancelled cancelled,
         nix::Store & localStore,
         const nix::StorePath & drvPath,
         nix::BuildMode mode,
+        Limits limits,
         const BuildEventSink & sendLogLine) const -> nix::BuildResult;
 };
 

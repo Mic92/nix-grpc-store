@@ -271,6 +271,7 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     import re
+    import time
     from datetime import timedelta
     def sec(n: int) -> timedelta:
         return timedelta(seconds=n)
@@ -412,6 +413,13 @@ pkgs.testers.runNixOSTest {
         idle, busy = sorted(ids, key=len)
         assert idle == [] and len(busy) == 2 and len(set(busy)) == 1, ids
         assert sum(events(w, "attached") for w in [worker1, worker2]) == 1
+
+    with subtest("--timeout and --max-silent-time reach the builder"):
+        for flag in ["--timeout 5", "--max-silent-time 5"]:
+            t0 = time.monotonic()
+            rc, out = client.execute(f"nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag tmo{flag[2]} {flag} 2>&1")
+            assert rc != 0 and "timed out" in out and time.monotonic() - t0 < 60, (flag, rc, time.monotonic() - t0, out)
+        assert building() == []
 
     with subtest("the first client leaving does not fail the second"):
         client.succeed(f"systemd-run --unit share1 nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag share")

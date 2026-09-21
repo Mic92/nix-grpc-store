@@ -58,6 +58,9 @@ message BuildDerivationRequest {
   uint32 protocol = 4;
   // From Assigned, for log correlation only.
   uint64 assign_id = 5;
+  // The client's build-timeout / max-silent-time settings, 0 = none.
+  uint64 build_timeout = 6;
+  uint64 max_silent_time = 7;
 }
 
 // `result` is the worker-protocol BuildResult serialisation at the request's
