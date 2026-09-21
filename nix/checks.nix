@@ -16,6 +16,10 @@ let
     nixPkgs = nixPackages;
     clientModule = nixosModule;
   };
+  # Drop once NixOS/nixpkgs#563394 reaches nixos-unstable.
+  clangTools = pkgs.llvmPackages_22.clang-tools.overrideAttrs (old: {
+    buildInputs = (old.buildInputs or [ ]) ++ [ pkgs.bash ];
+  });
 in
 # Every per-version plugin package doubles as a compile check.
 lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
@@ -27,13 +31,14 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     grep -q "gRPC StoreInfo" log
     touch $out
   '';
+  # LLVM 23 is not in the darwin cache yet.
   # Same clang as clang-tidy so compile_commands carry flags it understands.
   # No PCH: the cc-wrapper's hardening flags are not in compile_commands, so
   # clang-tidy could not load it.
-  clang-tidy = (packages.default.override { stdenv = pkgs.llvmPackages_latest.stdenv; }).overrideAttrs (old: {
+  clang-tidy = (packages.default.override { stdenv = pkgs.llvmPackages_22.stdenv; }).overrideAttrs (old: {
     pname = "nix-grpc-store-clang-tidy";
     separateDebugInfo = false;
-    nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.llvmPackages_latest.clang-tools ];
+    nativeBuildInputs = old.nativeBuildInputs ++ [ clangTools ];
     mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Db_pch=false" ];
     # Meson generates a clang-tidy target from .clang-tidy. The generated
     # protobuf headers must exist before it runs.
