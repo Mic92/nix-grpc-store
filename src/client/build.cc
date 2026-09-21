@@ -123,6 +123,8 @@ auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore)
   request.set_build_mode(static_cast<uint32_t>(buildMode));
   request.set_protocol(nixcompat::kBuildProtocolWire);
   request.set_assign_id(job.assignId);
+  request.set_build_timeout(static_cast<uint64_t>(nixcompat::buildTimeout()));
+  request.set_max_silent_time(static_cast<uint64_t>(nixcompat::maxSilentTime()));
   {
     StringSink sink;
     nixcompat::writeDrv(sink, *this, job.drv);
