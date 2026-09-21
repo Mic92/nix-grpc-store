@@ -45,7 +45,7 @@ namespace nix {
 
 auto GrpcStore::sslOptions() -> grpc::SslCredentialsOptions {
   grpc::SslCredentialsOptions ssl;
-  auto caCert = config->caCert.get().empty() ? nixgrpc::defaultCaCert() : config->caCert.get();
+  auto const caCert = config->caCert.get().empty() ? nixgrpc::defaultCaCert() : config->caCert.get();
   if (!caCert.empty()) {
     ssl.pem_root_certs = readFile(caCert);
   }
@@ -124,7 +124,7 @@ GrpcStore::GrpcStore(const ref<const Config> &config)
     }
   }
 
-  auto channel = makeChannel(false);
+  auto const channel = makeChannel(false);
   stub = remote::NixRemote::NewStub(channel);
   sched = remote::Scheduler::NewStub(channel);
 }
@@ -138,7 +138,7 @@ auto GrpcStore::transportError(std::string_view msg) -> bool {
 
 auto GrpcStore::connectHint(const std::string & msg) const -> std::string
 {
-  auto has = [&](std::string_view needle) -> bool { return msg.contains(needle); };
+  auto const has = [&](std::string_view needle) -> bool { return msg.contains(needle); };
   std::string const more = config->debug ? "" : " Set NIX_GRPC_DEBUG=1 for a handshake trace.";
   if (transportError(msg)) {
     return "\nhint: could not reach the server (TCP/DNS), not a certificate problem." + more;
@@ -159,7 +159,7 @@ auto GrpcStore::connectHint(const std::string & msg) const -> std::string
 auto GrpcStore::statusError(const grpc::Status & status, const char * opName) const -> Error
 {
   std::string hint;
-  auto code = status.error_code();
+  auto const code = status.error_code();
   if (!config->insecure &&
       (code == grpc::StatusCode::UNAUTHENTICATED || code == grpc::StatusCode::UNAVAILABLE)) {
     hint = connectHint(status.error_message());
@@ -183,10 +183,10 @@ auto GrpcStore::goneAway(const grpc::Status & status) -> bool {
 }
 
 auto GrpcStore::isTrustedClient() -> std::optional<TrustedFlag> {
-  std::call_once(trustedOnce, [&]() -> void {
+  std::call_once(trustedOnce, [&] -> void {
     remote::StoreInfoRequest const request;
     remote::StoreInfoReply reply;
-    retrying("StoreInfo", [&]() -> grpc::Status {
+    retrying("StoreInfo", [&] -> grpc::Status {
       grpc::ClientContext ctx;
       return stub->StoreInfo(&ctx, request, &reply);
     });
@@ -198,7 +198,7 @@ auto GrpcStore::isTrustedClient() -> std::optional<TrustedFlag> {
 }
 
 auto GrpcStore::openConnection() -> ref<RemoteStore::Connection> {
-  auto conn = make_ref<Connection>();
+  auto const conn = make_ref<Connection>();
 
   conn->stream = stub->Connect(&conn->ctx);
   if (!conn->stream) {
@@ -231,7 +231,7 @@ auto GrpcStore::openConnection() -> ref<RemoteStore::Connection> {
       ignoreExceptionInDestructor();
     }
     // RemoteStore only sees EOF on the pipe, so surface the real status here.
-    auto status = connPtr->stream->Finish();
+    auto const status = connPtr->stream->Finish();
     connPtr->finished = true;
     if (!status.ok() && status.error_code() != grpc::StatusCode::CANCELLED) {
       logError(statusError(status, "Connect").info());
@@ -256,8 +256,8 @@ namespace {
 
 // "2.31.5" / "2.35pre20260619_f8bb823a" -> "2.31" / "2.35"
 auto majorMinor(std::string_view version) -> std::string_view {
-  auto firstDot = version.find('.');
-  auto end = version.find_first_not_of("0123456789", firstDot + 1);
+  auto const firstDot = version.find('.');
+  auto const end = version.find_first_not_of("0123456789", firstDot + 1);
   return version.substr(0, end);
 }
 
@@ -266,8 +266,8 @@ auto majorMinor(std::string_view version) -> std::string_view {
 // Called by Nix right after dlopen(). Registering here instead of in a static
 // initializer lets a version mismatch degrade to a warning.
 extern "C" void nix_plugin_entry() {
-  auto running = majorMinor(nix::nixVersion);
-  auto builtAgainst = majorMinor(NIX_GRPC_BUILT_AGAINST_NIX);
+  auto const running = majorMinor(nix::nixVersion);
+  auto const builtAgainst = majorMinor(NIX_GRPC_BUILT_AGAINST_NIX);
   if (running != builtAgainst) {
     nix::warn(
         "nix-grpc-store plugin was built against Nix %s but is being loaded by Nix %s. "

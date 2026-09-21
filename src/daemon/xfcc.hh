@@ -68,7 +68,7 @@ public:
 
     auto remaining() -> std::string_view
     {
-        auto out = rest;
+        auto const out = rest;
         rest = {};
         return out;
     }

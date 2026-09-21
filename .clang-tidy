@@ -7,12 +7,14 @@
 #  - clang-analyzer-optin.cplusplus.VirtualCall: fires only inside Nix's
 #    serialise.hh (EnsureRead destructor); nothing to fix on our side
 #  - misc-header-include-cycle: curl.h includes itself via multi.h/urlapi.h
+#  - readability-trailing-comma: contradicts itself on nested initializers
 Checks: >
   *,
   -portability-avoid-pragma-once,
   -portability-template-virtual-member-function,
   -clang-analyzer-optin.cplusplus.VirtualCall,
   -misc-header-include-cycle,
+  -readability-trailing-comma,
   -abseil-*,
   -altera-*,
   -android-*,

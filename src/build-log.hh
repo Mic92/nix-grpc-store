@@ -39,14 +39,14 @@ public:
 #endif
 
 // nix::readString() preallocates the announced length.
-constexpr size_t kMaxLogString = 1UL << 20;
+constexpr size_t kMaxLogString = size_t{1} << 20U;
 
 namespace detail {
 
 inline auto readLogFields(nix::Source & source) -> std::vector<std::string>
 {
     std::vector<std::string> fields;
-    auto count = nix::readNum<uint64_t>(source);
+    auto const count = nix::readNum<uint64_t>(source);
     for (uint64_t idx = 0; idx < count; ++idx) {
         auto type = nix::readNum<uint64_t>(source);
         if (type == 0) {
@@ -90,7 +90,7 @@ inline void relayBuildLog(nix::Source & source, const BuildEventSink & send)
             nix::readNum<uint64_t>(source);
         } else if (msg == STDERR_RESULT) {
             nix::readNum<uint64_t>(source); // id
-            auto type = nix::readNum<uint64_t>(source);
+            auto const type = nix::readNum<uint64_t>(source);
             auto fields = detail::readLogFields(source);
             if (type == nix::resBuildLogLine && !fields.empty()) {
                 send({.text = std::move(fields.front())});

@@ -35,7 +35,7 @@ struct Reader
 };
 
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): curl's signature
-auto onData(char * data, size_t size, size_t nmemb, void * userp) noexcept -> size_t
+auto onData(char const * data, size_t size, size_t nmemb, void * userp) noexcept -> size_t
 {
     auto & reader = *static_cast<Reader *>(userp);
     try {
@@ -43,7 +43,7 @@ auto onData(char * data, size_t size, size_t nmemb, void * userp) noexcept -> si
         for (size_t eol = 0; (eol = reader.buf.find('\n')) != std::string::npos;) {
             auto line = nlohmann::json::parse(std::string_view(reader.buf).substr(0, eol), nullptr, false);
             reader.buf.erase(0, eol + 1);
-            if (auto lead = line.find("lead"); line.is_object() && lead != line.end() && lead->is_boolean()) {
+            if (auto const lead = line.find("lead"); line.is_object() && lead != line.end() && lead->is_boolean()) {
                 reader.lead(lead->get<bool>());
             }
         }
@@ -105,14 +105,14 @@ void Elector::run(const std::stop_token & stop)
             call->opt(CURLOPT_NOPROGRESS, 0L);
             call->opt(CURLOPT_XFERINFODATA, &reader);
             call->opt(CURLOPT_XFERINFOFUNCTION, &onProgress);
-            auto status = call->perform();
+            auto const status = call->perform();
             if (!stop.stop_requested()) {
                 logLine(LogLevel::info, {{"event", "scheduler_lock_lost"}, {"status", std::to_string(status)}});
             }
         } catch (const std::exception & e) {
             logLine(LogLevel::info, {{"event", "scheduler_lock_lost"}, {"error", e.what()}});
         }
-        auto now = std::chrono::steady_clock::now();
+        auto const now = std::chrono::steady_clock::now();
         lostAt = lostAt.value_or(now);
         if (!active || now - *lostAt > grace) {
             set(false);

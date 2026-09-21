@@ -93,7 +93,7 @@ void Builder::onRevoke(const nix::remote::Revoke & rev)
     uint64_t assignId = 0;
     {
         auto lck = state.lock();
-        auto found = lck->expected.find(rev.drv_path());
+        auto const found = lck->expected.find(rev.drv_path());
         if (found == lck->expected.end()) {
             return;
         }
@@ -112,7 +112,7 @@ void Builder::onRevoke(const nix::remote::Revoke & rev)
 auto Builder::admit(const std::string & drvPath) -> std::optional<Admission>
 {
     auto lck = state.lock();
-    auto found = lck->expected.find(drvPath);
+    auto const found = lck->expected.find(drvPath);
     if (found == lck->expected.end()) {
         return std::nullopt;
     }
@@ -132,7 +132,7 @@ void Builder::finished(
     std::shared_ptr<Expected::Shared> shared;
     {
         auto lck = state.lock();
-        auto found = lck->expected.find(drvPath);
+        auto const found = lck->expected.find(drvPath);
         if (found != lck->expected.end()) {
             assignId = found->second.assignId;
             shared = found->second.shared;
@@ -249,8 +249,8 @@ auto SchedulerService::Schedule(grpc::CallbackServerContext * context)
     if (!active_) {
         return new RejectReactor<ClientMsgs, SchedMsgs>(passive()); // NOLINT(cppcoreguidelines-owning-memory): deletes itself in OnDone
     }
-    auto caller = auth->identify(*context);
-    if (auto status = Auth::authorize(caller, "Schedule", Role::write); !status.ok()) {
+    auto const caller = auth->identify(*context);
+    if (auto const status = Auth::authorize(caller, "Schedule", Role::write); !status.ok()) {
         return new RejectReactor<ClientMsgs, SchedMsgs>(status); // NOLINT(cppcoreguidelines-owning-memory)
     }
     return new ScheduleReactor(context, *dispatcher); // NOLINT(cppcoreguidelines-owning-memory)
@@ -263,7 +263,7 @@ auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
         return new RejectReactor<WorkerMsgs, SchedCmds>(passive()); // NOLINT(cppcoreguidelines-owning-memory)
     }
     auto caller = auth->identify(*context);
-    if (auto status = Auth::authorize(caller, "WorkerSession", Role::trusted); !status.ok()) {
+    if (auto const status = Auth::authorize(caller, "WorkerSession", Role::trusted); !status.ok()) {
         return new RejectReactor<WorkerMsgs, SchedCmds>(status); // NOLINT(cppcoreguidelines-owning-memory)
     }
     logLine(LogLevel::info, {{"event", "worker_session_open"}, {"cn", caller.name}, {"peer", context->peer()}});
@@ -283,7 +283,7 @@ auto schedulerCreds(const Options & options) -> std::shared_ptr<grpc::ChannelCre
         return grpc::InsecureChannelCredentials();
     }
     std::string roots;
-    if (auto bundle = defaultCaCert(); !bundle.empty()) {
+    if (auto const bundle = defaultCaCert(); !bundle.empty()) {
         roots = nix::readFile(bundle);
     }
     if (!options.clientCA.empty()) {
@@ -291,8 +291,8 @@ auto schedulerCreds(const Options & options) -> std::shared_ptr<grpc::ChannelCre
     }
     grpc::experimental::TlsChannelCredentialsOptions tls;
     if (!roots.empty()) {
-        auto rootProvider = std::make_shared<grpc::experimental::InMemoryCertificateProvider>();
-        if (auto status = rootProvider->UpdateRoot(roots); !status.ok()) {
+        auto const rootProvider = std::make_shared<grpc::experimental::InMemoryCertificateProvider>();
+        if (auto const status = rootProvider->UpdateRoot(roots); !status.ok()) {
             throw nix::Error("loading CA certificates: %s", status.ToString());
         }
         tls.set_root_certificate_provider(rootProvider);
@@ -362,14 +362,14 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
     }
     if (builder && dispatcher && options.schedulerAddr.empty()) {
         // In-process worker: the Dispatcher calls straight into the Builder.
-        auto worker =
+        auto const worker =
             std::make_shared<Dispatcher::Worker>(Dispatcher::Worker{.send = [this](const SchedCmd & cmd) -> bool {
                 // Called under the dispatcher mutex; Builder takes only its own lock.
                 if (cmd.has_expect()) {
                     builder->onExpect(cmd.expect());
                 } else if (cmd.has_revoke()) {
                     // Revoke answers with Done, which re-enters the dispatcher: defer.
-                    std::thread([this, rev = cmd.revoke()]() -> void { builder->onRevoke(rev); }).detach();
+                    std::thread([this, rev = cmd.revoke()] -> void { builder->onRevoke(rev); }).detach();
                 }
                 return true;
             }});
@@ -422,21 +422,21 @@ void Coordinator::start(grpc::Server & server)
 
 void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
 {
-    auto creds = schedulerCreds(options);
+    auto const creds = schedulerCreds(options);
     grpc::ChannelArguments args;
     args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, keepaliveMs);
     // A replaced balancer pod blackholes the first SYN; do not sit out gRPC's 20s.
     args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, minReconnectBackoffMs);
-    auto target = options.schedulerAddr.starts_with(plaintextScheme) ? options.schedulerAddr.substr(plaintextScheme.size())
+    auto const target = options.schedulerAddr.starts_with(plaintextScheme) ? options.schedulerAddr.substr(plaintextScheme.size())
                                                                     : options.schedulerAddr;
-    auto channel = grpc::CreateCustomChannel(target, creds, args);
+    auto const channel = grpc::CreateCustomChannel(target, creds, args);
     auto stub = nix::remote::Scheduler::NewStub(channel);
     auto backoff = minBackoff;
     while (!stop.stop_requested()) {
         grpc::ClientContext ctx;
         auto stream = stub->WorkerSession(&ctx);
-        auto writeMutex = std::make_shared<std::mutex>();
-        auto live = std::make_shared<std::atomic<bool>>(true);
+        auto const writeMutex = std::make_shared<std::mutex>();
+        auto const live = std::make_shared<std::atomic<bool>>(true);
         auto * raw = stream.get();
         // Builders send a Done every few seconds at most. No batching needed.
         bld.setSend([raw, writeMutex, live](const WorkerMsg & msg) -> bool {
@@ -450,7 +450,7 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
             logLine(LogLevel::info, {{"event", "scheduler_connected"}, {"addr", options.schedulerAddr}});
             backoff = minBackoff;
         }
-        const std::stop_callback onStop(stop, [&ctx]() -> void { ctx.TryCancel(); });
+        const std::stop_callback onStop(stop, [&ctx] -> void { ctx.TryCancel(); });
         SchedCmds cmds;
         bool restarting = false;
         while (helloed && stream->Read(&cmds)) {
@@ -469,7 +469,7 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
             }
         }
         *live = false;
-        auto status = stream->Finish();
+        auto const status = stream->Finish();
         if (stop.stop_requested()) {
             return;
         }

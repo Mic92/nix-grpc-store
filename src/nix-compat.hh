@@ -275,25 +275,6 @@ inline auto failureStatus(nix::BuildResult &res) -> std::optional<FailureStatus>
   return std::nullopt;
 }
 
-inline auto deterministicFailureKind(nix::BuildResult &res) -> std::string {
-  auto status = failureStatus(res);
-  if (!status) {
-    return "";
-  }
-  switch (*status) {
-  case FailureStatus::PermanentFailure:
-    return "PermanentFailure";
-  case FailureStatus::OutputRejected:
-    return "OutputRejected";
-  case FailureStatus::TimedOut:
-    return "TimedOut";
-  case FailureStatus::LogLimitExceeded:
-    return "LogLimitExceeded";
-  default:
-    return "";
-  }
-}
-
 // Plain store path inputs of a BasicDerivation.
 inline auto drvInputs(const nix::BasicDerivation &drv) -> const nix::StorePathSet & {
 #if NIX_COMPAT_TEMPLATED_DRV
@@ -366,7 +347,7 @@ inline auto requiredSystemFeatures(const nix::StoreDirConfig &store,
                                    const nix::BasicDerivation &drv) -> nix::StringSet {
   const auto *attrs = drv.structuredAttrs ? &*drv.structuredAttrs : nullptr;
 #if NIX_COMPAT_AT_LEAST(2, 34)
-  auto options = nix::derivationOptionsFromStructuredAttrs(store, drv.env, attrs, /*shouldWarn=*/false);
+  auto const options = nix::derivationOptionsFromStructuredAttrs(store, drv.env, attrs, /*shouldWarn=*/false);
 #else
   (void)store;
   auto options = nix::DerivationOptions::fromStructuredAttrs(drv.env, attrs, /*shouldWarn=*/false);
@@ -386,7 +367,7 @@ inline void ensurePath(nix::Store &store, const nix::StorePath &path) {
 // Nix 2.35 added EnsureRead, which turns a short NAR read into an error
 // instead of silently truncating. Older versions read the NAR unguarded.
 #if NIX_COMPAT_AT_LEAST(2, 35)
-using EnsureRead = nix::EnsureRead;
+using nix::EnsureRead;
 #else
 class EnsureRead : public nix::Source {
   nix::Source &inner;

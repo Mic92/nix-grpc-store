@@ -100,7 +100,7 @@ inline auto ruleFrom(const Json & json) -> Rule
     if (auto sub = json.value("bound_subject", std::vector<std::string>{}); !sub.empty()) {
         rule.boundClaims["sub"] = std::move(sub);
     }
-    auto scopes = json.value("scopes", std::vector<std::string>{"write"});
+    auto const scopes = json.value("scopes", std::vector<std::string>{"write"});
     if (scopes.empty()) {
         throw nix::Error("OIDC rule: scopes must not be empty");
     }
@@ -270,7 +270,7 @@ inline auto ed25519Pem(const std::string & xB64) -> std::string
         return {};
     }
     char * data = nullptr;
-    auto len = BIO_get_mem_data(bio.get(), &data); // NOLINT(cppcoreguidelines-pro-type-cstyle-cast): macro
+    auto const len = BIO_get_mem_data(bio.get(), &data); // NOLINT(cppcoreguidelines-pro-type-cstyle-cast): macro
     return {data, static_cast<size_t>(len)};
 }
 
@@ -281,7 +281,7 @@ inline auto parseJwk(const Json & json) -> std::optional<Jwk>
         if (!json.is_object() || json.value("use", "sig") != "sig") {
             return std::nullopt;
         }
-        auto str = [&](const char * name) -> std::string { return json.at(name).get<std::string>(); };
+        auto const str = [&](const char * name) -> std::string { return json.at(name).get<std::string>(); };
         Jwk jwk{.kid = json.value("kid", ""), .kty = json.value("kty", ""), .crv = json.value("crv", ""), .pem = {}};
         if (jwk.kty == "RSA") {
             jwk.pem = jwt::helper::create_public_key_from_rsa_components(str("n"), str("e"));
@@ -311,8 +311,8 @@ using VerifierBuilder = jwt::verifier<FixedClock, jwt::traits::nlohmann_json>;
 inline auto allowKey(VerifierBuilder & verifier, const std::string & alg, const Jwk & key) -> bool
 {
     namespace algo = jwt::algorithm;
-    auto rsa = key.kty == "RSA";
-    auto ecc = [&](std::string_view crv) -> bool { return key.kty == "EC" && key.crv == crv; };
+    auto const rsa = key.kty == "RSA";
+    auto const ecc = [&](std::string_view crv) -> bool { return key.kty == "EC" && key.crv == crv; };
     if (alg == "RS256" && rsa) {
         verifier.allow_algorithm(algo::rs256(key.pem));
     } else if (alg == "RS384" && rsa) {
@@ -399,7 +399,7 @@ private:
         if (!url.starts_with("https://") && !config.allowInsecure) {
             throw nix::Error("refusing non-https OIDC URL '%s'", url);
         }
-        auto bearer = provider.bearerTokenFile.empty() ? "" : nix::chomp(nix::readFile(provider.bearerTokenFile));
+        auto const bearer = provider.bearerTokenFile.empty() ? "" : nix::chomp(nix::readFile(provider.bearerTokenFile));
         http::Call call(url, bearer, std::nullopt);
         // NOLINTBEGIN(cppcoreguidelines-pro-type-vararg): curl_easy_setopt.
         call.opt(CURLOPT_FOLLOWLOCATION, 1L);
@@ -447,7 +447,7 @@ public:
         if (!fetched) {
             return true;
         }
-        auto age = now - *fetched;
+        auto const age = now - *fetched;
         return age > refetchAfter || (!haveKey && age > refetchOnMiss);
     }
 
@@ -459,7 +459,7 @@ private:
         auto alg = token.has_algorithm() ? token.get_algorithm() : "";
         auto kid = token.has_key_id() ? token.get_key_id() : "";
         std::scoped_lock const guard(set.lock);
-        auto pick = [&]() -> std::optional<VerifierBuilder> {
+        auto const pick = [&] -> std::optional<VerifierBuilder> {
             auto verifier = jwt::verify<FixedClock, jwt::traits::nlohmann_json>(FixedClock{now})
                                 .with_issuer(provider.issuer)
                                 .with_audience(provider.audience)
@@ -473,7 +473,7 @@ private:
             return any ? std::optional(std::move(verifier)) : std::nullopt;
         };
         auto res = pick();
-        auto mono = std::chrono::steady_clock::now();
+        auto const mono = std::chrono::steady_clock::now();
         if (fetchDue(set.fetched, mono, res.has_value(), refetchOnMiss)) {
             set.fetched = mono;
             try {
@@ -496,7 +496,7 @@ private:
         if (!parsed) {
             return fail("malformed token");
         }
-        auto iss = parsed->has_issuer() ? parsed->get_issuer() : "";
+        auto const iss = parsed->has_issuer() ? parsed->get_issuer() : "";
         for (size_t idx = 0; idx < config.providers.size(); ++idx) {
             const auto & provider = config.providers.at(idx);
             if (provider.issuer != iss) {
@@ -510,12 +510,12 @@ private:
             if (err) {
                 return fail(provider.name + ": " + err.message());
             }
-            auto claims = Json::parse(parsed->get_payload());
-            auto sub = claims.value("sub", "");
+            auto const claims = Json::parse(parsed->get_payload());
+            auto const sub = claims.value("sub", "");
             if (sub.empty() || sub.contains('\0')) {
                 return fail("token lacks sub");
             }
-            auto role = roleFor(provider, claims);
+            auto const role = roleFor(provider, claims);
             return {
                 .identity = Identity{.subject = "oidc:" + provider.name + ":" + sub, .role = role},
                 .error = role ? "" : "no rule matched"};
@@ -527,7 +527,7 @@ private:
 inline auto bearerToken(const grpc::ServerContextBase & context) -> std::optional<std::string>
 {
     auto const & metadata = context.client_metadata();
-    auto found = metadata.find("authorization");
+    auto const found = metadata.find("authorization");
     if (found == metadata.end()) {
         return std::nullopt;
     }

@@ -34,9 +34,10 @@ inline auto decodePathInfo(const nix::StoreDirConfig & store, const nix::remote:
 {
     nix::StorePath path(entry.path());
     nix::StringSource source(entry.info());
-    auto info = nix::WorkerProto::Serialise<nix::UnkeyedValidPathInfo>::read(
-        store, nix::WorkerProto::ReadConn{.from = source, .version = nixcompat::infoProtocolVersion()});
-    auto full = std::make_shared<const nix::ValidPathInfo>(path, std::move(info));
+    auto full = std::make_shared<const nix::ValidPathInfo>(
+        path,
+        nix::WorkerProto::Serialise<nix::UnkeyedValidPathInfo>::read(
+            store, nix::WorkerProto::ReadConn{.from = source, .version = nixcompat::infoProtocolVersion()}));
     return {std::move(path), std::move(full)};
 }
 

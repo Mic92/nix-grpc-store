@@ -48,7 +48,7 @@ auto GrpcStore::queryValidPathsRouted(const StorePathSet & paths, SubstituteFlag
     request.add_paths(std::string(path.to_string()));
   }
   remote::QueryValidPathsReply reply;
-  retrying("QueryValidPaths", [&]() -> grpc::Status {
+  retrying("QueryValidPaths", [&] -> grpc::Status {
     grpc::ClientContext ctx;
     addHeaders(ctx, headers);
     reply.Clear();
@@ -69,10 +69,10 @@ auto GrpcStore::queryMissing(const std::vector<DerivedPath> & targets)
   }
   remote::QueryMissingReply reply;
   bool unimplemented = false;
-  retrying("QueryMissing", [&]() -> grpc::Status {
+  retrying("QueryMissing", [&] -> grpc::Status {
     grpc::ClientContext ctx;
     reply.Clear();
-    auto status = stub->QueryMissing(&ctx, request, &reply);
+    auto const status = stub->QueryMissing(&ctx, request, &reply);
     unimplemented = status.error_code() == grpc::StatusCode::UNIMPLEMENTED;
     return unimplemented ? grpc::Status::OK : status;
   });
@@ -103,7 +103,7 @@ auto GrpcStore::queryPathInfosNative(const StorePathSet &paths) -> PathInfoMap {
     request.add_paths(std::string(path.to_string()));
   }
   remote::QueryPathInfosReply reply;
-  retrying("QueryPathInfos", [&]() -> grpc::Status {
+  retrying("QueryPathInfos", [&] -> grpc::Status {
     grpc::ClientContext ctx;
     reply.Clear();
     return stub->QueryPathInfos(&ctx, request, &reply);
@@ -164,7 +164,7 @@ void GrpcStore::runInfoBatches(const std::stop_token & stop)
         }
         // Each callback fires exactly once, even if one throws.
         for (auto & [path, callback] : batch) {
-            auto found = infos.find(path);
+            auto const found = infos.find(path);
             try {
                 callback(found == infos.end() ? nullptr : found->second);
             } catch (...) {
@@ -178,7 +178,7 @@ void GrpcStore::queryPathInfoUncached(const StorePath & path, InfoCallback callb
     try {
         {
           std::scoped_lock const lock(prefetchMutex);
-          if (auto found = prefetchedInfos.find(path);
+          if (auto const found = prefetchedInfos.find(path);
               found != prefetchedInfos.end()) {
             auto info = std::move(found->second);
             prefetchedInfos.erase(found);
@@ -208,7 +208,7 @@ void GrpcStore::addMultipleToStoreRouted(
     for (auto & [pathInfo, pathSource] : pathsToCopy) {
       paths.emplace_back(pathInfo, ReplayableNar(std::move(pathSource)));
     }
-    retrying("AddMultipleToStore", [&]() -> grpc::Status {
+    retrying("AddMultipleToStore", [&] -> grpc::Status {
       return addMultipleToStoreOnce(paths, act, repair, checkSigs, headers);
     });
 }

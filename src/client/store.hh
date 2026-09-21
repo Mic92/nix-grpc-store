@@ -167,7 +167,7 @@ private:
         "Number of parallel TCP connections used for NAR downloads."};
 
 public:
-    GrpcStoreConfig(const Params & params)
+    explicit GrpcStoreConfig(const Params & params)
         : StoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params))
         , RemoteStoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params))
     {
@@ -187,10 +187,12 @@ public:
           RemoteStoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params)),
           authority(std::move(authority)) {}
 
+    // NOLINTNEXTLINE(modernize-use-string-view): nix::StoreConfig's signature
     static auto name() -> std::string { return "gRPC Store"; }
 
     static auto uriSchemes() -> StringSet { return {"grpc"}; }
 
+    // NOLINTNEXTLINE(modernize-use-string-view)
     static auto doc() -> std::string {
       return "Connects to a `nix-grpc-daemon`: native RPCs for queries, copies and "
              "scheduled builds, the tunnelled worker protocol for the rest.";
@@ -314,11 +316,11 @@ public:
     static constexpr std::chrono::milliseconds maxReconnectPause{4000};
     template<typename F>
     void retrying(const char * what, const F & attempt) {
-      auto giveUp = std::chrono::steady_clock::now()
+      auto const giveUp = std::chrono::steady_clock::now()
                     + (everConnected ? restartGrace() : std::chrono::seconds(config->connectTimeout.get()));
       auto pause = std::chrono::milliseconds(500); // NOLINT(*-magic-numbers)
       for (;;) {
-        auto status = attempt();
+        auto const status = attempt();
         if (status.ok()) {
           everConnected = true;
         }

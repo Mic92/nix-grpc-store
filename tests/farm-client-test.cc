@@ -70,7 +70,7 @@ public:
 void testPush(Suite & tst, nixgrpc::PushProcess & push)
 {
     // The child must outlive the thread that spawned it.
-    std::thread([&]() -> void { push.pushWait({"/nix/store/x.drv"}); }).join();
+    std::thread([&] -> void { push.pushWait({"/nix/store/x.drv"}); }).join();
     {
         constexpr std::chrono::milliseconds wellUnderCancelPoll{800};
         auto const started = std::chrono::steady_clock::now();
@@ -85,7 +85,7 @@ void testPush(Suite & tst, nixgrpc::PushProcess & push)
     }
     {
         // spec/push.qnt: two RPCs publishing the same path at once.
-        std::thread other([&]() -> void { push.pushWait({"/nix/store/shared"}); });
+        std::thread other([&] -> void { push.pushWait({"/nix/store/shared"}); });
         push.pushWait({"/nix/store/shared"});
         other.join();
     }
@@ -102,13 +102,13 @@ void testPush(Suite & tst, nixgrpc::PushProcess & push)
         constexpr int writers = 8;
         threads.reserve(writers);
         for (int i = 0; i < writers; i++) {
-            threads.emplace_back([&]() -> void { push.pushWait(many); });
+            threads.emplace_back([&] -> void { push.pushWait(many); });
         }
         for (auto & thr : threads) {
             thr.join();
         }
     }
-    auto throws = [&](const char * path) -> std::string {
+    auto const throws = [&](const char * path) -> std::string {
         try {
             push.pushWait({path});
         } catch (nix::Error &) {
@@ -121,13 +121,13 @@ void testPush(Suite & tst, nixgrpc::PushProcess & push)
     tst.check(throws("/nix/store/z") == "ok", "child is respawned");
     {
         bool stop = false;
-        std::thread canceller([&]() -> void {
+        std::thread canceller([&] -> void {
             std::this_thread::sleep_for(settle);
             stop = true;
         });
         std::string got = "ok";
         try {
-            push.pushWait({"/nix/store/hang"}, [&]() -> bool { return stop; });
+            push.pushWait({"/nix/store/hang"}, [&] -> bool { return stop; });
         } catch (nixgrpc::CancelledWait &) {
             got = "cancelled";
         } catch (nix::Error &) {
@@ -151,7 +151,7 @@ void testCache(Suite & tst, const std::string & base, const std::string & mock)
     tst.check(!off.hasRemote() && off.present({"a.narinfo"}).empty(), "no niks3: present is empty, publish is a no-op");
     off.publish({"/nix/store/whatever"});
 
-    auto tokenFile = std::filesystem::path(nix::createTempDir()).string() + "/token";
+    auto const tokenFile = std::filesystem::path(nix::createTempDir()).string() + "/token";
     nix::writeFile(tokenFile, "stale");
     nixgrpc::Cache cache(
         {.url = base + "/", .tokenFile = tokenFile, .pushArgv = {"python3", mock, "push", "--stdin", "--server-url", base}});
@@ -167,7 +167,7 @@ void testCache(Suite & tst, const std::string & base, const std::string & mock)
     std::filesystem::rename(tokenFile + ".new", tokenFile);
     tst.check(cache.present({"aaaa.narinfo"}).empty(), "token rotation picked up; unknown key absent");
     cache.publish({"/nix/store/aaaa-foo", "/nix/store/bbbb-bar"});
-    auto have = cache.present({"aaaa.narinfo", "bbbb.narinfo", "cccc.narinfo"});
+    auto const have = cache.present({"aaaa.narinfo", "bbbb.narinfo", "cccc.narinfo"});
     tst.check(have.size() == 2 && have.contains("aaaa.narinfo") && !have.contains("cccc.narinfo"), "published paths are present");
     tst.check(cache.present({}).empty(), "empty query, no request");
 }
