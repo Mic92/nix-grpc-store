@@ -63,20 +63,25 @@ auto GrpcStore::queryValidPathsRouted(const StorePathSet & paths, SubstituteFlag
 
 auto GrpcStore::queryMissing(const std::vector<DerivedPath> & targets)
     -> MissingPaths {
-  grpc::ClientContext ctx;
   remote::QueryMissingRequest request;
   for (const auto & target : targets) {
     request.add_targets(target.to_string(*this));
   }
   remote::QueryMissingReply reply;
-  auto status = stub->QueryMissing(&ctx, request, &reply);
-  if (status.error_code() == grpc::StatusCode::UNIMPLEMENTED) {
+  bool unimplemented = false;
+  retrying("QueryMissing", [&]() -> grpc::Status {
+    grpc::ClientContext ctx;
+    reply.Clear();
+    auto status = stub->QueryMissing(&ctx, request, &reply);
+    unimplemented = status.error_code() == grpc::StatusCode::UNIMPLEMENTED;
+    return unimplemented ? grpc::Status::OK : status;
+  });
+  if (unimplemented) {
     // Deliberate: RemoteStore::queryMissing would tunnel, the generic
     // Store walk works with native path queries.
     // NOLINTNEXTLINE(bugprone-parent-virtual-call)
     return Store::queryMissing(targets);
   }
-  checkStatus(status, "QueryMissing");
   MissingPaths res;
   for (const auto & path : reply.will_build()) {
     res.willBuild.insert(StorePath(path));
