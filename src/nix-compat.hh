@@ -44,6 +44,10 @@
 #endif
 #include <nix/store/derivation-options.hh>
 
+#if __has_include(<nix/store/substituter.hh>)
+#include <nix/store/substituter.hh> // IWYU pragma: export
+#endif
+
 #if __has_include(<nix/store/derivation/aterm.hh>)
 #include <nix/store/derivation/aterm.hh>
 #define NIX_COMPAT_HAS_DERIVATION_ATERM 1
