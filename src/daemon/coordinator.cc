@@ -60,6 +60,7 @@ using nix::remote::WorkerMsgs;
 
 namespace {
 constexpr int keepaliveMs = 20'000;
+constexpr int minReconnectBackoffMs = 2'000;
 constexpr std::chrono::milliseconds minBackoff{200};
 constexpr std::chrono::milliseconds maxBackoff{5000};
 } // namespace
@@ -424,6 +425,8 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
     auto creds = schedulerCreds(options);
     grpc::ChannelArguments args;
     args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, keepaliveMs);
+    // A replaced balancer pod blackholes the first SYN; do not sit out gRPC's 20s.
+    args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, minReconnectBackoffMs);
     auto target = options.schedulerAddr.starts_with(plaintextScheme) ? options.schedulerAddr.substr(plaintextScheme.size())
                                                                     : options.schedulerAddr;
     auto channel = grpc::CreateCustomChannel(target, creds, args);

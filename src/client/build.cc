@@ -460,7 +460,9 @@ auto schedulerGone(const grpc::Status & status) -> bool {
   case grpc::StatusCode::UNAVAILABLE:
   case grpc::StatusCode::UNKNOWN:
   case grpc::StatusCode::INTERNAL:
-    return !status.error_message().contains("andshake") && !status.error_message().contains("certificate");
+    // "tcp handshaker shutdown" is a plain connect timeout, not TLS.
+    return GrpcStore::transportError(status.error_message())
+           || (!status.error_message().contains("andshake") && !status.error_message().contains("certificate"));
   default:
     return false;
   }

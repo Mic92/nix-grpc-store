@@ -246,10 +246,10 @@ public:
       unsupported("getBuildLogExact");
     }
 
-private:
-    // gRPC folds every connect failure into UNAVAILABLE. Tell TCP from TLS apart by the message.
     // gRPC folds TCP and TLS failures into UNAVAILABLE, only the text differs.
     static auto transportError(std::string_view msg) -> bool;
+
+private:
 
     auto connectHint(const std::string & msg) const -> std::string
 ;
@@ -310,6 +310,7 @@ public:
       return std::chrono::seconds(config->restartGrace.get());
     }
     static constexpr std::chrono::milliseconds reconnectPause{500};
+    static constexpr int minReconnectBackoffMs = 2000;
     static constexpr std::chrono::milliseconds maxReconnectPause{4000};
     template<typename F>
     void retrying(const char * what, const F & attempt) {
