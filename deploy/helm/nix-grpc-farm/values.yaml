@@ -131,8 +131,10 @@ upstreamCaches:
   publicKeys: ["cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="]
 
 sandbox:
-  # Runs the nix-daemon container privileged. Without it builds are unsandboxed.
   enabled: true
+  # false: the nix-daemon container runs in a user namespace (hostUsers: false,
+  # Kubernetes >= 1.33) with CAP_SYS_ADMIN there instead of privileged.
+  privileged: false
 
 logLevel: info
 # On pod shutdown the worker tells the scheduler it is draining and exits once

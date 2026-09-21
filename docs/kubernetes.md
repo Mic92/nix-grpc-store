@@ -18,8 +18,9 @@ The chart expects:
 * A niks3 release in the cluster, and its public signing key.
 * [cert-manager](https://cert-manager.io). Without it, three TLS
   Secrets have to be created and rotated by hand.
-* Privileged pods allowed on the worker nodes, for the Nix sandbox. The
-  sandbox can be turned off instead.
+* Kubernetes 1.33 or later for user namespaces (`hostUsers: false`), which
+  the Nix sandbox uses. Older clusters can run the `nix-daemon` container
+  privileged or turn the sandbox off.
 
 ## Step 1: Install the chart
 
@@ -94,12 +95,23 @@ filled in.
 The example above is enough to get going. The sections below show what
 to add for the situations most clusters run into.
 
-### Build without privileged pods
+### Sandbox and pod privileges
 
-Builds run in the Nix sandbox, and for that the `nix-daemon` container
-is privileged. On clusters that forbid privileged pods, turn the sandbox
-off. Builds then run as root in the container with no isolation from
-each other.
+Builds run in the Nix sandbox. The `nix-daemon` container gets its own
+user namespace (`hostUsers: false`) and `CAP_SYS_ADMIN` inside it, with
+seccomp and AppArmor unconfined so it can create the sandbox's mount and
+user namespaces. Root in the container is an unprivileged UID on the node.
+
+On clusters older than 1.33, or where user namespaces are disabled, run
+the container privileged instead:
+
+```yaml
+sandbox:
+  privileged: true
+```
+
+Where neither is allowed, turn the sandbox off. Builds then run as root
+in the container with no isolation from each other.
 
 ```yaml
 sandbox:

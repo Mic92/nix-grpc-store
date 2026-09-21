@@ -28,15 +28,18 @@
 }:
 let
   client = variant == "client";
-  # auto-allocate-uids: no nixbld users to maintain in /etc/passwd.
-  passwd = writeTextDir "etc/passwd" ''
-    root:x:0:0:root:/root:/bin/sh
-    nix-grpc-daemon:x:990:990::/var/empty:/bin/false
-    nobody:x:65534:65534:nobody:/var/empty:/bin/false
-  '';
+  nixbld = lib.genList (i: "nixbld${toString (i + 1)}") 32;
+  passwd = writeTextDir "etc/passwd" (
+    ''
+      root:x:0:0:root:/root:/bin/sh
+      nix-grpc-daemon:x:990:990::/var/empty:/bin/false
+      nobody:x:65534:65534:nobody:/var/empty:/bin/false
+    ''
+    + lib.concatImapStrings (i: u: "${u}:x:${toString (30000 + i)}:30000::/var/empty:/bin/false\n") nixbld
+  );
   group = writeTextDir "etc/group" ''
     root:x:0:
-    nixbld:x:30000:
+    nixbld:x:30000:${lib.concatStringsSep "," nixbld}
     nix-grpc-daemon:x:990:
     nogroup:x:65534:
   '';
@@ -56,8 +59,7 @@ let
     else
       ''
         build-users-group = nixbld
-        auto-allocate-uids = true
-        experimental-features = nix-command auto-allocate-uids cgroups
+        experimental-features = nix-command
         sandbox = true
         sandbox-fallback = false
         sandbox-paths = /bin/sh=${busybox-sandbox-shell}/bin/busybox
