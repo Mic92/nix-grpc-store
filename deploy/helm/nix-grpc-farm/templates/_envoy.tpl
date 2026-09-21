@@ -36,6 +36,9 @@ health_checks:
   - timeout: 2s
     interval: {{ $root.Values.lb.healthCheckInterval }}
     no_traffic_interval: {{ $root.Values.lb.healthCheckInterval }}
+    # A standby that just took over should get traffic within a second.
+    unhealthy_interval: 1s
+    unhealthy_edge_interval: 1s
     unhealthy_threshold: 2
     healthy_threshold: 1
     grpc_health_check: {{ if .healthService }}{service_name: {{ .healthService }}}{{ else }}{}{{ end }}
@@ -103,6 +106,16 @@ match:
 route:
   cluster: {{ .cluster | quote }}
   timeout: 0s # builds run for hours
+  # An evicted pod stays in DNS until it is gone and in the healthy set for
+  # two probe intervals. Nothing reached it, so try the next host instead.
+  retry_policy:
+    retry_on: connect-failure,refused-stream
+    num_retries: 2
+    retry_host_predicate:
+      - name: envoy.retry_host_predicates.previous_hosts
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.retry.host.previous_hosts.v3.PreviousHostsPredicate
+    host_selection_retry_max_attempts: 3
 {{- end }}
 
 {{- define "farm.envoy.listener" -}}
