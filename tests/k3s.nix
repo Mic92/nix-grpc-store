@@ -43,6 +43,7 @@ let
         -extfile <(printf "subjectAltName=$3") -out $1.crt
     }
     issue lb lb "IP:127.0.0.1,IP:${hostIP},DNS:nix-grpc-farm.farm.svc"
+    issue lb-renewed lb "IP:127.0.0.1,IP:${hostIP},DNS:nix-grpc-farm.farm.svc,DNS:renewed.example"
     issue worker worker "DNS:worker,DNS:nix-grpc-farm-scheduler.farm.svc"
   '';
 
@@ -254,6 +255,7 @@ pkgs.testers.runNixOSTest {
       environment.systemPackages = [
         pkgs.kubectl
         pkgs.grpc-health-probe
+        pkgs.openssl
       ];
       environment.sessionVariables.KUBECONFIG = "/etc/rancher/k3s/k3s.yaml";
 
@@ -404,6 +406,18 @@ pkgs.testers.runNixOSTest {
         finally:
             machine.execute("kubectl -n ci logs job/ci >&2")
         machine.succeed(f"curl -sf ${niks3Url}/{out_path('${jobExpr}', 'ci').removeprefix('/nix/store/').split('-')[0]}.narinfo > /dev/null")
+
+    with subtest("a renewed balancer certificate is served without a rollout"):
+        kubectl("create secret tls farm-lb-tls --cert=${certs}/lb-renewed.crt --key=${certs}/lb-renewed.key --dry-run=client -o yaml | kubectl -n farm apply -f -")
+        # kubelet syncs Secret volumes about once a minute.
+        lb_pod = kubectl("get pods -l app.kubernetes.io/component=lb -o jsonpath='{.items[0].metadata.name}'")
+        machine.wait_until_succeeds(f"kubectl -n farm exec {lb_pod} -- cat /etc/envoy/tls/lb/tls.crt | openssl x509 -noout -ext subjectAltName | grep -q renewed.example", timeout=sec(120))
+        machine.wait_until_succeeds(
+            "openssl s_client -connect 127.0.0.1:${toString nodePort} </dev/null 2>/dev/null "
+            "| openssl x509 -noout -ext subjectAltName | grep -q renewed.example",
+            timeout=sec(20),
+        )
+        build("${jobExpr}", "t-renewed")
 
     with subtest("metrics carry build_info"):
         machine.succeed(f"curl -sf http://{pod_ip(pods[0])}:9464/metrics | grep -E 'nix_grpc_build_info\\{{.*worker=\"machine/{pods[0]}\"'")

@@ -126,7 +126,9 @@ let
   normalize = pkgs.writeText "normalize.jq" ''
     def names: {"x86_64-linux": "x86", "aarch64-linux": "arm"};
     def ren: . as $n | (names[$n] // $n);
-    .static_resources
+    # SDS resource files: a ConfigMap path in the chart, a store path in NixOS.
+    def sds: walk(if type == "object" and has("path_config_source") then .path_config_source.path = "X" else . end);
+    .static_resources | sds
     | .clusters |= (map(.name |= ren | .load_assignment.cluster_name |= ren
                         | .load_assignment.endpoints[0].lb_endpoints |= map(.endpoint.address.socket_address.address = "X" | .endpoint.address.socket_address |= del(.ipv4_compat))
                         | del(.dns_lookup_family))

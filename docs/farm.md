@@ -196,11 +196,11 @@ services.nix-grpc-farm-lb = {
     };
   };
 };
-security.acme.certs."farm.example.com" = {
-  group = "envoy";
-  reloadServices = [ "envoy.service" ];
-};
+security.acme.certs."farm.example.com".group = "envoy";
 ```
+
+Renewed certificates are picked up from disk without a restart, on the
+balancer as well as on workers and scheduler.
 
 | Option | Meaning |
 |---|---|
