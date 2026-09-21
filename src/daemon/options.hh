@@ -52,6 +52,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options;
 
 // --scheduler http://host:port is dialed without TLS.
 constexpr std::string_view plaintextScheme = "http://";
+constexpr unsigned certRefreshSeconds = 10;
+
 auto makeServerCredentials(const Options & options) -> std::shared_ptr<grpc::ServerCredentials>;
 
 } // namespace nixgrpc
