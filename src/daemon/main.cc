@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <signal.h> // NOLINT(modernize-deprecated-headers): sigaction is POSIX, not in <csignal>
@@ -117,6 +118,20 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         return nix::ref<nix::Store>(store);
     }
 
+    // A restarted nix-daemon leaves the pool full of dead connections that
+    // only fail on the next write. Drop them all so the retry gets fresh ones.
+    auto localDaemonGone(const std::exception & err) -> bool
+    {
+        const auto * sys = dynamic_cast<const nix::SysError *>(&err);
+        bool const gone = dynamic_cast<const nix::EndOfFile *>(&err) != nullptr
+                          || (sys != nullptr && (sys->errNo == EPIPE || sys->errNo == ECONNRESET));
+        if (gone) {
+            std::scoped_lock const lock(storeMutex);
+            store.reset();
+        }
+        return gone;
+    }
+
     // nix-daemon keeps temp roots per connection, so writes get their own.
     auto openScopedStore() -> nix::ref<nix::Store>
     {
@@ -146,6 +161,9 @@ private:
         } catch (std::exception & err) {
             if (stopSignal != 0) {
                 return {grpc::StatusCode::UNAVAILABLE, std::string("worker shutting down: ") + err.what()};
+            }
+            if (localDaemonGone(err)) {
+                return {grpc::StatusCode::UNAVAILABLE, std::string("local nix-daemon connection lost: ") + err.what()};
             }
             nixgrpc::logLine(
                 nixgrpc::LogLevel::info, {{"event", "handler_error"}, {"error", std::string(err.what())}});

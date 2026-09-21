@@ -244,6 +244,16 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"nix path-info '{p}'")
         machine.succeed(f"test -e '{p}'")
 
+    with subtest("a local nix-daemon restart does not fail the next RPC"):
+        machine.succeed(f"echo warm > /tmp/warm && nix store add --store '{store}' /tmp/warm")
+        machine.succeed("journalctl -u nix-daemon | grep -q 'accepted connection from pid .*nix-grpc-daemon'")
+        # SIGKILL, like a crashed container: no orderly close of the pooled connections.
+        machine.succeed("systemctl kill -s KILL nix-daemon.service")
+        machine.wait_until_succeeds("! systemctl is-active nix-daemon.service", timeout=sec(30))
+        machine.succeed("systemctl start nix-daemon.socket")
+        machine.succeed(f"nix path-info --store '{store}' '{p}' >&2")
+        machine.succeed(f"echo again > /tmp/warm && nix store add --store '{store}' /tmp/warm >&2")
+
     with subtest("build over gRPC"):
         p = machine.succeed(
             f"nix build --store '{store}' --impure -f /etc/hello.nix "

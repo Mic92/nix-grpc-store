@@ -170,7 +170,8 @@ auto GrpcStore::goneAway(const grpc::Status & status) -> bool {
   switch (status.error_code()) {
   case grpc::StatusCode::UNAVAILABLE:
     return transportError(status.error_message()) || status.error_message().contains("upstream")
-           || status.error_message().contains("shutting down");
+           || status.error_message().contains("shutting down")
+           || status.error_message().contains("local nix-daemon connection lost");
   case grpc::StatusCode::CANCELLED:
     return status.error_message().contains("Cancelling all calls");
   default:
