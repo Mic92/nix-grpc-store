@@ -1,7 +1,9 @@
 #pragma once
 // Holds niks3's POST /api/farm/lead open. onChange(true) while it says
-// {"lead":true}, onChange(false) otherwise. Starts passive.
+// {"lead":true}, onChange(false) on {"lead":false} or once niks3 has been
+// unreachable for `grace`. Starts passive.
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
@@ -25,6 +27,8 @@ private:
     const Niks3Client & niks3;
     std::function<void(bool)> onChange;
     bool active = false;
+    // Nobody else can be elected while niks3 is down.
+    static constexpr std::chrono::seconds grace{30};
     std::jthread thread;
     void run(const std::stop_token & stop);
     void set(bool lead);
