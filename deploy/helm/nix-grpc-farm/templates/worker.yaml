@@ -80,6 +80,9 @@ spec:
       terminationGracePeriodSeconds: {{ $root.Values.terminationGracePeriodSeconds }}
       # preStop hooks below wait for nix-grpc-daemon to exit.
       shareProcessNamespace: true
+      {{- if and $root.Values.sandbox.enabled (not $root.Values.sandbox.privileged) }}
+      hostUsers: false
+      {{- end }}
       {{- with $root.Values.imagePullSecrets }}
       imagePullSecrets: {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -129,10 +132,15 @@ spec:
               exec:
                 command: [/bin/sh, -c, "while pgrep -f ^/bin/nix-grpc-daemon >/dev/null; do sleep 1; done"]
           securityContext:
-            {{- if $root.Values.sandbox.enabled }}
-            privileged: true
-            {{- else }}
             runAsUser: 0
+            {{- if and $root.Values.sandbox.enabled $root.Values.sandbox.privileged }}
+            privileged: true
+            {{- else if $root.Values.sandbox.enabled }}
+            # Mount and user namespaces for the sandbox, inside the pod's user namespace.
+            capabilities: {add: [SYS_ADMIN]}
+            procMount: Unmasked
+            seccompProfile: {type: Unconfined}
+            appArmorProfile: {type: Unconfined}
             {{- end }}
           env:
             - {name: TMPDIR, value: /build}
