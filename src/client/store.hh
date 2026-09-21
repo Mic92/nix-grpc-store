@@ -676,6 +676,13 @@ private:
 ;
 
 public:
+    // copyPaths() roots on the destination since NixOS/nix#16113 (same
+    // 2.36pre as substituter.hh). RemoteStore would open the daemon socket
+    // for it, which the write role may not. The server roots what it gets.
+#if __has_include(<nix/store/substituter.hh>)
+    void addTempRoots(const StorePathSet & /*paths*/) override {}
+#endif
+
     // NOLINTNEXTLINE(misc-override-with-different-visibility): see narFromPath
     void setOptions(RemoteStore::Connection & /*conn*/) override {
       // As with SSHStore, do not forward local settings automatically.
