@@ -413,6 +413,17 @@ pkgs.testers.runNixOSTest {
         assert idle == [] and len(busy) == 2 and len(set(busy)) == 1, ids
         assert sum(events(w, "attached") for w in [worker1, worker2]) == 1
 
+    with subtest("the first client leaving does not fail the second"):
+        client.succeed(f"systemd-run --unit share1 nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag share")
+        client.succeed(f"sleep 1; systemd-run --unit share2 nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag share")
+        retry(lambda _: building() != [], timeout=sec(60))
+        client.succeed("sleep 2; systemctl kill -s INT share1")
+        client.wait_until_succeeds("! systemctl is-active share1", timeout=sec(30))
+        retry(lambda _: building() != [], timeout=sec(60))
+        release_slow()
+        client.wait_until_succeeds("! systemctl is-active share2", timeout=sec(120))
+        client.succeed("systemctl show -p Result share2 | grep -q success || { journalctl -u share2 >&2; false; }")
+
     with subtest("build hook: nix-daemon with builders = grpc://lb"):
         out = client.succeed(f"NIX_REMOTE=daemon nix build --log-format internal-json {hook} --print-out-paths --no-link -f ${jobExpr} --argstr tag hook 2>/tmp/hook.log").strip()
         client.succeed(f"grep farm-top-hook {out}")

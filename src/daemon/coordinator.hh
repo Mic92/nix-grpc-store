@@ -54,6 +54,7 @@ struct Expected
         std::mutex mutex;
         std::condition_variable cv;
         std::atomic<bool> revoked{false}; // scheduler moved the drv to a worker further along
+        std::atomic<unsigned> attached{0};  // callers waiting in attach(); the build outlives its first caller for them
         bool finished = false;
         std::string resultWire; // BuildDerivationDone serialised
     };
