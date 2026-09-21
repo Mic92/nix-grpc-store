@@ -444,6 +444,15 @@ pkgs.testers.runNixOSTest {
         worker1.systemctl("start nix-grpc-daemon.service")
         wait_health("${system}")
 
+    with subtest("a niks3 restart does not cost the leader its role"):
+        was = leader()
+        lb.systemctl("restart niks3.service")
+        lb.wait_for_unit("niks3.service")
+        retry(settled, timeout=sec(60))
+        assert leader() is was
+        was.fail("journalctl -u nix-grpc-daemon | grep -q event=scheduler_yield")
+        build(envoy, "after-niks3-restart")
+
     with subtest("scheduler down: the other node takes the lock and keeps it"):
         was, nxt = leader(), standby()
         was.systemctl("stop nix-grpc-daemon.socket nix-grpc-daemon.service")

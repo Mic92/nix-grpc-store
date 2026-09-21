@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <exception>
 #include <functional>
+#include <optional>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -85,10 +86,17 @@ void Elector::set(bool lead)
 // NOLINTBEGIN(cppcoreguidelines-pro-type-vararg): curl_easy_setopt
 void Elector::run(const std::stop_token & stop)
 {
+    std::optional<std::chrono::steady_clock::time_point> lostAt;
     while (!stop.stop_requested()) {
         try {
-            auto call = niks3.post("/api/farm/lead", nlohmann::json::object());
-            Reader reader{.stop = stop, .lead = [this](bool lead) -> void { set(lead); }, .buf = {}};
+            auto call = niks3.post("/api/farm/lead", nlohmann::json{{"incumbent", active}});
+            Reader reader{
+                .stop = stop,
+                .lead = [this, &lostAt](bool lead) -> void {
+                    lostAt.reset();
+                    set(lead);
+                },
+                .buf = {}};
             call->opt(CURLOPT_TIMEOUT, 0L);
             call->opt(CURLOPT_LOW_SPEED_LIMIT, 1L);
             call->opt(CURLOPT_LOW_SPEED_TIME, silentSecs);
@@ -104,7 +112,11 @@ void Elector::run(const std::stop_token & stop)
         } catch (const std::exception & e) {
             logLine(LogLevel::info, {{"event", "scheduler_lock_lost"}, {"error", e.what()}});
         }
-        set(false);
+        auto now = std::chrono::steady_clock::now();
+        lostAt = lostAt.value_or(now);
+        if (!active || now - *lostAt > grace) {
+            set(false);
+        }
         std::this_thread::sleep_for(retryEvery);
     }
 }
