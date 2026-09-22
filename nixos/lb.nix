@@ -407,7 +407,13 @@ in
                         stat_prefix = "farm";
                         codec_type = "HTTP2";
                         stream_idle_timeout = "0s";
-                        http2_protocol_options.max_concurrent_streams = cfg.maxStreams;
+                        http2_protocol_options = {
+                          max_concurrent_streams = cfg.maxStreams;
+                          connection_keepalive = {
+                            interval = "30s";
+                            timeout = "10s";
+                          };
+                        };
                         forward_client_cert_details = "SANITIZE_SET";
                         set_current_client_cert_details.subject = true;
                         route_config.virtual_hosts = [
