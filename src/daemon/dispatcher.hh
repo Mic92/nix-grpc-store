@@ -143,6 +143,12 @@ private:
     std::deque<LookupJob> lookupQueue ABSL_GUARDED_BY(lookupMutex);
     bool lookupStop ABSL_GUARDED_BY(lookupMutex) = false;
     std::vector<std::thread> lookupThreads;
+    // exportStats skips a call within a second of the last one. The skipped
+    // update would wait for the next event, minutes away while every build
+    // runs, so this thread sends it.
+    bool statsPending ABSL_GUARDED_BY(mutex) = false;
+    bool statsStop ABSL_GUARDED_BY(mutex) = false;
+    std::thread statsThread;
 
     [[nodiscard]] auto nowMs() const -> double;
     void debugLog(std::initializer_list<LogField> fields) const;
@@ -152,6 +158,7 @@ private:
     [[nodiscard]] auto lookup(const nix::remote::ClientMsgs & msgs) const -> std::vector<bool>;
     void applyClientMsgs(Client & client, const nix::remote::ClientMsgs & msgs, const std::vector<bool> & cached);
     void lookupLoop();
+    void statsLoop();
     // Run dispatch and deliver Expect (first) and Assigned.
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void dispatchLocked();
     // Per-system gauges. O(entries), so at most once a second unless forced.
