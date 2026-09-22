@@ -8,11 +8,11 @@
         "treefmt-nix": "treefmt-nix"
       },
       "locked": {
-        "lastModified": 1790067210,
-        "narHash": "sha256-YmY/lp86G7dZ9295PHC7tw6Mm/6BF08J5NB3vAvmsps=",
+        "lastModified": 1790094948,
+        "narHash": "sha256-rllb4XHCSJnr6szko7OSU/YE8ArpQclIK6O4BSd8Vu8=",
         "owner": "Mic92",
         "repo": "niks3",
-        "rev": "8ceb761b3db77461f3a21bdfd86998e0dc896d1c",
+        "rev": "1c74f969454c91db023fc37f286b5a113c30cdd6",
         "type": "github"
       },
       "original": {
