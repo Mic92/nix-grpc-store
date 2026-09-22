@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <print>
 #include <stdlib.h>
 #include <iostream>
 #include <memory>
@@ -355,7 +356,7 @@ auto main(int argc, char ** argv) -> int
         addr = std::string(cfg.tls ? "localhost:" : "127.0.0.1:") + std::to_string(port);
     }
     if (cfg.serve != 0) {
-        std::printf("event=serving addr=%s\n", addr.c_str());
+        std::print("event=serving addr={}\n", addr);
         std::fflush(stdout);
         server->Wait();
         return 0;
@@ -387,7 +388,7 @@ auto main(int argc, char ** argv) -> int
     for (int tick = 1; std::chrono::duration<double>(Clock::now() - t0).count() < cfg.seconds; tick++) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         auto a = assigned.load();
-        std::printf("event=tick s=%d assigned_per_s=%lu builds=%lu\n", tick, a - lastA, builds.load());
+        std::print("event=tick s={} assigned_per_s={} builds={}\n", tick, a - lastA, builds.load());
         std::fflush(stdout);
         lastA = a;
     }
@@ -406,15 +407,15 @@ auto main(int argc, char ** argv) -> int
     };
     auto total = assigned.load();
     // Each assignment is Want→(Expect→Done)→Assigned: 4 entries through the server.
-    std::printf(
-        "event=summary tls=%d workers=%zu clients=%zu inflight=%zu present_calls=%llu replies=%llu per_s=%.0f server_entries_per_s=%.0f "
-        "lat_us_p50=%u p90=%u p99=%u max=%u\n",
+    std::print(
+        "event=summary tls={} workers={} clients={} inflight={} present_calls={} replies={} per_s={:.0f} server_entries_per_s={:.0f} "
+        "lat_us_p50={} p90={} p99={} max={}\n",
         cfg.tls ? 1 : 0,
         cfg.workers,
         cfg.clients,
         cfg.inflight,
-        static_cast<unsigned long long>(presentCalls.load()),
-        static_cast<unsigned long long>(total),
+        presentCalls.load(),
+        total,
         static_cast<double>(total) / wall,
         4.0 * static_cast<double>(total) / wall,
         pct(0.5),
