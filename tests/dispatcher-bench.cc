@@ -27,7 +27,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
+#include <print>
 #include <cstdlib>
 #include <functional>
 #include <iostream>
@@ -258,9 +258,9 @@ struct Sim
             auto mono = [](HClock::time_point t) {
                 return std::chrono::duration<double>(t.time_since_epoch()).count();
             };
-            std::printf(
-                "event=spike op=%s us=%.0f sim_s=%.1f builds=%zu queued=%.0f "
-                "mono=%.6f,%.6f\n",
+            std::print(
+                "event=spike op={} us={:.0f} sim_s={:.1f} builds={} queued={:.0f} "
+                "mono={:.6f},{:.6f}\n",
                 what,
                 std::chrono::duration<double, std::micro>(dt).count(),
                 now,
@@ -488,9 +488,9 @@ struct Sim
 
     void report(double wallS) const
     {
-        std::printf(
-            "event=summary clients=%zu clients_done=%zu builds=%zu "
-            "sim_makespan_s=%.0f wall_s=%.3f\n",
+        std::print(
+            "event=summary clients={} clients_done={} builds={} "
+            "sim_makespan_s={:.0f} wall_s={:.3f}\n",
             clients.size(),
             clientsDone,
             builds,
@@ -502,17 +502,17 @@ struct Sim
             all += st.total;
             msgs += st.n;
             auto us = [](HClock::duration d) { return std::chrono::duration<double, std::micro>(d).count(); };
-            std::printf(
-                "event=op op=%s n=%lu total_ms=%.1f mean_us=%.2f max_us=%.0f\n",
-                name.c_str(),
+            std::print(
+                "event=op op={} n={} total_ms={:.1f} mean_us={:.2f} max_us={:.0f}\n",
+                name,
                 st.n,
                 us(st.total) / 1000,
                 us(st.total) / static_cast<double>(std::max<uint64_t>(st.n, 1)),
                 us(st.max));
         }
         auto totalS = std::chrono::duration<double>(all).count();
-        std::printf(
-            "event=total msgs=%lu dispatcher_s=%.3f msgs_per_s=%.0f\n",
+        std::print(
+            "event=total msgs={} dispatcher_s={:.3f} msgs_per_s={:.0f}\n",
             msgs,
             totalS,
             static_cast<double>(msgs) / std::max(totalS, 1e-9));
