@@ -248,6 +248,13 @@ public:
       unsupported("getBuildLogExact");
     }
 
+    // A farm has no single store to collect. The tunnel would reach whichever
+    // worker the balancer picked.
+    void collectGarbage(const GCOptions & /*options*/, GCResults & /*results*/) override {
+      throw Error("garbage collection is not available through '%s': workers collect their own stores",
+                  config->authority.to_string());
+    }
+
     // gRPC folds TCP and TLS failures into UNAVAILABLE, only the text differs.
     static auto transportError(std::string_view msg) -> bool;
 

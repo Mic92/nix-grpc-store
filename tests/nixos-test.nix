@@ -311,6 +311,12 @@ pkgs.testers.runNixOSTest {
         )
         machine.succeed(f"nix store info --json --store '{store_mtls}'")
 
+    with subtest("garbage collection is refused"):
+        for cmd in ["store gc", f"store delete '{p}'"]:
+            err = machine.fail(f"nix {cmd} --store '{store}' 2>&1")
+            assert "workers collect their own stores" in err, err
+        machine.succeed(f"nix path-info --store '{store}' '{p}'")
+
     with subtest("missing client cert yields a readable error"):
         machine.wait_for_unit("nix-grpc-daemon-strict.service")
         machine.wait_for_open_port(50053)
