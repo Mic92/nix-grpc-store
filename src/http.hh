@@ -102,7 +102,7 @@ public:
         : url(std::move(url_))
     {
         static std::once_flag once;
-        std::call_once(once, []() -> void { curl_global_init(CURL_GLOBAL_DEFAULT); });
+        std::call_once(once, [] -> void { curl_global_init(CURL_GLOBAL_DEFAULT); });
         curl.reset(curl_easy_init());
         if (!curl) {
             throw nix::Error("curl_easy_init failed");
@@ -128,7 +128,7 @@ public:
     // HTTP status, throws on transport errors.
     auto perform() -> long
     {
-        auto code = curl_easy_perform(curl.get());
+        auto const code = curl_easy_perform(curl.get());
         if (code != CURLE_OK && code != CURLE_WRITE_ERROR && code != CURLE_ABORTED_BY_CALLBACK) {
             throw nix::Error("%s: %s", url, curl_easy_strerror(code));
         }

@@ -42,7 +42,7 @@ Dispatcher::Dispatcher(Config config_, Metrics & metrics)
 {
     if (config.present) {
         for (unsigned i = 0; i < config.lookupThreads; i++) {
-            lookupThreads.emplace_back([this]() -> void { lookupLoop(); });
+            lookupThreads.emplace_back([this] -> void { lookupLoop(); });
         }
     }
 }
@@ -64,7 +64,7 @@ void Dispatcher::lookupLoop()
         LookupJob job;
         {
             const absl::MutexLock lock(lookupMutex);
-            auto ready = [this]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(lookupMutex) -> bool {
+            auto const ready = [this] ABSL_EXCLUSIVE_LOCKS_REQUIRED(lookupMutex) -> bool {
                 return lookupStop || !lookupQueue.empty();
             };
             lookupMutex.Await(absl::Condition(&ready));
@@ -89,7 +89,7 @@ Dispatcher::Lock::~Lock()
     std::vector<std::function<void()>> run;
     run.swap(disp.deferred);
     disp.mutex.unlock();
-    for (auto & func : run) {
+    for (auto const & func : run) {
         // A destructor must not throw. Deferred work is stream I/O kick-off,
         // a failure there ends that stream and is not ours to report.
         try {
@@ -163,7 +163,7 @@ void Dispatcher::dispatchLocked()
 {
     std::vector<sched::Assign> out;
     core.dispatch(out);
-    for (auto & asg : out) {
+    for (auto const & asg : out) {
         const auto & ent = core.entry(asg.drv);
         if (!ent) {
             continue;
@@ -172,7 +172,7 @@ void Dispatcher::dispatchLocked()
         SchedCmd cmd;
         cmd.mutable_expect()->set_drv_path(ent->drvPath);
         cmd.mutable_expect()->set_assign_id(asg.assignId);
-        auto wit = workers.find(asg.worker);
+        auto const wit = workers.find(asg.worker);
         if (wit == workers.end() || !wit->second(cmd)) {
             // Worker stream died under us; requeue and let the next event retry.
             core.workerGone(asg.worker);
@@ -184,8 +184,8 @@ void Dispatcher::dispatchLocked()
         msg.mutable_assigned()->set_drv_path(ent->drvPath);
         msg.mutable_assigned()->set_worker_addr(wkr.addr);
         msg.mutable_assigned()->set_assign_id(asg.assignId);
-        for (auto cid : asg.clients) {
-            if (auto cit = clients.find(cid); cit != clients.end()) {
+        for (auto const cid : asg.clients) {
+            if (auto const cit = clients.find(cid); cit != clients.end()) {
                 cit->second(msg);
             }
         }
@@ -245,8 +245,8 @@ void Dispatcher::supersede(sched::DrvId drv, sched::WorkerId loser)
     msg.mutable_assigned()->set_drv_path(ent->drvPath);
     msg.mutable_assigned()->set_worker_addr(core.worker(ent->worker).addr);
     msg.mutable_assigned()->set_assign_id(ent->assignId);
-    for (auto cid : ent->followers) {
-        if (auto cit = clients.find(cid); cit != clients.end()) {
+    for (auto const cid : ent->followers) {
+        if (auto const cit = clients.find(cid); cit != clients.end()) {
             cit->second(msg);
         }
     }
@@ -261,7 +261,7 @@ void Dispatcher::supersede(sched::DrvId drv, sched::WorkerId loser)
 
 void Dispatcher::revokeOn(sched::WorkerId wid, const std::string & drvPath)
 {
-    if (auto wit = workers.find(wid); wit != workers.end()) {
+    if (auto const wit = workers.find(wid); wit != workers.end()) {
         SchedCmd cmd;
         cmd.mutable_revoke()->set_drv_path(drvPath);
         wit->second(cmd);
@@ -362,7 +362,7 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
         client.known = true;
         clients[client.id] = client.send;
     }
-    auto system = systemFor(want.system());
+    auto const system = systemFor(want.system());
     auto res = core.want(
         client.id,
         {.drvPath = want.drv_path(),
@@ -464,7 +464,7 @@ void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg &
          .running = std::move(running)},
         superseded);
         workers[*worker.id] = worker.send;
-        for (auto sup : superseded) {
+        for (auto const sup : superseded) {
             supersede(sup.drv, sup.loser);
         }
         logLine(

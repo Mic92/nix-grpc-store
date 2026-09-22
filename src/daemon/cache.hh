@@ -70,7 +70,7 @@ public:
             throw nix::Error("niks3 present: HTTP %d: %s", status, call->body());
         }
         auto reply = nlohmann::json::parse(call->body(), nullptr, /*allow_exceptions=*/false);
-        auto found = reply.is_object() ? reply.find("present") : reply.end();
+        auto const found = reply.is_object() ? reply.find("present") : reply.end();
         // Go encodes an empty slice as null.
         if (found == reply.end() || !(found->is_array() || found->is_null())) {
             throw nix::Error("niks3 present: malformed reply: %s", call->body());

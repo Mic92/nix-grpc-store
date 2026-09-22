@@ -67,7 +67,7 @@ inline void sdNotify(std::string_view state)
     if (path->starts_with('@')) {
         addr.sun_path[0] = '\0'; // abstract namespace
     }
-    auto addrLen = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path->size());
+    auto const addrLen = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path->size());
     nix::AutoCloseFD const sock(::socket(AF_UNIX, SOCK_DGRAM, 0));
     if (!sock) {
         return;
@@ -79,7 +79,7 @@ inline void sdNotify(std::string_view state)
 // Half of WatchdogSec=, or zero if the watchdog is off.
 inline auto sdWatchdogInterval() -> std::chrono::microseconds
 {
-    auto usec = envInt<uint64_t>("WATCHDOG_USEC");
+    auto const usec = envInt<uint64_t>("WATCHDOG_USEC");
     return std::chrono::microseconds(usec.value_or(0) / 2);
 }
 
@@ -90,7 +90,7 @@ inline void
 acceptInto(const std::vector<int> & listenFds, const std::shared_ptr<grpc::experimental::ExternalConnectionAcceptor> & acceptor)
 {
     for (int const listenFd : listenFds) {
-        std::thread([listenFd, acceptor]() -> void {
+        std::thread([listenFd, acceptor] -> void {
             while (true) {
                 // No accept4 on macOS.
                 int const conn = ::accept(listenFd, nullptr, nullptr);
@@ -102,7 +102,7 @@ acceptInto(const std::vector<int> & listenFds, const std::shared_ptr<grpc::exper
                 }
                 // NOLINTBEGIN(cppcoreguidelines-pro-type-vararg): C API.
                 ::fcntl(conn, F_SETFD, FD_CLOEXEC);
-                ::fcntl(conn, F_SETFL, ::fcntl(conn, F_GETFL) | O_NONBLOCK);
+                ::fcntl(conn, F_SETFL, static_cast<unsigned>(std::max(0, ::fcntl(conn, F_GETFL))) | unsigned{O_NONBLOCK});
                 // NOLINTEND(cppcoreguidelines-pro-type-vararg)
                 grpc::experimental::ExternalConnectionAcceptor::NewConnectionParameters params;
                 params.listener_fd = listenFd;

@@ -70,11 +70,11 @@ auto b64url(std::string_view bytes) -> std::string
     return out;
 }
 
-auto bnParam(EVP_PKEY * key, const char * name, size_t padTo = 0) -> std::string
+auto bnParam(EVP_PKEY const * key, const char * name, size_t padTo = 0) -> std::string
 {
     BIGNUM * num = nullptr;
     EVP_PKEY_get_bn_param(key, name, &num);
-    auto width = padTo != 0 ? padTo : static_cast<size_t>(BN_num_bytes(num));
+    auto const width = padTo != 0 ? padTo : static_cast<size_t>(BN_num_bytes(num));
     std::string out(width, '\0');
     BN_bn2binpad(num, ossl(out.data()), static_cast<int>(width));
     BN_free(num);
@@ -233,27 +233,27 @@ auto writeConfig(const std::string & dir, const std::string & base) -> void
 auto run(const std::string & dir, const std::string & base) -> int
 {
     Checks check;
-    auto ecKey = Key::generate(Kind::ec, "ec-1");
-    auto rsaKey = Key::generate(Kind::rsa, "rsa-1");
-    auto pssKey = Key::generate(Kind::pss, "pss-1");
-    auto edKey = Key::generate(Kind::ed, "ed-1");
-    auto stranger = Key::generate(Kind::ec, "ec-1"); // same kid, different key
+    auto const ecKey = Key::generate(Kind::ec, "ec-1");
+    auto const rsaKey = Key::generate(Kind::rsa, "rsa-1");
+    auto const pssKey = Key::generate(Kind::pss, "pss-1");
+    auto const edKey = Key::generate(Kind::ed, "ed-1");
+    auto const stranger = Key::generate(Kind::ec, "ec-1"); // same kid, different key
 
     // k8s style: issuer taken from the SA token, JWKS behind explicit URL.
     nix::writeFile(dir + "/sa-token", ecKey.sign({{"iss", "https://kubernetes.default.svc"}, {"sub", "x"}}));
     writeConfig(dir, base);
 
     // Issuer serves nothing yet: config loads, verifier constructs, tokens are refused.
-    auto cfg = loadConfig(dir + "/oidc.json");
+    auto const cfg = loadConfig(dir + "/oidc.json");
     check(cfg.providers.size() == 2, "two providers");
     Verifier verifier(cfg, std::chrono::seconds(0));
 
-    auto claims = [&](const Json & extra) -> Json {
+    auto const claims = [&](const Json & extra) -> Json {
         Json res{{"iss", base}, {"aud", "grpc://cache"}, {"exp", now() + validFor}, {"iat", now()}};
         res.update(extra);
         return res;
     };
-    auto good = claims({{"sub", "repo:myorg/a:b"}});
+    auto const good = claims({{"sub", "repo:myorg/a:b"}});
 
     {
         using Clock = std::chrono::steady_clock;
@@ -266,7 +266,7 @@ auto run(const std::string & dir, const std::string & base) -> int
         check(!Verifier::fetchDue(justBooted, justBooted + onMiss * 2, true, onMiss), "known kid uses cached keys");
     }
     {
-        auto res = verifier.verify(ecKey.sign(good));
+        auto const res = verifier.verify(ecKey.sign(good));
         check(!res.identity && res.error.contains("no signing keys"), "issuer down -> refused, no crash");
     }
     nix::writeFile(dir + "/jwks.json", "garbage");
@@ -302,7 +302,7 @@ auto run(const std::string & dir, const std::string & base) -> int
         check(res.identity && !res.identity->role, "verified but no rule -> no role");
     }
     {
-        auto res = verifier.verify(ecKey.sign(claims({{"sub", "repo:myorg/a:b"}, {"aud", "someone-else"}})));
+        auto const res = verifier.verify(ecKey.sign(claims({{"sub", "repo:myorg/a:b"}, {"aud", "someone-else"}})));
         check(!res.identity && res.error.contains("audience"), "wrong audience");
     }
     {
@@ -310,22 +310,22 @@ auto run(const std::string & dir, const std::string & base) -> int
         check(res.identity && res.identity->role, "audience array");
     }
     {
-        auto res = verifier.verify(ecKey.sign(claims({{"sub", "repo:myorg/a:b"}, {"exp", now() - longAgo}})));
+        auto const res = verifier.verify(ecKey.sign(claims({{"sub", "repo:myorg/a:b"}, {"exp", now() - longAgo}})));
         check(!res.identity && res.error.contains("expired"), "expired");
         check(!verifier.verify(ecKey.sign({{"iss", base}, {"aud", "grpc://cache"}, {"sub", "s"}})).identity, "no exp");
-        auto future = claims({{"sub", "repo:myorg/a:b"}, {"nbf", now() + longAgo}});
+        auto const future = claims({{"sub", "repo:myorg/a:b"}, {"nbf", now() + longAgo}});
         check(!verifier.verify(ecKey.sign(future)).identity, "not yet valid");
     }
     {
-        auto res = verifier.verify(ecKey.sign(claims({{"sub", "repo:myorg/a:b"}, {"iss", "https://elsewhere"}})));
+        auto const res = verifier.verify(ecKey.sign(claims({{"sub", "repo:myorg/a:b"}, {"iss", "https://elsewhere"}})));
         check(!res.identity && res.error.contains("issuer"), "unknown issuer");
     }
     {
-        auto res = verifier.verify(stranger.sign(good));
+        auto const res = verifier.verify(stranger.sign(good));
         check(!res.identity && res.error.contains("signature"), "foreign key with known kid");
     }
     {
-        auto res = verifier.verify(rsaKey.sign(good, "HS256"));
+        auto const res = verifier.verify(rsaKey.sign(good, "HS256"));
         check(!res.identity && res.error.contains("alg"), "HS256 refused");
         check(!verifier.verify(rsaKey.sign(good, "none")).identity, "alg none refused");
         // RSA key material presented as ES256 must not verify.

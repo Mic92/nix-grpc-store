@@ -96,11 +96,11 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
         // Also `--flag=value`, one list item in a container spec.
         std::string_view arg = args.at(idx);
         std::optional<std::string_view> inlineValue;
-        if (auto sep = arg.find('='); arg.starts_with("--") && sep != std::string_view::npos) {
+        if (auto const sep = arg.find('='); arg.starts_with("--") && sep != std::string_view::npos) {
             inlineValue = arg.substr(sep + 1);
             arg = arg.substr(0, sep);
         }
-        auto next = [&]() -> std::string_view {
+        auto const next = [&] -> std::string_view {
             if (inlineValue) {
                 return *std::exchange(inlineValue, std::nullopt);
             }

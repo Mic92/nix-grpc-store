@@ -41,7 +41,7 @@ namespace nixgrpc {
 constexpr size_t kChunkSize = 256UL * 1024;
 constexpr size_t kPipeSize = 1024UL * 1024;
 
-inline void growPipe([[maybe_unused]] nix::Pipe & pipe)
+inline void growPipe([[maybe_unused]] nix::Pipe const & pipe)
 {
 #ifdef F_SETPIPE_SZ
     // A larger pipe lets the worker-protocol side run ahead of the pump
@@ -80,7 +80,7 @@ inline auto readCoalesced(int sourceFd, std::span<char> buf) -> ssize_t
             break; // drained
         }
 
-        auto rest = buf.subspan(got);
+        auto const rest = buf.subspan(got);
         ssize_t const count = ::read(sourceFd, rest.data(), rest.size());
         if (count > 0) {
             got += static_cast<size_t>(count);
@@ -149,10 +149,10 @@ inline auto pumpFdToStream(int sourceFd, Stream & stream) -> uint64_t
 
     // ZSTD_e_flush per batch is what makes the request/response protocol
     // work: the peer can decode each Chunk in isolation.
-    auto encode = [&](ZSTD_inBuffer zin, ZSTD_EndDirective directive) -> void {
+    auto const encode = [&](ZSTD_inBuffer zin, ZSTD_EndDirective directive) -> void {
         auto & out = *chunk.mutable_data();
         out.clear();
-        zstdCompressInto(*cctx, out, zin, directive, []() -> void {});
+        zstdCompressInto(*cctx, out, zin, directive, [] -> void {});
     };
 
     while (true) {
@@ -230,7 +230,7 @@ class ZstdWriterSink : public nix::Sink
 
     void compress(ZSTD_inBuffer input, ZSTD_EndDirective directive)
     {
-        zstdCompressInto(*cctx, *msg.mutable_data(), input, directive, [this]() -> void { ship(); });
+        zstdCompressInto(*cctx, *msg.mutable_data(), input, directive, [this] -> void { ship(); });
     }
 
 public:

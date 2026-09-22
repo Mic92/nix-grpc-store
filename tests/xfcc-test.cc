@@ -25,7 +25,7 @@ try {
     assert(subjectCommonName(R"(Subject="CN=)") == std::nullopt);
     assert(subjectCommonName(R"(Subject="CN=unterminated)") == std::nullopt);
     assert(subjectCommonName(R"(Subject="CN=x\)") == std::nullopt);
-    assert(subjectCommonName(std::string("Subject=\"CN=a\nb\"")) == std::nullopt);
+    assert(subjectCommonName("Subject=\"CN=a\nb\"") == std::nullopt);
     assert(subjectCommonName(std::string("Subject=CN=a") + '\0' + "b") == std::nullopt);
     assert(subjectCommonName("Subject=CN=" + std::string(300, 'a')) == std::nullopt);
     assert(subjectCommonName(std::string(20000, ';')) == std::nullopt);

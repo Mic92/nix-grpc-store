@@ -21,7 +21,8 @@ add_project_arguments(meson.get_compiler('cpp').get_supported_arguments(['-Werro
 # the prebuilt libabsl was compiled with; keep them in agreement. (UBSan
 # builds need clang: GCC rejects a constexpr in abseil's hash_policy_traits.h.)
 if get_option('b_sanitize').contains('address')
-  add_project_arguments('-DNDEBUG_SANITIZER', language : 'cpp')
+  # Same for protobuf >= 36's default-instance placement.
+  add_project_arguments('-DNDEBUG_SANITIZER', '-DPROTOBUF_MESSAGE_GLOBALS_TEMPORARY_OPTOUT', language : 'cpp')
 endif
 # glibc malloc stalls the scheduler for 5-40 ms consolidating its heap after
 # ~10^6 small frees (dispatcher-bench firehose); jemalloc keeps every call

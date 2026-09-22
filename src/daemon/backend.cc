@@ -98,7 +98,7 @@ auto Backends::forBuild(Cancelled cancelled, nix::Store & localStore) const -> s
 namespace {
 auto buildPathsVia(
     Backend & backend,
-    nix::Store & localStore,
+    nix::Store const & localStore,
     const std::vector<nix::DerivedPath> & targets,
     nix::BuildMode mode,
     const BuildEventSink & sendLogLine) -> std::vector<nix::KeyedBuildResult>

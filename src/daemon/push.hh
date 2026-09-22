@@ -85,7 +85,7 @@ public:
     // Returns after niks3 committed all of `paths`.
     auto pushWait(const std::vector<std::string> & paths, const Cancelled & cancelled = never) -> Signatures
     {
-        auto pending = std::make_shared<Pending>(paths.size());
+        auto const pending = std::make_shared<Pending>(paths.size());
         uint64_t reqId = 0;
         std::shared_ptr<nix::AutoCloseFD> stdinFd;
         {
@@ -217,7 +217,7 @@ private:
         fromChild.create();
         // dieWithParent (PDEATHSIG) fires when the forking gRPC thread exits.
         lck->pid = nix::startProcess(
-            [&]() -> void {
+            [&] -> void {
                 if (dup2(toChild.readSide.get(), STDIN_FILENO) == -1
                     || dup2(fromChild.writeSide.get(), STDOUT_FILENO) == -1) {
                     throw nix::SysError("dup2");
@@ -228,7 +228,7 @@ private:
             },
             {.dieWithParent = false});
         lck->stdinFd = std::make_shared<nix::AutoCloseFD>(std::move(toChild.writeSide));
-        reader = std::thread([this, acks = std::make_shared<nix::AutoCloseFD>(std::move(fromChild.readSide))]() -> void {
+        reader = std::thread([this, acks = std::make_shared<nix::AutoCloseFD>(std::move(fromChild.readSide))] -> void {
             readAcks(acks->get());
         });
         logLine(LogLevel::info, {{"event", "niks3_push_started"}, {"pid", std::to_string(static_cast<pid_t>(lck->pid))}});
@@ -239,13 +239,13 @@ private:
         std::string why;
         try {
             while (true) {
-                auto line = nix::readLine(acksFd);
-                auto ack = nlohmann::json::parse(line, nullptr, /*allow_exceptions=*/false);
+                auto const line = nix::readLine(acksFd);
+                auto const ack = nlohmann::json::parse(line, nullptr, /*allow_exceptions=*/false);
                 if (!ack.is_object()) {
                     continue;
                 }
                 auto lck = state.lock();
-                auto found = lck->waiting.find(ack.value("id", uint64_t{0}));
+                auto const found = lck->waiting.find(ack.value("id", uint64_t{0}));
                 if (found == lck->waiting.end()) {
                     continue;
                 }

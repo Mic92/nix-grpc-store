@@ -63,7 +63,7 @@ auto GrpcStore::routingFor(const BasicDerivation & drv, const std::string & work
 void GrpcStore::uploadDrvClosure(Store & evalStore, const StorePath & drvPath, const Metadata & headers) {
   StorePathSet closure;
   evalStore.computeFSClosure(drvPath, closure);
-  auto present = queryValidPathsRouted(closure, NoSubstitute, headers);
+  auto const present = queryValidPathsRouted(closure, NoSubstitute, headers);
   StorePathSet missing;
   for (const auto & path : closure) {
     if (!present.contains(path)) {
@@ -81,7 +81,7 @@ void GrpcStore::uploadDrvClosure(Store & evalStore, const StorePath & drvPath, c
     auto info = evalStore.queryPathInfo(path);
     // NOLINTNEXTLINE(bugprone-exception-escape): libc++ coroutine frames trip this.
     sources.emplace_back(*info, sinkToSource([this, &evalStore, info, parent = act.id](Sink & sink) -> void {
-      auto pathS = printStorePath(info->path);
+      auto const pathS = printStorePath(info->path);
       const std::vector<Logger::Field> fields{pathS, "local", config->authority.to_string()};
       const Activity pathAct(*logger, lvlInfo, actCopyPath,
                              fmt("copying path '%s' to '%s'", pathS, config->authority.to_string()), fields,
@@ -103,11 +103,11 @@ auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & reques
   grpc::ClientContext ctx;
   addHeaders(ctx, headers);
   // ^C cancels the stream so the worker stops the build at once.
-  auto const onInterrupt = createInterruptCallback([&ctx]() -> void { ctx.TryCancel(); });
+  auto const onInterrupt = createInterruptCallback([&ctx] -> void { ctx.TryCancel(); });
   auto reader = stub->BuildDerivation(&ctx, request);
 
   // Named like nix's own actBuild so log UIs merge them, opened lazily so the NOT_FOUND probe is silent.
-  auto drv = printStorePath(StorePath(request.drv_path()));
+  auto const drv = printStorePath(StorePath(request.drv_path()));
   BuildLogActivity act(fmt("building '%s' on %s", drv, config->authority.to_string()),
                        {drv, config->authority.to_string(), 1, 1});
   return readBuildStream(*reader, act, [&](const remote::BuildDerivationDone & done) -> void {
@@ -130,7 +130,7 @@ auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore)
     nixcompat::writeDrv(sink, *this, job.drv);
     *request.mutable_drv() = std::move(sink.s);
   }
-  auto headers = routingFor(job.drv, job.workerAddr);
+  auto const headers = routingFor(job.drv, job.workerAddr);
   std::optional<BuildResult> res;
   auto status = tryBuildDerivation(request, headers, res);
   if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
@@ -184,7 +184,7 @@ struct GrpcStore::Run {
 
   auto next() -> Job * {
     std::unique_lock lock(mutex);
-    cv.wait(lock, [&]() -> bool { return !ready.empty() || remaining == 0; });
+    cv.wait(lock, [&] -> bool { return !ready.empty() || remaining == 0; });
     if (ready.empty()) {
       return nullptr;
     }
@@ -353,8 +353,8 @@ struct GrpcStore::Run {
   }
 
   void onMsgLocked(const remote::SchedMsg & msg) {
-    auto name = drvOf(msg);
-    auto found = byName.find(name);
+    auto const name = drvOf(msg);
+    auto const found = byName.find(name);
     Job * job = found == byName.end() ? nullptr : found->second;
     if (job == nullptr || job->result) {
       return;
@@ -547,14 +547,14 @@ void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, BuildMode buildMode, St
       run.wantable.push_back(&job);
     }
   }
-  auto headers = routingFor(jobs.begin()->second.drv);
+  auto const headers = routingFor(jobs.begin()->second.drv);
   std::mutex ctxMutex; // not run.mutex: the interrupt callback must not wait on stream I/O
   grpc::ClientContext * liveCtx = nullptr;
-  auto setCtx = [&](grpc::ClientContext * ctx) -> void {
+  auto const setCtx = [&](grpc::ClientContext * ctx) -> void {
     std::scoped_lock const lock(ctxMutex);
     liveCtx = ctx;
   };
-  auto const onInterrupt = createInterruptCallback([&]() -> void {
+  auto const onInterrupt = createInterruptCallback([&] -> void {
     std::scoped_lock const lock(ctxMutex);
     if (liveCtx != nullptr) {
       liveCtx->TryCancel();
@@ -563,14 +563,14 @@ void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, BuildMode buildMode, St
 
   std::vector<std::jthread> threads(std::min<size_t>(config->maxBuilds, jobs.size()));
   for (auto & thread : threads) {
-    thread = std::jthread([&run]() -> void { run.work(); });
+    thread = std::jthread([&run] -> void { run.work(); });
   }
   std::jthread reaper([&run](const std::stop_token & stop) -> void { run.reapUnplaceable(stop); });
-  std::stop_callback const wakeReaper(reaper.get_stop_token(), [&run]() -> void { run.cv.notify_all(); });
+  std::stop_callback const wakeReaper(reaper.get_stop_token(), [&run] -> void { run.cv.notify_all(); });
   // Also on unwind: lets the threads drain so the join in ~jthread returns.
-  Finally const abandon([&run]() -> void { run.abandon(); });
+  Finally const abandon([&run] -> void { run.abandon(); });
 
-  auto status = scheduleUntilDone(run, headers, setCtx);
+  auto const status = scheduleUntilDone(run, headers, setCtx);
   run.abandon();
   reaper.request_stop();
   threads.clear(); // join
@@ -609,7 +609,7 @@ auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode b
       opaque.insert(opq->path);
     }
   }
-  auto validOpaque = opaque.empty() ? StorePathSet{} : queryValidPaths(opaque, Substitute);
+  auto const validOpaque = opaque.empty() ? StorePathSet{} : queryValidPaths(opaque, Substitute);
 
   std::vector<KeyedBuildResult> results;
   results.reserve(reqs.size());
@@ -680,7 +680,7 @@ auto GrpcStore::validInputDrvs(const std::vector<DerivedPath> & reqs, Store & ev
     if (drvs.contains(drvPath)) {
       return;
     }
-    auto & full = drvs.emplace(drvPath, evalStore.readDerivation(drvPath)).first->second;
+    auto const & full = drvs.emplace(drvPath, evalStore.readDerivation(drvPath)).first->second;
     nixcompat::forInputDrvs(full, collect);
   };
   StorePathSet tops;
@@ -717,10 +717,10 @@ void GrpcStore::loadJobs(const std::vector<DerivedPath> & reqs, Store & evalStor
                   std::map<StorePath, Job> & jobs) {
   auto valid = validInputDrvs(reqs, evalStore);
   std::function<Job &(const StorePath &)> load = [&](const StorePath & drvPath) -> Job & {
-    if (auto found = jobs.find(drvPath); found != jobs.end()) {
+    if (auto const found = jobs.find(drvPath); found != jobs.end()) {
       return found->second;
     }
-    auto full = evalStore.readDerivation(drvPath);
+    auto const full = evalStore.readDerivation(drvPath);
     auto & job = jobs.emplace(drvPath, Job{.drvPath = drvPath,
                                            .drv = basicForFarm(evalStore, drvPath, full)})
                      .first->second;

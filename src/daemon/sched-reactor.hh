@@ -83,7 +83,7 @@ public:
             }
             if (kick) {
                 // `writing` is set, so OnDone cannot fire before this runs.
-                disp.afterUnlock([this]() -> void { writeNext(); });
+                disp.afterUnlock([this] -> void { writeNext(); });
             }
             return true;
         };

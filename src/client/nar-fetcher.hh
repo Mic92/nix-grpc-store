@@ -66,7 +66,7 @@ public:
             throw nix::Error("gRPC FetchNars sent data after EOF for a path");
         }
         while (!data.empty()) {
-            auto count = ::pwrite(fd.get(), data.data(), data.size(), static_cast<off_t>(off));
+            auto const count = ::pwrite(fd.get(), data.data(), data.size(), static_cast<off_t>(off));
             if (count < 0) {
                 throw nix::SysError("writing NAR spool file");
             }
@@ -123,8 +123,8 @@ public:
                 }
             }
             while (pos < avail) {
-                auto want = std::min<uint64_t>(buf.size(), avail - pos);
-                auto count = ::pread(fd.get(), buf.data(), want, static_cast<off_t>(pos));
+                auto const want = std::min<uint64_t>(buf.size(), avail - pos);
+                auto const count = ::pread(fd.get(), buf.data(), want, static_cast<off_t>(pos));
                 if (count <= 0) {
                     throw nix::SysError("reading NAR spool file");
                 }
@@ -214,7 +214,7 @@ public:
         buffer->readInto(sink);
         {
             std::scoped_lock const lock(narMutex);
-            auto found = buffers.find(path);
+            auto const found = buffers.find(path);
             if (found != buffers.end() && found->second == buffer) {
                 buffers.erase(found);
             }
@@ -244,7 +244,7 @@ private:
         {
             try {
                 demuxNarFrames(*reader, targets);
-                auto status = reader->Finish();
+                auto const status = reader->Finish();
                 auto cause = std::make_exception_ptr(
                     status.ok() ? nix::Error("gRPC FetchNars stream ended early")
                                 : nix::Error("gRPC FetchNars failed: %s", status.error_message()));
@@ -271,7 +271,7 @@ private:
 
     [[nodiscard]] auto narSizeOf(const nix::StorePath & path) const -> uint64_t
     {
-        auto found = narSizes.find(path);
+        auto const found = narSizes.find(path);
         return found == narSizes.end() ? 0 : found->second;
     }
 
@@ -287,13 +287,13 @@ private:
         std::vector<std::vector<nix::StorePath>> groups(connections);
         std::vector<uint64_t> load(connections, 0);
         for (auto & path : pending) {
-            auto smallest = static_cast<size_t>(
+            auto const smallest = static_cast<size_t>(
                 std::ranges::min_element(load) - load.begin());
             groups.at(smallest).push_back(std::move(path));
             load.at(smallest) += narSizeOf(groups.at(smallest).back());
         }
         pending.clear();
-        for (auto & group : groups) {
+        for (auto const & group : groups) {
             if (!group.empty()) {
                 startSession(group);
             }

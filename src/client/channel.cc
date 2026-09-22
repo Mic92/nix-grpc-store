@@ -102,7 +102,7 @@ void retainGrpcRuntime() {
       grpc_event_engine::experimental::SetDefaultEventEngine(nullptr);
       constexpr std::chrono::seconds patience{2};
       constexpr std::chrono::milliseconds pollEvery{5};
-      auto deadline = std::chrono::steady_clock::now() + patience;
+      auto const deadline = std::chrono::steady_clock::now() + patience;
       while (engine.use_count() > 1 && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(pollEvery);
       }

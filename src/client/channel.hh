@@ -86,7 +86,7 @@ public:
                    const grpc::AuthContext & /*channelAuthContext*/,
                    std::multimap<grpc::string, grpc::string> * metadata) -> grpc::Status override {
     try {
-      auto token = nix::chomp(nix::readFile(path));
+      auto const token = nix::chomp(nix::readFile(path));
       if (token.empty() || token.find_first_of("\r\n") != std::string::npos) {
         return {grpc::StatusCode::UNAUTHENTICATED, "token file '" + path + "' is empty or multi-line"};
       }

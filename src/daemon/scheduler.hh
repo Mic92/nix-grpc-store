@@ -45,7 +45,7 @@ struct PathKey
     // `/nix/store/<hash>-name`, or a bare name in tests.
     explicit PathKey(std::string_view path)
     {
-        if (auto slash = path.rfind('/'); slash != std::string_view::npos) {
+        if (auto const slash = path.rfind('/'); slash != std::string_view::npos) {
             path.remove_prefix(slash + 1);
         }
         path = path.substr(0, len);
@@ -142,8 +142,8 @@ public:
             siftUp(heap.size() - 1);
             return;
         }
-        auto idx = pos.at(drv);
-        auto old = heap.at(idx).first;
+        auto const idx = pos.at(drv);
+        auto const old = heap.at(idx).first;
         heap.at(idx).first = key;
         if (key < old) {
             siftUp(idx);
@@ -157,7 +157,7 @@ public:
         if (!contains(drv)) {
             return;
         }
-        auto idx = pos.at(drv);
+        auto const idx = pos.at(drv);
         pos.at(drv) = npos;
         auto last = heap.back();
         heap.pop_back();
@@ -210,7 +210,7 @@ public:
         tracked.at(wid) = true;
         pos.at(wid) = static_cast<uint32_t>(byFree.at(0).size());
         byFree.at(0).push_back(wid);
-        nonempty |= 1;
+        nonempty |= uint64_t{1};
     }
 
     [[nodiscard]] auto get(WorkerId wid) const -> int32_t
@@ -221,18 +221,18 @@ public:
     void set(WorkerId wid, int32_t val)
     {
         check(wid);
-        auto from = bucket(free.at(wid));
-        auto dest = bucket(val);
+        auto const from = bucket(free.at(wid));
+        auto const dest = bucket(val);
         free.at(wid) = val;
         if (from == dest) {
             return;
         }
         auto & src = byFree.at(from);
-        auto idx = pos.at(wid);
+        auto const idx = pos.at(wid);
         if (idx >= src.size() || src.at(idx) != wid) {
             throw nix::Error("FreeIndex: corrupt bucket for worker %d", wid);
         }
-        auto last = src.back();
+        auto const last = src.back();
         src.at(idx) = last;
         pos.at(last) = idx;
         src.pop_back();
@@ -251,7 +251,7 @@ public:
 
     [[nodiscard]] auto emptiest() const -> std::optional<WorkerId>
     {
-        auto top = maxFree();
+        auto const top = maxFree();
         if (top <= 0 || byFree.at(static_cast<size_t>(top)).empty()) {
             return std::nullopt;
         }
@@ -317,7 +317,7 @@ public:
     auto drvId(std::string_view path) -> DrvId
     {
         const PathKey key(path);
-        if (auto iter = drvIds.find(key); iter != drvIds.end()) {
+        if (auto const iter = drvIds.find(key); iter != drvIds.end()) {
             return iter->second;
         }
         DrvId drv = 0;
@@ -337,16 +337,16 @@ public:
 
     [[nodiscard]] auto findDrv(std::string_view path) const -> std::optional<DrvId>
     {
-        auto iter = drvIds.find(PathKey(path));
+        auto const iter = drvIds.find(PathKey(path));
         return iter == drvIds.end() ? std::nullopt : std::optional(iter->second);
     }
 
     auto workerId(std::string_view addr) -> WorkerId
     {
-        if (auto iter = workerIds.find(std::string(addr)); iter != workerIds.end()) {
+        if (auto const iter = workerIds.find(std::string(addr)); iter != workerIds.end()) {
             return iter->second;
         }
-        auto wid = static_cast<WorkerId>(workers.size());
+        auto const wid = static_cast<WorkerId>(workers.size());
         workers.push_back(Worker{.addr = std::string(addr)});
         workerIds.emplace(std::string(addr), wid);
         return wid;
@@ -394,8 +394,8 @@ public:
     // Caller handled the cache-hit case already.
     auto want(ClientId client, WantInfo info, double nowMs) -> WantResult
     {
-        auto drv = drvId(info.drvPath);
-        auto cpHintMs = info.cpHintMs;
+        auto const drv = drvId(info.drvPath);
+        auto const cpHintMs = info.cpHintMs;
         auto & slot = entries.at(drv);
         if (!slot) {
             slot = Entry{
@@ -404,7 +404,7 @@ public:
                 .features = std::move(info.features),
                 .enqMs = nowMs};
             slot->inputs.reserve(info.inputs.size());
-            for (auto input : info.inputs) {
+            for (auto const input : info.inputs) {
                 slot->inputs.emplace_back(input);
             }
         } else if (slot->system.empty()) {
@@ -462,13 +462,13 @@ public:
 
     void clientGone(ClientId client, std::vector<std::pair<DrvId, WorkerId>> & revokes)
     {
-        auto iter = follows.find(client);
+        auto const iter = follows.find(client);
         if (iter == follows.end()) {
             return;
         }
-        auto drvs = std::move(iter->second);
+        auto const drvs = std::move(iter->second);
         follows.erase(iter);
-        for (auto drv : drvs) {
+        for (auto const drv : drvs) {
             if (auto wid = cancel(client, drv)) {
                 revokes.emplace_back(drv, *wid);
             }
@@ -498,7 +498,7 @@ public:
         if (info.addr.empty()) {
             throw nix::Error("scheduler: Hello without addr");
         }
-        auto wid = workerId(info.addr);
+        auto const wid = workerId(info.addr);
         if (workers.at(wid).up) {
             workerGone(wid);
         }
@@ -513,7 +513,7 @@ public:
         wkr.features = info.features;
         wkr.maxJobs = static_cast<int32_t>(std::min<uint32_t>(info.maxJobs, FreeIndex::maxSlots));
         for (auto [path, assignId] : info.running) {
-            auto drv = drvId(path);
+            auto const drv = drvId(path);
             auto & slot = entries.at(drv);
             if (!slot) {
                 slot = Entry{.drvPath = std::string(path)};
@@ -570,7 +570,7 @@ public:
         }
         wkr.up = false;
         refreshFree(wid);
-        for (auto drv : std::exchange(wkr.running, {})) {
+        for (auto const drv : std::exchange(wkr.running, {})) {
             if (drv >= entries.size()) {
                 continue;
             }
@@ -716,7 +716,7 @@ private:
     void rememberBuilder(std::string_view path, WorkerId wid, uint64_t size)
     {
         const PathKey key(path);
-        if (auto iter = lastBuilder.find(key); iter != lastBuilder.end()) {
+        if (auto const iter = lastBuilder.find(key); iter != lastBuilder.end()) {
             iter->second = {wid, size};
             return;
         }
@@ -740,7 +740,7 @@ private:
                 break;
             }
             auto & slot = entries.at(*head);
-            auto drv = *head;
+            auto const drv = *head;
             if (!slot || slot->followers.empty() || slot->worker != noWorker) {
                 queue.erase(drv); // stale
                 if (slot && slot->followers.empty() && slot->worker == noWorker) {
@@ -777,15 +777,15 @@ private:
         if (wkr.systems.empty()) {
             return 0;
         }
-        auto iter = systems.find(wkr.systems.front());
+        auto const iter = systems.find(wkr.systems.front());
         return iter == systems.end() ? 0 : iter->second.free.get(wid);
     }
 
     void refreshFree(WorkerId wid)
     {
-        auto & wkr = workers.at(wid);
-        auto running = static_cast<int32_t>(std::min<size_t>(wkr.running.size(), FreeIndex::maxSlots));
-        auto val = (wkr.up && !wkr.draining) ? wkr.maxJobs - running : 0;
+        auto const & wkr = workers.at(wid);
+        auto const running = static_cast<int32_t>(std::min<size_t>(wkr.running.size(), FreeIndex::maxSlots));
+        auto const val = (wkr.up && !wkr.draining) ? wkr.maxJobs - running : 0;
         for (const auto & name : wkr.systems) {
             sys(name).free.set(wid, val);
         }
@@ -793,7 +793,7 @@ private:
 
     [[nodiscard]] auto prio(const Entry & ent) const -> double
     {
-        auto extra = ent.followers.empty() ? 0.0 : static_cast<double>(ent.followers.size() - 1);
+        auto const extra = ent.followers.empty() ? 0.0 : static_cast<double>(ent.followers.size() - 1);
         return -(ent.cpHint + (cfg.faninWeight * extra) - (cfg.ageWeight * ent.enqMs));
     }
 
@@ -809,7 +809,7 @@ private:
     // features, O(workers) with.
     [[nodiscard]] auto emptiestFor(const Entry & ent) const -> std::optional<WorkerId>
     {
-        auto iter = systems.find(ent.system);
+        auto const iter = systems.find(ent.system);
         if (iter == systems.end()) {
             return std::nullopt;
         }
@@ -834,12 +834,12 @@ private:
             return std::nullopt;
         }
         const auto topFree = std::max(1.0, static_cast<double>(freeOf(*best)));
-        auto score = [&](WorkerId wid, double bytes) -> double {
+        auto const score = [&](WorkerId wid, double bytes) -> double {
             return bytes + (cfg.locLambda * freeOf(wid) / topFree);
         };
         std::vector<std::pair<WorkerId, double>> cands;
         for (const auto & input : ent.inputs) {
-            auto iter = lastBuilder.find(input);
+            auto const iter = lastBuilder.find(input);
             if (iter == lastBuilder.end()) {
                 continue;
             }
@@ -847,7 +847,7 @@ private:
             if (wid >= workers.size() || !workers.at(wid).up || freeOf(wid) <= 0 || !offers(workers.at(wid), ent)) {
                 continue;
             }
-            auto cand = std::ranges::find_if(cands, [&](auto & cnd) -> bool { return cnd.first == wid; });
+            auto const cand = std::ranges::find_if(cands, [&](auto & cnd) -> bool { return cnd.first == wid; });
             if (cand == cands.end()) {
                 cands.emplace_back(wid, static_cast<double>(size));
             } else {
@@ -857,7 +857,7 @@ private:
         WorkerId picked = *best;
         double bestScore = score(*best, 0);
         for (auto [wid, bytes] : cands) {
-            if (auto scr = score(wid, bytes); scr > bestScore) {
+            if (auto const scr = score(wid, bytes); scr > bestScore) {
                 bestScore = scr;
                 picked = wid;
             }

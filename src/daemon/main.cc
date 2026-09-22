@@ -147,9 +147,13 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
 
 public:
     // begin() throws this for callers the ACL refuses.
-    struct Denied
+    struct Denied : std::exception
     {
         grpc::Status status;
+        explicit Denied(grpc::Status status_)
+            : status(std::move(status_))
+        {
+        }
     };
 
 private:
@@ -214,7 +218,7 @@ private:
         -> Rpc
     {
         auto caller = auth.identify(context);
-        if (auto status = nixgrpc::Auth::authorize(caller, method, minRole, buildMode); !status.ok()) {
+        if (auto const status = nixgrpc::Auth::authorize(caller, method, minRole, buildMode); !status.ok()) {
             throw Denied{status};
         }
         metrics.countRpc(std::string(method), caller.name);
@@ -245,7 +249,7 @@ public:
 
     auto Connect(grpc::ServerContext * context, GrpcStream * stream) -> grpc::Status override
     {
-        return guarded([&]() -> grpc::Status {
+        return guarded([&] -> grpc::Status {
             // The opaque worker protocol cannot be inspected here. Builds sent
             // through it bypass the scheduler, hence trusted only.
             auto const rpc = begin(*context, "Connect", nixgrpc::Role::trusted);
@@ -258,7 +262,7 @@ public:
             }
 
             std::atomic<uint64_t> bytesIn{0};
-            std::jthread receiver([&]() -> void {
+            std::jthread receiver([&] -> void {
                 try {
                     bytesIn = nixgrpc::pumpStreamToFd(*stream, sock.get());
                 } catch (...) {
@@ -286,10 +290,10 @@ public:
         const nix::remote::QueryValidPathsRequest * request,
         nix::remote::QueryValidPathsReply * reply) -> grpc::Status override
     {
-        return guarded([&]() -> grpc::Status {
+        return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "QueryValidPaths", nixgrpc::Role::readOnly);
             nixgrpc::Metrics::Held const held(metrics, "QueryValidPaths");
-            auto localStore = getStore();
+            auto const localStore = getStore();
             nix::StorePathSet paths;
             for (const auto & path : request->paths()) {
                 paths.insert(nix::StorePath(path));
@@ -309,7 +313,7 @@ public:
                 }
                 // and what only we have must become so before the client relies on it.
                 phase.next("publish");
-                coord.cache.publish(*localStore, valid, [&]() -> bool { return context->IsCancelled(); });
+                coord.cache.publish(*localStore, valid, [&] -> bool { return context->IsCancelled(); });
             }
             return grpc::Status::OK;
         });
@@ -320,7 +324,7 @@ public:
         AddMultipleReader * reader,
         nix::remote::AddMultipleReply * /*reply*/) -> grpc::Status override
     {
-        return guarded([&]() -> grpc::Status {
+        return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "AddMultipleToStore", nixgrpc::Role::write);
             auto localStore = openScopedStore();
 
@@ -345,14 +349,14 @@ public:
             nixgrpc::Metrics::Held const held(metrics, "AddMultipleToStore");
             std::vector<std::string> imported;
             nixgrpc::Metrics::Phase phase(metrics, "AddMultipleToStore", "recv");
-            auto stats = nixgrpc::importPaths(
+            auto const stats = nixgrpc::importPaths(
                 *localStore, source, [&](const nix::ValidPathInfo & info, nix::Source & nar) -> void {
                     coord.cache.completeRefs(*localStore, info);
                     localStore->addToStore(info, nar, repair, checkSigs);
                     imported.push_back(localStore->printStorePath(info.path));
                 });
             phase.next("publish");
-            coord.cache.publish(*localStore, imported, [&]() -> bool { return context->IsCancelled(); });
+            coord.cache.publish(*localStore, imported, [&] -> bool { return context->IsCancelled(); });
             phase.done();
             rpc.done({{"paths", std::to_string(stats.paths)}, {"nar_bytes_in", std::to_string(stats.narBytes)}});
             metrics.countNarBytes("in", rpc.caller.name, stats.narBytes);
@@ -365,9 +369,9 @@ public:
         const nix::remote::QueryPathInfosRequest * request,
         nix::remote::QueryPathInfosReply * reply) -> grpc::Status override
     {
-        return guarded([&]() -> grpc::Status {
+        return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "QueryPathInfos", nixgrpc::Role::readOnly);
-            auto localStore = getStore();
+            auto const localStore = getStore();
             for (const auto & name : request->paths()) {
                 nix::StorePath const path(name);
                 std::shared_ptr<const nix::ValidPathInfo> info;
@@ -385,15 +389,16 @@ public:
         });
     }
 
+
     auto QueryMissing(
         grpc::ServerContext * context,
         const nix::remote::QueryMissingRequest * request,
         nix::remote::QueryMissingReply * reply) -> grpc::Status override
     {
-        return guarded([&]() -> grpc::Status {
+        return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "QueryMissing", nixgrpc::Role::readOnly);
-            auto localStore = getStore();
-            auto missing = localStore->queryMissing(parseTargets(*localStore, request->targets()));
+            auto const localStore = getStore();
+            auto const missing = localStore->queryMissing(parseTargets(*localStore, request->targets()));
             for (const auto & path : missing.willBuild) {
                 reply->add_will_build(std::string(path.to_string()));
             }
@@ -414,7 +419,7 @@ public:
         const nix::remote::StoreInfoRequest * /*request*/,
         nix::remote::StoreInfoReply * reply) -> grpc::Status override
     {
-        return guarded([&]() -> grpc::Status {
+        return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "StoreInfo", nixgrpc::Role::readOnly);
             // build-remote sends BuildDerivation and unsigned inputs only to stores that trust it.
             reply->set_trusted(rpc.caller.role == nixgrpc::Role::trusted);
@@ -511,7 +516,7 @@ public:
             return {grpc::StatusCode::FAILED_PRECONDITION, "not a builder"};
         }
         auto & builder = *coord.builder;
-        auto outPaths = staticOutputs(localStore, drv);
+        auto const outPaths = staticOutputs(localStore, drv);
         if (outPaths.size() != drv.outputs.size()) {
             return {grpc::StatusCode::UNIMPLEMENTED, "builds need statically known output paths"};
         }
@@ -551,7 +556,7 @@ public:
         auto outcome = nix::remote::Done::FAILED;
         std::vector<std::pair<std::string, uint64_t>> outputs;
         std::string wire;
-        auto report = [&]() -> void { builder.finished(drvName, outcome, outputs, wire); };
+        auto const report = [&] -> void { builder.finished(drvName, outcome, outputs, wire); };
         try {
             auto status =
                 buildExpected(context, *adm->shared, localStore, drvPath, drv, mode, limits, log, outPaths, done, outcome, outputs);
@@ -589,13 +594,13 @@ public:
         nix::remote::Done::Outcome & outcome,
         std::vector<std::pair<std::string, uint64_t>> & outputs) -> grpc::Status
     {
-        auto cancelled = [&]() -> bool {
+        auto const cancelled = [&] -> bool {
             return (context.IsCancelled() && shared.attached == 0) || shared.revoked || stopSignal >= nixgrpc::kCancelBuilds;
         };
         nixgrpc::Metrics::Held const held(metrics, "BuildDerivation");
         nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "substitute");
         // Roots inputs and outputs until publish is done.
-        auto roots = openScopedStore();
+        auto const roots = openScopedStore();
         if (auto status = gatherInputs(localStore, drv, *roots); !status.ok()) {
             return status;
         }
@@ -651,7 +656,7 @@ public:
         const nix::remote::BuildDerivationRequest * request,
         BuildWriter * writer) -> grpc::Status override
     {
-        return guarded([&]() -> grpc::Status {
+        return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "BuildDerivation", nixgrpc::Role::write, request->build_mode());
             if (request->protocol() != nixcompat::kBuildProtocolWire
                 || request->build_mode() > static_cast<uint32_t>(nix::bmCheck)) {
@@ -660,8 +665,8 @@ public:
             if (stopSignal != 0) {
                 return {grpc::StatusCode::UNAVAILABLE, "worker draining"};
             }
-            auto localStore = getStore();
-            auto sendLogLine = [&](nixgrpc::BuildEvent event) -> void {
+            auto const localStore = getStore();
+            auto const sendLogLine = [&](nixgrpc::BuildEvent event) -> void {
                 writer->Write(nixgrpc::toChunk<nix::remote::BuildDerivationChunk>(std::move(event)));
             };
 
@@ -674,7 +679,7 @@ public:
                 .buildTimeout = request->build_timeout(), .maxSilentTime = request->max_silent_time()};
 
             nix::remote::BuildDerivationChunk chunk;
-            if (auto status = build(*context, *localStore, drvPath, drv, mode, limits, sendLogLine, *chunk.mutable_done());
+            if (auto const status = build(*context, *localStore, drvPath, drv, mode, limits, sendLogLine, *chunk.mutable_done());
                 !status.ok()) {
                 return {status.error_code(), workerName + ": " + status.error_message()};
             }
@@ -692,9 +697,9 @@ public:
         const nix::remote::FetchNarsRequest * request,
         NarFrameWriter * writer) -> grpc::Status override
     {
-        return guarded([&]() -> grpc::Status {
+        return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "FetchNars", nixgrpc::Role::readOnly);
-            auto localStore = getStore();
+            auto const localStore = getStore();
 
             class TaggingWriter
             {
@@ -755,9 +760,9 @@ namespace {
 // taking builds and this returns once those in flight have reported. The
 // supervisor's stop timeout or a second signal bounds that.
 void serve(
-    grpc::Server & server,
+    grpc::Server const & server,
     const nixgrpc::Options & options,
-    nixgrpc::IdleTracker & idle,
+    nixgrpc::IdleTracker const & idle,
     nixgrpc::Coordinator & coord,
     nixgrpc::Metrics & metrics)
 {
@@ -856,7 +861,7 @@ try {
     builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
     constexpr int minPingIntervalMs = 10'000;
     builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, minPingIntervalMs);
-    auto creds = nixgrpc::makeServerCredentials(options);
+    auto const creds = nixgrpc::makeServerCredentials(options);
     std::shared_ptr<grpc::experimental::ExternalConnectionAcceptor> acceptor;
     if (listenFds.empty()) {
         builder.AddListeningPort(options.listen, creds);
@@ -892,7 +897,7 @@ try {
     coord.restarting();
     // Shutdown() then waits for handlers stuck in nix. Clients already got CANCELLED.
     static constexpr std::chrono::seconds shutdownGrace{5};
-    std::thread([]() -> void {
+    std::thread([] -> void {
         std::this_thread::sleep_for(shutdownGrace + std::chrono::seconds(1));
         nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "shutdown_forced"}});
         std::_Exit(0);
