@@ -98,7 +98,11 @@ def push_result(line: str) -> list[dict[str, Any]]:
         status, msg = "ok", ""
         with S.lock:
             S.pushed.update(narinfo_key(p) for p in paths)
-    return [{"id": rid, "path": p, "status": status, "message": msg} for p in paths]
+    return [
+        {"id": rid, "path": p, "status": status, "message": msg}
+        | ({"signatures": ["mock-1:" + narinfo_key(p)]} if status == "ok" and "signed" in p else {})
+        for p in paths
+    ]
 
 
 def push_stdin(argv: list[str]) -> None:

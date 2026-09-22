@@ -348,6 +348,8 @@ pkgs.testers.runNixOSTest {
 
     ci = "client-cert=${certs}/ci.pem&client-key=${certs}/ci.key"
     envoy = f"grpc://lb:50051?{ci}"
+    def direct(w) -> str:
+        return f"grpc://{w.name}:50051?{ci}&ca-cert=${certs}/ca.pem"
     hook = f"--max-jobs 0 --builders '{envoy}&system=${system} ${system} - 4'"
 
     def build(store: str, tag: str, extra: str = "") -> str:
@@ -392,6 +394,13 @@ pkgs.testers.runNixOSTest {
         before = wants()
         build(envoy, "t1", "--argstr top t1b")
         assert wants() - before == 1, wants() - before
+
+    with subtest("outputs read back through any worker carry the cache signature"):
+        signed = build(envoy, "sig")
+        for w in [worker1, worker2]:
+            out = client.succeed(f"nix path-info --sigs --store '{direct(w)}' {signed}").strip()
+            assert "${signingPublicKey}".split(":")[0] + ":" in out, (w.name, out)
+        client.succeed(f"nix-store --delete {signed} && nix copy --from '{envoy}' --option trusted-public-keys '${signingPublicKey}' {signed}")
 
     builder = "pgrep -f 'read -t [9]0 x'"
     def building() -> list[str]:

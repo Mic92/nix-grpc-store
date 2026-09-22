@@ -84,10 +84,20 @@ public:
     }
 
     // Make locally valid paths visible to other nodes. No-op without niks3.
-    void publish(const std::vector<std::string> & paths, const Cancelled & cancelled = never)
+    auto publish(const std::vector<std::string> & paths, const Cancelled & cancelled = never) -> PushProcess::Signatures
     {
-        if (remote && !paths.empty()) {
-            remote->push.pushWait(paths, cancelled);
+        if (!remote || paths.empty()) {
+            return {};
+        }
+        return remote->push.pushWait(paths, cancelled);
+    }
+
+    // Also puts the cache's signatures on the local paths: built here they are
+    // only "ultimate", and a client checking signatures would refuse them.
+    void publish(nix::Store & store, const std::vector<std::string> & paths, const Cancelled & cancelled = never)
+    {
+        for (const auto & [path, sigs] : publish(paths, cancelled)) {
+            nixcompat::addSignatures(store, store.parseStorePath(path), sigs);
         }
     }
 
