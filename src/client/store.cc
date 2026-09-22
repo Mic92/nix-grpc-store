@@ -145,6 +145,10 @@ auto GrpcStore::connectHint(const std::string & msg) const -> std::string
   }
   if (has("Handshake") || has("SSL") || has("TLS") ||
       has("certificate") || has("Socket closed")) {
+    if (has("verif") || has("issuer") || has("self-signed") || has("self signed")) {
+      return "\nhint: the server certificate is not trusted. Set 'ca-cert' to the CA bundle that "
+             "signed it." + more;
+    }
     if (!haveClientCert) {
       return "\nhint: TLS handshake failed and no client certificate was presented. If the "
              "server requires mTLS set 'client-cert'/'client-key' or install client.crt/"

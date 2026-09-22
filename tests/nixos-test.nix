@@ -319,6 +319,10 @@ pkgs.testers.runNixOSTest {
         print(err)
         assert "requires a TLS client certificate" in err, err
         assert "no client certificate was presented" in err, err
+        err = machine.fail(f"nix path-info --store 'grpc://localhost:50053' '{p}' 2>&1")
+        print(err)
+        assert "server certificate is not trusted" in err, err
+        assert "no client certificate was presented" not in err, err
         err = machine.fail(
             f"nix path-info --store '{store_strict}&client-cert=${certDir}/expired.pem"
             f"&client-key=${certDir}/expired.key' '{p}' 2>&1"
