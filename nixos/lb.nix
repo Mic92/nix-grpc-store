@@ -410,8 +410,8 @@ in
                         http2_protocol_options = {
                           max_concurrent_streams = cfg.maxStreams;
                           connection_keepalive = {
-                            interval = "30s";
-                            timeout = "10s";
+                            interval = "10s";
+                            timeout = "5s";
                           };
                         };
                         forward_client_cert_details = "SANITIZE_SET";
