@@ -547,6 +547,20 @@ pkgs.testers.runNixOSTest {
         wait_health("${system}")
         retry(settled, timeout=sec(90))
 
+    with subtest("queue gauges show a burst while every build blocks"):
+        slots = gauge_sum(leader(), 'kind="slots"')
+        tags = " ".join(f'"q{i}"' for i in range(slots + 2))
+        client.succeed(f"systemd-run --unit burst nix build --store '{envoy}' --eval-store auto --impure --expr 'map (tag: import ${slowExpr} {{ inherit tag; }}) [ {tags} ]'")
+        # The Wants arrive within a second and nothing else happens until a
+        # build ends, so only the trailing export can show the queue.
+        retry(lambda _: gauge_sum(leader(), 'kind="queued"') == 2, timeout=sec(10))
+        def burst_done(_) -> bool:
+            release_slow()
+            return client.execute("systemctl is-active burst")[0] != 0
+        retry(burst_done, timeout=sec(90))
+        client.succeed("systemctl show -p Result --value burst | grep -qx success || { journalctl -u burst >&2; false; }")
+        retry(lambda _: gauge_sum(leader(), 'kind="queued"') == 0, timeout=sec(10))
+
     with subtest("requiredSystemFeatures: placed on the worker that has them, refused when none does"):
         out = client.succeed(f"nix build -L --store '{envoy}' --eval-store auto --expr 'map (tag: import ${jobExpr} {{ inherit tag; features = [\"vip\"]; }}) [\"f1\" \"f2\" \"f3\"]' --impure 2>&1")
         assert "node-a: building " in out and "worker2: building" not in out, out

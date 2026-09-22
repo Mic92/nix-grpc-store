@@ -17,6 +17,7 @@
 
 #include <absl/base/thread_annotations.h>
 #include <absl/synchronization/mutex.h>
+#include <absl/time/time.h>
 #include <nix/util/error.hh>
 #include <nix/util/strings.hh>
 #include <nix/util/types.hh>
@@ -33,6 +34,7 @@ using nix::remote::SchedMsg;
 
 namespace {
 constexpr size_t maxSystemLen = 64;
+constexpr double statsEveryMs = 1000;
 } // namespace
 
 Dispatcher::Dispatcher(Config config_, Metrics & metrics)
@@ -45,6 +47,7 @@ Dispatcher::Dispatcher(Config config_, Metrics & metrics)
             lookupThreads.emplace_back([this] -> void { lookupLoop(); });
         }
     }
+    statsThread = std::thread([this] -> void { statsLoop(); });
 }
 
 Dispatcher::~Dispatcher()
@@ -55,6 +58,22 @@ Dispatcher::~Dispatcher()
     }
     for (auto & thr : lookupThreads) {
         thr.join();
+    }
+    {
+        const absl::MutexLock lock(mutex);
+        statsStop = true;
+    }
+    statsThread.join();
+}
+
+void Dispatcher::statsLoop()
+{
+    const Lock lock(*this);
+    while (!statsStop) {
+        mutex.AwaitWithTimeout(absl::Condition(&statsStop), absl::Milliseconds(statsEveryMs));
+        if (statsPending) {
+            exportStats(true);
+        }
     }
 }
 
@@ -201,11 +220,12 @@ void Dispatcher::dispatchLocked()
 
 void Dispatcher::exportStats(bool force)
 {
-    constexpr double everyMs = 1000;
     auto now = nowMs();
-    if (!force && statsAtMs && now - *statsAtMs < everyMs) {
+    if (!force && statsAtMs && now - *statsAtMs < statsEveryMs) {
+        statsPending = true;
         return;
     }
+    statsPending = false;
     statsAtMs = now;
     auto previous = std::exchange(statGauges, {});
     size_t queued = 0;
