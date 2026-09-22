@@ -107,13 +107,20 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     std::mutex storeMutex;
     std::shared_ptr<nix::Store> store;
 
+    // Without the path info cache a path deleted behind our back (gc) is
+    // invalid here too, instead of failing later when its NAR is read.
+    [[nodiscard]] auto openLocalStore() const -> nix::ref<nix::Store>
+    {
+        return nix::openStore(storeUri, {{"path-info-cache-size", "0"}});
+    }
+
     // The Store connects lazily and pools connections, but opening it can
     // still throw (e.g. daemon socket missing), so defer to first use.
     auto getStore() -> nix::ref<nix::Store>
     {
         std::scoped_lock const lock(storeMutex);
         if (!store) {
-            store = nix::openStore(storeUri).get_ptr();
+            store = openLocalStore().get_ptr();
         }
         return nix::ref<nix::Store>(store);
     }
@@ -135,7 +142,7 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     // nix-daemon keeps temp roots per connection, so writes get their own.
     auto openScopedStore() -> nix::ref<nix::Store>
     {
-        return nix::openStore(storeUri);
+        return openLocalStore();
     }
 
 public:
@@ -302,7 +309,7 @@ public:
                 }
                 // and what only we have must become so before the client relies on it.
                 phase.next("publish");
-                coord.cache.publish(valid, [&]() -> bool { return context->IsCancelled(); });
+                coord.cache.publish(*localStore, valid, [&]() -> bool { return context->IsCancelled(); });
             }
             return grpc::Status::OK;
         });
@@ -345,7 +352,7 @@ public:
                     imported.push_back(localStore->printStorePath(info.path));
                 });
             phase.next("publish");
-            coord.cache.publish(imported, [&]() -> bool { return context->IsCancelled(); });
+            coord.cache.publish(*localStore, imported, [&]() -> bool { return context->IsCancelled(); });
             phase.done();
             rpc.done({{"paths", std::to_string(stats.paths)}, {"nar_bytes_in", std::to_string(stats.narBytes)}});
             metrics.countNarBytes("in", rpc.caller.name, stats.narBytes);
@@ -621,7 +628,7 @@ public:
             }
             try {
                 phase.next("publish");
-                coord.cache.publish(built, cancelled);
+                coord.cache.publish(localStore, built, cancelled);
                 phase.done();
             } catch (nixgrpc::CancelledWait &) {
                 throw;

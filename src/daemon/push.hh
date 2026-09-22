@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <random>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -78,8 +79,11 @@ public:
         }
     }
 
+    // What niks3 signed each path with. Paths it already had come without.
+    using Signatures = std::map<std::string, std::set<std::string>>;
+
     // Returns after niks3 committed all of `paths`.
-    void pushWait(const std::vector<std::string> & paths, const Cancelled & cancelled = never)
+    auto pushWait(const std::vector<std::string> & paths, const Cancelled & cancelled = never) -> Signatures
     {
         auto pending = std::make_shared<Pending>(paths.size());
         uint64_t reqId = 0;
@@ -101,21 +105,27 @@ public:
             state.lock()->waiting.erase(reqId);
             throw;
         }
-        auto [status, message] = pending->wait(cancelled);
-        if (status == "cancelled") {
+        auto res = pending->wait(cancelled);
+        if (res.status == "cancelled") {
             state.lock()->waiting.erase(reqId);
-            throw CancelledWait("niks3 push: %s", message);
+            throw CancelledWait("niks3 push: %s", res.message);
         }
-        if (status != "ok") {
-            throw nix::Error("niks3 push: %s", message);
+        if (res.status != "ok") {
+            throw nix::Error("niks3 push: %s", res.message);
         }
+        return std::move(res.signatures);
     }
 
 private:
     // ack()/fail() run under the State lock, wait() under its own.
     struct Pending
     {
-        using Result = std::pair<std::string, std::string>;
+        struct Result
+        {
+            std::string status = "ok";
+            std::string message;
+            Signatures signatures;
+        };
 
         explicit Pending(size_t count)
             : sync(Inner{.left = count})
@@ -123,11 +133,22 @@ private:
         }
 
         // True once every path of the request was acked.
-        auto ack(const std::string & status, const std::string & message) -> bool
+        struct Ack
+        {
+            std::string status;
+            std::string message;
+            std::string path;
+            std::set<std::string> signatures;
+        };
+
+        auto ack(Ack msg) -> bool
         {
             auto inner = sync.lock();
-            if (status != "ok") {
-                inner->worst = {status, message};
+            if (msg.status != "ok") {
+                inner->res.status = std::move(msg.status);
+                inner->res.message = std::move(msg.message);
+            } else if (!msg.signatures.empty()) {
+                inner->res.signatures[msg.path] = std::move(msg.signatures);
             }
             if (inner->left > 0) {
                 inner->left--;
@@ -141,7 +162,8 @@ private:
         void fail(const std::string & message)
         {
             auto inner = sync.lock();
-            inner->worst = {"error", message};
+            inner->res.status = "error";
+            inner->res.message = message;
             inner->left = 0;
             done.notify_all();
         }
@@ -151,18 +173,18 @@ private:
             auto inner = sync.lock();
             while (inner->left > 0) {
                 if (cancelled()) {
-                    return {"cancelled", "gave up waiting for niks3 push"};
+                    return {.status = "cancelled", .message = "gave up waiting for niks3 push"};
                 }
                 inner.wait_for(done, cancelPoll);
             }
-            return inner->worst;
+            return std::move(inner->res);
         }
 
     private:
         struct Inner
         {
             size_t left;
-            Result worst{"ok", ""};
+            Result res;
         };
         nix::Sync<Inner> sync;
         std::condition_variable done;
@@ -227,7 +249,11 @@ private:
                 if (found == lck->waiting.end()) {
                     continue;
                 }
-                if (found->second->ack(ack.value("status", "error"), ack.value("message", ""))) {
+                if (found->second->ack(
+                        {.status = ack.value("status", "error"),
+                         .message = ack.value("message", ""),
+                         .path = ack.value("path", ""),
+                         .signatures = ack.value("signatures", std::set<std::string>{})})) {
                     lck->waiting.erase(found);
                 }
             }

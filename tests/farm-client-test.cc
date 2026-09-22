@@ -79,6 +79,11 @@ void testPush(Suite & tst, nixgrpc::PushProcess & push)
     }
     push.pushWait({"/nix/store/y", "/nix/store/y2"});
     {
+        auto sigs = push.pushWait({"/nix/store/signed-a", "/nix/store/plain"});
+        tst.check(sigs.size() == 1 && sigs.contains("/nix/store/signed-a"), "signatures come back for the paths niks3 signed");
+        tst.check(sigs["/nix/store/signed-a"].size() == 1, "one signature per key");
+    }
+    {
         // spec/push.qnt: two RPCs publishing the same path at once.
         std::thread other([&]() -> void { push.pushWait({"/nix/store/shared"}); });
         push.pushWait({"/nix/store/shared"});

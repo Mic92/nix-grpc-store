@@ -201,6 +201,20 @@ inline auto succeeded(R &res) -> bool {
   }
 }
 
+// 2.34 typed the signatures.
+inline void addSignatures(nix::Store &store, const nix::StorePath &path,
+                          const std::set<std::string> &sigs) {
+#if NIX_COMPAT_AT_LEAST(2, 34)
+  std::set<nix::Signature> parsed;
+  for (const auto &sig : sigs) {
+    parsed.insert(nix::Signature::parse(sig));
+  }
+  store.addSignatures(path, parsed);
+#else
+  store.addSignatures(path, nix::StringSet(sigs.begin(), sigs.end()));
+#endif
+}
+
 #if NIX_COMPAT_AT_LEAST(2, 32)
 using FailureStatus = nix::BuildResult::Failure::Status;
 #else
