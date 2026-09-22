@@ -241,6 +241,8 @@ void testFeatures()
     shard.want(1, {.drvPath = "gpu.drv", .inputs = {}, .system = "x", .features = {"cuda"}, .cpHintMs = 0}, 0);
     auto const gpu = *shard.findDrv("gpu.drv");
     assert(!shard.placeable(gpu));
+    assert((shard.offeredFeatures("x") == std::vector<std::string>{"kvm"}));
+    assert(shard.offeredFeatures("y").empty());
     shard.dispatch(out);
     // vm on kvm, a on plain; vm2 waits behind a despite higher priority; gpu unplaceable
     assert(out.size() == 2);

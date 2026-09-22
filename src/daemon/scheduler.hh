@@ -14,6 +14,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -599,6 +600,18 @@ public:
     {
         return std::ranges::any_of(
             workers, [&](const Worker & wkr) -> bool { return wkr.up && !wkr.draining && offers(wkr, ent); });
+    }
+
+    // Features of the connected, non-draining workers that serve the system.
+    [[nodiscard]] auto offeredFeatures(const std::string & system) const -> std::vector<std::string>
+    {
+        std::set<std::string> feats;
+        for (const auto & wkr : workers) {
+            if (wkr.up && !wkr.draining && std::ranges::find(wkr.systems, system) != wkr.systems.end()) {
+                feats.insert(wkr.features.begin(), wkr.features.end());
+            }
+        }
+        return {feats.begin(), feats.end()};
     }
 
     [[nodiscard]] auto placeable(DrvId drv) const -> bool

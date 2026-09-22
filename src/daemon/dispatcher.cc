@@ -382,10 +382,12 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
     if (!core.placeable(res.drv)) {
         // Keep the Want: right after a (re)start no worker has said Hello yet.
         reply.mutable_unplaceable()->set_drv_path(want.drv_path());
+        auto const join = [](const auto & feats) -> std::string {
+            return nix::concatStringsSep(",", nix::Strings(feats.begin(), feats.end()));
+        };
         reply.mutable_unplaceable()->set_reason(
             "no connected, non-draining worker for system '" + std::string(system) + "' offers features {"
-            + nix::concatStringsSep(",", nix::Strings(want.required_features().begin(), want.required_features().end()))
-            + "}");
+            + join(want.required_features()) + "}, the workers offer {" + join(core.offeredFeatures(std::string(system))) + "}");
         client.send(reply);
         exportStats(true); // rare, and nothing else may happen for a while
     }
