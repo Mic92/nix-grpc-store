@@ -121,6 +121,8 @@
         ];
       };
 
+      darwinModules.default = ./nixos/darwin.nix;
+
       herculesCI = import ./nix/effects.nix { inherit nixpkgs; };
 
       checks = forAllSystems (
