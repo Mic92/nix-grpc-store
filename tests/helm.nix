@@ -138,7 +138,7 @@ let
                         | del(.dns_lookup_family))
                     | sort_by(.name))
     | .listeners[0].address.socket_address |= (del(.ipv4_compat) | .address = "X")
-    | .listeners[0].filter_chains[0].filters[0].typed_config.route_config.virtual_hosts[0].routes |= map(.route.cluster |= ren)
+    | .listeners[0].filter_chains[0].filters[0].typed_config.route_config.virtual_hosts[0].routes |= map(if has("route") then .route.cluster |= ren else . end)
   '';
 in
 pkgs.runCommand "nix-grpc-farm-helm-check"

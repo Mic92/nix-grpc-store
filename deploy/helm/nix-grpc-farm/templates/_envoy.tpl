@@ -199,7 +199,8 @@ filter_chains:
 {{- $groups := keys .Values.workers | sortAlpha }}
 {{- /* default group last so its catch-all route does not shadow the others */}}
 {{- $clusters := list }}
-{{- $routes := list (include "farm.envoy.route" (dict "prefix" "/nix.remote.Scheduler/" "cluster" "sched" "system" "" "isDefault" true) | fromYaml) }}
+{{- /* Envoy reads the builder list from the scheduler over its own connection. A route for it here would let any client read the list. */}}
+{{- $routes := list (dict "match" (dict "prefix" "/envoy.service.endpoint.v3.EndpointDiscoveryService/" "grpc" (dict)) "direct_response" (dict "status" 404)) (include "farm.envoy.route" (dict "prefix" "/nix.remote.Scheduler/" "cluster" "sched" "system" "" "isDefault" true) | fromYaml) }}
 {{- range $g := concat (without $groups $defaultGroup) (list $defaultGroup) }}
 {{- $w := mustMergeOverwrite (deepCopy $root.Values.workerDefaults) ((index $root.Values.workers $g) | default dict) }}
 {{- $svc := include "farm.workerService" (dict "root" $root "group" $g) }}
