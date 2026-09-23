@@ -2,6 +2,7 @@
 # scheduler node (cluster `sched`, gRPC health service "nix.scheduler").
 # Everything else goes to the per-system worker cluster: BuildDerivation to
 # the worker named in x-nix-worker (override_host), the rest least-request.
+# The members of the worker clusters come from the active scheduler over EDS.
 {
   config,
   lib,
@@ -130,13 +131,19 @@ let
   };
 
   workerCluster =
-    name: workers:
+    name:
     upstreamTls
     // http2
     // {
       inherit name;
-      type = "STRICT_DNS";
+      type = "EDS";
       connect_timeout = "5s";
+      # A builder stops getting requests as soon as the scheduler drops it.
+      ignore_health_on_host_removal = true;
+      # With envoy's default 1 s window, list changes reach the workers late.
+      # In tests, builders added around an EDS stream reopen then got no
+      # requests at all.
+      common_lb_config.update_merge_window = "0s";
       load_balancing_policy.policies = [
         {
           typed_extension_config = {
@@ -157,9 +164,16 @@ let
         }
       ];
       health_checks = [ (healthCheck "") ];
-      load_assignment = {
-        cluster_name = name;
-        endpoints = [ { lb_endpoints = map endpoint workers; } ];
+      eds_cluster_config = {
+        service_name = name;
+        eds_config = {
+          resource_api_version = "V3";
+          api_config_source = {
+            api_type = "GRPC";
+            transport_api_version = "V3";
+            grpc_services = [ { envoy_grpc.cluster_name = "sched"; } ];
+          };
+        };
       };
     };
 
@@ -232,7 +246,7 @@ let
     }
   ];
 
-  systems = lib.attrNames cfg.workers;
+  systems = cfg.systems;
   ordered = lib.filter (s: s != cfg.defaultSystem) systems ++ [ cfg.defaultSystem ];
 in
 {
@@ -245,38 +259,50 @@ in
     };
 
     workers = lib.mkOption {
-      type = lib.types.attrsOf (lib.types.nonEmptyListOf lib.types.str);
-      example = {
-        x86_64-linux = [
-          "w1:50051"
-          "w2:50051"
-        ];
-      };
+      type = lib.types.nullOr (lib.types.attrsOf (lib.types.nonEmptyListOf lib.types.str));
+      default = null;
+      visible = false;
+      description = "Deprecated, use `systems`. Builders now register with the scheduler.";
+    };
+
+    systems = lib.mkOption {
+      type = lib.types.nonEmptyListOf lib.types.str;
+      example = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
       description = ''
-        `IP:port` of builder nodes per system. Must equal each node's
-        `services.nix-grpc-daemon.advertise` so `x-nix-worker` pins to it.
+        The systems the farm builds for. Each system has a worker cluster.
+        Its members are the builders that are connected to the active
+        scheduler and offer that system.
+
+        A builder's `services.nix-grpc-daemon.advertise` is its address in
+        the cluster, so it has to be an `IP:port`.
       '';
     };
 
     scheduler = lib.mkOption {
       type = lib.types.either lib.types.str (lib.types.listOf lib.types.str);
-      default = lib.head cfg.workers.${cfg.defaultSystem};
-      defaultText = lib.literalMD "first worker of `defaultSystem`";
       example = [
         "10.0.0.4:50051"
         "10.0.0.5:50051"
       ];
       description = ''
-        The worker(s) with the `scheduler` role. With more than one, they
-        take turns through niks3 and scheduler traffic goes to
-        whichever holds the lock. A single string is a list of one.
+        The node(s) with the `scheduler` role. With more than one, they
+        take turns through niks3 and scheduler traffic goes to whichever
+        holds the lock. A single string is a list of one.
+
+        Envoy also gets the members of the worker clusters from the active
+        scheduler, over the `StreamEndpoints` call. It authenticates with its
+        own certificate, so the scheduler nodes need an access rule for it,
+        for example `{ cn = "lb-*"; role = "trusted"; }`.
       '';
     };
 
     defaultSystem = lib.mkOption {
       type = lib.types.str;
       default = lib.head systems;
-      defaultText = lib.literalMD "first attribute of `workers`";
+      defaultText = lib.literalMD "first entry of `systems`";
       description = "Cluster for requests without or with an unknown `x-nix-system` (store queries, uploads, `builtin`).";
     };
 
@@ -356,6 +382,15 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    warnings = lib.optional (cfg.workers != null) ''
+      services.nix-grpc-farm-lb.workers is deprecated and its addresses are ignored.
+      Set `systems = [ ${lib.concatMapStringsSep " " (s: ''"${s}"'') (lib.attrNames cfg.workers)} ];`
+      and give every builder an `advertise` of the form IP:port.
+    '';
+    services.nix-grpc-farm-lb = lib.mkIf (cfg.workers != null) {
+      systems = lib.mkDefault (lib.attrNames cfg.workers);
+      scheduler = lib.mkDefault (lib.head cfg.workers.${cfg.defaultSystem});
+    };
     assertions = [
       {
         assertion = (cfg.tls.certFile == null) == (cfg.tls.keyFile == null);
@@ -437,7 +472,7 @@ in
               ];
             }
           ];
-          clusters = lib.mapAttrsToList workerCluster cfg.workers ++ [ schedCluster ];
+          clusters = map workerCluster systems ++ [ schedCluster ];
         };
       };
     };

@@ -90,8 +90,9 @@ spec:
             {{- range .Values.auth.trustedProxies }}
             - --trusted-proxy={{ . }}
             {{- end }}
-            # Workers dial in directly with their serving certificate.
-            {{- range .Values.auth.workerCNs }}
+            # Workers connect with their serving certificate. The balancer
+            # fetches the builders of each group with its own.
+            {{- range concat .Values.auth.workerCNs .Values.auth.trustedProxies }}
             - --allow={{ . }}=trusted
             {{- end }}
             {{- end }}
