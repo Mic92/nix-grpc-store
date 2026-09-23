@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+// Envoy matches the service path and field numbers, not message names, so this
+// subset of its endpoint discovery API lives in one file. Field numbers are
+// those of data-plane-api.
+package envoy.service.endpoint.v3;
+
+import "google/protobuf/any.proto";
+
+message SocketAddress {
+  string address = 2;
+  uint32 port_value = 3;
+}
+
+message Address {
+  SocketAddress socket_address = 1;
+}
+
+message Endpoint {
+  Address address = 1;
+}
+
+enum HealthStatus {
+  UNKNOWN = 0;
+  HEALTHY = 1;
+  UNHEALTHY = 2;
+  DRAINING = 3;
+}
+
+message LbEndpoint {
+  Endpoint endpoint = 1;
+  HealthStatus health_status = 2;
+}
+
+message LocalityLbEndpoints {
+  repeated LbEndpoint lb_endpoints = 2;
+}
+
+message ClusterLoadAssignment {
+  string cluster_name = 1;
+  repeated LocalityLbEndpoints endpoints = 2;
+}
+
+// Wire-compatible with google.rpc.Status.
+message ErrorDetail {
+  int32 code = 1;
+  string message = 2;
+}
+
+message DiscoveryRequest {
+  string version_info = 1;
+  repeated string resource_names = 3;
+  string type_url = 4;
+  string response_nonce = 5;
+  ErrorDetail error_detail = 6;
+}
+
+message DiscoveryResponse {
+  string version_info = 1;
+  repeated google.protobuf.Any resources = 2;
+  string type_url = 4;
+  string nonce = 5;
+}
+
+service EndpointDiscoveryService {
+  rpc StreamEndpoints(stream DiscoveryRequest) returns (stream DiscoveryResponse) {}
+}

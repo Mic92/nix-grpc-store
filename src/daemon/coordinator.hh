@@ -31,6 +31,7 @@
 #include "auth.hh"
 #include "cache.hh"
 #include "dispatcher.hh"
+#include "eds.hh"
 #include "elector.hh"
 #include "metrics.hh"
 #include "nix_remote.grpc.pb.h"
@@ -171,6 +172,7 @@ public:
     std::optional<Builder> builder;
     std::optional<Dispatcher> dispatcher;
     std::unique_ptr<SchedulerService> scheduler;
+    std::unique_ptr<EdsService> eds;
     // NOLINTEND(*-non-private-member-variables-in-classes)
 
     void start(grpc::Server & server);
