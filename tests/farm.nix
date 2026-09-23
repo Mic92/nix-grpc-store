@@ -103,6 +103,11 @@ let
             role = "trusted";
           }
           {
+            # Envoy reads the builder list with its own certificate.
+            cn = "lb-*";
+            role = "trusted";
+          }
+          {
             # worker1's WorkerSession by certificate. Worker2's CN has no
             # rule on purpose, it gets in with its OIDC token instead.
             cn = "worker-1";
@@ -214,10 +219,7 @@ pkgs.testers.runNixOSTest {
         services.nix-grpc-farm-lb = {
           accessLog = true;
           enable = true;
-          workers.${system} = [
-            "${ip.worker1}:50051"
-            "${ip.worker2}:50051"
-          ];
+          systems = [ system ];
           scheduler = [
             "${ip.worker1}:50051"
             "${ip.worker2}:50051"
@@ -299,17 +301,23 @@ pkgs.testers.runNixOSTest {
 
     names = {"${ip.worker1}": "worker1", "${ip.worker2}": "worker2"}
 
-    def wait_health(cluster: str, *down: str) -> None:
-        want = set(down)
-        with lb.nested(f"waiting until exactly {sorted(want) or 'no'} endpoints of {cluster} are unhealthy"):
+    def members(cluster: str) -> set[str]:
+        up = set()
+        for l in cluster_lines():
+            if (m := re.match(rf"{re.escape(cluster)}::([0-9.]+):[0-9]+::health_flags::healthy$", l)):
+                up.add(names[m[1]])
+        return up
+
+    def wait_members(cluster: str, *want: str) -> None:
+        with lb.nested(f"waiting until exactly {sorted(want)} are healthy members of {cluster}"):
             def check(last: bool) -> bool:
-                got = {names[a] for a in unhealthy(cluster)}
-                if last and got != want:
-                    raise AssertionError(f"unhealthy={sorted(got)} want={sorted(want)}\n" + "\n".join(l for l in cluster_lines() if "health_flags" in l))
-                return got == want
+                got = members(cluster)
+                if last and got != set(want):
+                    raise AssertionError(f"members={sorted(got)} want={sorted(want)}\n" + "\n".join(l for l in cluster_lines() if "health_flags" in l))
+                return got == set(want)
             retry(check, timeout=sec(90))
 
-    wait_health("${system}")
+    wait_members("${system}", "worker1", "worker2")
 
     def metrics(w) -> list[str]:
         return w.succeed("curl -sf http://127.0.0.1:9464/metrics").splitlines()
@@ -461,16 +469,16 @@ pkgs.testers.runNixOSTest {
         client.succeed(f"nix-store --export {ref} > /tmp/shared/ref.closure")
         worker1.succeed("nix-store --import < /tmp/shared/ref.closure")
         worker2.systemctl("stop nix-grpc-daemon.socket nix-grpc-daemon.service")
-        wait_health("${system}", "worker2")
+        wait_members("${system}", "worker1")
         client.succeed(f"nix path-info --store '{envoy}' {ref} >&2")  # worker1 publishes ref
         worker2.fail(f"test -e {ref}")
         worker2.systemctl("start nix-grpc-daemon.socket")
         worker1.systemctl("stop nix-grpc-daemon.socket nix-grpc-daemon.service")
-        wait_health("${system}", "worker1")
+        wait_members("${system}", "worker2")
         client.succeed(f"nix copy --no-check-sigs --to '{envoy}' {referrer} >&2")
         worker2.succeed(f"test -e {ref} && test -e {referrer}")
         worker1.systemctl("start nix-grpc-daemon.service")
-        wait_health("${system}")
+        wait_members("${system}", "worker1", "worker2")
 
     with subtest("a niks3 restart does not cost the leader its role"):
         was = leader()
@@ -544,7 +552,7 @@ pkgs.testers.runNixOSTest {
         client.wait_until_succeeds("! systemctl is-active sw", timeout=sec(90))
         client.succeed("systemctl show -p Result --value sw | grep -qx success || { journalctl -u sw >&2; false; }")
         busy.wait_until_succeeds("systemctl is-active nix-grpc-daemon.service || systemctl start nix-grpc-daemon.service")
-        wait_health("${system}")
+        wait_members("${system}", "worker1", "worker2")
         retry(settled, timeout=sec(90))
 
     with subtest("queue gauges show a burst while every build blocks"):
