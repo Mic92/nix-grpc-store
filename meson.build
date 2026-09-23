@@ -75,6 +75,22 @@ gen = custom_target('nix_remote_proto',
   depend_files : 'proto/nix_remote.proto',
 )
 
+eds_gen = custom_target('eds_proto',
+  output : [
+    'eds.pb.cc',        'eds.pb.h',
+    'eds.grpc.pb.cc',   'eds.grpc.pb.h',
+  ],
+  command : [
+    protoc,
+    '--proto_path=' + proto_dir,
+    '--cpp_out=@OUTDIR@',
+    '--grpc_out=@OUTDIR@',
+    '--plugin=protoc-gen-grpc=' + grpc_cpp_plugin.full_path(),
+    'eds.proto',
+  ],
+  depend_files : 'proto/eds.proto',
+)
+
 gen_inc = include_directories('.')
 src_inc = include_directories('src')
 
@@ -151,11 +167,12 @@ daemon_sources = [
   'src/daemon/auth.cc',
   'src/daemon/backend.cc',
   'src/daemon/coordinator.cc',
+  'src/daemon/eds.cc',
   'src/daemon/options.cc',
 ]
 
 executable('nix-grpc-daemon',
-  sources : daemon_sources + [gen],
+  sources : daemon_sources + [gen, eds_gen],
   include_directories : [gen_inc, src_inc],
   cpp_pch : 'pch/daemon_pch.hh',
   cpp_args : nix_compat_args + ['-DNIX_GRPC_VERSION="' + meson.project_version() + '"'],

@@ -873,6 +873,7 @@ try {
     builder.RegisterService(&service);
     if (coord.scheduler) {
         builder.RegisterService(coord.scheduler.get());
+        builder.RegisterService(coord.eds.get());
     }
 
     auto server = builder.BuildAndStart();
