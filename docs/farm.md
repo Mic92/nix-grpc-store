@@ -113,6 +113,7 @@ services.nix-grpc-daemon = {
   accessRules = [
     { cn = "ci-*"; role = "trusted"; }
     { cn = "worker-*"; role = "trusted"; }
+    { cn = "lb-*"; role = "trusted"; }   # the balancer, to read the builder list
   ];
   niks3 = {
     url = "https://niks3.example.com";
@@ -127,7 +128,7 @@ services.nix-grpc-daemon = {
 |---|---|
 | `roles` | `builder`, `scheduler` or both (the default). Only fixed machines should have `scheduler`. |
 | `scheduler` | Where a builder finds the scheduler: that node's address, or the balancer's when several nodes have the role (see [failover](#managing-the-farm)). Unset on a node that is the only scheduler. |
-| `advertise` | The address the balancer knows this node by. Must match its entry in the balancer's `workers` or `scheduler`. |
+| `advertise` | The address the balancer reaches this node at. A builder's must be `IP:port`, since the scheduler passes it to envoy as an endpoint. It routes requests and grants no access: only peers with the `trusted` role can open a session. A scheduler node's must match its entry in the balancer's `scheduler`. |
 | `maxJobs` | Concurrent builds. Defaults to the local nix-daemon's `max-jobs`. |
 | `minFree` | Below this much free disk the node takes no new builds until space returns. |
 | `trustedProxies` | Peers with a matching client cert are balancers. The node takes the real client identity from the `x-forwarded-client-cert` header they set. Other peers can't set it. |
@@ -141,7 +142,7 @@ config. `nix.settings.system-features` decides which
 `requiredSystemFeatures` a builder accepts: a derivation that needs
 `kvm` only goes to builders that list it. A builder with
 `nix.settings.extra-platforms` (binfmt, Rosetta) takes those systems
-too. List it under each of them in the balancer's `workers`. A
+too. Add each of them to the balancer's `systems`. A
 scheduler-only node is the same with `roles = [ "scheduler" ]` and no
 `scheduler`, `maxJobs` or `minFree`.
 
@@ -180,10 +181,7 @@ unsigned paths or open the worker-protocol tunnel.
 services.nix-grpc-farm-lb = {
   enable = true;
   listen = "[::]:50051";
-  workers = {
-    x86_64-linux  = [ "10.0.0.4:50052" ];
-    aarch64-linux = [ "10.0.0.5:50052" "10.0.0.6:50052" ];
-  };
+  systems = [ "x86_64-linux" "aarch64-linux" ];
   scheduler = "10.0.0.4:50052";
   tls = {
     certFile = "/var/lib/acme/farm.example.com/fullchain.pem";
@@ -204,11 +202,17 @@ balancer as well as on workers and scheduler.
 
 | Option | Meaning |
 |---|---|
-| `workers` | Builder addresses per system, as in their `advertise`. Requests for a system not listed go to `defaultSystem` (first entry by default). |
-| `scheduler` | The node(s) with the `scheduler` role, as in their `advertise`. With several, envoy routes to the active one. Defaults to the first entry of `workers.<defaultSystem>`. |
+| `systems` | The systems the farm builds for. Requests for a system not listed go to `defaultSystem` (first entry by default). There is no list of builders: they appear when they connect to the scheduler and disappear when they leave. |
+| `scheduler` | The node(s) with the `scheduler` role, as in their `advertise`. With several, envoy sends scheduler calls to the active one and reads the builder list from it. |
 | `tls.certFile`/`keyFile` | Public server certificate. |
 | `tls.clientCaFile` | Verify client certificates against this CA and forward the subject to workers. Clients without a certificate are still accepted so tokens work. |
 | `tls.upstream.*` | The certificate envoy presents to workers, and the CA to verify them. |
+
+![how the balancer routes a request](balancer.svg)
+
+A builder is in envoy's list while its session with the active scheduler is
+open. Envoy still health-checks each one, and a builder that is draining
+gets no new requests.
 
 To check that envoy sees your workers:
 
@@ -218,6 +222,9 @@ x86_64-linux::10.0.0.4:50052::health_flags::healthy
 aarch64-linux::10.0.0.5:50052::health_flags::healthy
 sched::10.0.0.4:50052::health_flags::healthy
 ```
+
+`workers` from earlier versions still evaluates, with a warning. Its
+addresses are ignored.
 
 `accessLog = true` adds one journal line per connection with the client
 certificate subject and, for failed TLS handshakes, the reason.
@@ -380,8 +387,8 @@ right after a scheduler restart the builders may still be reconnecting.
 Look for `event=scheduler_disconnected` in the builders' journal.
 
 **`asking the scheduler again` keeps repeating** — the client reaches a
-different worker than the scheduler picked. A worker's `advertise` does
-not match its entry in the balancer's `workers`.
+different worker than the scheduler picked. A worker's `advertise` is not
+the address envoy reaches it at.
 
 **A worker shows `failed_active_hc`** — it's stopping or envoy can't
 complete mTLS to it. Check `journalctl -u nix-grpc-daemon` on the worker.
