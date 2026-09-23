@@ -15,7 +15,9 @@
 #include <functional>
 #include <thread>
 #include <unordered_set>
+#include <flat_map>
 #include <initializer_list>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -101,6 +103,18 @@ public:
     void restarting();
     void serving();
 
+    struct Member
+    {
+        std::string addr;
+        bool draining = false;
+    };
+    using Membership = std::flat_map<std::string, std::vector<Member>>;
+    [[nodiscard]] auto membership() const -> std::shared_ptr<const Membership>;
+
+    // `wake` runs without the mutex, after every change.
+    auto watchMembership(std::function<void()> wake) -> uint64_t;
+    void unwatchMembership(uint64_t watcher);
+
 private:
     // Scoped lock that runs the afterUnlock queue on release.
     class ABSL_SCOPED_LOCKABLE Lock
@@ -131,6 +145,10 @@ private:
     std::optional<double> statsAtMs ABSL_GUARDED_BY(mutex);
     std::map<sched::Core::StatsKey, std::vector<prometheus::Gauge *>> statGauges ABSL_GUARDED_BY(mutex);
     std::atomic<sched::ClientId> nextClient{1};
+    std::map<uint64_t, std::function<void()>> watchers ABSL_GUARDED_BY(mutex);
+    mutable absl::Mutex publishedMutex ABSL_ACQUIRED_AFTER(mutex);
+    std::shared_ptr<const Membership> published ABSL_GUARDED_BY(publishedMutex) = std::make_shared<const Membership>();
+    uint64_t nextWatcher ABSL_GUARDED_BY(mutex) = 1;
 
     // Side pool for present() so gRPC threads never block on niks3.
     struct LookupJob
@@ -161,6 +179,8 @@ private:
     void statsLoop();
     // Run dispatch and deliver Expect (first) and Assigned.
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void dispatchLocked();
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void membershipChangedLocked();
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void wakeWatchersLocked();
     // Per-system gauges. O(entries), so at most once a second unless forced.
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void exportStats(bool force);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOn(sched::WorkerId wid, const std::string & drvPath);
