@@ -22,9 +22,13 @@ resources:
 {{- define "farm.envoy.clusterCommon" -}}
 {{- $root := .root }}
 name: {{ .name | quote }}
+{{- if .edsSystem }}
+type: EDS
+{{- else }}
 type: STRICT_DNS
-connect_timeout: 5s
 dns_lookup_family: ALL
+{{- end }}
+connect_timeout: 5s
 typed_extension_protocol_options:
   envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
     "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
@@ -45,7 +49,24 @@ health_checks:
 {{- if .healthService }}
 common_lb_config:
   healthy_panic_threshold: {value: 0}
+{{- else if .edsSystem }}
+# The default 1 s window delays a drain or removal on the workers.
+common_lb_config:
+  update_merge_window: 0s
 {{- end }}
+{{- if .edsSystem }}
+# A builder that left the list must stop getting requests now, not once its
+# health check fails.
+ignore_health_on_host_removal: true
+eds_cluster_config:
+  service_name: {{ .edsSystem | quote }}
+  eds_config:
+    resource_api_version: V3
+    api_config_source:
+      api_type: GRPC
+      transport_api_version: V3
+      grpc_services: [{envoy_grpc: {cluster_name: sched}}]
+{{- else }}
 load_assignment:
   cluster_name: {{ .name | quote }}
   endpoints:
@@ -57,6 +78,7 @@ load_assignment:
                 address: {{ printf "%s.%s.svc" $svc $root.Release.Namespace }}
                 port_value: 50051
         {{- end }}
+{{- end }}
 {{- if (include "farm.tlsSecret" (list $root "worker")) }}
 transport_socket:
   name: envoy.transport_sockets.tls
@@ -181,8 +203,8 @@ filter_chains:
 {{- $w := mustMergeOverwrite (deepCopy $root.Values.workerDefaults) ((index $root.Values.workers $g) | default dict) }}
 {{- $svc := include "farm.workerService" (dict "root" $root "group" $g) }}
 {{- $isDefault := eq $g $defaultGroup }}
-{{- if and (not $isDefault) (not $w.system) }}{{ fail (printf "workers.%s.system is required for non-default groups" $g) }}{{ end }}
-{{- $clusters = append $clusters (include "farm.envoy.workerCluster" (dict "root" $root "name" $g "service" $svc "healthService" "") | fromYaml) }}
+{{- if not $w.system }}{{ fail (printf "workers.%s.system is required, the scheduler names the endpoints of a group by system" $g) }}{{ end }}
+{{- $clusters = append $clusters (include "farm.envoy.workerCluster" (dict "root" $root "name" $g "edsSystem" $w.system) | fromYaml) }}
 {{- $routes = append $routes (include "farm.envoy.route" (dict "prefix" "/" "cluster" $g "system" $w.system "isDefault" $isDefault) | fromYaml) }}
 {{- end }}
 {{- $clusters = append $clusters (include "farm.envoy.clusterCommon" (dict "root" $root "name" "sched" "service" (include "farm.schedulerNames" $root) "healthService" "nix.scheduler") | fromYaml) }}
