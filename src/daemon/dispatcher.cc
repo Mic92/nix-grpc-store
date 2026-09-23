@@ -123,6 +123,53 @@ void Dispatcher::afterUnlock(std::function<void()> func)
     deferred.push_back(std::move(func));
 }
 
+auto Dispatcher::membership() const -> std::shared_ptr<const Membership>
+{
+    const absl::MutexLock lock(publishedMutex);
+    return published;
+}
+
+// Not Lock: its release would flush wake-ups that may re-enter here.
+auto Dispatcher::watchMembership(std::function<void()> wake) -> uint64_t
+{
+    const absl::MutexLock lock(mutex);
+    auto const watcher = nextWatcher++;
+    watchers.emplace(watcher, std::move(wake));
+    return watcher;
+}
+
+void Dispatcher::unwatchMembership(uint64_t watcher)
+{
+    const absl::MutexLock lock(mutex);
+    watchers.erase(watcher);
+}
+
+void Dispatcher::membershipChangedLocked()
+{
+    auto next = std::make_shared<Membership>();
+    for (size_t wid = 0; wid < core.workerCount(); wid++) {
+        const auto & wkr = core.worker(static_cast<sched::WorkerId>(wid));
+        if (!wkr.up) {
+            continue;
+        }
+        for (const auto & system : wkr.systems) {
+            (*next)[system].push_back({.addr = wkr.addr, .draining = wkr.draining || wkr.maxJobs == 0});
+        }
+    }
+    {
+        const absl::MutexLock lock(publishedMutex);
+        published = std::move(next);
+    }
+    wakeWatchersLocked();
+}
+
+void Dispatcher::wakeWatchersLocked()
+{
+    for (const auto & [watcher, wake] : watchers) {
+        afterUnlock(wake);
+    }
+}
+
 auto Dispatcher::nowMs() const -> double
 {
     return std::chrono::duration<double, std::milli>(Clock::now() - epoch).count();
@@ -195,6 +242,7 @@ void Dispatcher::dispatchLocked()
         if (wit == workers.end() || !wit->second(cmd)) {
             // Worker stream died under us; requeue and let the next event retry.
             core.workerGone(asg.worker);
+            membershipChangedLocked();
             workers.erase(asg.worker);
             metrics.event("expect_undeliverable");
             continue;
@@ -311,6 +359,7 @@ void Dispatcher::restarting()
     const Lock lock(*this);
     lettingGo = true;
     metrics.schedLeader(false);
+    wakeWatchersLocked();
     SchedMsg msg;
     msg.mutable_restarting();
     SchedCmd cmd;
@@ -486,6 +535,7 @@ void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg &
          .running = std::move(running)},
         superseded);
         workers[*worker.id] = worker.send;
+        membershipChangedLocked();
         for (auto const sup : superseded) {
             supersede(sup.drv, sup.loser);
         }
@@ -510,6 +560,7 @@ void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg &
         metrics.event("done_" + nix::remote::Done::Outcome_Name(done.outcome()));
     } else if (msg.has_load()) {
         core.setDraining(*worker.id, msg.load().draining());
+        membershipChangedLocked();
     }
 }
 
@@ -522,6 +573,7 @@ void Dispatcher::workerGone(Worker & worker)
     logLine(LogLevel::info, {{"event", "worker_gone"}, {"addr", core.worker(*worker.id).addr}});
     core.workerGone(*worker.id);
     workers.erase(*worker.id);
+    membershipChangedLocked();
     dispatchLocked();
     metrics.schedWorkers(core.workersUp());
     exportStats(true);

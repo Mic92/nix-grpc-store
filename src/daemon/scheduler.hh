@@ -377,6 +377,11 @@ public:
         return workersUp_;
     }
 
+    [[nodiscard]] auto workerCount() const -> size_t
+    {
+        return workers.size();
+    }
+
     struct WantResult
     {
         DrvId drv = 0;
