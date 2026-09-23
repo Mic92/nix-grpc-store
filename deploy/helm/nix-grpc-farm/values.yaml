@@ -76,7 +76,7 @@ auth:
 
 # Defaults merged into every entry of `workers`.
 workerDefaults:
-  system: "" # nix `system`. Empty uses the node's. Required with several groups.
+  system: "" # nix `system` of the group's builders. Required: the balancer finds a group's builders by it.
   replicas: 1
   # nix system-features. The scheduler only assigns drvs whose
   # requiredSystemFeatures a worker has.

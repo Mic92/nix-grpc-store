@@ -87,15 +87,16 @@ let
             options.services.envoy = lib.mkOption { type = lib.types.anything; };
             options.systemd = lib.mkOption { type = lib.types.anything; };
             options.assertions = lib.mkOption { type = lib.types.anything; };
+            options.warnings = lib.mkOption { type = lib.types.anything; };
             config._module.args.pkgs = pkgs;
             config.services.nix-grpc-farm-lb = {
               enable = true;
               defaultSystem = "x86_64-linux";
               accessLog = true;
-              workers = {
-                x86_64-linux = [ "HOST-x86:50051" ];
-                aarch64-linux = [ "HOST-arm:50051" ];
-              };
+              systems = [
+                "x86_64-linux"
+                "aarch64-linux"
+              ];
               scheduler = [
                 "HOST-sched0:50051"
                 "HOST-sched1:50051"
@@ -129,8 +130,11 @@ let
     # SDS resource files: a ConfigMap path in the chart, a store path in NixOS.
     def sds: walk(if type == "object" and has("path_config_source") then .path_config_source.path = "X" else . end);
     .static_resources | sds
-    | .clusters |= (map(.name |= ren | .load_assignment.cluster_name |= ren
-                        | .load_assignment.endpoints[0].lb_endpoints |= map(.endpoint.address.socket_address.address = "X" | .endpoint.address.socket_address |= del(.ipv4_compat))
+    | .clusters |= (map(.name |= ren
+                        | if has("load_assignment") then
+                            .load_assignment.cluster_name |= ren
+                            | .load_assignment.endpoints[0].lb_endpoints |= map(.endpoint.address.socket_address.address = "X" | .endpoint.address.socket_address |= del(.ipv4_compat))
+                          else . end
                         | del(.dns_lookup_family))
                     | sort_by(.name))
     | .listeners[0].address.socket_address |= (del(.ipv4_compat) | .address = "X")
