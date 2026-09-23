@@ -47,6 +47,15 @@ auto Auth::identify(const grpc::ServerContextBase & context) const -> Caller
 }
 
 
+auto Auth::identifyDirect(const grpc::ServerContextBase & context) const -> Caller
+{
+    auto const cert = clientCommonName(context);
+    return {
+        .name = cert.value_or("-"),
+        .role = acl.roleFor(cert),
+        .kind = cert ? Caller::Kind::named : Caller::Kind::anonymous};
+}
+
 auto Auth::authorize(const Caller & caller, std::string_view method, Role minRole) -> grpc::Status
 {
     auto const & role = caller.role;
