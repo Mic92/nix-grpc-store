@@ -281,7 +281,10 @@ per worker group. The replacement proxy needs these routes, in order:
 | header `x-nix-system: <system>` | headless Service `farm-nix-grpc-farm-worker-<group>` of that system |
 | anything else | the `defaultGroup` workers |
 
-Backends speak HTTP/2 and answer `grpc.health.v1.Health/Check`.
+Backends speak HTTP/2 and answer `grpc.health.v1.Health/Check`. The
+members of each worker group come from the scheduler, which serves envoy's
+endpoint discovery (`EndpointDiscoveryService/StreamEndpoints`) for the
+group's `system`, so `workers.<group>.system` is required.
 `nixos/lb.nix` and the chart's `_envoy.tpl` are working references.
 
 ## Step 2: Connect CI jobs in the cluster

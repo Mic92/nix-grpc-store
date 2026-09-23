@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="560" viewBox="0 0 900 560" font-family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="ab" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#2563eb"/>
+    </marker>
+    <marker id="ag" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#059669"/>
+    </marker>
+    <marker id="ax" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#64748b"/>
+    </marker>
+    <marker id="ap" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#9333ea"/>
+    </marker>
+    <filter id="sh" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
+    <style>
+      .box   { fill: #fff; stroke: #cbd5e1; stroke-width: 1.2; filter: url(#sh); }
+      .off   { fill: #f1f5f9; stroke: #cbd5e1; stroke-width: 1.2; stroke-dasharray: 5 4; }
+      .title { font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .sub   { font-size: 11px; fill: #64748b; }
+      .zone  { font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+      .step  { font-size: 13px; font-weight: 700; fill: #0f172a; }
+      .desc  { font-size: 12px; fill: #475569; }
+      .num   { font-size: 11px; font-weight: 700; fill: #fff; }
+      .mono  { font-family: ui-monospace, Menlo, Consolas, monospace; }
+    </style>
+  </defs>
+
+  <rect width="900" height="560" fill="#f8fafc"/>
+
+  <!-- Client and envoy -->
+  <rect x="28" y="152" width="150" height="64" rx="10" class="box"/>
+  <text x="103" y="190" text-anchor="middle" class="title">client</text>
+
+  <rect x="250" y="130" width="170" height="108" rx="10" fill="#4f46e5" filter="url(#sh)"/>
+  <text x="335" y="162" text-anchor="middle" class="title" fill="#fff">envoy :50051</text>
+  <text x="335" y="184" text-anchor="middle" font-size="11" fill="#c7d2fe">TLS, client certificate</text>
+  <text x="335" y="201" text-anchor="middle" font-size="11" fill="#c7d2fe">one cluster per system</text>
+  <text x="335" y="218" text-anchor="middle" font-size="11" fill="#c7d2fe">follows x-nix-worker</text>
+
+  <path d="M178 184 L246 184" stroke="#475569" stroke-width="1.8" fill="none" marker-end="url(#ab)"/>
+
+  <!-- Scheduler nodes -->
+  <rect x="560" y="40" width="312" height="120" rx="14" fill="#eef2ff" stroke="#a5b4fc" stroke-width="1.5"/>
+  <text x="580" y="64" class="zone" fill="#4f46e5">Scheduler nodes</text>
+  <rect x="580" y="80" width="130" height="58" rx="8" class="box"/>
+  <text x="645" y="104" text-anchor="middle" class="title" font-size="13">node A</text>
+  <text x="645" y="121" text-anchor="middle" class="sub">active</text>
+  <rect x="730" y="80" width="122" height="58" rx="8" class="off"/>
+  <text x="791" y="104" text-anchor="middle" class="title" font-size="13" fill="#64748b">node B</text>
+  <text x="791" y="121" text-anchor="middle" class="sub">standby, gets nothing</text>
+
+  <!-- Builders -->
+  <rect x="560" y="216" width="312" height="176" rx="14" fill="#ecfdf5" stroke="#6ee7b7" stroke-width="1.5"/>
+  <text x="580" y="240" class="zone" fill="#059669">Builders of one system</text>
+  <rect x="580" y="256" width="80" height="58" rx="8" class="box" stroke="#059669" stroke-width="2.5"/>
+  <text x="620" y="280" text-anchor="middle" class="title" font-size="13">w1</text>
+  <text x="620" y="297" text-anchor="middle" class="sub">healthy</text>
+  <rect x="676" y="256" width="80" height="58" rx="8" class="box"/>
+  <text x="716" y="280" text-anchor="middle" class="title" font-size="13">w2</text>
+  <text x="716" y="297" text-anchor="middle" class="sub">draining</text>
+  <rect x="772" y="256" width="80" height="58" rx="8" class="off"/>
+  <text x="812" y="280" text-anchor="middle" class="title" font-size="13" fill="#64748b">w3</text>
+  <text x="812" y="297" text-anchor="middle" class="sub">just connected</text>
+  <text x="580" y="342" class="sub">Whoever has a session with the active scheduler.</text>
+  <text x="580" y="358" class="sub">Envoy also health-checks each one every 5 s.</text>
+
+  <!-- Builders' sessions to the scheduler -->
+  <path d="M812 256 C812 200 745 172 714 132" stroke="#9333ea" stroke-width="1.8" stroke-dasharray="5 4" fill="none" marker-end="url(#ap)"/>
+  <circle cx="775" cy="188" r="10" fill="#9333ea"/><text x="775" y="192" text-anchor="middle" class="num">1</text>
+
+  <!-- Flows -->
+  <path d="M576 92 C520 60 300 60 300 126" stroke="#9333ea" stroke-width="1.8" stroke-dasharray="5 4" fill="none" marker-end="url(#ap)"/>
+  <circle cx="420" cy="62" r="10" fill="#9333ea"/><text x="420" y="66" text-anchor="middle" class="num">2</text>
+
+  <path d="M420 160 C490 160 500 108 576 108" stroke="#2563eb" stroke-width="2.4" fill="none" marker-end="url(#ab)"/>
+  <circle cx="496" cy="134" r="10" fill="#2563eb"/><text x="496" y="138" text-anchor="middle" class="num">3</text>
+
+  <path d="M420 200 C490 200 500 285 556 285" stroke="#059669" stroke-width="2.4" fill="none" marker-end="url(#ag)"/>
+  <circle cx="490" cy="243" r="10" fill="#059669"/><text x="490" y="247" text-anchor="middle" class="num">4</text>
+
+  <path d="M420 224 C470 224 500 355 556 355" stroke="#64748b" stroke-width="1.8" stroke-dasharray="5 4" fill="none" marker-end="url(#ax)"/>
+  <circle cx="480" cy="300" r="10" fill="#64748b"/><text x="480" y="304" text-anchor="middle" class="num">5</text>
+
+  <!-- Legend -->
+  <rect x="28" y="408" width="844" height="144" rx="12" fill="#fff" stroke="#cbd5e1" stroke-width="1.2"/>
+
+  <circle cx="54" cy="432" r="10" fill="#9333ea"/><text x="54" y="436" text-anchor="middle" class="num">1</text>
+  <text x="74" y="436" class="step">A builder connects</text>
+  <text x="330" y="436" class="desc">It opens a session to the active scheduler with its address, systems and slots.</text>
+
+  <circle cx="54" cy="458" r="10" fill="#9333ea"/><text x="54" y="462" text-anchor="middle" class="num">2</text>
+  <text x="74" y="462" class="step">The scheduler tells envoy</text>
+  <text x="330" y="462" class="desc">Envoy holds a stream open and gets the list again on every change.</text>
+
+  <circle cx="54" cy="484" r="10" fill="#2563eb"/><text x="54" y="488" text-anchor="middle" class="num">3</text>
+  <text x="74" y="488" class="step">Ask the scheduler</text>
+  <text x="330" y="488" class="desc">Which builder takes this derivation? It answers "w1" and tells w1 to expect it.</text>
+
+  <circle cx="54" cy="510" r="10" fill="#059669"/><text x="54" y="514" text-anchor="middle" class="num">4</text>
+  <text x="74" y="514" class="step">Send the build to that builder</text>
+  <text x="330" y="514" class="desc">The client puts w1's address in <tspan class="mono">x-nix-worker</tspan>. Envoy sends it there.</text>
+
+  <circle cx="54" cy="536" r="10" fill="#64748b"/><text x="54" y="540" text-anchor="middle" class="num">5</text>
+  <text x="74" y="540" class="step">Everything else</text>
+  <text x="330" y="540" class="desc">Uploads and queries go to any healthy builder, the least busy first.</text>
+</svg>
