@@ -135,7 +135,7 @@
       );
 
       devShells = forAllSystems (system: {
-        default = nixpkgs.legacyPackages.${system}.mkShell {
+        default = nixpkgs.legacyPackages.${system}.mkShell.override { stdenv = nixpkgs.legacyPackages.${system}.clangStdenv; } {
           inputsFrom = [ self.packages.${system}.default ];
           packages = [
             nixpkgs.legacyPackages.${system}.llvmPackages_latest.clang-tools

@@ -74,8 +74,7 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
   sanitize-smoke = import ../tests/sanitize-smoke.nix {
     inherit pkgs;
     nix = nixPackages.nix-everything;
-    # clang: GCC + UBSan fails to compile abseil's flat_hash_map headers.
-    package = (packages.default.override { stdenv = pkgs.clangStdenv; }).overrideAttrs (old: {
+    package = packages.default.overrideAttrs (old: {
       pname = "nix-grpc-store-asan";
       mesonFlags = (old.mesonFlags or [ ]) ++ [
         "-Db_sanitize=address,undefined"
