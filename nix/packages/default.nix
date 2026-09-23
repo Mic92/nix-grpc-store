@@ -14,7 +14,9 @@
   niks3 ? null,
   scopeFor ? null,
 }:
-lib.makeScope newScope (
+# Clang builds this with half the memory of GCC, whose PCH step alone needs
+# 1.3 GB.
+lib.makeScope (extra: newScope ({ stdenv = clangStdenv; } // extra)) (
   self:
   let
     linuxSystems = [
@@ -91,7 +93,7 @@ lib.makeScope newScope (
     };
 
     # libFuzzer + ASan/UBSan builds of fuzz/*.cc, installed as bin/fuzz-*.
-    fuzzers = (self.default.override { stdenv = clangStdenv; }).overrideAttrs (old: {
+    fuzzers = self.default.overrideAttrs (old: {
       pname = "nix-grpc-store-fuzzers";
       separateDebugInfo = false;
       mesonFlags = (old.mesonFlags or [ ]) ++ [

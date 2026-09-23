@@ -14,9 +14,18 @@ openssl_dep  = dependency('libcrypto')
 prometheus_dep = [dependency('prometheus-cpp-core'), dependency('prometheus-cpp-pull')]
 # Already in the closure via protobuf/gRPC; used for the scheduler's hash maps.
 absl_dep = [dependency('absl_flat_hash_map'), dependency('absl_hash'), dependency('absl_synchronization')]
-# Lock annotations (dispatcher.hh, sched-reactor.hh) are checked by clang,
-# i.e. in the clang-tidy and sanitize-smoke checks. GCC ignores them.
-add_project_arguments(meson.get_compiler('cpp').get_supported_arguments(['-Werror=thread-safety']), language : 'cpp')
+cxx = meson.get_compiler('cpp')
+# Lock annotations (dispatcher.hh, sched-reactor.hh) are checked by clang and
+# ignored by GCC.
+add_project_arguments(cxx.get_supported_arguments(['-Werror=thread-safety']), language : 'cpp')
+# GCC's precompiled headers take 1.3 GB each and did not lower the memory of
+# the units that use them. Clang's take 0.6 GB and save about a quarter of the
+# compile time, and -fpch-instantiate-templates instantiates the templates
+# once, in the PCH.
+do_pch = cxx.get_id() == 'clang'
+if do_pch
+  add_project_arguments('-fpch-instantiate-templates', language : 'cpp')
+endif
 # Under ASan abseil's headers switch flat_hash_map to a different layout than
 # the prebuilt libabsl was compiled with; keep them in agreement. (UBSan
 # builds need clang: GCC rejects a constexpr in abseil's hash_policy_traits.h.)
@@ -120,7 +129,7 @@ endif
 shared_module('nix-grpc-store',
   sources : ['src/client/store.cc', 'src/client/build.cc', 'src/client/transfer.cc', 'src/client/channel.cc', gen],
   include_directories : [gen_inc, src_inc],
-  cpp_pch : 'pch/client_pch.hh',
+  cpp_pch : do_pch ? ['pch/client_pch.hh'] : [],
   # nix_plugin_entry() skips registering the store when the running Nix
   # version differs from the one the plugin was built against.
   cpp_args : nix_compat_args + ['-DNIX_GRPC_BUILT_AGAINST_NIX="' + nix_store_dep.version() + '"'],
@@ -174,7 +183,7 @@ daemon_sources = [
 executable('nix-grpc-daemon',
   sources : daemon_sources + [gen, eds_gen],
   include_directories : [gen_inc, src_inc],
-  cpp_pch : 'pch/daemon_pch.hh',
+  cpp_pch : do_pch ? ['pch/daemon_pch.hh'] : [],
   cpp_args : nix_compat_args + ['-DNIX_GRPC_VERSION="' + meson.project_version() + '"'],
   # nix-store: native QueryValidPaths / AddMultipleToStore handlers.
   dependencies : common_deps + prometheus_dep + [dispatcher_dep, nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep, jemalloc_dep],
