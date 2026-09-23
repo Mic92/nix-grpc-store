@@ -204,6 +204,16 @@ let
       ];
     };
 
+  # Envoy reads the builder list from the scheduler over its own connection.
+  # A route for it here would let any client read the list.
+  edsRoute = {
+    match = {
+      prefix = "/envoy.service.endpoint.v3.EndpointDiscoveryService/";
+      grpc = { };
+    };
+    direct_response.status = 404;
+  };
+
   schedRoute = {
     match = {
       prefix = "/nix.remote.Scheduler/";
@@ -455,7 +465,7 @@ in
                           {
                             name = "farm";
                             domains = [ "*" ];
-                            routes = [ schedRoute ] ++ lib.concatMap routesFor ordered;
+                            routes = [ edsRoute schedRoute ] ++ lib.concatMap routesFor ordered;
                           }
                         ];
                         http_filters = [
