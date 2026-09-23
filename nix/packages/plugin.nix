@@ -51,6 +51,8 @@ stdenv.mkDerivation {
 
   doCheck = true;
   nativeCheckInputs = [ python3 ];
+  # The tests bind loopback mock servers.
+  __darwinAllowLocalNetworking = true;
 
   nativeBuildInputs = [
     meson

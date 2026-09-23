@@ -468,12 +468,12 @@ pkgs.testers.runNixOSTest {
         referrer = client.succeed("nix-build --no-out-link ${depExpr} -A referrer --argstr tag viacache").strip()
         client.succeed(f"nix-store --export {ref} > /tmp/shared/ref.closure")
         worker1.succeed("nix-store --import < /tmp/shared/ref.closure")
-        worker2.systemctl("stop nix-grpc-daemon.socket nix-grpc-daemon.service")
+        worker2.systemctl("stop nix-grpc-daemon.service")
         wait_members("${system}", "worker1")
         client.succeed(f"nix path-info --store '{envoy}' {ref} >&2")  # worker1 publishes ref
         worker2.fail(f"test -e {ref}")
-        worker2.systemctl("start nix-grpc-daemon.socket")
-        worker1.systemctl("stop nix-grpc-daemon.socket nix-grpc-daemon.service")
+        worker2.systemctl("start nix-grpc-daemon.service")
+        worker1.systemctl("stop nix-grpc-daemon.service")
         wait_members("${system}", "worker2")
         client.succeed(f"nix copy --no-check-sigs --to '{envoy}' {referrer} >&2")
         worker2.succeed(f"test -e {ref} && test -e {referrer}")
@@ -491,7 +491,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("scheduler down: the other node takes the lock and keeps it"):
         was, nxt = leader(), standby()
-        was.systemctl("stop nix-grpc-daemon.socket nix-grpc-daemon.service")
+        was.systemctl("stop nix-grpc-daemon.service")
         nxt.wait_until_succeeds("journalctl -u nix-grpc-daemon | grep -q event=scheduler_take_over", timeout=sec(30))
         retry(lambda _: sched_workers(nxt) == 1, timeout=sec(30))
         build(envoy, "on-standby")
