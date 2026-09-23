@@ -318,6 +318,7 @@ void Coordinator::setSchedulerActive(bool active)
         health->SetServingStatus("nix.scheduler", active);
     }
     scheduler->setActive(active);
+    eds->setActive(active);
     if (active) {
         dispatcher->serving(); // NOLINT(bugprone-unchecked-optional-access): set iff scheduler
     } else {
@@ -359,6 +360,7 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
                 .logLevel = options.logLevel},
             metrics);
         scheduler = std::make_unique<SchedulerService>(*dispatcher, auth);
+        eds = std::make_unique<EdsService>(*dispatcher, auth);
     }
     if (builder && dispatcher && options.schedulerAddr.empty()) {
         // In-process worker: the Dispatcher calls straight into the Builder.
@@ -394,6 +396,7 @@ Coordinator::~Coordinator()
     if (builder) {
         builder->setSend(nullptr);
     }
+    eds.reset();
     scheduler.reset();
     dispatcher.reset();
 }

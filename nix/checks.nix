@@ -43,7 +43,7 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     # Meson generates a clang-tidy target from .clang-tidy. The generated
     # protobuf headers must exist before it runs.
     buildPhase = ''
-      ninja nix_remote.pb.h nix_remote.grpc.pb.h
+      ninja nix_remote.pb.h nix_remote.grpc.pb.h eds.pb.h eds.grpc.pb.h
       ninja clang-tidy
     '';
     installPhase = "touch $out";
