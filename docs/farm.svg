@@ -9,11 +9,8 @@
     <marker id="ag" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
       <path d="M0,0 L7,3.5 L0,7 Z" fill="#059669"/>
     </marker>
-    <filter id="sh" x="-10%" y="-10%" width="120%" height="130%">
-      <feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-color="#0f172a" flood-opacity="0.12"/>
-    </filter>
     <style>
-      .box   { fill: #fff; stroke: #cbd5e1; stroke-width: 1.2; filter: url(#sh); }
+      .box   { fill: #fff; stroke: #cbd5e1; stroke-width: 1.2; }
       .title { font-size: 14px; font-weight: 700; fill: #0f172a; }
       .sub   { font-size: 11px; fill: #64748b; }
       .zone  { font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
@@ -37,8 +34,8 @@
   <text x="153" y="193" text-anchor="middle" class="sub">--eval-store auto · OIDC token</text>
 
   <!-- Balancer -->
-  <rect x="340" y="96" width="240" height="72" rx="10" fill="#4f46e5" filter="url(#sh)"/>
-  <text x="460" y="127" text-anchor="middle" class="title" fill="#fff">envoy :50051</text>
+  <rect x="340" y="96" width="240" height="72" rx="10" fill="#4f46e5"/>
+  <text x="460" y="127" text-anchor="middle" class="title" style="fill:#fff">envoy :50051</text>
   <text x="460" y="146" text-anchor="middle" font-size="11" fill="#c7d2fe">route by system · pin by x-nix-worker</text>
 
   <path d="M258 102 C300 102 300 120 336 120" stroke="#2563eb" stroke-width="2.2" fill="none" marker-end="url(#ab)"/>
@@ -50,14 +47,14 @@
   <text x="320" y="246" class="zone" fill="#047857">Nodes</text>
   <text x="460" y="344" text-anchor="middle" class="sub">nix-daemon + nix-grpc-daemon; one is also the scheduler</text>
 
-  <rect x="320" y="262" width="86" height="68" rx="10" fill="#059669" filter="url(#sh)"/>
-  <text x="363" y="292" text-anchor="middle" class="title" fill="#fff">scheduler</text>
-  <text x="363" y="310" text-anchor="middle" font-size="11" fill="#a7f3d0">+ worker x86_64</text>
-  <rect x="417" y="262" width="86" height="68" rx="10" fill="#059669" filter="url(#sh)"/>
-  <text x="460" y="292" text-anchor="middle" class="title" fill="#fff">worker</text>
+  <rect x="320" y="262" width="86" height="68" rx="10" fill="#059669"/>
+  <text x="363" y="292" text-anchor="middle" class="title" style="fill:#fff">scheduler</text>
+  <text x="363" y="310" text-anchor="middle" font-size="10" fill="#a7f3d0">+ worker x86_64</text>
+  <rect x="417" y="262" width="86" height="68" rx="10" fill="#059669"/>
+  <text x="460" y="292" text-anchor="middle" class="title" style="fill:#fff">worker</text>
   <text x="460" y="310" text-anchor="middle" font-size="11" fill="#a7f3d0">aarch64</text>
-  <rect x="514" y="262" width="86" height="68" rx="10" fill="#059669" filter="url(#sh)"/>
-  <text x="557" y="292" text-anchor="middle" class="title" fill="#fff">worker</text>
+  <rect x="514" y="262" width="86" height="68" rx="10" fill="#059669"/>
+  <text x="557" y="292" text-anchor="middle" class="title" style="fill:#fff">worker</text>
   <text x="557" y="310" text-anchor="middle" font-size="11" fill="#a7f3d0">aarch64</text>
 
   <path d="M410 168 L370 258" stroke="#2563eb" stroke-width="2.2" fill="none" marker-end="url(#ab)"/>
@@ -85,7 +82,7 @@
 
   <!-- Substitution -->
   <path d="M680 400 C520 400 470 400 460 334" class="edge" stroke-dasharray="5 4" marker-end="url(#a)"/>
-  <text x="560" y="418" text-anchor="middle" class="lbl">substitute inputs · outputs</text>
+  <text x="470" y="446" text-anchor="middle" class="lbl">substitute inputs · outputs</text>
   <path d="M680 412 C120 460 120 300 150 214" class="edge" stroke-dasharray="5 4" marker-end="url(#a)"/>
   <text x="150" y="300" class="lbl">results</text>
 </svg>
