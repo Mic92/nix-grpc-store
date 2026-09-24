@@ -899,6 +899,59 @@
    ],
    "title": "Scheduler",
    "type": "stat"
+  },
+  {
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "description": "Failed builds by Nix failure status. PermanentFailure is the derivation itself. TransientFailure and TimedOut can succeed on a retry.",
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 40,
+      "stacking": {
+       "mode": "normal"
+      }
+     },
+     "unit": "short",
+     "noValue": "no failures in range"
+    },
+    "overrides": []
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 36
+   },
+   "id": 19,
+   "options": {
+    "legend": {
+     "calcs": [
+      "mean",
+      "lastNotNull"
+     ],
+     "displayMode": "table",
+     "placement": "right"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "expr": "sum by (reason) (rate(${prefix}nix_grpc_build_failures_total[$__rate_interval]))",
+     "legendFormat": "{{reason}}",
+     "refId": "A"
+    }
+   ],
+   "title": "Build failures by reason",
+   "type": "timeseries"
   }
  ],
  "refresh": "30s",
