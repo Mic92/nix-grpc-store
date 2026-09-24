@@ -275,6 +275,45 @@ inline auto failureStatus(nix::BuildResult &res) -> std::optional<FailureStatus>
   return std::nullopt;
 }
 
+// Metric label: the enum name only, never the message, which is unbounded.
+// Templated so the HashMismatch probe stays dependent; 2.32 added that name,
+// and the older flat enum also carries the success names, which
+// failureStatus() never returns.
+template <typename S = FailureStatus>
+inline auto failureStatusName(S status) -> std::string_view {
+  if constexpr (requires { S::HashMismatch; }) {
+    if (status == S::HashMismatch) {
+      return "HashMismatch";
+    }
+  }
+  switch (status) {
+  case S::PermanentFailure:
+    return "PermanentFailure";
+  case S::InputRejected:
+    return "InputRejected";
+  case S::OutputRejected:
+    return "OutputRejected";
+  case S::TransientFailure:
+    return "TransientFailure";
+  case S::CachedFailure:
+    return "CachedFailure";
+  case S::TimedOut:
+    return "TimedOut";
+  case S::MiscFailure:
+    return "MiscFailure";
+  case S::DependencyFailed:
+    return "DependencyFailed";
+  case S::LogLimitExceeded:
+    return "LogLimitExceeded";
+  case S::NotDeterministic:
+    return "NotDeterministic";
+  case S::NoSubstituters:
+    return "NoSubstituters";
+  default:
+    return "Unknown";
+  }
+}
+
 // Plain store path inputs of a BasicDerivation.
 inline auto drvInputs(const nix::BasicDerivation &drv) -> const nix::StorePathSet & {
 #if NIX_COMPAT_TEMPLATED_DRV
