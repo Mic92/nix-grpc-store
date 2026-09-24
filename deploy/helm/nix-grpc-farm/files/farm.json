@@ -952,6 +952,218 @@
    ],
    "title": "Build failures by reason",
    "type": "timeseries"
+  },
+  {
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "description": "Wall time a derivation waited in the queue before a worker took it. A rising p95 on one system means that system is short of slots.",
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "noValue": "no builds in range"
+    },
+    "overrides": []
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 44
+   },
+   "id": 15,
+   "options": {
+    "legend": {
+     "calcs": [
+      "mean",
+      "max"
+     ],
+     "displayMode": "table",
+     "placement": "right"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "expr": "histogram_quantile(0.95, sum by (system, le) (rate(${prefix}nix_grpc_queue_seconds_bucket[$__rate_interval])))",
+     "legendFormat": "{{system}} p95",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "expr": "sum by (system) (rate(${prefix}nix_grpc_queue_seconds_sum[$__rate_interval])) / sum by (system) (rate(${prefix}nix_grpc_queue_seconds_count[$__rate_interval]))",
+     "legendFormat": "{{system}} mean",
+     "refId": "B"
+    }
+   ],
+   "title": "Queue wait by system",
+   "type": "timeseries"
+  },
+  {
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "description": "Build inputs the worker already had locally, against inputs it had to fetch from the cache. A high fetched share means the workers keep missing each other's outputs.",
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "fillOpacity": 40,
+      "stacking": {
+       "mode": "normal"
+      }
+     },
+     "unit": "short",
+     "noValue": "no builds in range"
+    },
+    "overrides": []
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 44
+   },
+   "id": 16,
+   "options": {
+    "legend": {
+     "calcs": [
+      "mean",
+      "lastNotNull"
+     ],
+     "displayMode": "table",
+     "placement": "right"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "expr": "sum by (state) (rate(${prefix}nix_grpc_build_inputs_total[$__rate_interval]))",
+     "legendFormat": "{{state}}",
+     "refId": "A"
+    }
+   ],
+   "title": "Build inputs per second: local against fetched",
+   "type": "timeseries"
+  },
+  {
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "description": "Time one build spent fetching its missing inputs from the cache. Compare it with the build time to see if the cache is the bottleneck.",
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "noValue": "no builds in range"
+    },
+    "overrides": []
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 52
+   },
+   "id": 17,
+   "options": {
+    "legend": {
+     "calcs": [
+      "mean",
+      "max"
+     ],
+     "displayMode": "table",
+     "placement": "right"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(${prefix}nix_grpc_build_input_seconds_bucket[$__rate_interval])))",
+     "legendFormat": "p95",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "expr": "sum(rate(${prefix}nix_grpc_build_input_seconds_sum[$__rate_interval])) / sum(rate(${prefix}nix_grpc_build_input_seconds_count[$__rate_interval]))",
+     "legendFormat": "mean",
+     "refId": "B"
+    }
+   ],
+   "title": "Input fetch time per build",
+   "type": "timeseries"
+  },
+  {
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS}"
+   },
+   "description": "NAR bytes the workers pulled from the cache to satisfy build inputs, by worker.",
+   "fieldConfig": {
+    "defaults": {
+     "unit": "Bps",
+     "noValue": "no builds in range"
+    },
+    "overrides": []
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 52
+   },
+   "id": 18,
+   "options": {
+    "legend": {
+     "calcs": [
+      "mean",
+      "lastNotNull"
+     ],
+     "displayMode": "table",
+     "placement": "right"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS}"
+     },
+     "expr": "sum by ($instance) (rate(${prefix}nix_grpc_build_input_bytes_total[$__rate_interval]))",
+     "legendFormat": "{{instance}}{{host}}",
+     "refId": "A"
+    }
+   ],
+   "title": "Input bytes fetched from the cache",
+   "type": "timeseries"
   }
  ],
  "refresh": "30s",
