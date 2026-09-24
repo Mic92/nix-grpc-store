@@ -35,6 +35,7 @@ using nix::remote::SchedMsg;
 namespace {
 constexpr size_t maxSystemLen = 64;
 constexpr double statsEveryMs = 1000;
+constexpr double msPerSecond = 1000;
 } // namespace
 
 Dispatcher::Dispatcher(Config config_, Metrics & metrics)
@@ -256,6 +257,7 @@ void Dispatcher::dispatchLocked()
             }
         }
         assignedCtr.Increment();
+        metrics.queueWait(ent->system, (nowMs() - ent->enqMs) / msPerSecond);
         debugLog(
             {{"event", "assigned"},
              {"drv", ent->drvPath},

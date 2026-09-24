@@ -587,6 +587,8 @@ pkgs.testers.runNixOSTest {
         retry(burst_done, timeout=sec(90))
         client.succeed("systemctl show -p Result --value burst | grep -qx success || { journalctl -u burst >&2; false; }")
         retry(lambda _: gauge_sum(leader(), 'kind="queued"') == 0, timeout=sec(10))
+        waits = gauge(leader(), 'nix_grpc_queue_seconds_count{system="${system}"}')
+        assert waits >= slots + 2, waits
 
     with subtest("requiredSystemFeatures: placed on the worker that has them, refused when none does"):
         out = client.succeed(f"nix build -L --store '{envoy}' --eval-store auto --expr 'map (tag: import ${jobExpr} {{ inherit tag; features = [\"vip\"]; }}) [\"f1\" \"f2\" \"f3\"]' --impure 2>&1")
