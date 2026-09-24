@@ -400,6 +400,14 @@ pkgs.testers.runNixOSTest {
         assert len(holders(top)) == 1, holders(top)
         client.fail(f"test -e {top}")
         client.succeed(f"nix copy --from ${niks3Url} --no-check-sigs {top} && grep farm-top-t1 {top}")
+        # The scheduler picks the worker, so only the total is fixed.
+        def inputs_of(w) -> tuple[int, int, int]:
+            local = gauge(w, 'nix_grpc_build_inputs_total{state="local"}')
+            fetched = gauge(w, 'nix_grpc_build_inputs_total{state="fetched"}')
+            return local, fetched, gauge(w, "nix_grpc_build_input_seconds_count")
+        counted = [inputs_of(w) for w in [worker1, worker2]]
+        assert sum(local + fetched for local, fetched, _ in counted) >= 2, counted
+        assert sum(builds for _, _, builds in counted) == 3, counted
 
     with subtest("repeat is answered Cached by the scheduler without building"):
         for w in [worker1, worker2]:

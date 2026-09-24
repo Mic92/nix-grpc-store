@@ -47,6 +47,22 @@ class Metrics
              .Name("nix_grpc_queue_seconds")
              .Help("Wall time a derivation waited for a worker, by system")
              .Register(*registry);
+    prometheus::Family<prometheus::Counter> * inputsCtr =
+        &prometheus::BuildCounter()
+             .Name("nix_grpc_build_inputs_total")
+             .Help("Build inputs by state: already local, or fetched from a substituter")
+             .Register(*registry);
+    prometheus::Counter * inputBytesCtr =
+        &prometheus::BuildCounter()
+             .Name("nix_grpc_build_input_bytes_total")
+             .Help("Uncompressed NAR bytes of build inputs fetched from a substituter")
+             .Register(*registry)
+             .Add({});
+    prometheus::Family<prometheus::Histogram> * inputSeconds =
+        &prometheus::BuildHistogram()
+             .Name("nix_grpc_build_input_seconds")
+             .Help("Wall time one build spent fetching its missing inputs")
+             .Register(*registry);
     prometheus::Family<prometheus::Gauge> * inflight =
         &prometheus::BuildGauge()
              .Name("nix_grpc_inflight")
@@ -186,6 +202,23 @@ public:
     void queueWait(std::string_view system, double seconds)
     {
         queueSeconds->Add({{"system", std::string(system)}}, buckets).Observe(seconds);
+    }
+
+    // What one build fetched before it started.
+    struct Inputs
+    {
+        size_t wanted = 0;
+        size_t fetched = 0;
+        uint64_t bytes = 0;
+        double seconds = 0;
+    };
+
+    void inputs(const Inputs & counted)
+    {
+        inputsCtr->Add({{"state", "local"}}).Increment(static_cast<double>(counted.wanted - counted.fetched));
+        inputsCtr->Add({{"state", "fetched"}}).Increment(static_cast<double>(counted.fetched));
+        inputBytesCtr->Increment(static_cast<double>(counted.bytes));
+        inputSeconds->Add({}, buckets).Observe(counted.seconds);
     }
     [[nodiscard]] auto schedQueuedNow() const -> double
     {

@@ -446,13 +446,25 @@ public:
     }
 
     // Inputs may have been uploaded to, or built on, another worker.
-    auto gatherInputs(nix::Store & localStore, const nix::BasicDerivation & drv, nix::Store & roots) -> grpc::Status
+    auto gatherInputs(nix::Store & localStore, const nix::BasicDerivation & drv, nix::Store & roots, nixgrpc::Metrics::Inputs & counted)
+        -> grpc::Status
     {
         try {
-            for (const auto & input : nixcompat::drvInputs(drv)) {
+            const auto & inputs = nixcompat::drvInputs(drv);
+            counted.wanted = inputs.size();
+            auto const local = localStore.queryValidPaths(inputs);
+            counted.fetched = inputs.size() - local.size();
+            auto const before = std::chrono::steady_clock::now();
+            for (const auto & input : inputs) {
                 roots.addTempRoot(input);
+                if (local.contains(input)) {
+                    continue;
+                }
                 nixcompat::ensurePath(localStore, input);
+                counted.bytes += localStore.queryPathInfo(input)->narSize;
             }
+            counted.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - before).count();
+            metrics.inputs(counted);
         } catch (nix::Error & err) {
             // Another worker may still hold it locally. UNAVAILABLE makes the client retry elsewhere.
             metrics.event("input_not_substitutable");
@@ -510,6 +522,7 @@ public:
         nix::BuildMode mode,
         nixgrpc::Backends::Limits limits,
         const nixgrpc::BuildEventSink & log,
+        nixgrpc::Metrics::Inputs & inputs,
         nix::remote::BuildDerivationDone & done) -> grpc::Status
     {
         if (!coord.builder) {
@@ -559,7 +572,9 @@ public:
         auto const report = [&] -> void { builder.finished(drvName, outcome, outputs, wire); };
         try {
             auto status =
-                buildExpected(context, *adm->shared, localStore, drvPath, drv, mode, limits, log, outPaths, done, outcome, outputs);
+                buildExpected(
+                    context, *adm->shared, localStore, drvPath, drv, mode, limits, log, inputs, outPaths, done, outcome,
+                    outputs);
             wire = done.SerializeAsString();
             if (!status.ok()) {
                 outcome = nix::remote::Done::FAILED;
@@ -589,6 +604,7 @@ public:
         nix::BuildMode mode,
         nixgrpc::Backends::Limits limits,
         const nixgrpc::BuildEventSink & log,
+        nixgrpc::Metrics::Inputs & inputs,
         const std::map<std::string, nix::StorePath> & outPaths,
         nix::remote::BuildDerivationDone & done,
         nix::remote::Done::Outcome & outcome,
@@ -601,7 +617,7 @@ public:
         nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "substitute");
         // Roots inputs and outputs until publish is done.
         auto const roots = openScopedStore();
-        if (auto status = gatherInputs(localStore, drv, *roots); !status.ok()) {
+        if (auto status = gatherInputs(localStore, drv, *roots, inputs); !status.ok()) {
             return status;
         }
         for (const auto & [name, path] : outPaths) {
@@ -682,7 +698,9 @@ public:
                 .buildTimeout = request->build_timeout(), .maxSilentTime = request->max_silent_time()};
 
             nix::remote::BuildDerivationChunk chunk;
-            if (auto const status = build(*context, *localStore, drvPath, drv, mode, limits, sendLogLine, *chunk.mutable_done());
+            nixgrpc::Metrics::Inputs inputs;
+            if (auto const status =
+                    build(*context, *localStore, drvPath, drv, mode, limits, sendLogLine, inputs, *chunk.mutable_done());
                 !status.ok()) {
                 return {status.error_code(), workerName + ": " + status.error_message()};
             }
@@ -690,7 +708,11 @@ public:
             rpc.done(
                 {{"drv", std::string(drvPath.to_string())},
                  {"assign_id", std::to_string(request->assign_id())},
-                 {"outputs", std::to_string(chunk.done().outputs_size())}});
+                 {"outputs", std::to_string(chunk.done().outputs_size())},
+                 {"inputs", std::to_string(inputs.wanted)},
+                 {"inputs_fetched", std::to_string(inputs.fetched)},
+                 {"input_bytes", std::to_string(inputs.bytes)},
+                 {"input_s", std::to_string(static_cast<int>(inputs.seconds))}});
             return grpc::Status::OK;
         });
     }
