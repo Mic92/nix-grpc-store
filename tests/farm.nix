@@ -167,6 +167,15 @@ let
       };
     }
   '';
+  failExpr = pkgs.writeText "fail.nix" ''
+    { tag }:
+    derivation {
+      name = "fail-''${tag}";
+      system = builtins.currentSystem;
+      builder = "/bin/sh";
+      args = [ "-c" "echo BOOM-''${tag} >&2; exit 1" ];
+    }
+  '';
   slowExpr = pkgs.writeText "slow.nix" ''
     { tag }:
     derivation {
@@ -339,6 +348,8 @@ pkgs.testers.runNixOSTest {
         return len(down) == 1 and sched_workers(worker2 if names[down.pop()] == "worker1" else worker1) == 2
     def events(w, kind: str) -> int:
         return gauge(w, f'nix_grpc_events_total{{kind="{kind}"}}')
+    def failures(reason: str) -> int:
+        return sum(gauge(w, f'nix_grpc_build_failures_total{{reason="{reason}"}}') for w in [worker1, worker2])
 
     with subtest("one node schedules and both builders hold a WorkerSession on it"):
         retry(settled, timeout=sec(60))
@@ -437,6 +448,14 @@ pkgs.testers.runNixOSTest {
             rc, out = client.execute(f"nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag tmo{flag[2]} {flag} 2>&1")
             assert rc != 0 and "timed out" in out and time.monotonic() - t0 < 60, (flag, rc, time.monotonic() - t0, out)
         assert building() == []
+        assert failures("TimedOut") == 2, [metrics(w) for w in [worker1, worker2]]
+
+    with subtest("a failing build is counted with its own reason"):
+        before = failures("PermanentFailure")
+        rc, out = client.execute(f"nix build -L --store '{envoy}' --eval-store auto -f ${failExpr} --argstr tag boom 2>&1")
+        assert rc != 0 and "BOOM-boom" in out, (rc, out)
+        assert failures("PermanentFailure") == before + 1, [metrics(w) for w in [worker1, worker2]]
+        assert sum(events(w, "build_failed") for w in [worker1, worker2]) == failures("PermanentFailure") + failures("TimedOut")
 
     with subtest("the first client leaving does not fail the second"):
         client.succeed(f"systemd-run --unit share1 nix build --store '{envoy}' --eval-store auto -f ${slowExpr} --argstr tag share")

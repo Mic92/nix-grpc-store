@@ -626,6 +626,9 @@ public:
             throw nixgrpc::CancelledWait("build interrupted");
         }
         metrics.event(nixcompat::succeeded(res) ? "built" : "build_failed");
+        if (auto const status = nixcompat::failureStatus(res)) {
+            metrics.buildFailure(nixcompat::failureStatusName(*status));
+        }
         if (nixcompat::succeeded(res)) {
             std::vector<std::string> built;
             built.reserve(outPaths.size());

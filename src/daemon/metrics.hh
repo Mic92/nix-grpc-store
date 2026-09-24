@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include <prometheus/counter.h>
@@ -48,6 +49,11 @@ class Metrics
              .Register(*registry);
     prometheus::Family<prometheus::Counter> * events =
         &prometheus::BuildCounter().Name("nix_grpc_events_total").Help("Scheduling events, by kind").Register(*registry);
+    prometheus::Family<prometheus::Counter> * buildFailures =
+        &prometheus::BuildCounter()
+             .Name("nix_grpc_build_failures_total")
+             .Help("Failed builds, by Nix BuildResult failure status")
+             .Register(*registry);
     prometheus::Family<prometheus::Gauge> * sched =
         &prometheus::BuildGauge().Name("nix_grpc_sched").Help("Scheduler state on this node, by kind").Register(*registry);
     prometheus::Family<prometheus::Gauge> * schedSystemFam =
@@ -134,6 +140,10 @@ public:
     void event(const std::string & kind)
     {
         events->Add({{"kind", kind}}).Increment();
+    }
+    void buildFailure(std::string_view reason)
+    {
+        buildFailures->Add({{"reason", std::string(reason)}}).Increment();
     }
     // For hot paths: resolve the label once, Increment() is then lock-free.
     auto eventCounter(const std::string & kind) -> prometheus::Counter &
