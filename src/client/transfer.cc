@@ -97,6 +97,18 @@ auto GrpcStore::queryMissing(const std::vector<DerivedPath> & targets)
   return res;
 }
 
+void GrpcStore::querySubstitutablePathInfos(const StorePathCAMap & paths,
+                                            SubstitutablePathInfos & infos) {
+  std::vector<DerivedPath> targets;
+  targets.reserve(paths.size());
+  for (const auto & [path, _ca] : paths) {
+    targets.emplace_back(DerivedPath::Opaque{path});
+  }
+  for (const auto & path : queryMissing(targets).willSubstitute) {
+    infos.insert_or_assign(path, SubstitutablePathInfo{});
+  }
+}
+
 auto GrpcStore::queryPathInfosNative(const StorePathSet &paths) -> PathInfoMap {
   remote::QueryPathInfosRequest request;
   for (const auto &path : paths) {
