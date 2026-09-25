@@ -33,6 +33,7 @@
 #include "dispatcher.hh"
 #include "eds.hh"
 #include "elector.hh"
+#include "log-spill.hh"
 #include "metrics.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
@@ -58,6 +59,16 @@ struct Expected
         std::atomic<unsigned> attached{0};  // callers waiting in attach(); the build outlives its first caller for them
         bool finished = false;
         std::string resultWire; // BuildDerivationDone serialised
+        LogSpill spill; // the owner's build log, replayed to whoever attaches
+
+        // Owner only. Waking under the lock keeps an attacher that just
+        // checked `written()` from sleeping through this record.
+        void logged(SpillKind kind, std::string_view text)
+        {
+            spill.append(kind, text);
+            const std::scoped_lock lock(mutex);
+            cv.notify_all();
+        }
     };
 
     std::shared_ptr<Shared> shared = std::make_shared<Shared>();

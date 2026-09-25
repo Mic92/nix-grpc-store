@@ -72,6 +72,7 @@
 #include "push.hh"
 #include "idle.hh"
 #include "import-paths.hh"
+#include "log-spill.hh"
 #include "logfmt.hh"
 #include "oidc.hh"
 #include "path-info-wire.hh"
@@ -92,6 +93,9 @@ volatile std::sig_atomic_t nixgrpc::stopSignal = 0;
 
 namespace {
 using nixgrpc::stopSignal;
+
+static_assert(static_cast<int>(nixgrpc::SpillKind::line) == static_cast<int>(nixgrpc::BuildEvent::Kind::line));
+static_assert(static_cast<int>(nixgrpc::SpillKind::phase) == static_cast<int>(nixgrpc::BuildEvent::Kind::phase));
 
 class NixRemoteService final : public nix::remote::NixRemote::Service
 {
@@ -501,15 +505,17 @@ public:
     {
         log({.text = "attached to the build already running on this worker"});
         shared.attached++;
-        std::unique_lock lock(shared.mutex);
-        while (!shared.finished) {
-            if (context.IsCancelled() || stopSignal >= nixgrpc::kCancelBuilds) {
-                shared.attached--;
-                return std::nullopt;
-            }
-            shared.cv.wait_for(lock, nixgrpc::cancelPoll);
-        }
+        auto const completed = nixgrpc::followSpill(
+            shared.spill, shared.mutex, shared.cv, shared.finished, nixgrpc::cancelPoll,
+            [&] -> bool { return context.IsCancelled() || stopSignal >= nixgrpc::kCancelBuilds; },
+            [&](nixgrpc::SpillKind kind, std::string_view text) -> void {
+                log({.kind = static_cast<nixgrpc::BuildEvent::Kind>(kind), .text = std::string(text)});
+            });
         shared.attached--;
+        if (!completed) {
+            return std::nullopt;
+        }
+        // Set before `finished`, and never written again.
         return shared.resultWire;
     }
 
@@ -570,10 +576,14 @@ public:
         std::vector<std::pair<std::string, uint64_t>> outputs;
         std::string wire;
         auto const report = [&] -> void { builder.finished(drvName, outcome, outputs, wire); };
+        auto const tee = [&](nixgrpc::BuildEvent event) -> void {
+            adm->shared->logged(static_cast<nixgrpc::SpillKind>(event.kind), event.text);
+            log(std::move(event));
+        };
         try {
             auto status =
                 buildExpected(
-                    context, *adm->shared, localStore, drvPath, drv, mode, limits, log, inputs, outPaths, done, outcome,
+                    context, *adm->shared, localStore, drvPath, drv, mode, limits, tee, inputs, outPaths, done, outcome,
                     outputs);
             wire = done.SerializeAsString();
             if (!status.ok()) {

@@ -237,6 +237,13 @@ test('xfcc', executable('xfcc-test',
   cpp_args : ['-UNDEBUG'],
 ))
 
+test('log-spill', executable('log-spill-test',
+  sources : ['tests/log-spill-test.cc'],
+  include_directories : [src_inc, include_directories('src/daemon')],
+  dependencies : [threads_dep],
+  cpp_args : ['-UNDEBUG'],
+))
+
 # --- fuzzers ----------------------------------------------------------------
 
 # Built only with -Dfuzzers=true (requires clang for libFuzzer).
