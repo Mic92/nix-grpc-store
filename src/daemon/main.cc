@@ -565,6 +565,9 @@ public:
             if (!wire) {
                 throw nixgrpc::CancelledWait("gave up waiting for the running build");
             }
+            if (wire->empty()) {
+                return {grpc::StatusCode::UNAVAILABLE, "the build this call attached to did not finish, retry"};
+            }
             if (!done.ParseFromString(*wire)) {
                 return {grpc::StatusCode::INTERNAL, "corrupt shared result"};
             }
@@ -585,8 +588,11 @@ public:
                 buildExpected(
                     context, *adm->shared, localStore, drvPath, drv, mode, limits, tee, inputs, outPaths, done, outcome,
                     outputs);
-            wire = done.SerializeAsString();
-            if (!status.ok()) {
+            // No result to share unless the build produced one: attachers of a
+            // failed owner must retry, not return an empty Done as success.
+            if (status.ok()) {
+                wire = done.SerializeAsString();
+            } else {
                 outcome = nix::remote::Done::FAILED;
             }
             report();
