@@ -289,6 +289,11 @@ public:
     auto queryMissing(const std::vector<DerivedPath> & targets)
         -> MissingPaths override;
 
+    // RemoteStore would tunnel this, which only trusted callers may. Nothing
+    // reads more than membership from it, so QueryMissing answers it.
+    void querySubstitutablePathInfos(const StorePathCAMap & paths,
+                                     SubstitutablePathInfos & infos) override;
+
     // Same: keep read-only clients off the tunnel.
     // RemoteStore would tunnel this even with an eval store at hand.
     auto queryPartialDerivationOutputMap(const StorePath & path, Store * evalStore)
