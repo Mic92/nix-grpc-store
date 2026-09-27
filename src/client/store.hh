@@ -565,6 +565,11 @@ public:
     void queryPathInfoUncached(const StorePath & path, InfoCallback callback) noexcept override
 ;
 
+    // RemoteStore would tunnel this, which only trusted callers may.
+    void queryRealisationUncached(const DrvOutput & /*id*/, nixcompat::RealisationCallback callback) noexcept override {
+      callback(nullptr);
+    }
+
 private:
     struct Connection : RemoteStore::Connection
     {

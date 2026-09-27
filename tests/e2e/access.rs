@@ -270,3 +270,30 @@ fn prometheus_metrics_are_labelled_by_certificate_cn() {
         "{lines:#?}"
     );
 }
+
+#[test]
+fn evaluation_with_ca_derivations_needs_no_tunnel() {
+    wait_for_mtls();
+    wait_for_unit("mock-oidc.service");
+    wait_for_open_port(8081);
+    let dir = workdir("eval-store");
+    let writer = token_store(
+        &dir,
+        "writer",
+        "--data-urlencode 'sub=repo:myorg/evalstore:ref:refs/heads/dev'",
+    );
+    write_file(
+        &format!("{dir}/ifd.nix"),
+        r#"let
+  gen = derivation { name = "ifd-gen"; system = builtins.currentSystem; builder = "/bin/sh"; args = [ "-c" "echo ifd-payload > $out" ]; };
+in { value = builtins.readFile gen; drv = gen; }"#,
+    );
+    let out = succeed(&format!(
+        "NIX_REMOTE='{writer}' nix eval --impure --raw --eval-store daemon -f {dir}/ifd.nix value"
+    ));
+    assert!(out.contains("ifd-payload"), "{out}");
+    assert_no_journal(
+        MTLS,
+        "event=denied method=Connect cn=oidc:mock:repo:myorg/evalstore",
+    );
+}

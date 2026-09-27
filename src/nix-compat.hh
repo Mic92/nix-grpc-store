@@ -221,6 +221,12 @@ using FailureStatus = nix::BuildResult::Failure::Status;
 using FailureStatus = nix::BuildResult::Status;
 #endif
 
+#if NIX_COMPAT_AT_LEAST(2, 34)
+using RealisationCallback = nix::Callback<std::shared_ptr<const nix::UnkeyedRealisation>>;
+#else
+using RealisationCallback = nix::Callback<std::shared_ptr<const nix::Realisation>>;
+#endif
+
 inline auto failed(FailureStatus status, const std::string &msg) -> nix::BuildResult {
   nix::BuildResult res;
 #if NIX_COMPAT_AT_LEAST(2, 32)

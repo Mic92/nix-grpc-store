@@ -74,7 +74,7 @@ pkgs.testers.runNixOSTest {
       # Must be a Nix version the plugin bundle contains a build for.
       nix.package = nixPkgs.nix-everything;
       nix.settings = {
-        experimental-features = [ "nix-command" ];
+        experimental-features = [ "nix-command" "ca-derivations" ];
         # Keep the benchmark deterministic and offline.
         substituters = [ ];
         trusted-public-keys = [ signingPublicKey ];
