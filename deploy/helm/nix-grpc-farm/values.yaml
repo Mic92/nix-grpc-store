@@ -87,6 +87,8 @@ workerDefaults:
   minFree: 20G
   store:
     sizeLimit: null # emptyDir sizeLimit for /nix
+  spool:
+    sizeLimit: null # emptyDir sizeLimit for uploads waiting to be imported
   buildDir:
     medium: "" # "Memory" for tmpfs builds
     sizeLimit: null

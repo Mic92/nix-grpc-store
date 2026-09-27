@@ -137,6 +137,8 @@ workerDefaults:
   buildDir:
     medium: Memory       # build in tmpfs
     sizeLimit: 16Gi
+  spool:
+    sizeLimit: 50Gi      # uploads are written here before they are imported
 gc:
   ensureFree: 80G        # start deleting
   keepRecent: 1d         # but never what was used in the last day

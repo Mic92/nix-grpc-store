@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <future>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -326,6 +327,60 @@ public:
         });
     }
 
+    // An import that waits for a path lock must not stop reading its stream:
+    // the unread bytes can fill an HTTP/2 window that other uploads share.
+    template<class Source>
+    auto importUploads(
+        nix::Store & localStore, Source & source, nix::RepairFlag repair, nix::CheckSigsFlag checkSigs, std::vector<std::string> & imported)
+        -> nixgrpc::ImportStats
+    {
+        struct Owned
+        {
+            std::shared_ptr<const nix::ValidPathInfo> info;
+            std::promise<void> promise;
+            nixgrpc::SpooledNar nar;
+        };
+        std::vector<Owned> owned;
+        std::map<std::string, std::shared_future<void>> theirs;
+        auto stats = nixgrpc::importPaths(
+            localStore, source, [&](const nix::ValidPathInfo & info, nix::Source & nar) -> void {
+                auto const name = localStore.printStorePath(info.path);
+                auto entry = uploads.enter(name);
+                if (entry.owner) {
+                    owned.push_back({.info = std::make_shared<const nix::ValidPathInfo>(info),
+                                     .promise = std::move(entry.promise),
+                                     .nar = nixgrpc::SpooledNar::spool(nar, info.narSize)});
+                } else {
+                    nixgrpc::SpooledNar::discard(nar, info.narSize);
+                    theirs.emplace(name, std::move(entry.result));
+                }
+            });
+        auto const await = [&](const std::string & name, const std::shared_future<void> & result) -> void {
+            try {
+                result.get();
+            } catch (const std::future_error &) {
+                throw nix::Error("a concurrent upload of '%s' failed", name);
+            }
+        };
+        // Only references are awaited, so two uploads cannot wait on each other.
+        for (auto & item : owned) {
+            for (const auto & ref : item.info->references) {
+                if (auto const other = theirs.find(localStore.printStorePath(ref)); other != theirs.end()) {
+                    await(other->first, other->second);
+                }
+            }
+            auto reader = item.nar.reader();
+            coord.cache.completeRefs(localStore, *item.info);
+            localStore.addToStore(*item.info, reader, repair, checkSigs);
+            imported.push_back(localStore.printStorePath(item.info->path));
+            item.promise.set_value();
+        }
+        for (const auto & [name, result] : theirs) {
+            await(name, result);
+        }
+        return stats;
+    }
+
     auto AddMultipleToStore(
         grpc::ServerContext * context,
         AddMultipleReader * reader,
@@ -354,46 +409,9 @@ public:
                 *reader, std::move(*first.mutable_data()));
 
             nixgrpc::Metrics::Held const held(metrics, "AddMultipleToStore");
-            std::vector<std::string> imported;
             nixgrpc::Metrics::Phase phase(metrics, "AddMultipleToStore", "recv");
-            // Every NAR is read off the wire before the store sees any of them.
-            // Otherwise an import waiting for a path lock stops reading its
-            // stream, and the unread bytes can fill a window that other uploads
-            // share.
-            struct Received
-            {
-                nix::ValidPathInfo info;
-                std::optional<nixgrpc::UploadClaims::Claim> owner;
-                std::optional<nixgrpc::UploadClaims::Waiter> waiter;
-                std::optional<nixgrpc::SpooledNar> nar;
-            };
-            std::vector<Received> received;
-            auto const stats = nixgrpc::importPaths(
-                *localStore, source, [&](const nix::ValidPathInfo & info, nix::Source & nar) -> void {
-                    auto ticket = uploads.enter(localStore->printStorePath(info.path));
-                    if (ticket.owner) {
-                        received.push_back(
-                            {info, std::move(ticket.owner), std::nullopt, nixgrpc::SpooledNar::spool(nar, info.narSize)});
-                    } else {
-                        nixgrpc::SpooledNar::drain(nar, info.narSize);
-                        received.push_back({info, std::nullopt, std::move(ticket.waiter), std::nullopt});
-                    }
-                });
-            // Later paths may reference earlier ones, so a path that another
-            // upload is importing has to be there before we go on.
-            for (auto & item : received) {
-                if (item.waiter) {
-                    if (item.waiter->wait() != nixgrpc::UploadClaims::Outcome::done) {
-                        throw nix::Error("a concurrent upload of the same path failed");
-                    }
-                    continue;
-                }
-                auto reader = item.nar->reader();
-                coord.cache.completeRefs(*localStore, item.info);
-                localStore->addToStore(item.info, reader, repair, checkSigs);
-                imported.push_back(localStore->printStorePath(item.info.path));
-                item.owner->done();
-            }
+            std::vector<std::string> imported;
+            auto const stats = importUploads(*localStore, source, repair, checkSigs, imported);
             phase.next("publish");
             coord.cache.publish(*localStore, imported, [&] -> bool { return context->IsCancelled(); });
             phase.done();

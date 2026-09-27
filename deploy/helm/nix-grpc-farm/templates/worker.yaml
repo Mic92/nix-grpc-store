@@ -202,6 +202,7 @@ spec:
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
             - name: POD_IP
               valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - {name: TMPDIR, value: /spool}
           securityContext:
             runAsUser: 990
             runAsGroup: 990
@@ -218,6 +219,7 @@ spec:
           livenessProbe: {{- toYaml (merge (dict "periodSeconds" 30 "timeoutSeconds" 10) $probe) | nindent 12 }}
           volumeMounts:
             - {name: nix, mountPath: /nix, subPath: nix}
+            - {name: spool, mountPath: /spool}
             - {name: nixconf, mountPath: /etc/nix/nix.conf.d}
             - {name: niks3-token, mountPath: /secrets/niks3, readOnly: true}
             {{- if (include "farm.tlsSecret" (list $root "worker")) }}
@@ -255,6 +257,8 @@ spec:
       volumes:
         - name: nix
           emptyDir: {{- if $w.store.sizeLimit }} {sizeLimit: {{ $w.store.sizeLimit }}} {{- else }} {} {{- end }}
+        - name: spool
+          emptyDir: {{- if $w.spool.sizeLimit }} {sizeLimit: {{ $w.spool.sizeLimit }}} {{- else }} {} {{- end }}
         - name: build
           emptyDir:
             {{- if or $w.buildDir.medium $w.buildDir.sizeLimit }}

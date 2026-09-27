@@ -1,69 +1,79 @@
 #include <cassert>
 #include <chrono>
+#include <future>
 #include <thread>
 
 #include "upload-claims.hh"
 
 using nixgrpc::UploadClaims;
-using Outcome = UploadClaims::Outcome;
 
 namespace {
+
+constexpr std::chrono::milliseconds kSettle{100};
+
+auto isReady(const std::shared_future<void> & result) -> bool
+{
+    return result.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+}
 
 void firstEntrantOwnsAndTheRestWait()
 {
     UploadClaims claims;
-    auto first = claims.enter("p");
-    auto second = claims.enter("p");
-    assert(first.owner && !first.waiter);
-    assert(!second.owner && second.waiter);
-    first.owner->done();
-    assert(second.waiter->wait() == Outcome::done);
+    auto first = claims.enter("path");
+    auto second = claims.enter("path");
+    assert(first.owner);
+    assert(!second.owner);
+    assert(!isReady(second.result));
+    first.promise.set_value();
+    second.result.get();
 }
 
-void anOwnerThatDiesFailsItsWaiters()
+void anOwnerThatGivesUpFailsItsWaiters()
 {
     UploadClaims claims;
-    auto owner = std::make_optional(claims.enter("p"));
-    auto other = claims.enter("p");
-    owner.reset();
-    assert(other.waiter->wait() == Outcome::failed);
-}
-
-void aWaiterThatNeverWaitsDoesNotBlockTheNextUpload()
-{
-    UploadClaims claims;
-    {
-        auto owner = claims.enter("p");
-        auto other = claims.enter("p");
-        owner.owner->done();
+    auto waiter = [&claims] -> std::shared_future<void> {
+        auto owner = claims.enter("path");
+        return claims.enter("path").result;
+    }();
+    bool failed = false;
+    try {
+        waiter.get();
+    } catch (const std::future_error &) {
+        failed = true;
     }
-    auto again = claims.enter("p");
+    assert(failed);
+}
+
+void aFinishedPathCanBeUploadedAgain()
+{
+    UploadClaims claims;
+    claims.enter("path").promise.set_value();
+    auto again = claims.enter("path");
     assert(again.owner);
-    again.owner->done();
+    again.promise.set_value();
 }
 
 void waitingBlocksUntilTheOwnerIsDone()
 {
     UploadClaims claims;
-    auto owner = claims.enter("p");
-    auto other = claims.enter("p");
-    Outcome seen = Outcome::pending;
-    std::thread thread([&] { seen = other.waiter->wait(); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    assert(seen == Outcome::pending);
-    owner.owner->done();
+    auto owner = claims.enter("path");
+    auto other = claims.enter("path");
+    std::thread thread([&other] -> void { other.result.get(); });
+    std::this_thread::sleep_for(kSettle);
+    assert(!isReady(other.result));
+    owner.promise.set_value();
     thread.join();
-    assert(seen == Outcome::done);
 }
 
 void differentPathsDoNotInteract()
 {
     UploadClaims claims;
-    auto a = claims.enter("a");
-    auto b = claims.enter("b");
-    assert(a.owner && b.owner);
-    a.owner->done();
-    b.owner->done();
+    auto first = claims.enter("one");
+    auto second = claims.enter("two");
+    assert(first.owner);
+    assert(second.owner);
+    first.promise.set_value();
+    second.promise.set_value();
 }
 
 } // namespace
@@ -71,8 +81,8 @@ void differentPathsDoNotInteract()
 auto main() -> int
 try {
     firstEntrantOwnsAndTheRestWait();
-    anOwnerThatDiesFailsItsWaiters();
-    aWaiterThatNeverWaitsDoesNotBlockTheNextUpload();
+    anOwnerThatGivesUpFailsItsWaiters();
+    aFinishedPathCanBeUploadedAgain();
     waitingBlocksUntilTheOwnerIsDone();
     differentPathsDoNotInteract();
     return 0;

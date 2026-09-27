@@ -44,7 +44,10 @@ in
       # builds, then exit. The socket or Restart=always starts the new
       # generation.
       reloadIfChanged = builder;
+      # /tmp is a size-limited tmpfs.
+      environment.TMPDIR = "/var/cache/nix-grpc-daemon";
       serviceConfig = {
+        CacheDirectory = "nix-grpc-daemon";
         Type = "notify";
         WatchdogSec = 30;
         # Keep RPCs responsive next to builds in nix-daemon.service.
