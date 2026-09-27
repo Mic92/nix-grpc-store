@@ -509,6 +509,7 @@ auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers,
   grpc::Status status;
   auto giveUp = std::chrono::steady_clock::time_point::max();
   auto pause = reconnectPause;
+  bool handover = false;
   for (;;) {
     grpc::ClientContext ctx;
     addHeaders(ctx, headers);
@@ -530,7 +531,10 @@ auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers,
     if (now + pause > giveUp) {
       return status;
     }
-    logReconnect(config->authority.to_string(), status, restarting);
+    // The balancer has no healthy upstream until the new leader is up, so
+    // retries after an announced restart belong to the same handover.
+    handover = answered ? restarting : handover || restarting;
+    logReconnect(config->authority.to_string(), status, handover);
     std::this_thread::sleep_for(pause);
     pause = std::min(pause * 2, maxReconnectPause);
   }
