@@ -96,7 +96,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     needs: push
     runs-on: ubuntu-latest
-    concurrency: {group: ghcr-cleanup}
+    concurrency: {group: "ghcr-cleanup-${{ matrix.package }}"}
     permissions:
       packages: write
     strategy:
