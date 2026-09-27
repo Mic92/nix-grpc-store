@@ -48,6 +48,7 @@ in
       environment.TMPDIR = "/var/cache/nix-grpc-daemon";
       serviceConfig = {
         CacheDirectory = "nix-grpc-daemon";
+        LimitNOFILE = lib.mkDefault 65536;
         Type = "notify";
         WatchdogSec = 30;
         # Keep RPCs responsive next to builds in nix-daemon.service.

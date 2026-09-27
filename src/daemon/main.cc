@@ -338,8 +338,9 @@ public:
         {
             std::shared_ptr<const nix::ValidPathInfo> info;
             std::promise<void> promise;
-            nixgrpc::SpooledNar nar;
+            nixgrpc::SpoolRange nar{};
         };
+        nixgrpc::NarSpool spool;
         std::vector<Owned> owned;
         std::map<std::string, std::shared_future<void>> theirs;
         auto stats = nixgrpc::importPaths(
@@ -349,9 +350,9 @@ public:
                 if (entry.owner) {
                     owned.push_back({.info = std::make_shared<const nix::ValidPathInfo>(info),
                                      .promise = std::move(entry.promise),
-                                     .nar = nixgrpc::SpooledNar::spool(nar, info.narSize)});
+                                     .nar = spool.add(nar, info.narSize)});
                 } else {
-                    nixgrpc::SpooledNar::discard(nar, info.narSize);
+                    nixgrpc::NarSpool::discard(nar, info.narSize);
                     theirs.emplace(name, std::move(entry.result));
                 }
             });
@@ -369,7 +370,7 @@ public:
                     await(other->first, other->second);
                 }
             }
-            auto reader = item.nar.reader();
+            auto reader = spool.reader(item.nar);
             coord.cache.completeRefs(localStore, *item.info);
             localStore.addToStore(*item.info, reader, repair, checkSigs);
             imported.push_back(localStore.printStorePath(item.info->path));
