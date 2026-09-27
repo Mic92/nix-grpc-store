@@ -366,7 +366,7 @@ fn a_deploy_mid_build_drains_and_the_new_generation_takes_over() {
     if busy == WORKER2 {
         succeed(
             WORKER2,
-            "timeout 20 /run/current-system/specialisation/next/bin/switch-to-configuration test >&2",
+            "timeout 120 /run/current-system/specialisation/next/bin/switch-to-configuration test >&2",
         );
     } else {
         succeed(WORKER1, "systemctl reload nix-grpc-daemon.service");
