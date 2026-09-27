@@ -244,6 +244,13 @@ test('log-spill', executable('log-spill-test',
   cpp_args : ['-UNDEBUG'],
 ))
 
+test('upload-claims', executable('upload-claims-test',
+  sources : ['tests/upload-claims-test.cc'],
+  include_directories : [src_inc, include_directories('src/daemon')],
+  dependencies : [threads_dep],
+  cpp_args : ['-UNDEBUG'],
+))
+
 # --- fuzzers ----------------------------------------------------------------
 
 # Built only with -Dfuzzers=true (requires clang for libFuzzer).

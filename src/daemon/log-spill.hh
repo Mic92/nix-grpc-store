@@ -65,6 +65,32 @@ private:
     int fd_ = -1;
 };
 
+// The directory follows TMPDIR: /tmp is a size-limited tmpfs on NixOS.
+// O_TMPFILE is Linux-only, and not every Linux filesystem has it, so fall
+// back to create-then-unlink.
+inline auto openTempFile() -> std::expected<UniqueFd, std::error_code>
+{
+    std::error_code error;
+    auto const dir = std::filesystem::temp_directory_path(error);
+    if (error) {
+        return std::unexpected(error);
+    }
+    UniqueFd file;
+#ifdef O_TMPFILE
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,bugprone-signed-bitwise): C API takes int flags.
+    file = UniqueFd(::open(dir.c_str(), O_TMPFILE | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR));
+#endif
+    if (!file) {
+        auto name = (dir / "nix-grpc-XXXXXX").string();
+        file = UniqueFd(::mkostemp(name.data(), O_CLOEXEC));
+        if (!file) {
+            return std::unexpected(std::error_code(errno, std::generic_category()));
+        }
+        ::unlink(name.c_str());
+    }
+    return {std::move(file)};
+}
+
 class LogSpill
 {
 public:
@@ -90,7 +116,7 @@ public:
             text = kTruncated;
         }
         if (!fd_) {
-            auto opened = openTemp();
+            auto opened = openTempFile();
             if (!opened) {
                 ended_ = true;
                 return;
@@ -146,32 +172,6 @@ private:
     static constexpr std::size_t kHeader = 1 + sizeof(std::uint32_t);
 
     using Opened = std::expected<UniqueFd, std::error_code>;
-
-    // The directory follows TMPDIR: /tmp is a size-limited tmpfs on NixOS.
-    // O_TMPFILE is Linux-only, and not every Linux filesystem has it, so fall
-    // back to create-then-unlink.
-    static auto openTemp() -> Opened
-    {
-        std::error_code error;
-        auto const dir = std::filesystem::temp_directory_path(error);
-        if (error) {
-            return std::unexpected(error);
-        }
-        UniqueFd file;
-#ifdef O_TMPFILE
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,bugprone-signed-bitwise): C API takes int flags.
-        file = UniqueFd(::open(dir.c_str(), O_TMPFILE | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR));
-#endif
-        if (!file) {
-            auto name = (dir / "nix-grpc-log-XXXXXX").string();
-            file = UniqueFd(::mkostemp(name.data(), O_CLOEXEC));
-            if (!file) {
-                return std::unexpected(std::error_code(errno, std::generic_category()));
-            }
-            ::unlink(name.c_str());
-        }
-        return {std::move(file)};
-    }
 
     [[nodiscard]] auto writeAt(std::span<const std::byte> data, std::size_t offset) const -> bool
     {

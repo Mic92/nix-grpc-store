@@ -66,7 +66,7 @@ pkgs.testers.runNixOSTest {
       ];
 
       virtualisation.memorySize = 2048;
-      virtualisation.diskSize = 8192;
+      virtualisation.diskSize = 24576;
       # The default overlay lives in RAM, and the 1 GiB uploads need more.
       virtualisation.writableStoreUseTmpfs = false;
       virtualisation.cores = 2;

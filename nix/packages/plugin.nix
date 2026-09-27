@@ -44,6 +44,7 @@ stdenv.mkDerivation {
       ../../tests/oidc-test.sh
       ../../tests/xfcc-test.cc
       ../../tests/log-spill-test.cc
+      ../../tests/upload-claims-test.cc
       ../../tests/scheduler-test.cc
       ../../tests/dispatcher-bench.cc
       ../../tests/scheduler-grpc-bench.cc
