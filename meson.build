@@ -205,6 +205,12 @@ benchmark('scheduler-grpc', scheduler_grpc_bench, args : ['seconds=3'], timeout 
 
 # --- tests ------------------------------------------------------------------
 
+test('plugin-loader', executable('plugin-loader-test',
+  sources : ['tests/plugin-loader-test.cc'],
+  include_directories : [src_inc],
+  cpp_args : ['-UNDEBUG'],
+))
+
 farm_client_test = executable('farm-client-test',
   sources : ['tests/farm-client-test.cc'],
   include_directories : [src_inc, include_directories('src/daemon')],

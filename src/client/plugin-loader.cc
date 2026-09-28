@@ -14,6 +14,8 @@
 #include <string>
 #include <system_error>
 
+#include "plugin-loader-path.hh"
+
 #ifdef __APPLE__
 #include <cstdint>
 #include <mach-o/dyld.h>
@@ -41,7 +43,6 @@ auto hostHasVersionedLibrary(const std::string &soname) -> bool {
 #else
 auto hostHasDarwinNixStore(const std::string &soversion) -> bool {
   const auto versionedName = nixStoreSoname(soversion);
-  const auto outputSuffix = "-nix-store-" + soversion;
   for (uint32_t index = 0; index < _dyld_image_count(); ++index) {
     const char *imageName = _dyld_get_image_name(index);
     if (imageName == nullptr) {
@@ -50,8 +51,8 @@ auto hostHasDarwinNixStore(const std::string &soversion) -> bool {
     const std::filesystem::path imagePath(imageName);
     if (imagePath.filename() == versionedName ||
         (imagePath.filename() == "libnixstore.dylib" &&
-         imagePath.parent_path().parent_path().filename().string().ends_with(
-             outputSuffix))) {
+         nixgrpc::darwinNixStoreOutputMatches(
+             imagePath.parent_path().parent_path().filename().string(), soversion))) {
       return true;
     }
   }
