@@ -14,9 +14,9 @@
 #include <string>
 #include <system_error>
 
+#ifdef __APPLE__
 #include "plugin-loader-path.hh"
 
-#ifdef __APPLE__
 #include <cstdint>
 #include <mach-o/dyld.h>
 #endif
