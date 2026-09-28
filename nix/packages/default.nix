@@ -49,29 +49,38 @@ lib.makeScope (extra: newScope ({ stdenv = clangStdenv; } // extra)) (
     docker-lb = self.callPackage ./docker-lb.nix { tag = self.imagePlugin.version; };
     # nix, plugin and nix-eval-jobs must share one libnixstore, so follow
     # the release nix-eval-jobs links.
-    docker-client =
+    clientNix =
       let
         v = lib.replaceStrings [ "." ] [ "_" ] (lib.versions.majorMinor nix-eval-jobs.passthru.nix.version);
-        clientNix = nixVersions."nix_${v}";
       in
-      self.callPackage ./docker.nix {
-        variant = "client";
-        nix = clientNix;
-        inherit nix-eval-jobs;
-        # 2.0.3 adds --store/--no-download. Drop once nixpkgs has it.
-        nix-fast-build =
-          if lib.versionAtLeast nix-fast-build.version "2.0.3" then
-            nix-fast-build
-          else
-            nix-fast-build.overrideAttrs (old: rec {
-              version = "2.0.3";
-              src = old.src.override {
-                tag = version;
-                hash = "sha256-L4HfADUq4Imq1LnvmjBPFBEAZAIKD9Pnj6ExRkVqHC4=";
-              };
-            });
-        nix-grpc-daemon = self.callPackage ./plugin.nix { inherit (clientNix.libs) nix-store nix-util; };
-      };
+      nixVersions."nix_${v}";
+    # 2.0.3 adds --store/--no-download, 2.0.4 forwards --option to every nix
+    # call. Drop once nixpkgs has it.
+    clientFastBuild =
+      if lib.versionAtLeast nix-fast-build.version "2.0.4" then
+        nix-fast-build
+      else
+        nix-fast-build.overrideAttrs (old: rec {
+          version = "2.0.4";
+          src = old.src.override {
+            tag = version;
+            hash = "sha256-sc/NZIHkRhgyAzK8Xn6G++vGrl/Uf7QHh+J5fnZ/o4s=";
+          };
+        });
+    clientPlugin = self.callPackage ./plugin.nix { inherit (self.clientNix.libs) nix-store nix-util; };
+    # nix-eval-jobs never sees a wrapped `nix`, so nix-fast-build passes
+    # the plugin to every nix it runs via --option.
+    nix-fast-build-with-plugin = self.callPackage ./wrap-nix-fast-build.nix {
+      nix-fast-build = self.clientFastBuild;
+      plugin = self.clientPlugin;
+    };
+    docker-client = self.callPackage ./docker.nix {
+      variant = "client";
+      nix = self.clientNix;
+      inherit nix-eval-jobs;
+      nix-fast-build = self.clientFastBuild;
+      nix-grpc-daemon = self.clientPlugin;
+    };
     docker-multiarch = self.callPackage ./docker-multiarch.nix {
       name = "nix-grpc-farm-docker";
       imageName = "nix-grpc-farm:latest";
