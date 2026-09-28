@@ -52,7 +52,9 @@ auto hostHasDarwinNixStore(const std::string &soversion) -> bool {
     if (imagePath.filename() == versionedName ||
         (imagePath.filename() == "libnixstore.dylib" &&
          nixgrpc::darwinNixStoreOutputMatches(
-             imagePath.parent_path().parent_path().filename().string(), soversion))) {
+             {.outputName =
+                  imagePath.parent_path().parent_path().filename().string(),
+              .soversion = soversion}))) {
       return true;
     }
   }
