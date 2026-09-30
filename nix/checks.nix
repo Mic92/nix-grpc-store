@@ -109,6 +109,15 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     module = nixosModule;
   };
 
+  vm-upload = import ../tests/nixos-test.nix {
+    e2eTests = pkgs.callPackage ../tests/e2e { };
+    mockOidc = niks3.packages.${pkgs.stdenv.hostPlatform.system}.mock-oidc-server;
+    inherit pkgs;
+    nixPkgs = nixPackages;
+    module = nixosModule;
+    phase = "upload";
+  };
+
   helm = import ../tests/helm.nix {
     inherit pkgs;
     chart = ../deploy/helm/nix-grpc-farm;

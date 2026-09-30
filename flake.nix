@@ -104,15 +104,6 @@
             module = self.nixosModules.default;
             e2eTests = nixpkgs.legacyPackages.${system}.callPackage ./tests/e2e { };
           };
-          # Red until concurrent uploads stop deadlocking behind Envoy, so not in `checks`.
-          vm-upload = import ./tests/nixos-test.nix {
-            pkgs = nixpkgs.legacyPackages.${system};
-            nixPkgs = nixPackagesFor nixpkgs.legacyPackages.${system};
-            module = self.nixosModules.default;
-            e2eTests = nixpkgs.legacyPackages.${system}.callPackage ./tests/e2e { };
-            mockOidc = niks3.packages.${system}.mock-oidc-server;
-            phase = "upload";
-          };
         }
       );
 
