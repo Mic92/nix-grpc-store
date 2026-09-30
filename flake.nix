@@ -2,7 +2,7 @@
   description = "Nix store plugin + daemon that tunnel the worker protocol over gRPC";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable-small";
     # Build farm mode (PLAN.md). Only the NixOS test uses it.
     niks3.url = "github:Mic92/niks3";
     niks3.inputs.nixpkgs.follows = "nixpkgs";
@@ -33,15 +33,15 @@
                 ;
             }
           )).overrideScope
-          (
-            _final: prev: {
-              inherit (nixGitPin) version;
-              # The eval cache moved into libexpr. nixpkgs' packaging lags.
-              nix-expr = prev.nix-expr.overrideAttrs (old: {
-                buildInputs = old.buildInputs ++ [ pkgs.sqlite ];
-              });
-            }
-          )
+            (
+              _final: prev: {
+                inherit (nixGitPin) version;
+                # The eval cache moved into libexpr. nixpkgs' packaging lags.
+                nix-expr = prev.nix-expr.overrideAttrs (old: {
+                  buildInputs = old.buildInputs ++ [ pkgs.sqlite ];
+                });
+              }
+            )
         ).nix-everything;
       nixPackagesFor =
         pkgs:
@@ -76,6 +76,7 @@
           inherit (scope)
             default
             nix-with-plugin
+            nix-fast-build-with-plugin
             jwt-cpp
             plugin-dispatcher
             fuzzers
@@ -147,13 +148,16 @@
       );
 
       devShells = forAllSystems (system: {
-        default = nixpkgs.legacyPackages.${system}.mkShell.override { stdenv = nixpkgs.legacyPackages.${system}.clangStdenv; } {
-          inputsFrom = [ self.packages.${system}.default ];
-          packages = [
-            nixpkgs.legacyPackages.${system}.llvmPackages_latest.clang-tools
-            (nixGitFor nixpkgs.legacyPackages.${system})
-          ];
-        };
+        default =
+          nixpkgs.legacyPackages.${system}.mkShell.override
+            { stdenv = nixpkgs.legacyPackages.${system}.clangStdenv; }
+            {
+              inputsFrom = [ self.packages.${system}.default ];
+              packages = [
+                nixpkgs.legacyPackages.${system}.llvmPackages_latest.clang-tools
+                (nixGitFor nixpkgs.legacyPackages.${system})
+              ];
+            };
       });
     };
 }
