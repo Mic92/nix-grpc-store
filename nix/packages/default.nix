@@ -54,13 +54,12 @@ lib.makeScope (extra: newScope ({ stdenv = clangStdenv; } // extra)) (
       nix-grpc-store = self.imagePackage;
     };
     docker-lb = self.callPackage ./docker-lb.nix { tag = self.imagePackage.version; };
-    # nix, plugin and nix-eval-jobs must share one libnixstore, so follow
-    # the release nix-eval-jobs links.
-    clientNix =
-      let
-        v = lib.replaceStrings [ "." ] [ "_" ] (lib.versions.majorMinor nix-eval-jobs.passthru.nix.version);
-      in
-      nixVersions."nix_${v}";
+    # nix, plugin and nix-eval-jobs must share one libnixstore.
+    clientNix = nix-eval-jobs.passthru.nix // {
+      libs = {
+        inherit (nix-eval-jobs.passthru.nixComponents) nix-store nix-util;
+      };
+    };
     # 2.0.3 adds --store/--no-download, 2.0.4 forwards --option to every nix
     # call. Drop once nixpkgs has it.
     clientFastBuild =
