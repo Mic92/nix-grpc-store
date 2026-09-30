@@ -17,14 +17,21 @@
   openssh,
   jq,
   nix,
-  nix-grpc-daemon,
+  # The worker runs the daemon, the client only loads the plugin.
+  nix-grpc-store ? null,
+  plugin ? null,
   nix-eval-jobs ? null,
   nix-fast-build ? null,
   niks3,
   harmonia-gc,
   variant ? "worker",
-  imageName ? { worker = "nix-grpc-farm"; client = "nix-grpc-farm-client"; }.${variant},
-  tag ? nix-grpc-daemon.version,
+  imageName ?
+    {
+      worker = "nix-grpc-farm";
+      client = "nix-grpc-farm-client";
+    }
+    .${variant},
+  tag ? (if variant == "client" then plugin else nix-grpc-store).version,
 }:
 let
   client = variant == "client";
@@ -35,7 +42,9 @@ let
       nix-grpc-daemon:x:990:990::/var/empty:/bin/false
       nobody:x:65534:65534:nobody:/var/empty:/bin/false
     ''
-    + lib.concatImapStrings (i: u: "${u}:x:${toString (30000 + i)}:30000::/var/empty:/bin/false\n") nixbld
+    + lib.concatImapStrings (
+      i: u: "${u}:x:${toString (30000 + i)}:30000::/var/empty:/bin/false\n"
+    ) nixbld
   );
   group = writeTextDir "etc/group" ''
     root:x:0:
@@ -52,7 +61,7 @@ let
         build-users-group =
         sandbox = false
         experimental-features = nix-command flakes
-        plugin-files = ${nix-grpc-daemon}/lib/nix/plugins
+        plugin-files = ${plugin}/lib/nix/plugins
         accept-flake-config = false
         !include /etc/nix/nix.conf.d/farm.conf
       ''
@@ -90,7 +99,7 @@ let
       else
         [
           nix
-          nix-grpc-daemon
+          nix-grpc-store
           niks3
           harmonia-gc
           busybox
@@ -103,10 +112,11 @@ let
   gcRoot = runCommand "${imageName}-gcroot" { } ''
     mkdir -p $out/nix/var/nix/gcroots
     ln -s ${path} $out/nix/var/nix/gcroots/image
-    ${lib.optionalString client "ln -s ${nix-grpc-daemon} $out/nix/var/nix/gcroots/plugin"}
+    ${lib.optionalString client "ln -s ${plugin} $out/nix/var/nix/gcroots/plugin"}
   '';
 in
-assert client -> nix-eval-jobs != null && nix-fast-build != null;
+assert client -> plugin != null && nix-eval-jobs != null && nix-fast-build != null;
+assert !client -> nix-grpc-store != null;
 dockerTools.buildLayeredImage {
   name = imageName;
   inherit tag;
@@ -141,7 +151,10 @@ dockerTools.buildLayeredImage {
     Labels = {
       "org.opencontainers.image.source" = "https://github.com/Mic92/nix-grpc-store";
       "org.opencontainers.image.description" =
-        if client then "CI job image with nix and the grpc:// store plugin" else "nix-grpc-store build farm worker";
+        if client then
+          "CI job image with nix and the grpc:// store plugin"
+        else
+          "nix-grpc-store build farm worker";
     };
   }
   // lib.optionalAttrs client { Cmd = [ "/bin/bash" ]; };

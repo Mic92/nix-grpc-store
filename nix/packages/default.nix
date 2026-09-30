@@ -36,17 +36,24 @@ lib.makeScope (extra: newScope ({ stdenv = clangStdenv; } // extra)) (
   in
   {
     jwt-cpp = self.callPackage ./jwt-cpp.nix { };
+    # The store plugin alone, built against the nix that will dlopen() it.
+    pluginFor =
+      nix':
+      self.callPackage ./nix-grpc-store.nix {
+        inherit (nix'.libs) nix-store nix-util;
+        components = "plugin";
+      };
     wrapNix = self.callPackage ./wrap-nix.nix { };
     nix-with-plugin = self.wrapNix nix;
     harmonia-gc = self.callPackage ./harmonia-gc.nix { };
 
     # Kubernetes images, see deploy/helm. Built against `nix`, not nixPackages.
-    imagePlugin = self.callPackage ./plugin.nix { inherit (nix.libs) nix-store nix-util; };
+    imagePackage = self.callPackage ./nix-grpc-store.nix { inherit (nix.libs) nix-store nix-util; };
     docker = self.callPackage ./docker.nix {
       inherit nix niks3;
-      nix-grpc-daemon = self.imagePlugin;
+      nix-grpc-store = self.imagePackage;
     };
-    docker-lb = self.callPackage ./docker-lb.nix { tag = self.imagePlugin.version; };
+    docker-lb = self.callPackage ./docker-lb.nix { tag = self.imagePackage.version; };
     # nix, plugin and nix-eval-jobs must share one libnixstore, so follow
     # the release nix-eval-jobs links.
     clientNix =
@@ -67,7 +74,7 @@ lib.makeScope (extra: newScope ({ stdenv = clangStdenv; } // extra)) (
             hash = "sha256-sc/NZIHkRhgyAzK8Xn6G++vGrl/Uf7QHh+J5fnZ/o4s=";
           };
         });
-    clientPlugin = self.callPackage ./plugin.nix { inherit (self.clientNix.libs) nix-store nix-util; };
+    clientPlugin = self.pluginFor self.clientNix;
     # nix-eval-jobs never sees a wrapped `nix`, so nix-fast-build passes
     # the plugin to every nix it runs via --option.
     nix-fast-build-with-plugin = self.callPackage ./wrap-nix-fast-build.nix {
@@ -79,7 +86,7 @@ lib.makeScope (extra: newScope ({ stdenv = clangStdenv; } // extra)) (
       nix = self.clientNix;
       inherit nix-eval-jobs;
       nix-fast-build = self.clientFastBuild;
-      nix-grpc-daemon = self.clientPlugin;
+      plugin = self.clientPlugin;
     };
     docker-multiarch = self.callPackage ./docker-multiarch.nix {
       name = "nix-grpc-farm-docker";
@@ -97,7 +104,7 @@ lib.makeScope (extra: newScope ({ stdenv = clangStdenv; } // extra)) (
       perArch = lib.genAttrs linuxSystems (s: (scopeFor s).docker-client);
     };
 
-    default = self.callPackage ./plugin.nix {
+    default = self.callPackage ./nix-grpc-store.nix {
       inherit (nixPackages) nix-store nix-util;
     };
 
@@ -130,14 +137,7 @@ lib.makeScope (extra: newScope ({ stdenv = clangStdenv; } // extra)) (
 
     # One plugin per supported Nix release. nixVersions.git is `default`.
     versionPlugins = lib.listToAttrs (
-      map (
-        version:
-        lib.nameValuePair "plugin-${version}" (
-          self.callPackage ./plugin.nix {
-            inherit (nixVersions.${version}.libs) nix-store nix-util;
-          }
-        )
-      ) supportedNixVersions
+      map (version: lib.nameValuePair "plugin-${version}" (self.pluginFor nixVersions.${version})) supportedNixVersions
     );
 
     # The loader picks the one matching the running Nix, see meson.build.

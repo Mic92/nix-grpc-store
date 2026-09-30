@@ -8,7 +8,10 @@
 }:
 nix:
 let
-  plugin = callPackage ./plugin.nix { inherit (nix.libs) nix-store nix-util; };
+  plugin = callPackage ./nix-grpc-store.nix {
+    inherit (nix.libs) nix-store nix-util;
+    components = "plugin";
+  };
 in
 symlinkJoin {
   pname = "nix-with-grpc-store";
