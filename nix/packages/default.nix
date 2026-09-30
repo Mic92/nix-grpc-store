@@ -4,7 +4,9 @@
   newScope,
   nixVersions,
   clangStdenv,
+  runCommand,
   symlinkJoin,
+  makeBinaryWrapper,
   # Nix package set the default plugin builds against.
   nixPackages,
   # Nix the images ship: nixpkgs' release, not the master pin the tests track.
@@ -30,14 +32,40 @@ lib.makeScope (extra: newScope ({ stdenv = clangStdenv; } // extra)) (
       name:
       builtins.match "nix_[0-9]+_[0-9]+" name != null
       && (builtins.tryEval (
-        lib.versionAtLeast nixVersions.${name}.version "2.31" && (nixVersions.${name}.libs or { }) ? nix-store
+        lib.versionAtLeast nixVersions.${name}.version "2.31"
+        && (nixVersions.${name}.libs or { }) ? nix-store
       )).value or false
     ) (builtins.attrNames nixVersions);
+    # nix-eval-jobs exposes the Nix CLI and component libraries it was built
+    # against separately. Adapt that modular package to wrapNix's aggregate
+    # interface without reconstructing a nixVersions attribute from a version.
+    nixEvalJobsNix = nix-eval-jobs.passthru.nix // {
+      libs = {
+        inherit (nix-eval-jobs.passthru.nixComponents) nix-store nix-util;
+      };
+    };
   in
   {
     jwt-cpp = self.callPackage ./jwt-cpp.nix { };
     wrapNix = self.callPackage ./wrap-nix.nix { };
-    nix-with-plugin = self.wrapNix nix;
+    nix-with-plugin = self.wrapNix nixEvalJobsNix;
+    nix-fast-build-with-plugin =
+      runCommand "nix-fast-build-with-plugin"
+        {
+          nativeBuildInputs = [ makeBinaryWrapper ];
+          passthru = {
+            inherit nix-fast-build nix-eval-jobs;
+            nix = self.nix-with-plugin;
+          };
+        }
+        ''
+          makeBinaryWrapper ${lib.getExe nix-fast-build} "$out/bin/nix-fast-build" \
+            --argv0 "$name" \
+            --set NIX_FAST_BUILD_NIX ${lib.getExe self.nix-with-plugin} \
+            --set NIX_FAST_BUILD_EVAL_JOBS ${lib.getExe nix-eval-jobs} \
+            --add-flags "--option plugin-files ${self.nix-with-plugin.plugin}/lib/nix/plugins"
+        '';
+
     harmonia-gc = self.callPackage ./harmonia-gc.nix { };
 
     # Kubernetes images, see deploy/helm. Built against `nix`, not nixPackages.
@@ -47,30 +75,13 @@ lib.makeScope (extra: newScope ({ stdenv = clangStdenv; } // extra)) (
       nix-grpc-daemon = self.imagePlugin;
     };
     docker-lb = self.callPackage ./docker-lb.nix { tag = self.imagePlugin.version; };
-    # nix, plugin and nix-eval-jobs must share one libnixstore, so follow
-    # the release nix-eval-jobs links.
     docker-client =
-      let
-        v = lib.replaceStrings [ "." ] [ "_" ] (lib.versions.majorMinor nix-eval-jobs.passthru.nix.version);
-        clientNix = nixVersions."nix_${v}";
-      in
       self.callPackage ./docker.nix {
         variant = "client";
-        nix = clientNix;
+        nix = self.nix-with-plugin;
         inherit nix-eval-jobs;
-        # 2.0.3 adds --store/--no-download. Drop once nixpkgs has it.
-        nix-fast-build =
-          if lib.versionAtLeast nix-fast-build.version "2.0.3" then
-            nix-fast-build
-          else
-            nix-fast-build.overrideAttrs (old: rec {
-              version = "2.0.3";
-              src = old.src.override {
-                tag = version;
-                hash = "sha256-L4HfADUq4Imq1LnvmjBPFBEAZAIKD9Pnj6ExRkVqHC4=";
-              };
-            });
-        nix-grpc-daemon = self.callPackage ./plugin.nix { inherit (clientNix.libs) nix-store nix-util; };
+        nix-fast-build = self.nix-fast-build-with-plugin;
+        nix-grpc-daemon = self.nix-with-plugin.plugin;
       };
     docker-multiarch = self.callPackage ./docker-multiarch.nix {
       name = "nix-grpc-farm-docker";
