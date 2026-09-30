@@ -11,9 +11,15 @@ zstd_dep     = dependency('libzstd')
 threads_dep  = dependency('threads')
 openssl_dep  = dependency('libcrypto')
 
-prometheus_dep = [dependency('prometheus-cpp-core'), dependency('prometheus-cpp-pull')]
-# Already in the closure via protobuf/gRPC; used for the scheduler's hash maps.
-absl_dep = [dependency('absl_flat_hash_map'), dependency('absl_hash'), dependency('absl_synchronization')]
+# src/client is rebuilt for every supported Nix release. The daemon is not.
+build_server = get_option('components') == 'all'
+
+if build_server
+  prometheus_dep = [dependency('prometheus-cpp-core'), dependency('prometheus-cpp-pull')]
+  # Already in the closure via protobuf/gRPC. The scheduler uses them for its
+  # hash maps.
+  absl_dep = [dependency('absl_flat_hash_map'), dependency('absl_hash'), dependency('absl_synchronization')]
+endif
 cxx = meson.get_compiler('cpp')
 # Lock annotations (dispatcher.hh, sched-reactor.hh) are checked by clang and
 # ignored by GCC.
@@ -33,18 +39,20 @@ if get_option('b_sanitize').contains('address')
   # Same for protobuf >= 36's default-instance placement.
   add_project_arguments('-DNDEBUG_SANITIZER', '-DPROTOBUF_MESSAGE_GLOBALS_TEMPORARY_OPTOUT', language : 'cpp')
 endif
-# glibc malloc stalls the scheduler for 5-40 ms consolidating its heap after
-# ~10^6 small frees (dispatcher-bench firehose); jemalloc keeps every call
-# under 1 ms. Nix itself links it too.
-jemalloc_dep = dependency('jemalloc')
-
 nix_store_dep = dependency('nix-store')
 nix_util_dep  = dependency('nix-util')
-# niks3 /present over HTTPS, niks3 push acks as JSON lines.
-curl_dep = dependency('libcurl')
-json_dep = dependency('nlohmann_json')
-# Header-only, ships only cmake config: found through the include path.
-meson.get_compiler('cpp').check_header('jwt-cpp/traits/nlohmann-json/defaults.h', required: true)
+
+if build_server
+  # glibc malloc stalls the scheduler for 5-40 ms consolidating its heap after
+  # ~10^6 small frees (dispatcher-bench firehose). jemalloc keeps every call
+  # under 1 ms. Nix itself links it too.
+  jemalloc_dep = dependency('jemalloc')
+  # niks3 /present over HTTPS, niks3 push acks as JSON lines.
+  curl_dep = dependency('libcurl')
+  json_dep = dependency('nlohmann_json')
+  # Header-only and ships only a cmake config. The include path finds it.
+  cxx.check_header('jwt-cpp/traits/nlohmann-json/defaults.h', required: true)
+endif
 
 # Pre-release versions look like "2.35pre20260619_f8bb823a".
 nix_ver = nix_store_dep.version().split('.')
@@ -84,21 +92,23 @@ gen = custom_target('nix_remote_proto',
   depend_files : 'proto/nix_remote.proto',
 )
 
-eds_gen = custom_target('eds_proto',
-  output : [
-    'eds.pb.cc',        'eds.pb.h',
-    'eds.grpc.pb.cc',   'eds.grpc.pb.h',
-  ],
-  command : [
-    protoc,
-    '--proto_path=' + proto_dir,
-    '--cpp_out=@OUTDIR@',
-    '--grpc_out=@OUTDIR@',
-    '--plugin=protoc-gen-grpc=' + grpc_cpp_plugin.full_path(),
-    'eds.proto',
-  ],
-  depend_files : 'proto/eds.proto',
-)
+if build_server
+  eds_gen = custom_target('eds_proto',
+    output : [
+      'eds.pb.cc',        'eds.pb.h',
+      'eds.grpc.pb.cc',   'eds.grpc.pb.h',
+    ],
+    command : [
+      protoc,
+      '--proto_path=' + proto_dir,
+      '--cpp_out=@OUTDIR@',
+      '--grpc_out=@OUTDIR@',
+      '--plugin=protoc-gen-grpc=' + grpc_cpp_plugin.full_path(),
+      'eds.proto',
+    ],
+    depend_files : 'proto/eds.proto',
+  )
+endif
 
 gen_inc = include_directories('.')
 src_inc = include_directories('src')
@@ -154,115 +164,118 @@ shared_module('nix-grpc-store-loader',
   install_dir : get_option('libdir') / 'nix' / 'plugins',
 )
 
-# --- server -----------------------------------------------------------------
+# --- server and tests -------------------------------------------------------
 
-# The scheduler without gRPC: shared by the daemon and dispatcher-bench.
-dispatcher_lib = static_library('nix-grpc-dispatcher',
-  sources : ['src/daemon/dispatcher.cc', gen[0], gen[1]],
-  include_directories : [gen_inc, src_inc],
-  dependencies : [protobuf_dep, nix_util_dep] + prometheus_dep + absl_dep,
-)
-dispatcher_dep = declare_dependency(
-  link_with : dispatcher_lib,
-  sources : [gen[1]],  # users include nix_remote.pb.h, order them after protoc
-  include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
-  dependencies : [protobuf_dep, nix_util_dep] + prometheus_dep + absl_dep,
-)
+if build_server
 
-daemon_sources = [
-  'src/daemon/main.cc',
-  'src/client/channel.cc',
-  'src/daemon/elector.cc',
-  'src/daemon/auth.cc',
-  'src/daemon/backend.cc',
-  'src/daemon/coordinator.cc',
-  'src/daemon/eds.cc',
-  'src/daemon/options.cc',
-]
+  # The scheduler without gRPC. The daemon and dispatcher-bench share it.
+  dispatcher_lib = static_library('nix-grpc-dispatcher',
+    sources : ['src/daemon/dispatcher.cc', gen[0], gen[1]],
+    include_directories : [gen_inc, src_inc],
+    dependencies : [protobuf_dep, nix_util_dep] + prometheus_dep + absl_dep,
+  )
+  dispatcher_dep = declare_dependency(
+    link_with : dispatcher_lib,
+    sources : [gen[1]],  # users include nix_remote.pb.h, order them after protoc
+    include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
+    dependencies : [protobuf_dep, nix_util_dep] + prometheus_dep + absl_dep,
+  )
 
-executable('nix-grpc-daemon',
-  sources : daemon_sources + [gen, eds_gen],
-  include_directories : [gen_inc, src_inc],
-  cpp_pch : do_pch ? ['pch/daemon_pch.hh'] : [],
-  cpp_args : nix_compat_args + ['-DNIX_GRPC_VERSION="' + meson.project_version() + '"'],
-  # nix-store: native QueryValidPaths / AddMultipleToStore handlers.
-  dependencies : common_deps + prometheus_dep + [dispatcher_dep, nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep, jemalloc_dep],
-  install : true,
-)
+  daemon_sources = [
+    'src/daemon/main.cc',
+    'src/client/channel.cc',
+    'src/daemon/elector.cc',
+    'src/daemon/auth.cc',
+    'src/daemon/backend.cc',
+    'src/daemon/coordinator.cc',
+    'src/daemon/eds.cc',
+    'src/daemon/options.cc',
+  ]
 
-dispatcher_bench = executable('dispatcher-bench',
-  sources : ['tests/dispatcher-bench.cc'],
-  dependencies : [dispatcher_dep, jemalloc_dep],
-)
-benchmark('dispatcher', dispatcher_bench, args : ['large'], timeout : 300)
+  executable('nix-grpc-daemon',
+    sources : daemon_sources + [gen, eds_gen],
+    include_directories : [gen_inc, src_inc],
+    cpp_pch : do_pch ? ['pch/daemon_pch.hh'] : [],
+    cpp_args : nix_compat_args + ['-DNIX_GRPC_VERSION="' + meson.project_version() + '"'],
+    # nix-store has the native QueryValidPaths / AddMultipleToStore handlers.
+    dependencies : common_deps + prometheus_dep + [dispatcher_dep, nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep, jemalloc_dep],
+    install : true,
+  )
 
-# Same Dispatcher behind the real gRPC service on loopback.
-scheduler_grpc_bench = executable('scheduler-grpc-bench',
-  sources : ['tests/scheduler-grpc-bench.cc', gen[2], gen[3]],
-  dependencies : [dispatcher_dep, grpc_dep, jemalloc_dep],
-)
-benchmark('scheduler-grpc', scheduler_grpc_bench, args : ['seconds=3'], timeout : 60)
+  dispatcher_bench = executable('dispatcher-bench',
+    sources : ['tests/dispatcher-bench.cc'],
+    dependencies : [dispatcher_dep, jemalloc_dep],
+  )
+  benchmark('dispatcher', dispatcher_bench, args : ['large'], timeout : 300)
 
-# --- tests ------------------------------------------------------------------
+  # Same Dispatcher behind the real gRPC service on loopback.
+  scheduler_grpc_bench = executable('scheduler-grpc-bench',
+    sources : ['tests/scheduler-grpc-bench.cc', gen[2], gen[3]],
+    dependencies : [dispatcher_dep, grpc_dep, jemalloc_dep],
+  )
+  benchmark('scheduler-grpc', scheduler_grpc_bench, args : ['seconds=3'], timeout : 60)
 
-test('plugin-loader', executable('plugin-loader-test',
-  sources : ['tests/plugin-loader-test.cc'],
-  include_directories : [src_inc],
-  cpp_args : ['-UNDEBUG'],
-))
+  # --- tests ------------------------------------------------------------------
 
-farm_client_test = executable('farm-client-test',
-  sources : ['tests/farm-client-test.cc'],
-  include_directories : [src_inc, include_directories('src/daemon')],
-  cpp_args : nix_compat_args,
-  dependencies : [nix_util_dep, nix_store_dep, curl_dep, json_dep, threads_dep],
-)
-test('farm-client', find_program('tests/farm-client-test.sh'),
-  args : [farm_client_test, files('tests/farm-mock.py')],
-  timeout : 60,
-)
+  test('plugin-loader', executable('plugin-loader-test',
+    sources : ['tests/plugin-loader-test.cc'],
+    include_directories : [src_inc],
+    cpp_args : ['-UNDEBUG'],
+  ))
 
-oidc_test = executable('oidc-test',
-  sources : ['tests/oidc-test.cc'],
-  include_directories : [src_inc, include_directories('src/daemon')],
-  dependencies : [nix_util_dep, curl_dep, json_dep, openssl_dep, grpc_dep, threads_dep],
-)
-test('oidc', find_program('tests/oidc-test.sh'), args : [oidc_test], timeout : 60)
+  farm_client_test = executable('farm-client-test',
+    sources : ['tests/farm-client-test.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    cpp_args : nix_compat_args,
+    dependencies : [nix_util_dep, nix_store_dep, curl_dep, json_dep, threads_dep],
+  )
+  test('farm-client', find_program('tests/farm-client-test.sh'),
+    args : [farm_client_test, files('tests/farm-mock.py')],
+    timeout : 60,
+  )
 
-test('scheduler', executable('scheduler-test',
-  sources : ['tests/scheduler-test.cc'],
-  include_directories : [src_inc, include_directories('src/daemon')],
-  dependencies : [nix_util_dep] + absl_dep,
-  cpp_args : ['-UNDEBUG'],
-))
+  oidc_test = executable('oidc-test',
+    sources : ['tests/oidc-test.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    dependencies : [nix_util_dep, curl_dep, json_dep, openssl_dep, grpc_dep, threads_dep],
+  )
+  test('oidc', find_program('tests/oidc-test.sh'), args : [oidc_test], timeout : 60)
 
-test('xfcc', executable('xfcc-test',
-  sources : ['tests/xfcc-test.cc'],
-  include_directories : [src_inc, include_directories('src/daemon')],
-  dependencies : [grpc_dep],
-  cpp_args : ['-UNDEBUG'],
-))
+  test('scheduler', executable('scheduler-test',
+    sources : ['tests/scheduler-test.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    dependencies : [nix_util_dep] + absl_dep,
+    cpp_args : ['-UNDEBUG'],
+  ))
 
-test('log-spill', executable('log-spill-test',
-  sources : ['tests/log-spill-test.cc'],
-  include_directories : [src_inc, include_directories('src/daemon')],
-  dependencies : [threads_dep],
-  cpp_args : ['-UNDEBUG'],
-))
+  test('xfcc', executable('xfcc-test',
+    sources : ['tests/xfcc-test.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    dependencies : [grpc_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
 
-test('upload-spool', executable('upload-spool-test',
-  sources : ['tests/upload-spool-test.cc'],
-  include_directories : [src_inc, include_directories('src/daemon')],
-  dependencies : [nix_util_dep, threads_dep],
-  cpp_args : ['-UNDEBUG'],
-))
+  test('log-spill', executable('log-spill-test',
+    sources : ['tests/log-spill-test.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    dependencies : [threads_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
 
-test('upload-claims', executable('upload-claims-test',
-  sources : ['tests/upload-claims-test.cc'],
-  include_directories : [src_inc, include_directories('src/daemon')],
-  dependencies : [threads_dep],
-  cpp_args : ['-UNDEBUG'],
-))
+  test('upload-spool', executable('upload-spool-test',
+    sources : ['tests/upload-spool-test.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    dependencies : [nix_util_dep, threads_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
+
+  test('upload-claims', executable('upload-claims-test',
+    sources : ['tests/upload-claims-test.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    dependencies : [threads_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
+endif
 
 # --- fuzzers ----------------------------------------------------------------
 

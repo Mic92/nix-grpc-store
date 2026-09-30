@@ -1,1 +1,5 @@
 option('fuzzers', type : 'boolean', value : false, description : 'Build libFuzzer targets (requires clang)')
+# The client plugin is rebuilt for every supported Nix release. The daemon is
+# not. 'plugin' keeps those matrix builds down to src/client.
+option('components', type : 'combo', choices : ['all', 'plugin'], value : 'all',
+  description : 'Which components to build')
