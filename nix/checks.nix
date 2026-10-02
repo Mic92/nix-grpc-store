@@ -31,6 +31,22 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     grep -q "gRPC StoreInfo" log
     touch $out
   '';
+  client = pkgs.runCommand "nix-grpc-store-client-check" { } ''
+    test "$(readlink -f ${packages.client}/bin/nix)" = \
+      "$(readlink -f ${packages.client-nix-with-plugin}/bin/nix)"
+    test "$(readlink -f ${packages.client}/bin/nix-eval-jobs)" = \
+      "$(readlink -f ${pkgs.nix-eval-jobs}/bin/nix-eval-jobs)"
+    test "$(readlink -f ${packages.client}/bin/nix-fast-build)" = \
+      "$(readlink -f ${packages.nix-fast-build-with-plugin}/bin/nix-fast-build)"
+
+    HOME=$TMPDIR ${packages.client}/bin/nix --extra-experimental-features nix-command \
+      store info --store 'grpc://127.0.0.1:1?insecure=1' 2>nix.log || true
+    grep -q "gRPC StoreInfo" nix.log
+
+    grep -aF '${packages.client.plugin}/lib/nix/plugins' \
+      ${packages.nix-fast-build-with-plugin}/bin/nix-fast-build
+    touch $out
+  '';
   # LLVM 23 is not in the darwin cache yet.
   # Same clang as clang-tidy so compile_commands carry flags it understands.
   # No PCH: the cc-wrapper's hardening flags are not in compile_commands, so
