@@ -74,11 +74,24 @@ lib.makeScope (extra: newScope ({ stdenv = clangStdenv; } // extra)) (
           };
         });
     clientPlugin = self.pluginFor self.clientNix;
-    # nix-eval-jobs never sees a wrapped `nix`, so nix-fast-build passes
-    # the plugin to every nix it runs via --option.
+    client-nix-with-plugin = self.wrapNix self.clientNix;
     nix-fast-build-with-plugin = self.callPackage ./wrap-nix-fast-build.nix {
       nix-fast-build = self.clientFastBuild;
       plugin = self.clientPlugin;
+    };
+    client = symlinkJoin {
+      name = "nix-grpc-store-client";
+      paths = [
+        self.client-nix-with-plugin
+        nix-eval-jobs
+        self.nix-fast-build-with-plugin
+      ];
+      passthru = {
+        nix = self.client-nix-with-plugin;
+        inherit nix-eval-jobs;
+        nix-fast-build = self.nix-fast-build-with-plugin;
+        plugin = self.clientPlugin;
+      };
     };
     docker-client = self.callPackage ./docker.nix {
       variant = "client";

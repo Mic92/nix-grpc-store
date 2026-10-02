@@ -23,12 +23,14 @@ symlinkJoin {
     inherit (nix) libs;
   };
   # The legacy commands are symlinks to nix and dispatch on argv[0].
+  # NIX_CONFIG rather than --add-flags: the `nix __build-remote` hook nix
+  # spawns for grpc:// builders inherits the environment, not our flags.
   postBuild = ''
     for f in "$out"/bin/*; do
       name=$(basename "$f")
       rm "$f"
       makeBinaryWrapper ${lib.getExe' nix "nix"} "$f" --argv0 "$name" \
-        --add-flags "--option plugin-files ${plugin}/lib/nix/plugins"
+        --suffix NIX_CONFIG $'\n' "plugin-files = ${plugin}/lib/nix/plugins"
     done
   '';
   meta = removeAttrs nix.meta [ "outputsToInstall" ] // {
