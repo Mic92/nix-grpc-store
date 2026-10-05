@@ -52,6 +52,7 @@ stdenv.mkDerivation {
         ../../proto/eds.proto
         ../../src
         ../../fuzz
+        ../../tests/.clang-tidy
         ../../tests/farm-mock.py
         ../../tests/farm-client-test.cc
         ../../tests/farm-client-test.sh
