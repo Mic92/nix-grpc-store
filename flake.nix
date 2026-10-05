@@ -2,7 +2,7 @@
   description = "Nix store plugin + daemon that tunnel the worker protocol over gRPC";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable-small";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     # Build farm mode (PLAN.md). Only the NixOS test uses it.
     niks3.url = "github:Mic92/niks3";
     niks3.inputs.nixpkgs.follows = "nixpkgs";
