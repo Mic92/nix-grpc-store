@@ -1,4 +1,4 @@
-# Helm chart in k3s. Workers and envoy run from our images, niks3, rustfs
+# Helm chart in k3s. Workers and envoy run from our images, niks3, garage
 # and postgres as NixOS services on the node. Workers authenticate to niks3
 # with their service account token, and the client uses one for the farm.
 # The test builds through the balancer, runs a Job with the client image,
