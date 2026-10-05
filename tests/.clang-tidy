@@ -1,0 +1,7 @@
+InheritParentConfig: true
+# glibc 2.44's assert() expands to constant ternaries, which trips these on
+# every assert in the tests.
+Checks: >
+  -cert-dcl03-c,
+  -misc-static-assert,
+  -readability-function-cognitive-complexity

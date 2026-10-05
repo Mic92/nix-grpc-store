@@ -250,12 +250,14 @@ struct GrpcStore::Run {
   void finishLocked(Job & job, BuildResult res) {
     bool const succeeded = nixcompat::succeeded(res);
     job.result = std::move(res);
+    // NOLINTNEXTLINE(cert-dcl03-c,misc-static-assert): glibc 2.44's assert() expands to constant ternaries
     assert(remaining > 0);
     remaining--;
     for (auto * dep : job.dependants) {
       if (!succeeded && !dep->failedInput) {
         dep->failedInput = job.drvPath;
       }
+      // NOLINTNEXTLINE(cert-dcl03-c,misc-static-assert): glibc 2.44's assert() expands to constant ternaries
       assert(dep->waiting > 0);
       if (--dep->waiting == 0) {
         wantable.push_back(dep);
