@@ -76,8 +76,7 @@
           inherit (scope)
             default
             nix-with-plugin
-            client
-            client-nix-with-plugin
+            nix-tools-with-plugin
             nix-fast-build-with-plugin
             jwt-cpp
             plugin-dispatcher
@@ -114,13 +113,16 @@
       # nix-grpc-store.lib.wrapNix pkgs pkgs.nix: that nix with the plugin loaded.
       lib.wrapNix = pkgs: (packageSetFor pkgs).wrapNix;
 
-      overlays.client = _final: prev: {
-        inherit (self.packages.${prev.stdenv.hostPlatform.system}.client)
-          nix
-          nix-eval-jobs
-          nix-fast-build
-          ;
-      };
+      # nix-grpc-store.lib.nixToolsWithPlugin pkgs: { nix, nix-eval-jobs,
+      # nix-fast-build } from pkgs, with the plugin loaded in all of them.
+      lib.nixToolsWithPlugin =
+        pkgs:
+        let
+          tools = (packageSetFor pkgs).nix-tools-with-plugin;
+        in
+        {
+          inherit (tools) nix nix-eval-jobs nix-fast-build;
+        };
 
       nixosModules = {
         server = ./nixos/server.nix;

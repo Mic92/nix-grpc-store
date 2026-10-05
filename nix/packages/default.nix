@@ -55,14 +55,14 @@ lib.makeScope (extra: newScope ({ stdenv = clangStdenv; } // extra)) (
     };
     docker-lb = self.callPackage ./docker-lb.nix { tag = self.imagePackage.version; };
     # nix, plugin and nix-eval-jobs must share one libnixstore.
-    clientNix = nix-eval-jobs.passthru.nix // {
+    evalJobsNix = nix-eval-jobs.passthru.nix // {
       libs = {
         inherit (nix-eval-jobs.passthru.nixComponents) nix-store nix-util;
       };
     };
     # 2.0.3 adds --store/--no-download, 2.0.4 forwards --option to every nix
     # call. Drop once nixpkgs has it.
-    clientFastBuild =
+    fastBuildPinned =
       if lib.versionAtLeast nix-fast-build.version "2.0.4" then
         nix-fast-build
       else
@@ -73,32 +73,33 @@ lib.makeScope (extra: newScope ({ stdenv = clangStdenv; } // extra)) (
             hash = "sha256-sc/NZIHkRhgyAzK8Xn6G++vGrl/Uf7QHh+J5fnZ/o4s=";
           };
         });
-    clientPlugin = self.pluginFor self.clientNix;
-    client-nix-with-plugin = self.wrapNix self.clientNix;
+    evalJobsPlugin = self.pluginFor self.evalJobsNix;
     nix-fast-build-with-plugin = self.callPackage ./wrap-nix-fast-build.nix {
-      nix-fast-build = self.clientFastBuild;
-      plugin = self.clientPlugin;
+      nix-fast-build = self.fastBuildPinned;
+      plugin = self.evalJobsPlugin;
     };
-    client = symlinkJoin {
-      name = "nix-grpc-store-client";
+    evalJobsNixWithPlugin = self.wrapNix self.evalJobsNix;
+    # nix, nix-eval-jobs and nix-fast-build on one PATH, all sharing one Nix ABI.
+    nix-tools-with-plugin = symlinkJoin {
+      name = "nix-grpc-store-nix-tools";
       paths = [
-        self.client-nix-with-plugin
+        self.evalJobsNixWithPlugin
         nix-eval-jobs
         self.nix-fast-build-with-plugin
       ];
       passthru = {
-        nix = self.client-nix-with-plugin;
+        nix = self.evalJobsNixWithPlugin;
         inherit nix-eval-jobs;
         nix-fast-build = self.nix-fast-build-with-plugin;
-        plugin = self.clientPlugin;
+        plugin = self.evalJobsPlugin;
       };
     };
     docker-client = self.callPackage ./docker.nix {
       variant = "client";
-      nix = self.clientNix;
+      nix = self.evalJobsNix;
       inherit nix-eval-jobs;
-      nix-fast-build = self.clientFastBuild;
-      plugin = self.clientPlugin;
+      nix-fast-build = self.fastBuildPinned;
+      plugin = self.evalJobsPlugin;
     };
     docker-multiarch = self.callPackage ./docker-multiarch.nix {
       name = "nix-grpc-farm-docker";

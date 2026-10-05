@@ -91,16 +91,24 @@ For a client outside NixOS, `nix build .#nix-with-plugin` gives a `nix`
 another flake, `nix-grpc-store.lib.wrapNix pkgs pkgs.nix` does the same
 for any nixpkgs `nix`, for example to put into a CI image.
 
-`nix build .#client` provides a coherent `nix`, `nix-eval-jobs` and
-`nix-fast-build` toolchain on one PATH. All three use the same Nix ABI;
-nix-fast-build 2.0.4 forwards the plugin to its Nix and nix-eval-jobs
-subprocesses. The wrapped tools are also exposed individually as
-`client-nix-with-plugin` and `nix-fast-build-with-plugin`.
+`nix-grpc-store.lib.nixToolsWithPlugin pkgs` returns `nix`,
+`nix-eval-jobs` and `nix-fast-build` built from your `pkgs`, with the
+plugin loaded in all of them. Use it in a dev shell, not in
+`environment.systemPackages` (that would collide with `nix.package`):
 
-To replace the canonical package names in another flake, use the client
-overlay:
+    inputs.nix-grpc-store.inputs.nixpkgs.follows = "nixpkgs";
+    # ...
+    devShells.x86_64-linux.default =
+      let
+        pkgs = nixpkgs.legacyPackages.x86_64-linux;
+        tools = nix-grpc-store.lib.nixToolsWithPlugin pkgs;
+      in
+      pkgs.mkShell {
+        packages = [ tools.nix tools.nix-eval-jobs tools.nix-fast-build ];
+      };
 
-    nixpkgs.overlays = [ nix-grpc-store.overlays.client ];
+`nix build .#nix-tools-with-plugin` builds the same set from this flake's
+nixpkgs.
 
 ## Quick start (NixOS)
 
