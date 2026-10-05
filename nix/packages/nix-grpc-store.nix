@@ -42,6 +42,7 @@ stdenv.mkDerivation {
         ../../pch/client_pch.hh
         ../../proto/nix_remote.proto
         ../../src/client
+        ../../src/macro-compat.hh
         ../../src/nix-compat.hh
         ../../src/path-info-wire.hh
         ../../src/pump.hh
