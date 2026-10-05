@@ -39,6 +39,9 @@ if get_option('b_sanitize').contains('address')
   # Same for protobuf >= 36's default-instance placement.
   add_project_arguments('-DNDEBUG_SANITIZER', '-DPROTOBUF_MESSAGE_GLOBALS_TEMPORARY_OPTOUT', language : 'cpp')
 endif
+# See src/macro-compat.hh: gRPC has to be parsed before nix/util/error.hh.
+add_project_arguments('-include', meson.current_source_dir() / 'src' / 'macro-compat.hh', language : 'cpp')
+
 nix_store_dep = dependency('nix-store')
 nix_util_dep  = dependency('nix-util')
 
