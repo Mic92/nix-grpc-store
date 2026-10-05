@@ -2,6 +2,7 @@
   pkgs,
   packages,
   nixPackages,
+  nixToolsWithPlugin,
   nixosModule,
   niks3,
 }:

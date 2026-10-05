@@ -55,6 +55,7 @@
       packageSetFor =
         pkgs:
         pkgs.callPackage ./nix/packages {
+          inherit (pkgs) nix nix-eval-jobs nix-fast-build;
           nixPackages = nixPackagesFor pkgs;
           niks3 = niks3.packages.${pkgs.stdenv.hostPlatform.system}.niks3 or null;
           # For the multi-arch image merge.
@@ -146,6 +147,7 @@
           packages = self.packages.${system};
           nixPackages = nixPackagesFor nixpkgs.legacyPackages.${system};
           nixosModule = self.nixosModules.default;
+          nixToolsWithPlugin = self.lib.nixToolsWithPlugin;
           inherit niks3;
         }
       );
