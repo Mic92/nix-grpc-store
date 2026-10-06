@@ -5,6 +5,7 @@
   nixVersions,
   clangStdenv,
   symlinkJoin,
+  regclient,
   # Nix package set the default plugin builds against.
   nixPackages,
   # Nix the images ship: nixpkgs' release, not the master pin the tests track.
@@ -36,6 +37,15 @@ lib.makeScope (extra: newScope ({ stdenv = clangStdenv; } // extra)) (
   in
   {
     jwt-cpp = self.callPackage ./jwt-cpp.nix { };
+    # Drop once NixOS/nixpkgs#569689 reaches our nixpkgs.
+    regctl =
+      (regclient.overrideAttrs (old: {
+        postInstall =
+          builtins.replaceStrings
+            [ "export bin=" "export outputBin=bin" "unset bin outputBin" ]
+            [ "local bin=" "local outputBin=bin" "" ]
+            old.postInstall;
+      })).regctl;
     # The store plugin alone, built against the nix that will dlopen() it.
     pluginFor =
       nix':

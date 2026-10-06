@@ -91,6 +91,7 @@
         // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
           inherit (scope)
             harmonia-gc
+            regctl
             docker
             docker-lb
             docker-client

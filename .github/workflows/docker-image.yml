@@ -64,7 +64,7 @@ jobs:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           set -euo pipefail
-          PATH="$(nix build --inputs-from . nixpkgs#regctl --print-out-paths --no-link)/bin:$PATH"
+          PATH="$(nix build .#regctl --print-out-paths --no-link)/bin:$PATH"
           regctl registry login "$REGISTRY" -u "${{ github.actor }}" --pass-stdin <<< "$REGCTL_PASSWORD"
           for kind in worker lb client; do
             refs=()
@@ -80,6 +80,12 @@ jobs:
             done
             echo "$kind=$(regctl image digest "ocidir://$kind:merged")" >> "$GITHUB_OUTPUT"
           done
+      # regctl keeps its own credentials, but the attest action reads Docker's.
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ github.repository_owner }}/nix-grpc-farm
