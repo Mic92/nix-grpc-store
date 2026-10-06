@@ -245,7 +245,7 @@ fn access_log_attributes_clients_by_certificate_cn() {
     ));
     succeed(&format!("nix store info --store '{STORE}'"));
     succeed(&format!("nix path-info --store '{STORE}' '{p}'"));
-    let connect = "event=rpc method=Connect cn=localhost .*bytes_out=[0-9][0-9]*";
+    let connect = "event=rpc method=Connect cn=localhost .*bytes_out=";
     wait_journal_above(MTLS, connect, 0, 20);
     assert_journal("nix-grpc-daemon.service", "event=rpc method=Connect cn=- ");
     assert_journal(

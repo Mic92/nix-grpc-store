@@ -257,30 +257,51 @@ pub fn unit_state(node: Node, unit: &str) -> String {
         .to_string()
 }
 
+pub fn journal(node: Node, unit: &str) -> String {
+    query(node, &format!("journalctl -u {unit} --no-pager"))
+}
+
+/// Whether `line` matches `pattern`, where `.*` stands for any text. That is
+/// all the patterns in these tests use of a regular expression.
+fn line_matches(line: &str, pattern: &str) -> bool {
+    let mut rest = line;
+    for part in pattern.split(".*") {
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+pub fn journal_matches(node: Node, unit: &str, pattern: &str) -> Vec<String> {
+    journal(node, unit)
+        .lines()
+        .filter(|l| line_matches(l, pattern))
+        .map(String::from)
+        .collect()
+}
+
 pub fn journal_count(node: Node, unit: &str, pattern: &str) -> u64 {
-    query(
-        node,
-        &format!("journalctl -u {unit} --no-pager | grep -c '{pattern}' || true"),
-    )
-    .trim()
-    .parse()
-    .expect("grep -c prints a number")
+    journal_matches(node, unit, pattern).len() as u64
 }
 
 pub fn assert_journal(node: Node, unit: &str, pattern: &str) {
+    let log = journal(node, unit);
     assert!(
-        journal_count(node, unit, pattern) > 0,
-        "[{}] journal of {unit} has no line matching: {pattern}",
+        log.lines().any(|l| line_matches(l, pattern)),
+        "[{}] journal of {unit} has no line matching: {pattern}\n{log}",
         node.0
     );
 }
 
 pub fn assert_no_journal(node: Node, unit: &str, pattern: &str) {
-    assert_eq!(
-        journal_count(node, unit, pattern),
-        0,
-        "[{}] journal of {unit} has a line matching: {pattern}",
-        node.0
+    let hits: Vec<_> = journal_matches(node, unit, pattern);
+    assert!(
+        hits.is_empty(),
+        "[{}] journal of {unit} has lines matching: {pattern}\n{}",
+        node.0,
+        hits.join("\n")
     );
 }
 
@@ -357,5 +378,17 @@ mod tests {
     fn another_command_is_retried_only_if_ssh_never_connected() {
         assert_eq!(calls(false, "Connection reset by peer"), 1);
         assert_eq!(calls(false, "Connection refused"), 3);
+    }
+
+    #[test]
+    fn a_pattern_matches_text_with_a_wildcard_between_its_parts() {
+        let line = "event=denied method=Connect cn=stranger role=none";
+        assert!(line_matches(
+            line,
+            "event=denied method=.* cn=stranger role=none"
+        ));
+        assert!(line_matches(line, "cn=stranger"));
+        assert!(!line_matches(line, "cn=stranger.*event=denied"));
+        assert!(!line_matches(line, "role=read-only"));
     }
 }

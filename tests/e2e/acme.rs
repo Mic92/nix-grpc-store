@@ -1,6 +1,7 @@
 //! README access-control example: step-ca and the daemon on `server`, a
 //! read-only ACME client on `host1`.
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use crate::harness::*;
 
@@ -22,11 +23,21 @@ fn cert_field(field: &str) -> String {
 
 // A placeholder self-signed cert sits there until the ACME order completes.
 fn wait_for_acme_cert() {
-    wait_until_succeeds(
-        HOST1,
-        "openssl x509 -in /var/lib/acme/host1/cert.pem -noout -issuer | grep -q 'Test Intermediate CA'",
-        300,
-    );
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let issuer = succeed(
+            HOST1,
+            "openssl x509 -in /var/lib/acme/host1/cert.pem -noout -issuer",
+        );
+        if issuer.contains("Test Intermediate CA") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "host1 still has a placeholder certificate, issuer: {issuer}"
+        );
+        sleep(1);
+    }
 }
 
 fn signed_path() -> &'static str {

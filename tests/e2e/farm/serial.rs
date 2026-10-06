@@ -54,13 +54,10 @@ fn balancer_auth_client_cert_token_nothing_unknown_cn() {
 fn one_node_schedules_and_both_builders_hold_a_worker_session() {
     farm_ready();
     let ldr = leader();
-    let opened = query(
-        ldr,
-        "journalctl -u nix-grpc-daemon -o cat | grep 'event=worker_session_open'",
-    );
+    let opened = journal_matches(ldr, "nix-grpc-daemon", "event=worker_session_open").join("\n");
     assert!(
         opened.contains("cn=worker-1 ") && opened.contains("cn=oidc:mock:node:worker2 "),
-        "{opened}"
+        "worker sessions opened on the leader:\n{opened}"
     );
     assert_eq!(gauge(ldr, r#"nix_grpc_sched{kind="leader"}"#), 1);
     assert_eq!(gauge(standby(), r#"nix_grpc_sched{kind="leader"}"#), 0);
@@ -91,10 +88,12 @@ fn dag_build_is_scheduled_across_workers_and_lands_in_the_cache() {
     succeed(
         CLIENT,
         &format!(
-            "nix copy --from {} --no-check-sigs {top} && grep farm-top-t1 {top}",
+            "nix copy --from {} --no-check-sigs {top}",
             env("NGS_NIKS3_URL")
         ),
     );
+    let content = succeed(CLIENT, &format!("cat {top}"));
+    assert!(content.contains("farm-top-t1"), "{top} holds: {content}");
     let (inputs1, builds1) = input_counts();
     assert!(inputs1 - inputs0 >= 2, "{inputs0} -> {inputs1}");
     assert_eq!(builds1 - builds0, 3);

@@ -1,4 +1,7 @@
+use std::time::{Duration, Instant};
+
 use crate::fixtures::*;
+use crate::harness::sleep;
 
 #[test]
 fn idle_exit_and_socket_activation() {
@@ -47,11 +50,21 @@ fn renewed_server_certificate_is_served_without_restart() {
              -extfile <(printf 'subjectAltName=DNS:localhost,DNS:renewed.example') -out new.pem && \
              mv new.key server.key && mv new.pem server.pem"
     ));
-    wait_until_succeeds(
-        "openssl s_client -connect localhost:50052 </dev/null 2>/dev/null \
-         | openssl x509 -noout -ext subjectAltName | grep -c renewed.example",
-        30,
-    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let sans = succeed(
+            "openssl s_client -connect localhost:50052 </dev/null 2>/dev/null \
+             | openssl x509 -noout -ext subjectAltName",
+        );
+        if sans.contains("renewed.example") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server still presents the old certificate, SANs: {sans}"
+        );
+        sleep(1);
+    }
     succeed(&format!(
         "nix store info --json --store '{}'",
         cert_store("client")
