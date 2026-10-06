@@ -25,9 +25,17 @@ pub fn anon_store() -> String {
 pub fn hello_path() -> &'static str {
     static P: OnceLock<String> = OnceLock::new();
     P.get_or_init(|| {
-        succeed(&format!(
-            "nix build --store '{STORE}' --impure -f /etc/hello.nix --no-link --print-out-paths"
-        ))
+        succeed(&[
+            "nix",
+            "build",
+            "--store",
+            STORE,
+            "--impure",
+            "-f",
+            "/etc/hello.nix",
+            "--no-link",
+            "--print-out-paths",
+        ])
         .trim()
         .to_string()
     })
@@ -35,17 +43,20 @@ pub fn hello_path() -> &'static str {
 
 pub fn workdir(name: &str) -> String {
     let dir = format!("/root/{name}");
-    succeed(&format!("mkdir -p {dir}"));
+    succeed(&["mkdir", "-p", &dir]);
     dir
 }
 
-/// Shell command that writes `bytes` random bytes, base64-encoded, to `path`.
-pub fn random_file_cmd(path: &str, bytes: usize) -> String {
-    format!("head -c {bytes} /dev/urandom | base64 > {path}")
-}
-
+/// Writes `bytes` random bytes, base64-encoded, to `path`.
 pub fn random_file(path: &str, bytes: usize) {
-    succeed(&random_file_cmd(path, bytes));
+    succeed(&[
+        "sh",
+        "-c",
+        r#"head -c "$1" /dev/urandom | base64 > "$2""#,
+        "sh",
+        &bytes.to_string(),
+        path,
+    ]);
 }
 
 pub fn deny_file(dir: &str) -> String {
@@ -60,20 +71,20 @@ pub fn drv_expr(name: &str, script: &str) -> String {
     )
 }
 
-pub fn succeed(cmd: &str) -> String {
-    harness::succeed(MACHINE, cmd)
+pub fn succeed(argv: &[&str]) -> String {
+    harness::succeed(MACHINE, argv)
 }
 
-pub fn fail(cmd: &str) -> String {
-    harness::fail(MACHINE, cmd)
+pub fn fail(argv: &[&str]) -> String {
+    harness::fail(MACHINE, argv)
 }
 
-pub fn run_t(cmd: &str, secs: u64) -> harness::Out {
-    harness::run_t(MACHINE, cmd, secs)
+pub fn run_t(argv: &[&str], secs: u64) -> harness::Out {
+    harness::run_t(MACHINE, argv, secs)
 }
 
-pub fn wait_until_succeeds(cmd: &str, secs: u64) {
-    harness::wait_until_succeeds(MACHINE, cmd, secs);
+pub fn wait_until_succeeds(argv: &[&str], secs: u64) {
+    harness::wait_until_succeeds(MACHINE, argv, secs);
 }
 
 pub fn wait_for_unit(unit: &str) {

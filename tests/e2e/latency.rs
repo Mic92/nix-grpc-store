@@ -7,20 +7,18 @@ const N_DRVS: usize = 20;
 const RTT_MS: u64 = 50;
 const STORE_URI: &str = "grpc://127.0.0.1:50051?insecure=1";
 
-/// Runs `cmd` on the VM and returns the elapsed seconds, so ssh latency stays out of it.
-fn timed(cmd: &str) -> f64 {
-    let o = run_t(
-        &format!(
-            "s=$(date +%s%N); rc=0; {{ {cmd}\n}} >/root/timed.log 2>&1 || rc=$?; e=$(date +%s%N); \
-             echo $(( (e - s) / 1000000 )); exit $rc"
-        ),
-        600,
-    );
+/// Runs `argv` on the VM and returns the elapsed seconds, so ssh latency stays out of it.
+fn timed(argv: &[&str]) -> f64 {
+    let script = r#"s=$(date +%s%N); rc=0; "$@" >/root/timed.log 2>&1 || rc=$?; e=$(date +%s%N);
+                    echo $(( (e - s) / 1000000 )); exit $rc"#;
+    let mut cmd = vec!["sh", "-c", script, "sh"];
+    cmd.extend(argv);
+    let o = run_t(&cmd, 600);
     assert_eq!(
         o.code,
         0,
-        "{cmd}\n{}",
-        succeed("tail -n 30 /root/timed.log")
+        "{argv:?}\n{}",
+        succeed(&["tail", "-n", "30", "/root/timed.log"])
     );
     let ms: f64 = o.stdout.trim().parse().expect("elapsed ms");
     ms / 1000.0
@@ -30,16 +28,24 @@ struct Netem;
 
 impl Netem {
     fn add(one_way_ms: u64) -> Netem {
-        succeed(&format!(
-            "tc qdisc add dev lo root netem delay {one_way_ms}ms"
-        ));
+        succeed(&[
+            "tc",
+            "qdisc",
+            "add",
+            "dev",
+            "lo",
+            "root",
+            "netem",
+            "delay",
+            &format!("{one_way_ms}ms"),
+        ]);
         Netem
     }
 }
 
 impl Drop for Netem {
     fn drop(&mut self) {
-        let _ = run_t("tc qdisc del dev lo root netem", 30);
+        let _ = run_t(&["tc", "qdisc", "del", "dev", "lo", "root", "netem"], 30);
     }
 }
 
@@ -50,33 +56,61 @@ fn copy_and_remote_build_hide_the_round_trip() {
     let chain = env("NGS_CHAIN_EXPR");
     let system = env("NGS_SYSTEM");
 
-    succeed(&format!(
-        "mkdir -p /root/small && for i in $(seq {N_PATHS}); do {}; done",
-        random_file_cmd("/root/small/f$i", 4096)
-    ));
-    let paths: Vec<String> = succeed("cd /root/small && nix-store --store /root/src --add f*")
-        .lines()
-        .map(|p| format!("'{p}'"))
-        .collect();
+    succeed(&["mkdir", "-p", "/root/small"]);
+    let files: Vec<String> = (0..N_PATHS).map(|i| format!("/root/small/f{i}")).collect();
+    for f in &files {
+        random_file(f, 4096);
+    }
+    let mut add = vec!["nix-store", "--store", "/root/src", "--add"];
+    add.extend(files.iter().map(String::as_str));
+    let added = succeed(&add);
+    let paths: Vec<&str> = added.lines().collect();
     assert_eq!(paths.len(), N_PATHS);
-    let paths = paths.join(" ");
-    succeed(&format!(
-        "nix copy --no-check-sigs --from /root/src --to '{STORE_URI}' {paths}"
-    ));
+    let mut copy = vec![
+        "nix",
+        "copy",
+        "--no-check-sigs",
+        "--from",
+        "/root/src",
+        "--to",
+        STORE_URI,
+    ];
+    copy.extend(&paths);
+    succeed(&copy);
 
     let download = |label: &str| {
-        succeed("rm -rf /root/dst");
-        let t = timed(&format!(
-            "nix copy --no-check-sigs --from '{STORE_URI}' --to /root/dst {paths}"
-        ));
+        succeed(&["rm", "-rf", "/root/dst"]);
+        let mut copy = vec![
+            "nix",
+            "copy",
+            "--no-check-sigs",
+            "--from",
+            STORE_URI,
+            "--to",
+            "/root/dst",
+        ];
+        copy.extend(&paths);
+        let t = timed(&copy);
         println!("[bench] download/{label:9} {t:6.2}s ({N_PATHS} paths)");
         t
     };
     let build = |label: &str| {
-        let t = timed(&format!(
-            "nix build -f {chain} --argstr salt {label} --store /root/bstore --no-link \
-             --max-jobs 0 --builders '{STORE_URI} {system} - 4 1'"
-        ));
+        let t = timed(&[
+            "nix",
+            "build",
+            "-f",
+            &chain,
+            "--argstr",
+            "salt",
+            label,
+            "--store",
+            "/root/bstore",
+            "--no-link",
+            "--max-jobs",
+            "0",
+            "--builders",
+            &format!("{STORE_URI} {system} - 4 1"),
+        ]);
         println!("[bench] build/{label:12} {t:6.2}s ({N_DRVS} drvs)");
         t
     };

@@ -166,7 +166,27 @@ fn retrying(repeatable: bool, mut attempt: impl FnMut() -> Out) -> Out {
     o
 }
 
-fn run(node: Node, cmd: &str, secs: u64, repeatable: bool) -> Out {
+/// Quotes `arg` for the remote shell, so it arrives as one word.
+fn quote(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,".contains(c));
+    if plain {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', r"'\''"))
+    }
+}
+
+/// The remote command line for `argv`. ssh hands it to the login shell.
+fn shell_join(argv: &[&str]) -> String {
+    argv.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
+}
+
+fn run(node: Node, argv: &[&str], secs: u64, repeatable: bool) -> Out {
+    let cmd = shell_join(argv);
+    let cmd = cmd.as_str();
     ensure_ready(node);
     let o = retrying(repeatable, || {
         run_once(node, cmd, Duration::from_secs(secs))
@@ -186,12 +206,13 @@ fn run(node: Node, cmd: &str, secs: u64, repeatable: bool) -> Out {
     o
 }
 
-pub fn run_t(node: Node, cmd: &str, secs: u64) -> Out {
-    run(node, cmd, secs, false)
+pub fn run_t(node: Node, argv: &[&str], secs: u64) -> Out {
+    run(node, argv, secs, false)
 }
 
-fn expect_ok(node: Node, cmd: &str, repeatable: bool) -> String {
-    let o = run(node, cmd, 300, repeatable);
+fn expect_ok(node: Node, argv: &[&str], repeatable: bool) -> String {
+    let cmd = shell_join(argv);
+    let o = run(node, argv, 300, repeatable);
     assert_eq!(
         o.code,
         0,
@@ -203,18 +224,19 @@ fn expect_ok(node: Node, cmd: &str, repeatable: bool) -> String {
     o.stdout
 }
 
-pub fn succeed(node: Node, cmd: &str) -> String {
-    expect_ok(node, cmd, false)
+pub fn succeed(node: Node, argv: &[&str]) -> String {
+    expect_ok(node, argv, false)
 }
 
 /// Like `succeed`, for read-only commands such as `journalctl` or `systemctl
 /// show`, which are safe to repeat after a dropped connection.
-pub fn query(node: Node, cmd: &str) -> String {
-    expect_ok(node, cmd, true)
+pub fn query(node: Node, argv: &[&str]) -> String {
+    expect_ok(node, argv, true)
 }
 
-pub fn fail(node: Node, cmd: &str) -> String {
-    let o = run_t(node, cmd, 300);
+pub fn fail(node: Node, argv: &[&str]) -> String {
+    let cmd = shell_join(argv);
+    let o = run_t(node, argv, 300);
     assert_ne!(
         o.code,
         0,
@@ -225,10 +247,11 @@ pub fn fail(node: Node, cmd: &str) -> String {
     o.combined()
 }
 
-pub fn wait_until_succeeds(node: Node, cmd: &str, secs: u64) {
+pub fn wait_until_succeeds(node: Node, argv: &[&str], secs: u64) {
+    let cmd = shell_join(argv);
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
-        let o = run(node, cmd, 60, true);
+        let o = run(node, argv, 60, true);
         if o.code == 0 {
             return;
         }
@@ -244,21 +267,25 @@ pub fn wait_until_succeeds(node: Node, cmd: &str, secs: u64) {
 }
 
 pub fn wait_for_unit(node: Node, unit: &str) {
-    wait_until_succeeds(node, &format!("systemctl is-active {unit}"), 120);
+    wait_until_succeeds(node, &["systemctl", "is-active", unit], 120);
 }
 
 pub fn wait_for_open_port(node: Node, port: u16) {
-    wait_until_succeeds(node, &format!(": < /dev/tcp/127.0.0.1/{port}"), 60);
+    wait_until_succeeds(
+        node,
+        &["bash", "-c", &format!(": < /dev/tcp/127.0.0.1/{port}")],
+        60,
+    );
 }
 
 pub fn unit_state(node: Node, unit: &str) -> String {
-    query(node, &format!("systemctl show -P ActiveState {unit}"))
+    query(node, &["systemctl", "show", "-P", "ActiveState", unit])
         .trim()
         .to_string()
 }
 
 pub fn journal(node: Node, unit: &str) -> String {
-    query(node, &format!("journalctl -u {unit} --no-pager"))
+    query(node, &["journalctl", "-u", unit, "--no-pager"])
 }
 
 /// Whether `line` matches `pattern`, where `.*` stands for any text. That is
@@ -318,7 +345,17 @@ pub fn wait_journal_above(node: Node, unit: &str, pattern: &str, before: u64, se
 }
 
 pub fn write_file(node: Node, path: &str, content: &str) {
-    succeed(node, &format!("cat > {path} <<'NGSEOF'\n{content}\nNGSEOF"));
+    succeed(
+        node,
+        &[
+            "sh",
+            "-c",
+            r#"printf '%s\n' "$1" > "$2""#,
+            "write",
+            content,
+            path,
+        ],
+    );
 }
 
 pub fn retry(secs: u64, what: &str, mut f: impl FnMut() -> bool) {
@@ -334,16 +371,22 @@ pub fn sleep(secs: u64) {
 }
 
 pub fn metrics(node: Node, port: u16) -> Vec<String> {
-    query(node, &format!("curl -sf http://127.0.0.1:{port}/metrics"))
-        .lines()
-        .map(String::from)
-        .collect()
+    query(
+        node,
+        &["curl", "-sf", &format!("http://127.0.0.1:{port}/metrics")],
+    )
+    .lines()
+    .map(String::from)
+    .collect()
 }
 
 pub fn unit_result(node: Node, unit: &str) -> String {
-    query(node, &format!("systemctl show -p Result --value {unit}"))
-        .trim()
-        .to_string()
+    query(
+        node,
+        &["systemctl", "show", "-p", "Result", "--value", unit],
+    )
+    .trim()
+    .to_string()
 }
 
 #[cfg(test)]
@@ -378,6 +421,15 @@ mod tests {
     fn another_command_is_retried_only_if_ssh_never_connected() {
         assert_eq!(calls(false, "Connection reset by peer"), 1);
         assert_eq!(calls(false, "Connection refused"), 3);
+    }
+
+    #[test]
+    fn arguments_reach_the_remote_shell_as_single_words() {
+        assert_eq!(shell_join(&["ls", "-l", "/nix/store"]), "ls -l /nix/store");
+        assert_eq!(
+            shell_join(&["echo", "a b", "", "it's", "$HOME", "x;y"]),
+            r#"echo 'a b' '' 'it'\''s' '$HOME' 'x;y'"#
+        );
     }
 
     #[test]

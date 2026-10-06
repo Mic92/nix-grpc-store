@@ -8,7 +8,7 @@ pub const WORKER1: Node = Node("worker1");
 pub const WORKER2: Node = Node("worker2");
 pub const WORKERS: [Node; 2] = [WORKER1, WORKER2];
 
-const BUILDER: &str = "pgrep -f 'read -t [9]0 x'";
+pub const BUILDER: &[&str] = &["pgrep", "-f", "read -t [9]0 x"];
 
 pub fn system() -> String {
     env("NGS_SYSTEM")
@@ -35,34 +35,49 @@ pub fn direct(w: Node) -> String {
     format!("grpc://{}:50051?{}&ca-cert={}/ca.pem", w.0, ci(), certs())
 }
 
-pub fn hook() -> String {
+/// Options that send builds through the farm instead of building locally.
+pub fn hook() -> Vec<String> {
     let sys = system();
-    format!(
-        "--max-jobs 0 --builders '{}&system={sys} {sys} - 4'",
-        envoy()
-    )
+    vec![
+        "--max-jobs".into(),
+        "0".into(),
+        "--builders".into(),
+        format!("{}&system={sys} {sys} - 4", envoy()),
+    ]
 }
 
-pub fn build(store: &str, tag: &str, extra: &str) -> String {
+pub fn build(store: &str, tag: &str, extra: &[&str]) -> String {
     let job = expr("JOB");
-    succeed(
-        CLIENT,
-        &format!(
-            "nix build -L --store '{store}' --eval-store auto -f {job} --argstr tag {tag} {extra} >&2"
-        ),
-    );
-    succeed(
-        CLIENT,
-        &format!("nix eval --raw -f {job} --argstr tag {tag} {extra} outPath"),
-    )
-    .trim()
-    .to_string()
+    let mut args = vec!["--argstr", "tag", tag];
+    args.extend_from_slice(extra);
+    // nix prints its log on stdout, which is not the path we want back.
+    let mut cmd = vec![
+        "sh",
+        "-c",
+        r#"exec "$@" >&2"#,
+        "sh",
+        "nix",
+        "build",
+        "-L",
+        "--store",
+        store,
+        "--eval-store",
+        "auto",
+        "-f",
+        &job,
+    ];
+    cmd.extend_from_slice(&args);
+    succeed(CLIENT, &cmd);
+    let mut cmd = vec!["nix", "eval", "--raw", "-f", &job];
+    cmd.extend_from_slice(&args);
+    cmd.push("outPath");
+    succeed(CLIENT, &cmd).trim().to_string()
 }
 
 pub fn holders(path: &str) -> Vec<Node> {
     WORKERS
         .into_iter()
-        .filter(|&w| run_t(w, &format!("test -e {path}"), 60).code == 0)
+        .filter(|&w| run_t(w, &["test", "-e", path], 60).code == 0)
         .collect()
 }
 
@@ -121,7 +136,7 @@ fn node_for(addr: &str) -> Option<Node> {
 }
 
 fn health(cluster: &str) -> Vec<(Node, String)> {
-    succeed(LB, "curl -sf localhost:9901/clusters")
+    succeed(LB, &["curl", "-sf", "localhost:9901/clusters"])
         .lines()
         .filter_map(|l| {
             let mut p = l.split("::");
@@ -204,29 +219,42 @@ pub fn building() -> Vec<Node> {
 
 pub fn release_slow() {
     for w in WORKERS {
-        run_t(w, "pkill -f 'read -t [9]0 x'", 60);
+        run_t(w, &["pkill", "-f", "read -t [9]0 x"], 60);
     }
 }
 
 pub fn spawn_build(unit: &str, tag: &str) {
     succeed(
         CLIENT,
-        &format!(
-            "systemd-run --unit {unit} nix build --store '{}' --eval-store auto -f {} --argstr tag {tag}",
-            envoy(),
-            expr("SLOW")
-        ),
+        &[
+            "systemd-run",
+            "--unit",
+            unit,
+            "nix",
+            "build",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "-f",
+            &expr("SLOW"),
+            "--argstr",
+            "tag",
+            tag,
+        ],
     );
 }
 
 pub fn wait_unit_done(units: &str, secs: u64) {
-    wait_until_succeeds(CLIENT, &format!("! systemctl is-active {units}"), secs);
+    let mut cmd = vec!["sh", "-c", r#"! systemctl is-active "$@""#, "sh"];
+    cmd.extend(units.split_whitespace());
+    wait_until_succeeds(CLIENT, &cmd, secs);
 }
 
 pub fn assert_unit_success(unit: &str) {
     let result = unit_result(CLIENT, unit);
     if result != "success" {
-        let log = query(CLIENT, &format!("journalctl -u {unit}"));
+        let log = query(CLIENT, &["journalctl", "-u", unit]);
         panic!("{unit} ended with {result}\n{log}");
     }
 }

@@ -6,11 +6,16 @@ use crate::harness::*;
 const UNIT: &str = "nix-grpc-daemon";
 
 fn probe(query: &str) -> String {
+    let system = succeed(CLIENT, &["readlink", "-f", "/run/current-system"]);
     let o = run_t(
         CLIENT,
-        &format!(
-            "nix path-info --store 'grpc://lb:50051?{query}' $(readlink -f /run/current-system) 2>&1"
-        ),
+        &[
+            "nix",
+            "path-info",
+            "--store",
+            &format!("grpc://lb:50051?{query}"),
+            system.trim(),
+        ],
         120,
     );
     let out = o.combined();
@@ -29,18 +34,31 @@ fn balancer_auth_client_cert_token_nothing_unknown_cn() {
     assert_eq!(probe(&ci()), "ok");
     succeed(
         CLIENT,
-        &format!(
-            "curl -sfG http://lb:8081/issue --data-urlencode 'aud={aud}' --data-urlencode sub=dev:alice > /root/dev.jwt && test -s /root/dev.jwt"
-        ),
+        &[
+            "sh",
+            "-c",
+            r#"curl -sfG "$@" > /root/dev.jwt && test -s /root/dev.jwt"#,
+            "sh",
+            "http://lb:8081/issue",
+            "--data-urlencode",
+            &format!("aud={aud}"),
+            "--data-urlencode",
+            "sub=dev:alice",
+        ],
     );
-    succeed(
-        CLIENT,
-        &format!(
-            "install -D {certs}/foreign.pem /var/lib/nix-grpc-store/client.crt && install -D {certs}/foreign.key /var/lib/nix-grpc-store/client.key"
-        ),
-    );
+    for (from, to) in [("foreign.pem", "client.crt"), ("foreign.key", "client.key")] {
+        succeed(
+            CLIENT,
+            &[
+                "install",
+                "-D",
+                &format!("{certs}/{from}"),
+                &format!("/var/lib/nix-grpc-store/{to}"),
+            ],
+        );
+    }
     let out = probe("token-file=/root/dev.jwt");
-    succeed(CLIENT, "rm -r /var/lib/nix-grpc-store");
+    succeed(CLIENT, &["rm", "-r", "/var/lib/nix-grpc-store"]);
     assert_eq!(out, "ok");
     let out = probe("");
     assert!(out.contains("client certificate or bearer token"), "{out}");
@@ -82,17 +100,21 @@ fn input_counts() -> (i64, i64) {
 fn dag_build_is_scheduled_across_workers_and_lands_in_the_cache() {
     farm_ready();
     let (inputs0, builds0) = input_counts();
-    let top = build(&envoy(), "t1", "");
+    let top = build(&envoy(), "t1", &[]);
     assert_eq!(holders(&top).len(), 1, "{:?}", holders(&top));
-    fail(CLIENT, &format!("test -e {top}"));
+    fail(CLIENT, &["test", "-e", &top]);
     succeed(
         CLIENT,
-        &format!(
-            "nix copy --from {} --no-check-sigs {top}",
-            env("NGS_NIKS3_URL")
-        ),
+        &[
+            "nix",
+            "copy",
+            "--from",
+            &env("NGS_NIKS3_URL"),
+            "--no-check-sigs",
+            &top,
+        ],
     );
-    let content = succeed(CLIENT, &format!("cat {top}"));
+    let content = succeed(CLIENT, &["cat", &top]);
     assert!(content.contains("farm-top-t1"), "{top} holds: {content}");
     let (inputs1, builds1) = input_counts();
     assert!(inputs1 - inputs0 >= 2, "{inputs0} -> {inputs1}");
@@ -102,12 +124,12 @@ fn dag_build_is_scheduled_across_workers_and_lands_in_the_cache() {
 #[test]
 fn repeat_is_answered_cached_by_the_scheduler_without_building() {
     farm_ready();
-    let top = build(&envoy(), "cached1", "");
+    let top = build(&envoy(), "cached1", &[]);
     for w in WORKERS {
-        succeed(w, &format!("nix-store --delete {top}"));
+        succeed(w, &["nix-store", "--delete", &top]);
     }
     let before = events(leader(), "cached");
-    build(&envoy(), "cached1", "");
+    build(&envoy(), "cached1", &[]);
     assert!(holders(&top).is_empty(), "{:?}", holders(&top));
     assert!(events(leader(), "cached") > before);
 }
@@ -115,10 +137,10 @@ fn repeat_is_answered_cached_by_the_scheduler_without_building() {
 #[test]
 fn inputs_already_in_the_cache_are_not_sent_to_the_scheduler() {
     farm_ready();
-    build(&envoy(), "wants1", "");
+    build(&envoy(), "wants1", &[]);
     let wants = || journal_count(leader(), UNIT, "event=want ");
     let before = wants();
-    build(&envoy(), "wants1", "--argstr top wants1b");
+    build(&envoy(), "wants1", &["--argstr", "top", "wants1b"]);
     assert_eq!(wants() - before, 1);
 }
 
@@ -145,7 +167,7 @@ fn two_clients_wanting_the_same_drv_build_it_once() {
     let mut ids: Vec<Vec<String>> = WORKERS
         .into_iter()
         .map(|w| {
-            query(w, "journalctl -u nix-grpc-daemon -o cat")
+            query(w, &["journalctl", "-u", "nix-grpc-daemon", "-o", "cat"])
                 .lines()
                 .filter(|l| l.contains("method=BuildDerivation") && l.contains("slow-dedup"))
                 .filter_map(|l| l.split_whitespace().find(|t| t.starts_with("assign_id=")))
@@ -166,15 +188,25 @@ fn two_clients_wanting_the_same_drv_build_it_once() {
 fn timeout_and_max_silent_time_reach_the_builder() {
     farm_ready();
     let before = failures("TimedOut");
-    for (flag, tag) in [("--timeout 5", "tmot"), ("--max-silent-time 5", "tmom")] {
+    for (flag, tag) in [("--timeout", "tmot"), ("--max-silent-time", "tmom")] {
         let t0 = Instant::now();
         let o = run_t(
             CLIENT,
-            &format!(
-                "nix build --store '{}' --eval-store auto -f {} --argstr tag {tag} {flag} 2>&1",
-                envoy(),
-                expr("SLOW")
-            ),
+            &[
+                "nix",
+                "build",
+                "--store",
+                &envoy(),
+                "--eval-store",
+                "auto",
+                "-f",
+                &expr("SLOW"),
+                "--argstr",
+                "tag",
+                tag,
+                flag,
+                "5",
+            ],
             120,
         );
         let out = o.combined();
@@ -201,11 +233,20 @@ fn a_failing_build_is_counted_with_its_own_reason() {
     let (before, events_before) = (failed(), build_failed());
     let o = run_t(
         CLIENT,
-        &format!(
-            "nix build -L --store '{}' --eval-store auto -f {} --argstr tag boom 2>&1",
-            envoy(),
-            expr("FAIL")
-        ),
+        &[
+            "nix",
+            "build",
+            "-L",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "-f",
+            &expr("FAIL"),
+            "--argstr",
+            "tag",
+            "boom",
+        ],
         120,
     );
     assert!(
@@ -224,7 +265,8 @@ fn the_first_client_leaving_does_not_fail_the_second() {
     sleep(1);
     spawn_build("share2", "share");
     wait_building();
-    succeed(CLIENT, "sleep 2; systemctl kill -s INT share1");
+    sleep(2);
+    succeed(CLIENT, &["systemctl", "kill", "-s", "INT", "share1"]);
     wait_unit_done("share1", 30);
     wait_building();
     release_slow();
@@ -240,7 +282,16 @@ fn upload_whose_reference_the_worker_lacks_is_completed_from_the_cache() {
     let nix_build = |attr: &str| {
         succeed(
             CLIENT,
-            &format!("nix-build --no-out-link {dep} -A {attr} --argstr tag viacache"),
+            &[
+                "nix-build",
+                "--no-out-link",
+                &dep,
+                "-A",
+                attr,
+                "--argstr",
+                "tag",
+                "viacache",
+            ],
         )
         .trim()
         .to_string()
@@ -248,25 +299,39 @@ fn upload_whose_reference_the_worker_lacks_is_completed_from_the_cache() {
     let (rf, referrer) = (nix_build("input"), nix_build("referrer"));
     succeed(
         CLIENT,
-        &format!("nix-store --export {rf} > /tmp/shared/ref.closure"),
+        &[
+            "sh",
+            "-c",
+            r#"nix-store --export "$1" > /tmp/shared/ref.closure"#,
+            "sh",
+            &rf,
+        ],
     );
-    succeed(WORKER1, "nix-store --import < /tmp/shared/ref.closure");
-    succeed(WORKER2, "systemctl stop nix-grpc-daemon.service");
-    wait_members(&sys, &[WORKER1]);
     succeed(
-        CLIENT,
-        &format!("nix path-info --store '{}' {rf} >&2", envoy()),
+        WORKER1,
+        &["sh", "-c", "nix-store --import < /tmp/shared/ref.closure"],
     );
-    fail(WORKER2, &format!("test -e {rf}"));
-    succeed(WORKER2, "systemctl start nix-grpc-daemon.service");
-    succeed(WORKER1, "systemctl stop nix-grpc-daemon.service");
+    succeed(WORKER2, &["systemctl", "stop", "nix-grpc-daemon.service"]);
+    wait_members(&sys, &[WORKER1]);
+    succeed(CLIENT, &["nix", "path-info", "--store", &envoy(), &rf]);
+    fail(WORKER2, &["test", "-e", &rf]);
+    succeed(WORKER2, &["systemctl", "start", "nix-grpc-daemon.service"]);
+    succeed(WORKER1, &["systemctl", "stop", "nix-grpc-daemon.service"]);
     wait_members(&sys, &[WORKER2]);
     succeed(
         CLIENT,
-        &format!("nix copy --no-check-sigs --to '{}' {referrer} >&2", envoy()),
+        &[
+            "nix",
+            "copy",
+            "--no-check-sigs",
+            "--to",
+            &envoy(),
+            &referrer,
+        ],
     );
-    succeed(WORKER2, &format!("test -e {rf} && test -e {referrer}"));
-    succeed(WORKER1, "systemctl start nix-grpc-daemon.service");
+    succeed(WORKER2, &["test", "-e", &rf]);
+    succeed(WORKER2, &["test", "-e", &referrer]);
+    succeed(WORKER1, &["systemctl", "start", "nix-grpc-daemon.service"]);
     wait_members(&sys, &WORKERS);
 }
 
@@ -276,12 +341,12 @@ fn a_niks3_restart_does_not_cost_the_leader_its_role() {
     let was = leader();
     let yields = || journal_count(was, UNIT, "event=scheduler_yield");
     let before = yields();
-    succeed(LB, "systemctl restart niks3.service");
+    succeed(LB, &["systemctl", "restart", "niks3.service"]);
     wait_for_unit(LB, "niks3.service");
     retry(60, "scheduler settled", settled);
     assert_eq!(leader(), was);
     assert_eq!(yields(), before);
-    build(&envoy(), "after-niks3-restart", "");
+    build(&envoy(), "after-niks3-restart", &[]);
 }
 
 #[test]
@@ -290,13 +355,13 @@ fn scheduler_down_the_other_node_takes_the_lock_and_keeps_it() {
     let (was, nxt) = (leader(), standby());
     let pattern = "event=scheduler_take_over";
     let before = journal_count(nxt, UNIT, pattern);
-    succeed(was, "systemctl stop nix-grpc-daemon.service");
+    succeed(was, &["systemctl", "stop", "nix-grpc-daemon.service"]);
     wait_journal_above(nxt, UNIT, pattern, before, 30);
     retry(30, "one worker on the new scheduler", || {
         sched_workers(nxt) == 1
     });
-    build(&envoy(), "on-standby", "");
-    succeed(was, "systemctl start nix-grpc-daemon.service");
+    build(&envoy(), "on-standby", &[]);
+    succeed(was, &["systemctl", "start", "nix-grpc-daemon.service"]);
     retry(60, "scheduler settled", settled);
     assert_eq!(leader(), nxt);
     assert_eq!(sched_workers(was), 0);
@@ -313,7 +378,15 @@ fn clean_scheduler_restart_peers_are_told_and_running_builds_survive() {
     let before = journal_count(nxt, UNIT, pattern);
     // --no-block: a build on the leader drains first, so the restart only
     // completes after release_slow().
-    succeed(was, "systemctl restart --no-block nix-grpc-daemon.service");
+    succeed(
+        was,
+        &[
+            "systemctl",
+            "restart",
+            "--no-block",
+            "nix-grpc-daemon.service",
+        ],
+    );
     sleep(5);
     assert_eq!(building(), who, "restart killed or moved the build");
     release_slow();
@@ -332,10 +405,12 @@ fn scheduler_restart_mid_build_finishes_without_a_double_build() {
     assert_eq!(building().len(), 1, "{:?}", building());
     // The scheduler forgets the build. If it ran on the leader it dies with
     // the daemon. Either way no second copy may start while one is alive.
+    let ldr = leader();
     succeed(
-        leader(),
-        "systemctl kill -s KILL nix-grpc-daemon.service; systemctl start nix-grpc-daemon.service",
+        ldr,
+        &["systemctl", "kill", "-s", "KILL", "nix-grpc-daemon.service"],
     );
+    succeed(ldr, &["systemctl", "start", "nix-grpc-daemon.service"]);
     sleep(5);
     assert!(building().len() <= 1, "{:?}", building());
     release_slow();
@@ -348,7 +423,7 @@ fn interrupting_the_client_stops_the_build_on_the_worker() {
     farm_ready();
     spawn_build("intr", "intr");
     wait_building();
-    succeed(CLIENT, "systemctl kill -s INT intr");
+    succeed(CLIENT, &["systemctl", "kill", "-s", "INT", "intr"]);
     retry(20, "the build stopped", || building().is_empty());
 }
 
@@ -365,19 +440,28 @@ fn a_deploy_mid_build_drains_and_the_new_generation_takes_over() {
     if busy == WORKER2 {
         succeed(
             WORKER2,
-            "timeout 120 /run/current-system/specialisation/next/bin/switch-to-configuration test >&2",
+            &[
+                "timeout",
+                "120",
+                "/run/current-system/specialisation/next/bin/switch-to-configuration",
+                "test",
+            ],
         );
     } else {
-        succeed(WORKER1, "systemctl reload nix-grpc-daemon.service");
+        succeed(WORKER1, &["systemctl", "reload", "nix-grpc-daemon.service"]);
     }
-    succeed(busy, "pgrep -f 'read -t [9]0 x'");
-    build(&envoy(), "during-drain", "");
-    succeed(busy, "pkill -f 'read -t [9]0 x'");
+    succeed(busy, BUILDER);
+    build(&envoy(), "during-drain", &[]);
+    succeed(busy, &["pkill", "-f", "read -t [9]0 x"]);
     wait_unit_done("sw", 90);
     assert_unit_success("sw");
     wait_until_succeeds(
         busy,
-        "systemctl is-active nix-grpc-daemon.service || systemctl start nix-grpc-daemon.service",
+        &[
+            "sh",
+            "-c",
+            "systemctl is-active nix-grpc-daemon.service || systemctl start nix-grpc-daemon.service",
+        ],
         60,
     );
     wait_members(&system(), &WORKERS);
@@ -394,20 +478,33 @@ fn queue_gauges_show_a_burst_while_every_build_blocks() {
         .map(|i| format!("\"q{i}\""))
         .collect::<Vec<_>>()
         .join(" ");
+    let burst = format!(
+        "map (tag: import {} {{ inherit tag; }}) [ {tags} ]",
+        expr("SLOW")
+    );
     succeed(
         CLIENT,
-        &format!(
-            "systemd-run --unit burst nix build --store '{}' --eval-store auto --impure --expr 'map (tag: import {} {{ inherit tag; }}) [ {tags} ]'",
-            envoy(),
-            expr("SLOW")
-        ),
+        &[
+            "systemd-run",
+            "--unit",
+            "burst",
+            "nix",
+            "build",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "--impure",
+            "--expr",
+            &burst,
+        ],
     );
     // The Wants arrive within a second and nothing else happens until a build
     // ends, so only the trailing export can show the queue.
     retry(10, "two builds queued", || queued() == 2);
     retry(90, "burst finished", || {
         release_slow();
-        run_t(CLIENT, "systemctl is-active burst", 60).code != 0
+        run_t(CLIENT, &["systemctl", "is-active", "burst"], 60).code != 0
     });
     assert_unit_success("burst");
     retry(10, "queue empty", || queued() == 0);
@@ -431,13 +528,27 @@ fn has_vip_build_info(line: &str) -> bool {
 fn required_system_features_are_placed_or_refused() {
     farm_ready();
     let job = expr("JOB");
-    let out = succeed(
-        CLIENT,
-        &format!(
-            r#"nix build -L --store '{}' --eval-store auto --expr 'map (tag: import {job} {{ inherit tag; features = ["vip"]; }}) ["f1" "f2" "f3"]' --impure 2>&1"#,
-            envoy()
-        ),
+    let vip = format!(
+        r#"map (tag: import {job} {{ inherit tag; features = ["vip"]; }}) ["f1" "f2" "f3"]"#
     );
+    let o = run_t(
+        CLIENT,
+        &[
+            "nix",
+            "build",
+            "-L",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "--expr",
+            &vip,
+            "--impure",
+        ],
+        300,
+    );
+    assert_eq!(o.code, 0, "{}", o.combined());
+    let out = o.combined();
     assert!(out.contains("node-a: building "), "{out}");
     assert!(
         out.lines()
@@ -453,10 +564,26 @@ fn required_system_features_are_placed_or_refused() {
 
     succeed(
         CLIENT,
-        &format!(
-            r#"systemd-run --unit gpu nix build -L --store '{}&restart-grace=30' --eval-store auto -f {job} --argstr tag f5 --arg features '["gpu"]'"#,
-            envoy()
-        ),
+        &[
+            "systemd-run",
+            "--unit",
+            "gpu",
+            "nix",
+            "build",
+            "-L",
+            "--store",
+            &format!("{}&restart-grace=30", envoy()),
+            "--eval-store",
+            "auto",
+            "-f",
+            &job,
+            "--argstr",
+            "tag",
+            "f5",
+            "--arg",
+            "features",
+            r#"["gpu"]"#,
+        ],
     );
     let unplaceable = format!(
         r#"nix_grpc_sched_system{{features="gpu",kind="unplaceable",system="{}"}}"#,
@@ -468,7 +595,7 @@ fn required_system_features_are_placed_or_refused() {
     retry(60, "gpu build failed", || {
         unit_result(CLIENT, "gpu") == "exit-code"
     });
-    let out = query(CLIENT, "journalctl -u gpu -o cat");
+    let out = query(CLIENT, &["journalctl", "-u", "gpu", "-o", "cat"]);
     assert!(out.contains("features {gpu}"), "{out}");
     retry(30, "no unplaceable build", || {
         gauge(leader(), &unplaceable) == 0
@@ -484,13 +611,20 @@ fn low_disk_drains_a_worker_and_builds_go_to_the_other() {
         "event=healthy reason=min_free",
     );
     let (down0, up0) = (count(down), count(up));
+    let avail = succeed(WORKER1, &["df", "--output=avail", "-B1", "/nix/store"]);
+    let avail: u64 = avail.lines().last().unwrap().trim().parse().unwrap();
     succeed(
         WORKER1,
-        "fallocate -l $(( $(df --output=avail -B1 /nix/store | tail -1) - 100*1024*1024 )) /nix/.rw-store/fill",
+        &[
+            "fallocate",
+            "-l",
+            &(avail - 100 * 1024 * 1024).to_string(),
+            "/nix/.rw-store/fill",
+        ],
     );
     wait_journal_above(WORKER1, UNIT, down, down0, 30);
-    let top = build(&envoy(), "drain", "");
+    let top = build(&envoy(), "drain", &[]);
     assert_eq!(holders(&top), [WORKER2]);
-    succeed(WORKER1, "rm /nix/.rw-store/fill");
+    succeed(WORKER1, &["rm", "/nix/.rw-store/fill"]);
     wait_journal_above(WORKER1, UNIT, up, up0, 30);
 }

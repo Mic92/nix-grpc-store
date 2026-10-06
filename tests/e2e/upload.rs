@@ -27,7 +27,14 @@ fn build_sharing_one_input(name: &str, jobs: usize) -> Outcome {
     wait_for_open_port(50060);
     let dir = workdir(name);
     let big = format!("{dir}/big");
-    succeed(&format!("head -c {INPUT_MIB}M /dev/urandom > {big}"));
+    succeed(&[
+        "dd",
+        "if=/dev/urandom",
+        &format!("of={big}"),
+        "bs=1M",
+        &format!("count={INPUT_MIB}"),
+        "status=none",
+    ]);
     write_file(
         &format!("{dir}/jobs.nix"),
         &format!(
@@ -43,28 +50,46 @@ builtins.genList (i: derivation {{
         ),
     );
     let src = format!("local?root={dir}/src");
-    let targets = succeed(&format!(
-        "for i in $(seq 0 {}); do nix-instantiate --store '{src}' {dir}/jobs.nix -A $i; done",
-        jobs - 1
-    ))
-    .split_whitespace()
-    .map(|drv| format!("'{drv}^out'"))
-    .collect::<Vec<_>>()
-    .join(" ");
+    let jobs_nix = format!("{dir}/jobs.nix");
+    let targets: Vec<String> = (0..jobs)
+        .map(|i| {
+            let drv = succeed(&[
+                "nix-instantiate",
+                "--store",
+                &src,
+                &jobs_nix,
+                "-A",
+                &i.to_string(),
+            ]);
+            format!("{}^out", drv.trim())
+        })
+        .collect();
 
     let (started0, finished0) = (uploads("event=rpc_start"), uploads("event=rpc"));
-    let o = run_t(
-        &format!(
-            "timeout -s KILL {BUILD_TIMEOUT_S} nix build --store '{ENVOY_STORE}' --eval-store '{src}' --no-link {targets} 2>&1 | tail -n 20"
-        ),
-        BUILD_TIMEOUT_S + 60,
-    );
-    succeed(&format!("rm -rf {big} {dir}/src"));
+    let timeout = BUILD_TIMEOUT_S.to_string();
+    let mut build = vec![
+        "timeout",
+        "-s",
+        "KILL",
+        &timeout,
+        "nix",
+        "build",
+        "--store",
+        ENVOY_STORE,
+        "--eval-store",
+        &src,
+        "--no-link",
+    ];
+    build.extend(targets.iter().map(String::as_str));
+    let o = run_t(&build, BUILD_TIMEOUT_S + 60);
+    let output = o.combined();
+    let tail: Vec<&str> = output.lines().rev().take(20).collect();
+    succeed(&["rm", "-rf", &big, &format!("{dir}/src")]);
     Outcome {
         code: o.code,
         started: uploads("event=rpc_start") - started0,
         finished: uploads("event=rpc") - finished0,
-        log: o.stdout,
+        log: tail.into_iter().rev().collect::<Vec<_>>().join("\n"),
     }
 }
 

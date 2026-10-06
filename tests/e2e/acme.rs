@@ -17,7 +17,14 @@ fn store_uri() -> String {
 fn cert_field(field: &str) -> String {
     succeed(
         HOST1,
-        &format!("openssl x509 -in /var/lib/acme/host1/cert.pem -noout -{field}"),
+        &[
+            "openssl",
+            "x509",
+            "-in",
+            "/var/lib/acme/host1/cert.pem",
+            "-noout",
+            &format!("-{field}"),
+        ],
     )
 }
 
@@ -25,10 +32,7 @@ fn cert_field(field: &str) -> String {
 fn wait_for_acme_cert() {
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
-        let issuer = succeed(
-            HOST1,
-            "openssl x509 -in /var/lib/acme/host1/cert.pem -noout -issuer",
-        );
+        let issuer = cert_field("issuer");
         if issuer.contains("Test Intermediate CA") {
             return;
         }
@@ -45,11 +49,22 @@ fn signed_path() -> &'static str {
     P.get_or_init(|| {
         let p = succeed(
             SERVER,
-            "nix build --impure -f /etc/hello.nix --no-link --print-out-paths",
+            &[
+                "nix",
+                "build",
+                "--impure",
+                "-f",
+                "/etc/hello.nix",
+                "--no-link",
+                "--print-out-paths",
+            ],
         )
         .trim()
         .to_string();
-        succeed(SERVER, &format!("nix store sign -k /etc/cache-key '{p}'"));
+        succeed(
+            SERVER,
+            &["nix", "store", "sign", "-k", "/etc/cache-key", &p],
+        );
         p
     })
 }
@@ -67,7 +82,7 @@ fn host1_obtains_a_certificate_via_acme() {
 #[test]
 fn server_builds_and_signs_a_path() {
     let p = signed_path();
-    let info = succeed(SERVER, &format!("nix path-info --json '{p}'"));
+    let info = succeed(SERVER, &["nix", "path-info", "--json", p]);
     assert!(info.contains("nix-grpc-test-1:"), "not signed: {info}");
 }
 
@@ -75,19 +90,26 @@ fn server_builds_and_signs_a_path() {
 fn host1_substitutes_the_signed_path_with_a_read_only_cert() {
     wait_for_acme_cert();
     let p = signed_path();
-    fail(HOST1, &format!("test -e '{p}'"));
-    succeed(HOST1, &format!("nix-store -r '{p}'"));
-    let content = succeed(HOST1, &format!("cat '{p}'"));
+    fail(HOST1, &["test", "-e", p]);
+    succeed(HOST1, &["nix-store", "-r", p]);
+    let content = succeed(HOST1, &["cat", p]);
     assert!(content.contains("hello-over-grpc"), "{content}");
 }
 
 #[test]
 fn a_read_only_host_cannot_write() {
     wait_for_acme_cert();
-    succeed(HOST1, "echo deny > /root/denyfile");
+    write_file(HOST1, "/root/denyfile", "deny");
     fail(
         HOST1,
-        &format!("nix store add --store '{}' /root/denyfile", store_uri()),
+        &[
+            "nix",
+            "store",
+            "add",
+            "--store",
+            &store_uri(),
+            "/root/denyfile",
+        ],
     );
     assert_journal(
         SERVER,
