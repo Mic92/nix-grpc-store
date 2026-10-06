@@ -40,6 +40,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       packages: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v5
       - uses: cachix/install-nix-action@v31
@@ -56,6 +58,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
       - name: Merge and push
+        id: push
         env:
           REGCTL_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
           TAGS: ${{ steps.meta.outputs.tags }}
@@ -75,7 +78,23 @@ jobs:
               [ "$kind" = worker ] || tag="${tag/nix-grpc-farm:/nix-grpc-farm-$kind:}"
               regctl image copy "ocidir://$kind:merged" "$tag"
             done
+            echo "$kind=$(regctl image digest "ocidir://$kind:merged")" >> "$GITHUB_OUTPUT"
           done
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ github.repository_owner }}/nix-grpc-farm
+          subject-digest: ${{ steps.push.outputs.worker }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ github.repository_owner }}/nix-grpc-farm-lb
+          subject-digest: ${{ steps.push.outputs.lb }}
+          push-to-registry: true
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ github.repository_owner }}/nix-grpc-farm-client
+          subject-digest: ${{ steps.push.outputs.client }}
+          push-to-registry: true
   helm-chart:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
