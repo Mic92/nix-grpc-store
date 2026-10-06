@@ -52,9 +52,11 @@ fn renewed_server_certificate_is_served_without_restart() {
     ));
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
+        // s_client may exit non-zero because the server wants a client
+        // certificate, so only the printed SANs count.
         let sans = succeed(
             "openssl s_client -connect localhost:50052 </dev/null 2>/dev/null \
-             | openssl x509 -noout -ext subjectAltName",
+             | openssl x509 -noout -ext subjectAltName || true",
         );
         if sans.contains("renewed.example") {
             break;
