@@ -54,6 +54,10 @@ in
         GroupName = "nix-grpc-daemon";
         RunAtLoad = true;
         KeepAlive = true;
+        # launchd's default soft limit is 256, which a busy worker exhausts
+        # with one socket per balancer connection plus the NAR spool files.
+        SoftResourceLimits.NumberOfFiles = lib.mkDefault 65536;
+        HardResourceLimits.NumberOfFiles = lib.mkDefault 65536;
         StandardOutPath = logFile;
         StandardErrorPath = logFile;
       };
