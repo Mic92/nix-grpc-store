@@ -199,6 +199,11 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
 
     # cert-manager mode: chart-named Secrets everywhere, worker cert covers every scheduler Service.
     helm template t chart -f ${json.generate "values.json" valuesCertManager} > cm.yaml
+    helm template t chart -f ${json.generate "values.json" valuesInCluster} --api-versions monitoring.coreos.com/v1/PodMonitor > in-cluster.yaml
+    # The worker must not remain Ready after its separate nix-daemon container dies.
+    for f in out.yaml cm.yaml in-cluster.yaml; do
+      test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.containers[] | select(.name == "nix-grpc-daemon") | .readinessProbe.exec.command | join(" ")' "$f")" = 'nix store info --store daemon'
+    done
     for n in t-nix-grpc-farm-scheduler-0.default.svc t-nix-grpc-farm-scheduler-1.default.svc t-nix-grpc-farm.default.svc; do
       pick Certificate t-nix-grpc-farm-worker '.spec.dnsNames[]' cm.yaml | grep -qx "$n"
     done

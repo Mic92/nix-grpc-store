@@ -208,7 +208,12 @@ spec:
           {{- $probe := ternary (dict "tcpSocket" (dict "port" 50051)) (dict "grpc" (dict "port" 50051)) (not (empty (include "farm.tlsSecret" (list $root "worker")))) }}
           # Covers the store seed and niks3 becoming reachable.
           startupProbe: {{- toYaml (merge (dict "periodSeconds" 5 "failureThreshold" 120) $probe) | nindent 12 }}
-          readinessProbe: {{- toYaml (merge (dict "periodSeconds" 5) $probe) | nindent 12 }}
+          # Ready only while the local nix-daemon answers, not just the gRPC port.
+          readinessProbe:
+            exec:
+              command: [nix, store, info, --store, daemon]
+            periodSeconds: 5
+            timeoutSeconds: 10
           livenessProbe: {{- toYaml (merge (dict "periodSeconds" 30 "timeoutSeconds" 10) $probe) | nindent 12 }}
           volumeMounts:
             - {name: nix, mountPath: /nix, subPath: nix}

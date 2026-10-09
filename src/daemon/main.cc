@@ -135,11 +135,15 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
 
     // A restarted nix-daemon leaves the pool full of dead connections that
     // only fail on the next write. Drop them all so the retry gets fresh ones.
+    // A failed reconnect while the daemon is down is latched by the store and
+    // reported as "previously failed", so that drops the store too.
     auto localDaemonGone(const std::exception & err) -> bool
     {
         const auto * sys = dynamic_cast<const nix::SysError *>(&err);
         bool const gone = dynamic_cast<const nix::EndOfFile *>(&err) != nullptr
-                          || (sys != nullptr && (sys->errNo == EPIPE || sys->errNo == ECONNRESET));
+                          || (sys != nullptr && (sys->errNo == EPIPE || sys->errNo == ECONNRESET
+                                                 || sys->errNo == ECONNREFUSED || sys->errNo == ENOENT))
+                          || std::string_view(err.what()).contains("previously failed");
         if (gone) {
             std::scoped_lock const lock(storeMutex);
             store.reset();

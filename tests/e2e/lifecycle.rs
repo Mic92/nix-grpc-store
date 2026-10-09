@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::fixtures::*;
-use crate::harness::{retry, sleep};
+use crate::harness::{MACHINE, query, retry, sleep};
 
 #[test]
 fn idle_exit_and_socket_activation() {
@@ -36,6 +36,62 @@ fn nix_daemon_restart_does_not_fail_the_next_rpc() {
     succeed(&["nix", "path-info", "--store", STORE, p]);
     write_file("/tmp/warm", "again");
     succeed(&["nix", "store", "add", "--store", STORE, "/tmp/warm"]);
+}
+
+fn build_argv<'a>(store: &'a str, file: &'a str) -> Vec<&'a str> {
+    vec![
+        "nix",
+        "build",
+        "--store",
+        store,
+        "--eval-store",
+        "local",
+        "--impure",
+        "--no-link",
+        "-f",
+        file,
+    ]
+}
+
+#[test]
+fn a_failed_connection_while_nix_daemon_is_down_does_not_poison_the_worker() {
+    let unit = "nix-grpc-daemon-mtls.service";
+    wait_for_unit(unit);
+    wait_for_open_port(50052);
+    let store = cert_store("client");
+    let main_pid = || query(MACHINE, &["systemctl", "show", "-P", "MainPID", unit]);
+    let pid = main_pid();
+
+    // Pool a connection first, then keep the daemon down long enough for an RPC to fail.
+    succeed(&build_argv(&store, "/etc/hello.nix"));
+    write_file(
+        "/tmp/reconnect.nix",
+        &drv_expr("reconnect-after-daemon-restart", "echo reconnected > $out"),
+    );
+    succeed(&[
+        "systemctl",
+        "stop",
+        "nix-daemon.socket",
+        "nix-daemon.service",
+    ]);
+    let mut down = vec!["timeout", "6s"];
+    down.extend(build_argv(&store, "/tmp/reconnect.nix"));
+    let out = run_t(&down, 15);
+    succeed(&["systemctl", "start", "nix-daemon.socket"]);
+    assert_ne!(out.code, 0, "build succeeded with the daemon down");
+    assert!(
+        out.combined().contains("local nix-daemon connection lost"),
+        "RPC never reached the unavailable daemon: {}",
+        out.combined()
+    );
+
+    wait_until_succeeds(&["nix", "store", "info", "--store", "daemon"], 30);
+    wait_until_succeeds(&build_argv(&store, "/tmp/reconnect.nix"), 30);
+    assert_eq!(
+        pid,
+        main_pid(),
+        "the worker recovered only because it restarted"
+    );
 }
 
 #[test]
