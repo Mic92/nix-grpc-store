@@ -95,4 +95,11 @@
     cfg.niks3.clientKeyFile
   ]
 )
+++ lib.optionals cfg.sandbox.enable (
+  [ "--sandbox" ]
+  ++ lib.concatMap (path: [
+    "--sandbox-write"
+    (toString path)
+  ]) cfg.sandbox.writePaths
+)
 ++ cfg.extraFlags

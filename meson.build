@@ -193,7 +193,8 @@ if build_server
     'src/daemon/coordinator.cc',
     'src/daemon/eds.cc',
     'src/daemon/options.cc',
-  ]
+    {'darwin': 'src/daemon/sandbox-darwin.cc', 'linux': 'src/daemon/sandbox-linux.cc'}.get(host_machine.system(), 'src/daemon/sandbox-unsupported.cc'),
+  ] + (host_machine.system() == 'darwin' ? ['src/daemon/sbpl.cc'] : [])
 
   executable('nix-grpc-daemon',
     sources : daemon_sources + [gen, eds_gen],
@@ -250,6 +251,22 @@ if build_server
     dependencies : [nix_util_dep] + absl_dep,
     cpp_args : ['-UNDEBUG'],
   ))
+
+  test('sbpl', executable('sbpl-test',
+    sources : ['tests/sbpl-test.cc', 'src/daemon/sbpl.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    dependencies : common_deps,
+    cpp_args : ['-UNDEBUG'],
+  ))
+
+  if host_machine.system() == 'linux'
+    test('sandbox', executable('sandbox-test',
+      sources : ['tests/sandbox-test.cc', 'src/daemon/sandbox-linux.cc'],
+      include_directories : [src_inc, include_directories('src/daemon')],
+      dependencies : [nix_util_dep],
+      cpp_args : ['-UNDEBUG'],
+    ))
+  endif
 
   test('xfcc', executable('xfcc-test',
     sources : ['tests/xfcc-test.cc'],

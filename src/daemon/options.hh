@@ -46,6 +46,9 @@ struct Options
     unsigned maxJobs = 0; // 0 = take nix's max-jobs
     uint64_t minFree = 0;
     std::string storeDir;
+    bool sandbox = false;
+    // Extra subtrees the sandbox lets the daemon write.
+    std::vector<std::string> sandboxWrite;
 };
 
 auto parseOptions(const std::vector<std::string_view> & args) -> Options;

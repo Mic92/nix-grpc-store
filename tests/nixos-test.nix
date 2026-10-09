@@ -95,6 +95,7 @@ pkgs.testers.runNixOSTest {
       # nix copy --to can add unsigned paths.
       services.nix-grpc-daemon.trustClients = true;
 
+
       environment.systemPackages = [
         pkgs.perf
         pkgs.curl
@@ -196,7 +197,7 @@ pkgs.testers.runNixOSTest {
         ];
         requires = [ "nix-grpc-certs.service" ];
         serviceConfig.ExecStart = ''
-          ${lib.getExe config.services.nix-grpc-daemon.package} --listen 127.0.0.1:50052 \
+          ${lib.getExe config.services.nix-grpc-daemon.package} --sandbox --listen 127.0.0.1:50052 \
             --proxy-socket /nix/var/nix/daemon-socket/socket \
             --tls-cert ${certDir}/server.pem --tls-key ${certDir}/server.key \
             --client-ca ${certDir}/ca.pem \
@@ -217,7 +218,7 @@ pkgs.testers.runNixOSTest {
         ];
         requires = [ "nix-grpc-certs.service" ];
         serviceConfig.ExecStart = ''
-          ${lib.getExe config.services.nix-grpc-daemon.package} --listen 127.0.0.1:50053 \
+          ${lib.getExe config.services.nix-grpc-daemon.package} --sandbox --listen 127.0.0.1:50053 \
             --proxy-socket /nix/var/nix/daemon-socket/socket \
             --tls-cert ${certDir}/server.pem --tls-key ${certDir}/server.key \
             --client-ca ${certDir}/ca.pem \

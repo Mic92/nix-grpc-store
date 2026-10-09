@@ -84,6 +84,8 @@
 #include "pump.hh"
 #include "socket-activation.hh"
 #include "upload-claims.hh"
+#include "parse-int.hh"
+#include "sandbox.hh"
 #include "upload-spool.hh"
 
 using GrpcStream = grpc::ServerReaderWriter<nix::remote::Chunk, nix::remote::Chunk>;
@@ -888,6 +890,47 @@ void serve(
 }
 } // namespace
 
+namespace {
+
+constexpr std::string_view unixPrefix = "unix:";
+
+// What the daemon may write, execute, connect to and listen on after startup.
+auto sandboxPolicy(const nixgrpc::Options & options, bool listenFdsEmpty) -> nixgrpc::sandbox::Policy
+{
+    using nixgrpc::sandbox::CanonicalPath;
+    namespace fs = std::filesystem;
+    nixgrpc::sandbox::Policy policy;
+    policy.execPaths.push_back(CanonicalPath::from(options.storeDir));
+    policy.writePaths.push_back(CanonicalPath::from(fs::temp_directory_path()));
+    for (auto const & path : options.sandboxWrite) {
+        policy.writePaths.push_back(CanonicalPath::from(path));
+    }
+    policy.connectSockets.push_back(CanonicalPath::from(options.socketPath));
+
+    // Only what the daemon binds itself: systemd hands over the main listener.
+    // An address we cannot read a TCP port from leaves binding unrestricted.
+    std::vector<uint16_t> ports;
+    for (const std::string_view addr : {std::string_view(options.metricsListen), std::string_view(listenFdsEmpty ? options.listen : "")}) {
+        if (addr.empty()) {
+            continue;
+        }
+        if (addr.starts_with(unixPrefix)) {
+            policy.listenSockets.push_back(CanonicalPath::from(addr.substr(unixPrefix.size())));
+            continue;
+        }
+        auto const port = nixgrpc::parseInt<uint16_t>(addr.substr(addr.rfind(':') + 1));
+        if (!port) {
+            policy.listenPorts = nixgrpc::sandbox::AnyPort{};
+            return policy;
+        }
+        ports.push_back(*port);
+    }
+    policy.listenPorts = std::move(ports);
+    return policy;
+}
+
+} // namespace
+
 auto main(int argc, char ** argv) -> int
 try {
     // Pump threads write to a socket whose peer may already be gone; we want
@@ -909,6 +952,9 @@ try {
     const std::span args(argv, static_cast<size_t>(argc));
     auto options = nixgrpc::parseOptions({args.begin(), args.end()});
     auto const listenFds = nixgrpc::systemdListenFds();
+    if (options.sandbox) {
+        nixgrpc::sandbox::apply(sandboxPolicy(options, listenFds.empty()));
+    }
     if (listenFds.empty() && options.idleTimeout) {
         // Nobody would restart us on the next connection.
         throw nix::Error("--idle-timeout requires systemd socket activation");

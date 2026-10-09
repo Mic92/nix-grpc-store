@@ -212,6 +212,24 @@ in
       '';
     };
 
+    sandbox = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Confine the daemon after startup: it may write only its temporary
+          directory, execute only from the store and use only its sockets and
+          ports. Reading stays unrestricted (Landlock on Linux, Seatbelt on macOS). The daemon refuses
+          to start where the kernel offers neither.
+        '';
+      };
+      writePaths = lib.mkOption {
+        type = lib.types.listOf lib.types.path;
+        default = [ ];
+        description = "Extra directories the daemon may write. The temporary directory is always allowed.";
+      };
+    };
+
     extraFlags = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];

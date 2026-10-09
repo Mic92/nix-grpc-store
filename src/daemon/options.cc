@@ -176,6 +176,10 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
                 throw nix::Error("--max-jobs expects an integer in 1..%d", sched::FreeIndex::maxSlots);
             }
             options.maxJobs = *jobs;
+        } else if (arg == "--sandbox") {
+            options.sandbox = true;
+        } else if (arg == "--sandbox-write") {
+            options.sandboxWrite.emplace_back(next());
         } else if (arg == "--min-free") {
             options.minFree = nix::string2IntWithUnitPrefix<uint64_t>(next());
         } else {
