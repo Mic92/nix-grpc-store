@@ -83,6 +83,9 @@ spec:
       {{- if and $root.Values.sandbox.enabled (not $root.Values.sandbox.privileged) }}
       hostUsers: false
       {{- end }}
+      {{- with $root.Values.sandbox.runtimeClassName }}
+      runtimeClassName: {{ . }}
+      {{- end }}
       {{- with $root.Values.imagePullSecrets }}
       imagePullSecrets: {{- toYaml . | nindent 8 }}
       {{- end }}

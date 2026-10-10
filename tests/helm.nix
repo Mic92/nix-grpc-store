@@ -197,6 +197,10 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
     test "$(pick Deployment t-nix-grpc-farm-worker-arm '.spec.template.spec.topologySpreadConstraints[0].whenUnsatisfiable' out.yaml)" = DoNotSchedule
     test "$(pick Deployment t-nix-grpc-farm-scheduler-0 '.spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].topologyKey' out.yaml)" = kubernetes.io/hostname
 
+    test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.runtimeClassName' out.yaml)" = null
+    helm template t chart -f ${valuesFile} --set sandbox.runtimeClassName=cgroup-writable --api-versions monitoring.coreos.com/v1/PodMonitor > rc.yaml
+    test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.runtimeClassName' rc.yaml)" = cgroup-writable
+
     # cert-manager mode: chart-named Secrets everywhere, worker cert covers every scheduler Service.
     helm template t chart -f ${json.generate "values.json" valuesCertManager} > cm.yaml
     helm template t chart -f ${json.generate "values.json" valuesInCluster} --api-versions monitoring.coreos.com/v1/PodMonitor > in-cluster.yaml
