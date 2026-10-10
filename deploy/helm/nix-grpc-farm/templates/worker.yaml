@@ -108,7 +108,10 @@ spec:
           command: [/bin/sh, -ec]
           args:
             - |
-              if [ -e /vol/nix/var/nix/db/db.sqlite ]; then exit 0; fi
+              # A restart can pull a newer image whose /bin points at store paths the volume lacks.
+              if [ -e /vol/nix/var/nix/db/db.sqlite ] &&
+                 [ "$(readlink /vol/nix/var/nix/gcroots/image)" = "$(readlink /nix/var/nix/gcroots/image)" ]; then exit 0; fi
+              rm -rf /vol/nix
               mkdir -p /vol/nix
               cp -a /nix/store /nix/var /vol/nix/
               mkdir -p /vol/nix/var/nix/daemon-socket /vol/nix/var/nix/gcroots /vol/nix/var/nix/profiles
