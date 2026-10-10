@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <utility>
 #include <string_view>
@@ -168,6 +169,11 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.schedulerAddr = next();
         } else if (arg == "--scheduler-token-file") {
             options.schedulerTokenFile = next();
+        } else if (arg == "--farm-id") {
+            options.farmId = next();
+            if (options.farmId.empty()) {
+                throw nix::Error("--farm-id cannot be empty; omit it for the legacy lock");
+            }
         } else if (arg == "--advertise") {
             options.advertise = next();
         } else if (arg == "--max-jobs") {
@@ -197,6 +203,19 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
     }
     if (!options.builder && !options.scheduler) {
         throw nix::Error("--role: need at least one of builder, scheduler");
+    }
+    if (!options.farmId.empty()) {
+        if (!options.scheduler || !options.niks3.enabled()) {
+            throw nix::Error("--farm-id requires --role scheduler and --niks3");
+        }
+        const auto valid = [](char c) -> bool {
+            return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
+        };
+        if (options.farmId.size() > 63 || !std::ranges::all_of(options.farmId, valid)
+            || !valid(options.farmId.front()) || options.farmId.front() == '-'
+            || options.farmId.back() == '-') {
+            throw nix::Error("--farm-id must be a lowercase DNS label (up to 63 characters)");
+        }
     }
     if (!options.builder) {
         options.maxJobs = 0;

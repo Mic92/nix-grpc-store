@@ -71,6 +71,7 @@ let
     };
   };
   valuesPublicSecret = lib.recursiveUpdate values { tls.public.existingSecret = "public"; };
+  valuesNamedFarm = lib.recursiveUpdate values { scheduler.farmId = "build-x86"; };
   # Service account tokens both ways, no TLS.
   valuesInCluster = lib.recursiveUpdate values {
     niks3.auth = {
@@ -94,6 +95,7 @@ let
       valuesCertManager
       valuesPublicCertManager
       valuesPublicSecret
+      valuesNamedFarm
     ]
     ++ extraValues
   );
@@ -178,6 +180,13 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
       helm template t chart -f "$v" --api-versions monitoring.coreos.com/v1/PodMonitor | yq -e '.kind' > /dev/null
     done
     helm template t chart -f ${valuesFile} --api-versions monitoring.coreos.com/v1/PodMonitor > out.yaml
+    helm template t chart -f ${json.generate "values.json" valuesNamedFarm} > named-farm.yaml
+    test "$(yq -r 'select(.kind == "Deployment" and .metadata.name == "t-nix-grpc-farm-scheduler-0") | .spec.template.spec.containers[0].args[] | select(startswith("--farm-id="))' named-farm.yaml)" = --farm-id=build-x86
+    ! yq -r 'select(.kind == "Deployment" and .metadata.name == "t-nix-grpc-farm-scheduler-0") | .spec.template.spec.containers[0].args[]' out.yaml | grep -q -- '--farm-id='
+    if helm template t chart -f ${valuesFile} --set scheduler.farmId=Bad >/dev/null 2>&1; then
+      echo 'invalid scheduler.farmId was accepted' >&2
+      exit 1
+    fi
 
     yq -r 'select(.kind == "ConfigMap" and .metadata.name == "t-nix-grpc-farm-lb") | .data."envoy.json"' out.yaml \
       | jq -S -f ${normalize} > chart.json

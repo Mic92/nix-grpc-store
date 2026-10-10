@@ -16,7 +16,7 @@ namespace nixgrpc {
 class Elector
 {
 public:
-    Elector(const Niks3Client & niks3, std::function<void(bool)> onChange);
+    Elector(const Niks3Client & niks3, std::string farmId, std::function<void(bool)> onChange);
     ~Elector();
     Elector(const Elector &) = delete;
     auto operator=(const Elector &) -> Elector & = delete;
@@ -25,6 +25,7 @@ public:
 
 private:
     const Niks3Client & niks3;
+    std::string farmId;
     std::function<void(bool)> onChange;
     bool active = false;
     // Nobody else can be elected while niks3 is down.

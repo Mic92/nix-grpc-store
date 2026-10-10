@@ -78,6 +78,9 @@ spec:
             - --metrics-listen=0.0.0.0:9464
             - --worker-name=scheduler/$(POD_NAME)
             - --log-level={{ .Values.logLevel }}
+            {{- with $s.farmId }}
+            - {{ printf "--farm-id=%s" . | quote }}
+            {{- end }}
             # Cached replies need niks3; without it every Want is Assigned.
             - --niks3={{ .Values.niks3.serverURL }}
             - --niks3-token-file=/secrets/niks3/token

@@ -409,7 +409,7 @@ void Coordinator::start(grpc::Server & server)
         const bool elect = options.niks3.enabled() && (!builder || !options.schedulerAddr.empty());
         setSchedulerActive(!elect);
         if (elect) {
-            elector.emplace(*cache.client(), [this](bool lead) -> void { setSchedulerActive(lead); });
+            elector.emplace(*cache.client(), options.farmId, [this](bool lead) -> void { setSchedulerActive(lead); });
         }
     }
     if (!builder) {
