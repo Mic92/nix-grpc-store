@@ -118,6 +118,40 @@ sandbox:
   enabled: false
 ```
 
+### Writable cgroups
+
+Kubernetes mounts `/sys/fs/cgroup` read-only in every unprivileged
+container, so builds cannot get a cgroup of their own. Where the nodes
+can hand a pod a delegated cgroup, point the workers at it with
+`sandbox.runtimeClassName`:
+
+```yaml
+sandbox:
+  runtimeClassName: cgroup-writable
+```
+
+On self-managed nodes this takes containerd 2.1 or later with a runtime
+handler that sets `cgroup_writable = true` and `SystemdCgroup = true`, a
+`RuntimeClass` naming that handler, and the kubelet on the systemd
+cgroup driver. Together with `hostUsers: false`, which the chart sets,
+runc then makes the pod's cgroup owned by the pod's root. The pod can
+create child cgroups but cannot change its own `memory.max`.
+
+On GKE (1.34.1 or later) enable `writableCgroups` in the node pool's
+containerd config instead and select it per pod:
+
+```yaml
+workerDefaults:
+  nodeSelector: {node.gke.io/enable-writable-cgroups: "true"}
+  podAnnotations: {node.gke.io/enable-writable-cgroups: "true"}
+  resources:
+    requests: {cpu: "8", memory: 32Gi}
+    limits: {cpu: "8", memory: 32Gi}
+```
+
+GKE requires the Guaranteed QoS class, so requests and limits must be
+equal on every container of the pod.
+
 ### Size the store and the disk watermarks
 
 A worker's `/nix` is an `emptyDir` on the node's disk. When free space
