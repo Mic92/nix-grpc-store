@@ -448,7 +448,7 @@ public:
     }
 
     // Same headers on every RPC so the balancer keeps us on that worker.
-    void uploadDrvClosure(Store & evalStore, const StorePath & drvPath, const Metadata & headers);
+    void uploadDrvClosure(Store & evalStore, std::vector<StorePath> drvPaths, const Metadata & headers);
 
     // Relays log/phase chunks, hands `done` to onDone, keeps the output infos for queryPathInfo.
     template<typename Chunk, typename F>

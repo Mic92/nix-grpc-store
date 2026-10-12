@@ -63,9 +63,9 @@ auto GrpcStore::routingFor(const BasicDerivation & drv, const std::string & work
   return meta;
 }
 
-void GrpcStore::uploadDrvClosure(Store & evalStore, const StorePath & drvPath, const Metadata & headers) {
+void GrpcStore::uploadDrvClosure(Store & evalStore, std::vector<StorePath> drvPaths, const Metadata & headers) {
   auto const missing = nixgrpc::missingTopDown(
-      std::vector{drvPath},
+      std::move(drvPaths),
       [](const StorePath & path) -> std::vector<StorePath> { return {path}; },
       [&](const StorePath & path) -> StorePathSet { return evalStore.queryPathInfo(path)->references; },
       [&](const StorePathSet & paths) -> StorePathSet { return queryValidPathsRouted(paths, NoSubstitute, headers); });
@@ -132,7 +132,7 @@ auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore)
   std::optional<BuildResult> res;
   auto status = tryBuildDerivation(request, headers, res);
   if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
-    uploadDrvClosure(evalStore, job.drvPath, headers);
+    uploadDrvClosure(evalStore, {job.drvPath}, headers);
     status = tryBuildDerivation(request, headers, res);
   }
   // Our own cancel ends the stream CANCELLED, and a dead worker looks the same.
@@ -553,6 +553,13 @@ void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, BuildMode buildMode, St
     }
   }
   auto const headers = routingFor(jobs.begin()->second.drv);
+  // Uploading here keeps a build from waiting on the upload of its inputs' derivations.
+  std::vector<StorePath> drvPaths;
+  drvPaths.reserve(jobs.size());
+  for (const auto & [drvPath, job] : jobs) {
+    drvPaths.push_back(drvPath);
+  }
+  uploadDrvClosure(evalStore, std::move(drvPaths), headers);
   std::vector<std::jthread> threads(std::min<size_t>(config->maxBuilds, jobs.size()));
   for (auto & thread : threads) {
     thread = std::jthread([&run] -> void { run.work(); });
