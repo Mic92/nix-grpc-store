@@ -46,6 +46,7 @@ stdenv.mkDerivation {
         ../../src/nix-compat.hh
         ../../src/path-info-wire.hh
         ../../src/pump.hh
+        ../../src/top-down.hh
       ]
       ++ lib.optionals server [
         ../../pch/daemon_pch.hh
@@ -64,6 +65,7 @@ stdenv.mkDerivation {
         ../../tests/log-spill-test.cc
         ../../tests/plugin-loader-test.cc
         ../../tests/upload-claims-test.cc
+        ../../tests/top-down-test.cc
         ../../tests/upload-spool-test.cc
         ../../tests/call-test.cc
         ../../tests/nar-fetcher-test.cc

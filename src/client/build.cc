@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -49,6 +50,7 @@
 #include "nix-compat.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
+#include "top-down.hh"
 
 namespace nix {
 
@@ -62,15 +64,11 @@ auto GrpcStore::routingFor(const BasicDerivation & drv, const std::string & work
 }
 
 void GrpcStore::uploadDrvClosure(Store & evalStore, const StorePath & drvPath, const Metadata & headers) {
-  StorePathSet closure;
-  evalStore.computeFSClosure(drvPath, closure);
-  auto const present = queryValidPathsRouted(closure, NoSubstitute, headers);
-  StorePathSet missing;
-  for (const auto & path : closure) {
-    if (!present.contains(path)) {
-      missing.insert(path);
-    }
-  }
+  auto const missing = nixgrpc::missingTopDown(
+      std::vector{drvPath},
+      [](const StorePath & path) -> std::vector<StorePath> { return {path}; },
+      [&](const StorePath & path) -> StorePathSet { return evalStore.queryPathInfo(path)->references; },
+      [&](const StorePathSet & paths) -> StorePathSet { return queryValidPathsRouted(paths, NoSubstitute, headers); });
   if (missing.empty()) {
     return;
   }
@@ -664,11 +662,15 @@ auto GrpcStore::basicForFarm(Store & evalStore, const StorePath & drvPath, const
 }
 
 // Inputs whose outputs the farm already has or can substitute are not
-// jobs: the worker fetches them when it builds the dependant. One
-// QueryValidPaths for the whole closure instead of a Want per drv.
-// NoSubstitute: a farm node also reports what its substituters offer,
-// without fetching it just to answer.
-auto GrpcStore::validInputDrvs(const std::vector<DerivedPath> & reqs, Store & evalStore) -> StorePathSet {
+// jobs: the worker fetches them when it builds the dependant.
+//
+// The server is queried top-down. One QueryValidPaths for the whole closure is
+// slow: with a remote cache configured, the daemon publishes every path it
+// holds before it answers.
+//
+// NoSubstitute: the daemon still reports what its substituters offer, but
+// does not fetch anything just to answer.
+auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, Store & evalStore) -> StorePathSet {
   std::map<StorePath, Derivation> drvs;
   std::function<void(const StorePath &)> collect = [&](const StorePath & drvPath) -> void {
     if (drvs.contains(drvPath)) {
@@ -684,32 +686,31 @@ auto GrpcStore::validInputDrvs(const std::vector<DerivedPath> & reqs, Store & ev
       collect(built->drvPath->getBaseStorePath());
     }
   }
-  StorePathSet outputs;
-  std::map<StorePath, std::vector<StorePath>> outputsOf;
-  for (auto & [drvPath, full] : drvs) {
-    if (tops.contains(drvPath)) {
-      continue;
-    }
-    for (auto & [name, path] : evalStore.queryStaticPartialDerivationOutputMap(drvPath)) {
-      if (path) {
-        outputs.insert(*path);
-        outputsOf[drvPath].push_back(*path);
-      }
-    }
-  }
-  auto present = outputs.empty() ? StorePathSet{} : queryValidPaths(outputs, NoSubstitute);
-  StorePathSet valid;
-  for (auto & [drvPath, outs] : outputsOf) {
-    if (!outs.empty() && std::ranges::all_of(outs, [&](auto & out) -> bool { return present.contains(out); })) {
-      valid.insert(drvPath);
-    }
-  }
-  return valid;
+  return nixgrpc::missingTopDown(
+      std::vector(tops.begin(), tops.end()),
+      [&](const StorePath & drvPath) -> std::vector<StorePath> {
+        std::vector<StorePath> outs;
+        if (tops.contains(drvPath)) {
+          return outs;
+        }
+        for (auto & [name, path] : evalStore.queryStaticPartialDerivationOutputMap(drvPath)) {
+          if (path) {
+            outs.push_back(*path);
+          }
+        }
+        return outs;
+      },
+      [&](const StorePath & drvPath) -> std::vector<StorePath> {
+        std::vector<StorePath> inputs;
+        nixcompat::forInputDrvs(drvs.at(drvPath), [&](const StorePath & input) -> void { inputs.push_back(input); });
+        return inputs;
+      },
+      [&](const StorePathSet & paths) -> StorePathSet { return queryValidPaths(paths, NoSubstitute); });
 }
 
 void GrpcStore::loadJobs(const std::vector<DerivedPath> & reqs, Store & evalStore,
                   std::map<StorePath, Job> & jobs) {
-  auto valid = validInputDrvs(reqs, evalStore);
+  auto const missing = missingInputDrvs(reqs, evalStore);
   std::function<Job &(const StorePath &)> load = [&](const StorePath & drvPath) -> Job & {
     if (auto const found = jobs.find(drvPath); found != jobs.end()) {
       return found->second;
@@ -719,7 +720,7 @@ void GrpcStore::loadJobs(const std::vector<DerivedPath> & reqs, Store & evalStor
                                            .drv = basicForFarm(evalStore, drvPath, full)})
                      .first->second;
     nixcompat::forInputDrvs(full, [&](const StorePath & input) -> void {
-      if (valid.contains(input)) {
+      if (!missing.contains(input)) {
         return;
       }
       auto & dep = load(input);

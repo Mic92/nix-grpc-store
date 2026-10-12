@@ -518,7 +518,7 @@ public:
     auto basicForFarm(Store & evalStore, const StorePath & drvPath, const Derivation & full)
         -> BasicDerivation;
 
-    auto validInputDrvs(const std::vector<nix::DerivedPath> & reqs, nix::Store & evalStore) -> nix::StorePathSet;
+    auto missingInputDrvs(const std::vector<nix::DerivedPath> & reqs, nix::Store & evalStore) -> nix::StorePathSet;
     void loadJobs(const std::vector<DerivedPath> & reqs, Store & evalStore,
                   std::map<StorePath, Job> & jobs);
 

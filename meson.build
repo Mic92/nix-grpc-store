@@ -303,6 +303,12 @@ if build_server
     dependencies : common_deps + [nix_store_dep, nix_util_dep],
   ), timeout : 30)
 
+  test('top-down', executable('top-down-test',
+    sources : ['tests/top-down-test.cc'],
+    include_directories : [src_inc],
+    cpp_args : ['-UNDEBUG'],
+  ))
+
   test('upload-claims', executable('upload-claims-test',
     sources : ['tests/upload-claims-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
