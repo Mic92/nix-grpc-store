@@ -109,6 +109,21 @@ void Builder::onRevoke(const nix::remote::Revoke & rev)
     sendDone(rev.drv_path(), assignId, nix::remote::Done::CANCELLED, {});
 }
 
+void Builder::release(const std::string & drvPath)
+{
+    uint64_t assignId = 0;
+    {
+        auto lck = state.lock();
+        auto const found = lck->expected.find(drvPath);
+        if (found == lck->expected.end() || found->second.running) {
+            return;
+        }
+        assignId = found->second.assignId;
+        lck->expected.erase(found);
+    }
+    sendDone(drvPath, assignId, nix::remote::Done::CANCELLED, {});
+}
+
 auto Builder::admit(const std::string & drvPath) -> std::optional<Admission>
 {
     auto lck = state.lock();

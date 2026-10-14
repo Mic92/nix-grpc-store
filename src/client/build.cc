@@ -115,6 +115,21 @@ auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & reques
   });
 }
 
+namespace {
+// The assigned worker cannot take the job (any more), the scheduler may place it elsewhere.
+auto workerLeft(grpc::StatusCode code) -> bool {
+  switch (code) {
+  case grpc::StatusCode::FAILED_PRECONDITION: // not expected there (any more)
+  case grpc::StatusCode::UNAVAILABLE:         // worker draining or gone
+  case grpc::StatusCode::UNKNOWN:             // worker died mid-stream ("Stream removed"),
+  case grpc::StatusCode::INTERNAL:            //   or RST_STREAM via the balancer
+    return true;
+  default:
+    return false;
+  }
+}
+} // namespace
+
 auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore) -> std::optional<BuildResult> {
   remote::BuildDerivationRequest request;
   request.set_drv_path(std::string(job.drvPath.to_string()));
@@ -132,25 +147,30 @@ auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore)
   std::optional<BuildResult> res;
   auto status = tryBuildDerivation(request, headers, res);
   if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
-    uploadDrvClosure(evalStore, {job.drvPath}, headers);
-    status = tryBuildDerivation(request, headers, res);
+    try {
+      uploadDrvClosure(evalStore, {job.drvPath}, headers);
+      status = tryBuildDerivation(request, headers, res);
+    } catch (GrpcStatusError & err) {
+      // The upload goes to the assigned worker as well, which may drain or
+      // die under it just like under BuildDerivation.
+      if (!workerLeft(err.status.error_code())) {
+        throw;
+      }
+      status = err.status;
+    }
   }
   // Our own cancel ends the stream CANCELLED, and a dead worker looks the same.
   if (!status.ok()) {
     checkInterrupt();
   }
-  switch (status.error_code()) {
-  case grpc::StatusCode::ABORTED: // superseded: the scheduler already sent where to go
+  if (status.error_code() == grpc::StatusCode::ABORTED) { // superseded: the scheduler already sent where to go
     return std::nullopt;
-  case grpc::StatusCode::FAILED_PRECONDITION: // not expected there (any more)
-  case grpc::StatusCode::UNAVAILABLE:         // worker draining or gone
-  case grpc::StatusCode::UNKNOWN:             // worker died mid-stream ("Stream removed"),
-  case grpc::StatusCode::INTERNAL:            //   or RST_STREAM via the balancer
+  }
+  if (workerLeft(status.error_code())) {
     printError("%s: %s, asking the scheduler again", job.drvPath.to_string(), firstLine(status.error_message()));
     return std::nullopt;
-  default:
-    checkStatus(status, "BuildDerivation");
   }
+  checkStatus(status, "BuildDerivation");
   if (!res) {
     throw Error("gRPC BuildDerivation stream ended without a result");
   }

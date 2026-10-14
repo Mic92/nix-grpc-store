@@ -160,7 +160,7 @@ auto GrpcStore::connectHint(const std::string & msg) const -> std::string
   return more.empty() ? "" : "\nhint:" + more;
 }
 
-auto GrpcStore::statusError(const grpc::Status & status, const char * opName) const -> Error
+auto GrpcStore::statusError(const grpc::Status & status, const char * opName) const -> GrpcStatusError
 {
   std::string hint;
   auto const code = status.error_code();
@@ -169,8 +169,8 @@ auto GrpcStore::statusError(const grpc::Status & status, const char * opName) co
     hint = connectHint(status.error_message());
   }
   // NOLINTNEXTLINE(modernize-return-braced-init-list): Error ctor is explicit
-  return Error("gRPC %s on '%s' failed: %s%s", opName, config->authority.to_string(),
-               status.error_message(), hint);
+  return GrpcStatusError(status, "gRPC %s on '%s' failed: %s%s", opName, config->authority.to_string(),
+                         status.error_message(), hint);
 }
 
 auto GrpcStore::goneAway(const grpc::Status & status) -> bool {

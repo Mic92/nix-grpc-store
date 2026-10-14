@@ -469,6 +469,79 @@ fn a_deploy_mid_build_drains_and_the_new_generation_takes_over() {
 }
 
 #[test]
+fn a_builder_stopped_mid_upload_lets_it_land_and_the_build_moves_on() {
+    farm_ready();
+    let big = succeed(
+        CLIENT,
+        &[
+            "sh",
+            "-c",
+            "head -c 16M /dev/urandom > /tmp/big && nix-store --add /tmp/big",
+        ],
+    )
+    .trim()
+    .to_string();
+    // ~16 s for the upload, so the stop lands while it is in flight.
+    succeed(
+        CLIENT,
+        &[
+            "tc", "qdisc", "add", "dev", "eth1", "root", "tbf", "rate", "8mbit", "burst", "32kbit",
+            "latency", "400ms",
+        ],
+    );
+    succeed(
+        CLIENT,
+        &[
+            "systemd-run",
+            "--unit",
+            "up",
+            "nix",
+            "build",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "-f",
+            &expr("DEP"),
+            "job",
+            "--argstr",
+            "tag",
+            "drain-upload",
+            "--argstr",
+            "inputPath",
+            &big,
+        ],
+    );
+    let uploading = |w: Node| gauge(w, r#"nix_grpc_inflight{kind="AddMultipleToStore"}"#) > 0;
+    let mut busy = None;
+    retry(60, "an upload is in flight", || {
+        busy = WORKERS.into_iter().find(|&w| uploading(w));
+        busy.is_some()
+    });
+    let busy = busy.unwrap();
+    // Like a CI job leaving: one SIGTERM, nothing building there.
+    succeed(
+        busy,
+        &["systemctl", "stop", "--no-block", "nix-grpc-daemon.service"],
+    );
+    wait_unit_done("up", 180);
+    succeed(CLIENT, &["tc", "qdisc", "del", "dev", "eth1", "root"]);
+    assert_unit_success("up");
+    assert_no_journal(CLIENT, "up", "Cancelling all calls");
+    wait_until_succeeds(
+        busy,
+        &[
+            "sh",
+            "-c",
+            "systemctl is-active nix-grpc-daemon.service || systemctl start nix-grpc-daemon.service",
+        ],
+        60,
+    );
+    wait_members(&system(), &WORKERS);
+    retry(90, "scheduler settled", settled);
+}
+
+#[test]
 fn queue_gauges_show_a_burst_while_every_build_blocks() {
     farm_ready();
     let sys = system();

@@ -758,6 +758,9 @@ public:
                 return {grpc::StatusCode::INVALID_ARGUMENT, "unsupported build protocol or mode"};
             }
             if (stopSignal != 0) {
+                if (coord.builder) {
+                    coord.builder->release(request->drv_path());
+                }
                 return {grpc::StatusCode::UNAVAILABLE, "worker draining"};
             }
             auto const localStore = getStore();
@@ -858,8 +861,10 @@ public:
 
 namespace {
 // Returns on idle timeout or SIGTERM. A builder's first SIGTERM only stops
-// taking builds and this returns once those in flight have reported. The
-// supervisor's stop timeout or a second signal bounds that.
+// taking builds and this returns once those in flight have reported, and
+// uploads in flight have landed: Shutdown() would cut them off and fail the
+// client's build instead of bouncing it. The supervisor's stop timeout or a
+// second signal bounds that.
 void serve(
     grpc::Server const & server,
     const nixgrpc::Options & options,
@@ -878,7 +883,9 @@ void serve(
                 return;
             }
             coord.tick();
-        } else if (stopSignal >= nixgrpc::kCancelBuilds || !coord.builder || metrics.inflightNow("BuildDerivation") == 0) {
+        } else if (
+            stopSignal >= nixgrpc::kCancelBuilds || !coord.builder
+            || metrics.inflightNow("BuildDerivation") + metrics.inflightNow("AddMultipleToStore") == 0) {
             return;
         } else if (!draining) {
             draining = true;

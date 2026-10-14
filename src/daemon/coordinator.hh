@@ -86,6 +86,9 @@ public:
     // From the scheduler.
     void onExpect(const nix::remote::Expect & exp);
     void onRevoke(const nix::remote::Revoke & rev);
+    // Gives back an Expect this worker will not build, so the scheduler
+    // places the drv anew instead of sending its client back here.
+    void release(const std::string & drvPath);
 
     // BuildDerivation entry: nullopt => FAILED_PRECONDITION. `attach` set if
     // the drv already runs. Caller then waits on it instead of building.
