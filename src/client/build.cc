@@ -310,6 +310,7 @@ struct GrpcStore::Run {
   // follow a redirect it already sent.
   void requeueLocked(Job & job) {
     bool const free = std::exchange(job.freeBounce, false);
+    std::pair left{job.workerAddr, job.assignId};
     job.workerAddr = std::exchange(job.redirectAddr, {});
     job.assignId = std::exchange(job.redirectId, 0);
     if (!job.workerAddr.empty()) {
@@ -321,6 +322,9 @@ struct GrpcStore::Run {
       finishLocked(job, nixcompat::failed(nixcompat::FailureStatus::MiscFailure,
                                           fmt("gave up after %d reschedules", job.bounced)));
     } else {
+      if (!free && job.bouncedId == 0) {
+        job.refundable = std::move(left);
+      }
       wantable.push_back(&job);
       flushWants();
     }
@@ -420,6 +424,10 @@ struct GrpcStore::Run {
       }
       job->workerAddr = msg.assigned().worker_addr();
       job->assignId = msg.assigned().assign_id();
+      if (job->refundable == std::pair{job->workerAddr, job->assignId}) {
+        job->bounced--; // that worker still holds the build, only our stream to it broke
+      }
+      job->refundable.reset();
       job->bouncedId = 0;
     } else if (msg.has_cached()) {
       job->result = cachedResult(*job);

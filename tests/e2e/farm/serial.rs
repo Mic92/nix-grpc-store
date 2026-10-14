@@ -685,6 +685,66 @@ fn a_builder_the_balancer_cannot_reach_hands_its_builds_to_another() {
     retry(60, "scheduler settled", settled);
 }
 
+/// Moves the scheduler to `w`.
+fn lead(w: Node) {
+    if leader() == w {
+        return;
+    }
+    let was = leader();
+    let pattern = "event=scheduler_take_over";
+    let before = journal_count(w, UNIT, pattern);
+    succeed(was, &["systemctl", "stop", "nix-grpc-daemon.service"]);
+    wait_journal_above(w, UNIT, pattern, before, 30);
+    succeed(was, &["systemctl", "start", "nix-grpc-daemon.service"]);
+    wait_members(&system(), &WORKERS);
+    retry(60, "scheduler settled", settled);
+    assert_eq!(leader(), w);
+}
+
+#[test]
+fn a_build_whose_stream_breaks_goes_on_and_the_client_follows_it_again() {
+    farm_ready();
+    // Then the balancer's connections to worker1 carry the build only.
+    lead(WORKER2);
+    succeed(
+        CLIENT,
+        &[
+            "systemd-run",
+            "--unit",
+            "flap",
+            "nix",
+            "build",
+            "--store",
+            &format!("{}&reschedule-retries=1", envoy()),
+            "--eval-store",
+            "auto",
+            "-f",
+            &expr("SLOW"),
+            "--argstr",
+            "tag",
+            "flap",
+            "--arg",
+            "features",
+            r#"["vip"]"#,
+        ],
+    );
+    wait_building();
+    assert_eq!(building(), [WORKER1]);
+    let ip = env("NGS_WORKER1_IP");
+    for _ in 0..3 {
+        let attached = events(WORKER1, "attached");
+        // Like a tunnel or proxy on the way resetting the stream.
+        succeed(LB, &["ss", "-tK", "dst", &ip, "dport", "=", ":50051"]);
+        retry(60, "the client attached again", || {
+            events(WORKER1, "attached") > attached
+        });
+        assert_eq!(building(), [WORKER1], "the build stopped or moved");
+    }
+    release_slow();
+    wait_unit_done("flap", 90);
+    assert_unit_success("flap");
+}
+
 #[test]
 fn a_store_query_cut_off_by_a_builder_shutting_down_is_retried() {
     farm_ready();

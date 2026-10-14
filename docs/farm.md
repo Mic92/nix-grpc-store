@@ -40,7 +40,8 @@ What happens on a build:
   up. A build nobody announced is turned away and the client asks the
   scheduler again. So does a client the balancer could not connect to
   that builder, and the scheduler picks another one. A second client for
-  a build that is already running attaches to it.
+  a build that is already running attaches to it, and so does a client
+  whose stream to it broke: the build goes on until no client wants it.
 * The balancer (envoy) sends scheduler traffic to the active scheduler,
   sends each build to the builder the scheduler named, and spreads
   everything else (uploads, queries, downloads) over the builders of

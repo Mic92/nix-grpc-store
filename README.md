@@ -345,7 +345,9 @@ which also requires `trustClients` (see above).
     scheduler says no worker can take a build.
   * `reschedule-retries` (default 8) — how often a derivation bounced by
     its assigned worker is handed back to the scheduler. The first bounce
-    by a worker that drained, left or lost the assignment does not count.
+    by a worker that drained, left or lost the assignment does not count,
+    nor does one after which the scheduler sends it back to the same
+    assignment, where the build still runs.
   * `max-builds` (default 64) — concurrent `BuildDerivation` streams.
   * `system` — send `x-nix-system` on every call, not just builds, so a
     balancer routes input uploads and substitution to a worker of that

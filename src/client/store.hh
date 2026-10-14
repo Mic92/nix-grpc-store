@@ -503,6 +503,9 @@ public:
       bool freeBounce = false; // the last bounce does not count against reschedule-retries
       // The assignment whose worker did not take the job, for the next Want.
       uint64_t bouncedId = 0;
+      // A counted bounce off this worker and assignment. Refunded if the
+      // scheduler sends us back to it: the build there outlived our stream.
+      std::optional<std::pair<std::string, uint64_t>> refundable;
       std::optional<StorePath> failedInput;
       std::optional<BuildResult> result;
       // Set by the reader thread, consumed by a build thread.
