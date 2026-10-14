@@ -343,8 +343,8 @@ public:
     static constexpr std::chrono::milliseconds maxReconnectPause{4000};
     template<typename F>
     void retrying(const char * what, const F & attempt) {
-      auto const giveUp = std::chrono::steady_clock::now()
-                    + (everConnected ? restartGrace() : std::chrono::seconds(config->connectTimeout.get()));
+      // From the first failure: an upload cut off after minutes still gets the whole window.
+      std::optional<std::chrono::steady_clock::time_point> giveUp;
       auto pause = std::chrono::milliseconds(500); // NOLINT(*-magic-numbers)
       for (;;) {
         auto const status = attempt();
@@ -352,7 +352,11 @@ public:
         if (status.ok()) {
           everConnected = true;
         }
-        if (!goneAway(status) || std::chrono::steady_clock::now() + pause > giveUp) {
+        auto const now = std::chrono::steady_clock::now();
+        if (!giveUp) {
+          giveUp = now + (everConnected ? restartGrace() : std::chrono::seconds(config->connectTimeout.get()));
+        }
+        if (!goneAway(status) || now + pause > *giveUp) {
           checkStatus(status, what);
           return;
         }

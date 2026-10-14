@@ -795,6 +795,69 @@ fn a_store_query_cut_off_by_a_builder_shutting_down_is_retried() {
 }
 
 #[test]
+fn an_upload_cut_off_after_longer_than_the_restart_grace_is_retried() {
+    farm_ready();
+    // An upload is answered once niks3 has it, so a stopped niks3 push holds it.
+    // Bracketed so pkill does not stop the shell running it.
+    let push = "push --[s]tdin";
+    for w in WORKERS {
+        let path = succeed(
+            CLIENT,
+            &[
+                "sh",
+                "-c",
+                &format!("echo prime-{} > /tmp/prime && nix-store --add /tmp/prime", w.0),
+            ],
+        )
+        .trim()
+        .to_string();
+        succeed(
+            CLIENT,
+            &["nix", "copy", "--no-check-sigs", "--to", &direct(w), &path],
+        );
+        succeed(w, &["pkill", "-STOP", "-f", push]);
+    }
+    succeed(
+        CLIENT,
+        &[
+            "systemd-run",
+            "--unit",
+            "held",
+            "nix",
+            "build",
+            "--store",
+            &format!("{}&restart-grace=10", envoy()),
+            "--eval-store",
+            "auto",
+            "-f",
+            &expr("JOB"),
+            "--argstr",
+            "tag",
+            "held",
+        ],
+    );
+    let uploading = |w: Node| gauge(w, r#"nix_grpc_inflight{kind="AddMultipleToStore"}"#) > 0;
+    let mut busy = None;
+    retry(60, "the derivations are uploading", || {
+        busy = WORKERS.into_iter().find(|&w| uploading(w));
+        busy.is_some()
+    });
+    let busy = busy.unwrap();
+    // In CI a busy niks3 held the derivation upload for minutes.
+    sleep(15);
+    assert!(uploading(busy), "the upload did not wait for niks3");
+    // Like the builder's tunnel going away: "reset reason: connection termination".
+    let ip = env(&format!("NGS_{}_IP", busy.0.to_uppercase()));
+    succeed(LB, &["ss", "-tK", "dst", &ip, "dport", "=", ":50051"]);
+    for w in WORKERS {
+        succeed(w, &["pkill", "-CONT", "-f", push]);
+    }
+    wait_unit_done("held", 180);
+    assert_unit_success("held");
+    assert_journal(CLIENT, "held", "upstream.*, retrying");
+}
+
+#[test]
 fn queue_gauges_show_a_burst_while_every_build_blocks() {
     farm_ready();
     let sys = system();
