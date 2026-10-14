@@ -455,8 +455,12 @@ fn a_deploy_mid_build_drains_and_the_new_generation_takes_over() {
     succeed(busy, &["pkill", "-f", "read -t [9]0 x"]);
     wait_unit_done("sw", 90);
     assert_unit_success("sw");
+    restart_daemon(busy);
+}
+
+fn restart_daemon(w: Node) {
     wait_until_succeeds(
-        busy,
+        w,
         &[
             "sh",
             "-c",
@@ -466,6 +470,36 @@ fn a_deploy_mid_build_drains_and_the_new_generation_takes_over() {
     );
     wait_members(&system(), &WORKERS);
     retry(90, "scheduler settled", settled);
+}
+
+#[test]
+fn a_draining_builder_lets_a_client_attach_to_the_build_it_runs() {
+    farm_ready();
+    spawn_build("da1", "drain-attach");
+    wait_building();
+    let busy = building()[0];
+    let draining = "event=draining";
+    let before = journal_count(busy, UNIT, draining);
+    succeed(
+        busy,
+        &["systemctl", "stop", "--no-block", "nix-grpc-daemon.service"],
+    );
+    wait_journal_above(busy, UNIT, draining, before, 30);
+    // The scheduler sends whoever wants the drv to the worker that runs it,
+    // draining or not. Like a client whose stream to it broke.
+    let attached = events(busy, "attached");
+    spawn_build("da2", "drain-attach");
+    retry(60, "the second client attached", || {
+        events(busy, "attached") > attached
+    });
+    release_slow();
+    wait_unit_done("da1 da2", 90);
+    for unit in ["da1", "da2"] {
+        assert_unit_success(unit);
+    }
+    // Before, the worker answered "worker draining" until reschedule-retries ran out.
+    assert_no_journal(CLIENT, "da2", "asking the scheduler again");
+    restart_daemon(busy);
 }
 
 #[test]
@@ -529,17 +563,7 @@ fn a_builder_stopped_mid_upload_lets_it_land_and_the_build_moves_on() {
     succeed(CLIENT, &["tc", "qdisc", "del", "dev", "eth1", "root"]);
     assert_unit_success("up");
     assert_no_journal(CLIENT, "up", "Cancelling all calls");
-    wait_until_succeeds(
-        busy,
-        &[
-            "sh",
-            "-c",
-            "systemctl is-active nix-grpc-daemon.service || systemctl start nix-grpc-daemon.service",
-        ],
-        60,
-    );
-    wait_members(&system(), &WORKERS);
-    retry(90, "scheduler settled", settled);
+    restart_daemon(busy);
 }
 
 #[test]

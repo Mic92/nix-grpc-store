@@ -769,10 +769,10 @@ public:
                 || request->build_mode() > static_cast<uint32_t>(nix::bmCheck)) {
                 return {grpc::StatusCode::INVALID_ARGUMENT, "unsupported build protocol or mode"};
             }
-            if (stopSignal != 0) {
-                if (coord.builder) {
-                    coord.builder->release(request->drv_path());
-                }
+            // Draining takes no new builds. A caller whose stream to a build
+            // already running here broke still attaches to it: the scheduler
+            // sends it back here for as long as that build runs.
+            if (stopSignal != 0 && (!coord.builder || !coord.builder->release(request->drv_path()))) {
                 return {grpc::StatusCode::UNAVAILABLE, "worker draining"};
             }
             auto const localStore = getStore();
