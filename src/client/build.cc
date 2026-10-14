@@ -129,6 +129,19 @@ auto workerLeft(grpc::StatusCode code) -> bool {
     return false;
   }
 }
+
+// The worker never got the call or turned it down: it does not hold the build.
+auto notTaken(const grpc::Status & status) -> bool {
+  auto const & msg = status.error_message();
+  switch (status.error_code()) {
+  case grpc::StatusCode::FAILED_PRECONDITION: // not expected there, or the balancer sent us to another worker
+    return true;
+  case grpc::StatusCode::UNAVAILABLE: // draining, or the balancer could not connect to it
+    return msg.contains("worker draining") || msg.contains("connection failure") || msg.contains("connection timeout");
+  default:
+    return false;
+  }
+}
 } // namespace
 
 auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore) -> std::optional<BuildResult> {
@@ -172,12 +185,10 @@ auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore)
   }
   if (workerLeft(status.error_code())) {
     printError("%s: %s, asking the scheduler again", job.drvPath.to_string(), firstLine(status.error_message()));
+    // Tells the scheduler to place it elsewhere instead of sending us back.
+    job.bouncedId = notTaken(status) ? job.assignId : 0;
     // Not the job's fault, so not worth a retry, the first time per worker.
-    // Once more from the same worker counts: the scheduler may not know it is
-    // unreachable from here.
-    auto const & msg = status.error_message();
-    job.freeBounce = (goneAway(status) || msg.contains("worker draining") || msg.contains("not scheduled here"))
-                     && job.leftBy.insert(job.workerAddr).second;
+    job.freeBounce = (goneAway(status) || job.bouncedId != 0) && job.leftBy.insert(job.workerAddr).second;
     return std::nullopt;
   }
   checkStatus(status, "BuildDerivation");
@@ -241,6 +252,7 @@ struct GrpcStore::Run {
     want->set_cp_hint_ms(job.cpHintMs);
     want->set_build_mode(static_cast<uint32_t>(mode));
     want->set_system(job.drv.platform);
+    want->set_bounced_assign_id(job.bouncedId);
     debug("grpc: want %s", job.drvPath.to_string());
   }
 
@@ -408,6 +420,7 @@ struct GrpcStore::Run {
       }
       job->workerAddr = msg.assigned().worker_addr();
       job->assignId = msg.assigned().assign_id();
+      job->bouncedId = 0;
     } else if (msg.has_cached()) {
       job->result = cachedResult(*job);
     } else {

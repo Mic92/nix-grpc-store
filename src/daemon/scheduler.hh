@@ -287,6 +287,7 @@ struct Entry
     std::vector<ClientId> followers;
     WorkerId worker = noWorker;
     uint64_t assignId = 0;
+    std::vector<WorkerId> bouncedOff; // passed over while another worker can run it
     double enqMs = 0;
     double cpHint = 0;
 };
@@ -386,6 +387,7 @@ public:
     {
         DrvId drv = 0;
         std::optional<std::pair<WorkerId, uint64_t>> assigned;
+        std::optional<WorkerId> bouncedOff; // the worker the drv was taken back from
     };
 
     struct WantInfo
@@ -395,6 +397,7 @@ public:
         std::string_view system;
         std::vector<std::string> features;
         double cpHintMs = 0;
+        uint64_t bouncedAssignId = 0; // see Want.bounced_assign_id
     };
 
     // Caller handled the cache-hit case already.
@@ -424,11 +427,20 @@ public:
             follows[client].push_back(drv);
         }
         slot->cpHint = std::max(slot->cpHint, cpHintMs);
+        std::optional<WorkerId> taken;
+        if (slot->worker != noWorker && info.bouncedAssignId != 0 && slot->assignId == info.bouncedAssignId) {
+            // That worker did not take it, so there is nothing to revoke: an
+            // Expect left there runs out on its own.
+            taken = std::exchange(slot->worker, noWorker);
+            std::erase(workers.at(*taken).running, drv);
+            refreshFree(*taken);
+            slot->bouncedOff.push_back(*taken);
+        }
         if (slot->worker != noWorker) {
             return {.drv = drv, .assigned = std::pair(slot->worker, slot->assignId)};
         }
         sys(slot->system).queue.set(drv, prio(*slot));
-        return {.drv = drv};
+        return {.drv = drv, .bouncedOff = taken};
     }
 
     // Worker to Revoke on, if the last follower left an assigned drv.
@@ -767,6 +779,11 @@ private:
                 continue;
             }
             auto wid = pick(*slot);
+            if (!wid && !slot->bouncedOff.empty() && !placeableElsewhere(*slot)) {
+                // Only the workers it bounced off can run it: try them again.
+                slot->bouncedOff.clear();
+                wid = pick(*slot);
+            }
             queue.erase(*head);
             if (!wid) {
                 skipped.emplace_back(*head, prio(*slot));
@@ -823,8 +840,25 @@ private:
                   });
     }
 
+    [[nodiscard]] static auto bouncedOff(const Entry & ent, WorkerId wid) -> bool
+    {
+        return std::ranges::find(ent.bouncedOff, wid) != ent.bouncedOff.end();
+    }
+
+    // A connected, non-draining worker it did not bounce off could ever run it.
+    [[nodiscard]] auto placeableElsewhere(const Entry & ent) const -> bool
+    {
+        for (WorkerId wid = 0; wid < workers.size(); wid++) {
+            const auto & wkr = workers.at(wid);
+            if (wkr.up && !wkr.draining && offers(wkr, ent) && !bouncedOff(ent, wid)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Most free among workers offering system and features. O(1) without
-    // features, O(workers) with.
+    // features, O(workers) with or after a bounce.
     [[nodiscard]] auto emptiestFor(const Entry & ent) const -> std::optional<WorkerId>
     {
         auto const iter = systems.find(ent.system);
@@ -832,12 +866,12 @@ private:
             return std::nullopt;
         }
         const auto & fidx = iter->second.free;
-        if (ent.features.empty()) {
+        if (ent.features.empty() && ent.bouncedOff.empty()) {
             return fidx.emptiest();
         }
         std::optional<WorkerId> best;
         for (WorkerId wid = 0; wid < workers.size(); wid++) {
-            if (workers.at(wid).up && fidx.get(wid) > 0 && offers(workers.at(wid), ent)
+            if (workers.at(wid).up && fidx.get(wid) > 0 && offers(workers.at(wid), ent) && !bouncedOff(ent, wid)
                 && (!best || fidx.get(wid) > fidx.get(*best))) {
                 best = wid;
             }
@@ -862,7 +896,8 @@ private:
                 continue;
             }
             auto [wid, size] = iter->second;
-            if (wid >= workers.size() || !workers.at(wid).up || freeOf(wid) <= 0 || !offers(workers.at(wid), ent)) {
+            if (wid >= workers.size() || !workers.at(wid).up || freeOf(wid) <= 0 || !offers(workers.at(wid), ent)
+                || bouncedOff(ent, wid)) {
                 continue;
             }
             auto const cand = std::ranges::find_if(cands, [&](auto & cnd) -> bool { return cnd.first == wid; });

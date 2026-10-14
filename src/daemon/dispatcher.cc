@@ -439,8 +439,15 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
          .inputs = {want.inputs().begin(), want.inputs().end()}, // string_views into `want`
          .system = system,
          .features = {want.required_features().begin(), want.required_features().end()},
-         .cpHintMs = static_cast<double>(want.cp_hint_ms())},
+         .cpHintMs = static_cast<double>(want.cp_hint_ms()),
+         .bouncedAssignId = want.bounced_assign_id()},
         nowMs());
+    if (res.bouncedOff) {
+        metrics.event("bounced");
+        logLine(
+            LogLevel::info,
+            {{"event", "bounced"}, {"drv", want.drv_path()}, {"worker", core.worker(*res.bouncedOff).addr}});
+    }
     if (res.assigned) {
         reply.mutable_assigned()->set_drv_path(want.drv_path());
         reply.mutable_assigned()->set_worker_addr(core.worker(res.assigned->first).addr);

@@ -157,6 +157,11 @@ message Want {
   repeated string required_features = 6;
   // drv.platform; empty means the scheduler's own system.
   string system = 7;
+  // Asking again because the worker of this assignment was not reached or
+  // does not expect the drv. Unless the drv was placed anew meanwhile, the
+  // scheduler takes it back from that worker and places it on another one
+  // that can run it, if there is any.
+  uint64 bounced_assign_id = 8;
 }
 
 message Cancel {

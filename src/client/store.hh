@@ -501,6 +501,8 @@ public:
       // Workers that drained, vanished or lost the assignment under this job.
       std::set<std::string> leftBy;
       bool freeBounce = false; // the last bounce does not count against reschedule-retries
+      // The assignment whose worker did not take the job, for the next Want.
+      uint64_t bouncedId = 0;
       std::optional<StorePath> failedInput;
       std::optional<BuildResult> result;
       // Set by the reader thread, consumed by a build thread.

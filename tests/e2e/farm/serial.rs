@@ -637,6 +637,55 @@ fn an_upload_slower_than_the_expect_timeout_keeps_the_assignment() {
 }
 
 #[test]
+fn a_builder_the_balancer_cannot_reach_hands_its_builds_to_another() {
+    farm_ready();
+    let sys = system();
+    // Still connected to the scheduler, like a CI builder whose tunnel from
+    // the balancer is not up yet.
+    let cut = standby();
+    let reject = |op: &str| {
+        succeed(
+            cut,
+            &[
+                "iptables", op, "INPUT", "-p", "tcp", "-s", "lb", "--dport", "50051", "-j", "REJECT",
+                "--reject-with", "tcp-reset",
+            ],
+        );
+    };
+    reject("-I");
+    retry(30, "the balancer lost the builder", || {
+        unhealthy(&sys).contains(&cut)
+    });
+    let bounced = events(leader(), "bounced");
+    let tags = (0..4)
+        .map(|i| format!("\"cut{i}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let o = run_t(
+        CLIENT,
+        &[
+            "nix",
+            "build",
+            "--store",
+            // Before, the scheduler sent the build back to the same builder
+            // until the retries ran out.
+            &format!("{}&reschedule-retries=0", envoy()),
+            "--eval-store",
+            "auto",
+            "--impure",
+            "--expr",
+            &format!("map (tag: import {} {{ inherit tag; }}) [ {tags} ]", expr("JOB")),
+        ],
+        300,
+    );
+    reject("-D");
+    assert_eq!(o.code, 0, "{}", o.combined());
+    assert!(events(leader(), "bounced") > bounced);
+    wait_members(&sys, &WORKERS);
+    retry(60, "scheduler settled", settled);
+}
+
+#[test]
 fn a_store_query_cut_off_by_a_builder_shutting_down_is_retried() {
     farm_ready();
     let sys = system();

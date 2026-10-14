@@ -213,6 +213,41 @@ void testCancelAndClientGone()
     assert(!shard.cancel(9, "nope.drv"));
 }
 
+// The client could not reach w0. The drv goes to w1 once w1 has a slot, and
+// back to w0 only when nobody else can run it.
+void testBouncedOff()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 1);
+    shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    auto const w1 = hello(shard, "w1", 1);
+    shard.want(1, {.drvPath = "busy.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 2 && out[0].worker == w0 && out[1].worker == w1);
+    auto const asg = out[0];
+    auto const busy = out[1];
+    // An id that is not the drv's own changes nothing.
+    auto res = shard.want(1, {.drvPath = "busy.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0, .bouncedAssignId = asg.assignId}, 0);
+    assert(res.assigned && !res.bouncedOff);
+    res = shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0, .bouncedAssignId = asg.assignId}, 0);
+    assert(!res.assigned && res.bouncedOff == w0 && shard.worker(w0).running.empty());
+    out.clear();
+    shard.dispatch(out);
+    assert(out.empty()); // w0 is free but bounced it, w1 is busy
+    shard.done(w1, shard.entry(busy.drv)->drvPath, {});
+    shard.dispatch(out);
+    assert(out.size() == 1 && out[0].worker == w1 && out[0].assignId != asg.assignId);
+    // Only w0 is left: it gets another try.
+    res = shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0, .bouncedAssignId = out[0].assignId}, 0);
+    assert(res.bouncedOff == w1);
+    shard.workerGone(w1);
+    out.clear();
+    shard.dispatch(out);
+    assert(out.size() == 1 && out[0].worker == w0);
+}
+
 void testDraining()
 {
     Core shard;
@@ -345,6 +380,7 @@ try {
     testHelloReconciles();
     testHelloSupersedes();
     testCancelAndClientGone();
+    testBouncedOff();
     testDraining();
     testFeatures();
     testSystems();
