@@ -92,6 +92,7 @@ app.kubernetes.io/component: scheduler
 {{- if and $tok.existingSecret $tok.serviceAccountToken.enabled }}{{ fail "set only one of niks3.auth.existingSecret and niks3.auth.serviceAccountToken.enabled" }}{{ end }}
 {{- if not (or $tok.existingSecret $tok.serviceAccountToken.enabled) }}{{ fail "set niks3.auth.existingSecret or niks3.auth.serviceAccountToken.enabled" }}{{ end }}
 {{- if empty .Values.workers }}{{ fail "workers is empty, add e.g. workers.x86-64: {system: x86_64-linux, replicas: 2}" }}{{ end }}
+{{- with .Values.scheduler.farmId }}{{ if or (gt (len .) 63) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" .)) }}{{ fail "scheduler.farmId must be a lowercase DNS label (up to 63 characters)" }}{{ end }}{{ end }}
 {{- if and (or .Values.auth.accessRules .Values.auth.anonymousRole) (not (or (include "farm.tlsSecret" (list . "clientCA")) (include "farm.oidcProviders" .))) }}{{ fail "auth.accessRules/anonymousRole need tls.clientCA or an OIDC provider" }}{{ end }}
 {{- if and (include "farm.tlsSecret" (list . "clientCA")) (not (include "farm.tlsSecret" (list . "worker"))) }}{{ fail "tls.clientCA requires tls.worker (workers verify the balancer over TLS)" }}{{ end }}
 {{- if and .Values.lb.enabled (include "farm.tlsSecret" (list . "clientCA")) (not (include "farm.tlsSecret" (list . "lb"))) }}{{ fail "tls.clientCA requires tls.lb (the balancer presents it to clients and workers)" }}{{ end }}

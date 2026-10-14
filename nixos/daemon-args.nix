@@ -73,6 +73,10 @@
   "--scheduler-token-file"
   cfg.schedulerTokenFile
 ]
+++ lib.optionals (cfg.farmId != null) [
+  "--farm-id"
+  cfg.farmId
+]
 ++ lib.optionals (cfg.advertise != null) [
   "--advertise"
   cfg.advertise

@@ -60,8 +60,9 @@ auto onProgress(void * userp, curl_off_t /*dlt*/, curl_off_t /*dln*/, curl_off_t
 }
 } // namespace
 
-Elector::Elector(const Niks3Client & niks3_, std::function<void(bool)> onChange_)
+Elector::Elector(const Niks3Client & niks3_, std::string farmId_, std::function<void(bool)> onChange_)
     : niks3(niks3_)
+    , farmId(std::move(farmId_))
     , onChange(std::move(onChange_))
     , thread([this](const std::stop_token & stop) -> void { run(stop); })
 {
@@ -89,7 +90,8 @@ void Elector::run(const std::stop_token & stop)
     std::optional<std::chrono::steady_clock::time_point> lostAt;
     while (!stop.stop_requested()) {
         try {
-            auto call = niks3.post("/api/farm/lead", nlohmann::json{{"incumbent", active}});
+            const auto path = farmId.empty() ? "/api/farm/lead" : "/api/farm/lead/" + farmId;
+            auto call = niks3.post(path, nlohmann::json{{"incumbent", active}});
             Reader reader{
                 .stop = stop,
                 .lead = [this, &lostAt](bool lead) -> void {

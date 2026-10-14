@@ -261,6 +261,15 @@ A second scheduler on another node takes over within seconds when the
 first one goes away. The two agree on who is active through a lock in
 niks3's database.
 
+If two *independent* farms use the same niks3 database, give one of them a
+stable `scheduler.farmId` (for example `build-x86`). The default empty ID uses
+the existing shared lock, so an already-running farm need not change. Each
+farm's standby schedulers use the same ID as its active scheduler. This needs
+a niks3 version with the named `/api/farm/lead/{farmID}` endpoint: an older
+server rejects the named endpoint rather than accidentally electing a second
+farm against the default lock. Different farm IDs separate election only;
+they do not share worker pools or the scheduler's queue.
+
 ```yaml
 scheduler:
   replicas: 2

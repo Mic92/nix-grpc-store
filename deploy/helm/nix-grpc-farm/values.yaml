@@ -124,9 +124,12 @@ defaultGroup: ""
 # The one scheduler pod (all systems). Holds only soft state.
 scheduler:
   # >1 adds standby schedulers on separate nodes. niks3 picks the active one
-  # through a lock in its database, so this needs a `niks3` no other farm
-  # elects against.
+  # through a lock in its database, scoped by farmId.
   replicas: 1
+  # Optional stable ID for independent farms sharing the same niks3 database.
+  # Empty uses the legacy lock; don't give it to a second farm. Requires a
+  # niks3 release with POST /api/farm/lead/{farmID} support.
+  farmId: ""
   resources: {}
   nodeSelector: {}
   tolerations: []
