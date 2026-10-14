@@ -122,7 +122,8 @@ auto workerLeft(grpc::StatusCode code) -> bool {
   case grpc::StatusCode::FAILED_PRECONDITION: // not expected there (any more)
   case grpc::StatusCode::UNAVAILABLE:         // worker draining or gone
   case grpc::StatusCode::UNKNOWN:             // worker died mid-stream ("Stream removed"),
-  case grpc::StatusCode::INTERNAL:            //   or RST_STREAM via the balancer
+  case grpc::StatusCode::INTERNAL:            //   or RST_STREAM via the balancer,
+  case grpc::StatusCode::CANCELLED:           //   or its process went away (ours is checked first)
     return true;
   default:
     return false;

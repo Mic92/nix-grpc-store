@@ -503,6 +503,26 @@ fn a_draining_builder_lets_a_client_attach_to_the_build_it_runs() {
 }
 
 #[test]
+fn a_builder_killed_mid_build_sends_the_build_elsewhere() {
+    farm_ready();
+    spawn_build("killed", "killed");
+    wait_building();
+    let busy = building()[0];
+    succeed(
+        busy,
+        &["systemctl", "kill", "-s", "KILL", "nix-grpc-daemon.service"],
+    );
+    // How the stream ends depends on the path to the worker: here a reset,
+    // in a farm behind tunnels also CANCELLED. Neither may fail the build.
+    retry(180, "the build finished elsewhere", || {
+        release_slow();
+        run_t(CLIENT, &["systemctl", "is-active", "killed"], 60).code != 0
+    });
+    assert_unit_success("killed");
+    restart_daemon(busy);
+}
+
+#[test]
 fn a_builder_stopped_mid_upload_lets_it_land_and_the_build_moves_on() {
     farm_ready();
     let big = succeed(
