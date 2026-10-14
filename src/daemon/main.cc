@@ -205,6 +205,16 @@ private:
 
     using Fields = std::vector<nixgrpc::LogField>;
 
+    // A client uploads the inputs of the drv in x-nix-drv before it builds it here.
+    auto uploading(const grpc::ServerContext & context) -> nixgrpc::Builder::Uploading
+    {
+        auto const & metadata = context.client_metadata();
+        auto const found = metadata.find("x-nix-drv");
+        return {
+            coord.builder ? &*coord.builder : nullptr,
+            found == metadata.end() ? "" : std::string(found->second.data(), found->second.size())};
+    }
+
     // The authorised, counted part of an RPC. done() writes the one info line per call.
     struct Rpc
     {
@@ -306,6 +316,7 @@ public:
     {
         return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "QueryValidPaths", nixgrpc::Role::readOnly);
+            auto const keep = uploading(*context);
             nixgrpc::Metrics::Held const held(metrics, "QueryValidPaths");
             auto const localStore = getStore();
             nix::StorePathSet paths;
@@ -395,6 +406,7 @@ public:
     {
         return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "AddMultipleToStore", nixgrpc::Role::write);
+            auto const keep = uploading(*context);
             auto localStore = openScopedStore();
 
             nix::remote::AddMultipleChunk first;

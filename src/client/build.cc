@@ -148,7 +148,10 @@ auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore)
   auto status = tryBuildDerivation(request, headers, res);
   if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
     try {
-      uploadDrvClosure(evalStore, {job.drvPath}, headers);
+      // Keeps the assignment from expiring there however long the upload takes.
+      auto uploadHeaders = headers;
+      uploadHeaders.emplace_back("x-nix-drv", request.drv_path());
+      uploadDrvClosure(evalStore, {job.drvPath}, uploadHeaders);
       status = tryBuildDerivation(request, headers, res);
     } catch (GrpcStatusError & err) {
       // The upload goes to the assigned worker as well, which may drain or
@@ -168,6 +171,12 @@ auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore)
   }
   if (workerLeft(status.error_code())) {
     printError("%s: %s, asking the scheduler again", job.drvPath.to_string(), firstLine(status.error_message()));
+    // Not the job's fault, so not worth a retry, the first time per worker.
+    // Once more from the same worker counts: the scheduler may not know it is
+    // unreachable from here.
+    auto const & msg = status.error_message();
+    job.freeBounce = (goneAway(status) || msg.contains("worker draining") || msg.contains("not scheduled here"))
+                     && job.leftBy.insert(job.workerAddr).second;
     return std::nullopt;
   }
   checkStatus(status, "BuildDerivation");
@@ -287,6 +296,7 @@ struct GrpcStore::Run {
   // Under `mutex`. Bounced by the worker: hand back to the scheduler, or
   // follow a redirect it already sent.
   void requeueLocked(Job & job) {
+    bool const free = std::exchange(job.freeBounce, false);
     job.workerAddr = std::exchange(job.redirectAddr, {});
     job.assignId = std::exchange(job.redirectId, 0);
     if (!job.workerAddr.empty()) {
@@ -294,7 +304,7 @@ struct GrpcStore::Run {
       cv.notify_all();
       return;
     }
-    if (++job.bounced > store.config->rescheduleRetries) {
+    if (!free && ++job.bounced > store.config->rescheduleRetries) {
       finishLocked(job, nixcompat::failed(nixcompat::FailureStatus::MiscFailure,
                                           fmt("gave up after %d reschedules", job.bounced)));
     } else {

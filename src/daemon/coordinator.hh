@@ -49,6 +49,7 @@ struct Expected
     uint64_t assignId = 0;
     Clock::time_point since;
     bool running = false;
+    unsigned uploads = 0; // the client's uploads in flight, see Builder::Uploading
 
     // Second BuildDerivation for the same drv attaches here.
     struct Shared
@@ -118,6 +119,22 @@ public:
     // Expire unclaimed Expects. Called from the serve loop.
     void tick();
 
+    // An upload for drvPath is in flight. Its client calls BuildDerivation
+    // only once the inputs are here, so the Expect does not expire meanwhile.
+    class Uploading
+    {
+        Builder * builder;
+        std::string drvPath;
+
+    public:
+        Uploading(Builder * builder, std::string drvPath);
+        Uploading(const Uploading &) = delete;
+        Uploading(Uploading &&) = delete;
+        auto operator=(const Uploading &) -> Uploading & = delete;
+        auto operator=(Uploading &&) -> Uploading & = delete;
+        ~Uploading();
+    };
+
     // Swapped by the session thread on every (re)connect.
     void setSend(SendFn send);
     auto send(const nix::remote::WorkerMsg & msg) const -> bool;
@@ -134,7 +151,6 @@ private:
     mutable nix::Sync<State> state;
     mutable nix::Sync<SendFn> sendFn;
     std::atomic<bool> draining_{false};
-    static constexpr std::chrono::seconds expectTimeout{60};
 
     void sendDone(
         const std::string & drvPath,

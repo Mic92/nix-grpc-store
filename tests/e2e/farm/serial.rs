@@ -498,7 +498,8 @@ fn a_builder_stopped_mid_upload_lets_it_land_and_the_build_moves_on() {
             "nix",
             "build",
             "--store",
-            &envoy(),
+            // A worker leaving is not the job's fault, so no retry is spent on it.
+            &format!("{}&reschedule-retries=0", envoy()),
             "--eval-store",
             "auto",
             "-f",
@@ -539,6 +540,56 @@ fn a_builder_stopped_mid_upload_lets_it_land_and_the_build_moves_on() {
     );
     wait_members(&system(), &WORKERS);
     retry(90, "scheduler settled", settled);
+}
+
+#[test]
+fn an_upload_slower_than_the_expect_timeout_keeps_the_assignment() {
+    farm_ready();
+    let big = succeed(
+        CLIENT,
+        &[
+            "sh",
+            "-c",
+            "head -c 16M /dev/urandom > /tmp/slow && nix-store --add /tmp/slow",
+        ],
+    )
+    .trim()
+    .to_string();
+    // ~32 s for the upload, three times the farm's --expect-timeout.
+    succeed(
+        CLIENT,
+        &[
+            "tc", "qdisc", "add", "dev", "eth1", "root", "tbf", "rate", "4mbit", "burst", "32kbit",
+            "latency", "400ms",
+        ],
+    );
+    let o = run_t(
+        CLIENT,
+        &[
+            "nix",
+            "build",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "-f",
+            &expr("DEP"),
+            "job",
+            "--argstr",
+            "tag",
+            "slow-upload",
+            "--argstr",
+            "inputPath",
+            &big,
+        ],
+        180,
+    );
+    succeed(CLIENT, &["tc", "qdisc", "del", "dev", "eth1", "root"]);
+    let out = o.combined();
+    assert_eq!(o.code, 0, "{out}");
+    // Before, the Expect ran out mid-upload: "not scheduled here", and the
+    // next worker got the same upload.
+    assert!(!out.contains("asking the scheduler again"), "{out}");
 }
 
 #[test]

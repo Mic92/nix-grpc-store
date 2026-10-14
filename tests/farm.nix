@@ -117,6 +117,11 @@ let
         ];
         oidc = oidcConfig;
         minFree = "200M";
+        # Uploads slower than this stay cheap to test.
+        extraFlags = [
+          "--expect-timeout"
+          "10"
+        ];
         niks3 = {
           package = niks3Pkgs.niks3;
           url = niks3Url;

@@ -55,6 +55,7 @@
 #include <openssl/x509.h>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <string>
 #include <string_view>
 #include <stop_token>
@@ -497,6 +498,9 @@ public:
       size_t waiting = 0;
       uint64_t cpHintMs = 0;
       unsigned bounced = 0;
+      // Workers that drained, vanished or lost the assignment under this job.
+      std::set<std::string> leftBy;
+      bool freeBounce = false; // the last bounce does not count against reschedule-retries
       std::optional<StorePath> failedInput;
       std::optional<BuildResult> result;
       // Set by the reader thread, consumed by a build thread.
