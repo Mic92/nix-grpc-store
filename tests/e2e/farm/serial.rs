@@ -637,6 +637,55 @@ fn an_upload_slower_than_the_expect_timeout_keeps_the_assignment() {
 }
 
 #[test]
+fn a_store_query_cut_off_by_a_builder_shutting_down_is_retried() {
+    farm_ready();
+    let sys = system();
+    // The query has to be in flight on the builder that stops.
+    let (gone, other) = (leader(), standby());
+    succeed(other, &["systemctl", "stop", "nix-grpc-daemon.service"]);
+    wait_members(&sys, &[gone]);
+    succeed(gone, &["pkill", "-STOP", "-x", "nix-daemon"]);
+    let pattern = "event=rpc_start method=QueryMissing";
+    let before = journal_count(gone, UNIT, pattern);
+    succeed(
+        CLIENT,
+        &[
+            "systemd-run",
+            "--unit",
+            "qm",
+            "nix",
+            "build",
+            "--dry-run",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "-f",
+            &expr("JOB"),
+            "--argstr",
+            "tag",
+            "qm",
+        ],
+    );
+    wait_journal_above(gone, UNIT, pattern, before, 60);
+    // Nothing builds there, so it shuts down at once and cuts the query off.
+    succeed(
+        gone,
+        &["systemctl", "stop", "--no-block", "nix-grpc-daemon.service"],
+    );
+    succeed(other, &["systemctl", "start", "nix-grpc-daemon.service"]);
+    wait_until_succeeds(
+        gone,
+        &["sh", "-c", "! systemctl is-active nix-grpc-daemon.service"],
+        60,
+    );
+    succeed(gone, &["pkill", "-CONT", "-x", "nix-daemon"]);
+    wait_unit_done("qm", 120);
+    assert_unit_success("qm");
+    restart_daemon(gone);
+}
+
+#[test]
 fn queue_gauges_show_a_burst_while_every_build_blocks() {
     farm_ready();
     let sys = system();
