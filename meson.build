@@ -64,10 +64,18 @@ nix_ver_minor = nix_ver[1].split('pre')[0]
 # host already has exactly these libraries mapped.
 nix_soversion = nix_store_dep.version().split('+')[0].split('pre')[0]
 
+# Store::addTempRoots (NixOS/nix 011dcfe3f) is younger than substituter.hh,
+# so 2.36pre forks between the two have only the single-path virtual.
+has_add_temp_roots = cxx.compiles('''
+#include <nix/store/store-api.hh>
+void f(nix::Store & s) { s.addTempRoots({}); }
+''', dependencies : [nix_store_dep, nix_util_dep], name : 'Store::addTempRoots')
+
 # Version macros for src/nix-compat.hh.
 nix_compat_args = [
   '-DNIX_COMPAT_VERSION_MAJOR=' + nix_ver[0],
   '-DNIX_COMPAT_VERSION_MINOR=' + nix_ver_minor,
+  '-DNIX_COMPAT_HAS_ADD_TEMP_ROOTS=' + (has_add_temp_roots ? '1' : '0'),
 ]
 
 # --- protobuf / gRPC codegen -----------------------------------------------
