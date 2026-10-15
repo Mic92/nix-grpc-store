@@ -153,7 +153,9 @@ void Dispatcher::membershipChangedLocked()
             continue;
         }
         for (const auto & system : wkr.systems) {
-            (*next)[system].push_back({.addr = wkr.addr, .draining = wkr.draining || wkr.maxJobs == 0});
+            // A worker that cannot publish fails uploads and queries too. Builds
+            // still reach it, the balancer routes those by name.
+            (*next)[system].push_back({.addr = wkr.addr, .draining = wkr.draining || wkr.maxJobs == 0 || wkr.faulty});
         }
     }
     {
@@ -540,7 +542,8 @@ void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg &
          .systems = std::move(systems),
          .features = {hel.features().begin(), hel.features().end()},
          .maxJobs = hel.max_jobs(),
-         .running = std::move(running)},
+         .running = std::move(running),
+         .faulty = hel.publish_failing()},
         superseded);
         workers[*worker.id] = worker.send;
         membershipChangedLocked();
@@ -564,12 +567,29 @@ void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg &
                 outputs.emplace_back(out.path(), out.nar_size());
             }
         }
-        core.done(*worker.id, done.drv_path(), outputs);
+        bool const returned = done.outcome() == nix::remote::Done::RETURNED;
+        core.done(*worker.id, done.drv_path(), outputs, returned);
         metrics.event("done_" + nix::remote::Done::Outcome_Name(done.outcome()));
+        if (returned) {
+            logLine(
+                LogLevel::info,
+                {{"event", "returned"}, {"drv", done.drv_path()}, {"worker", core.worker(*worker.id).addr}});
+        }
     } else if (msg.has_load()) {
-        core.setDraining(*worker.id, msg.load().draining());
-        membershipChangedLocked();
+        onLoad(*worker.id, msg.load());
     }
+}
+
+void Dispatcher::onLoad(sched::WorkerId wid, const nix::remote::Load & load)
+{
+    core.setDraining(wid, load.draining());
+    if (load.publish_failing() != core.worker(wid).faulty) {
+        logLine(
+            LogLevel::info,
+            {{"event", load.publish_failing() ? "publish_failing" : "publishing"}, {"worker", core.worker(wid).addr}});
+    }
+    core.setFaulty(wid, load.publish_failing());
+    membershipChangedLocked();
 }
 
 void Dispatcher::workerGone(Worker & worker)

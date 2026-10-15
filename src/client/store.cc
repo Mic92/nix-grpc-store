@@ -180,7 +180,9 @@ auto GrpcStore::goneAway(const grpc::Status & status) -> bool {
     return transportError(status.error_message()) || status.error_message().contains("upstream")
            || status.error_message().contains("shutting down")
            || status.error_message().contains("Cancelling all calls")
-           || status.error_message().contains("local nix-daemon connection lost");
+           || status.error_message().contains("local nix-daemon connection lost")
+           // that worker cannot reach the cache, the balancer takes it out
+           || status.error_message().contains("publish failed");
   case grpc::StatusCode::CANCELLED:
     return status.error_message().contains("Cancelling all calls");
   default:

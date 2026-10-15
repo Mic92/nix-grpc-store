@@ -300,6 +300,9 @@ struct Worker
     int32_t maxJobs = 0;
     bool up = false;
     bool draining = false;
+    // Its last publish to the cache failed: it gets builds only while no
+    // other worker has a slot, until it reports that publishing works again.
+    bool faulty = false;
     std::vector<DrvId> running;
 };
 
@@ -500,6 +503,7 @@ public:
         std::vector<std::string> features;
         uint32_t maxJobs = 0;
         std::vector<std::pair<std::string_view, uint64_t>> running; // running + expecting, with assignId
+        bool faulty = false;
     };
 
     // A reported drv that this scheduler had meanwhile placed on `loser`:
@@ -524,6 +528,7 @@ public:
         wkr.up = true;
         workersUp_++;
         wkr.draining = false;
+        setFaulty(wid, info.faulty);
         wkr.systems = info.systems;
         for (const auto & name : wkr.systems) {
             sys(name).free.push(wid);
@@ -553,8 +558,12 @@ public:
         return wid;
     }
 
-    void
-    done(WorkerId wid, std::string_view drvPath, const std::vector<std::pair<std::string_view, uint64_t>> & outputs)
+    // `returned`: the worker could not finish it, another one should.
+    void done(
+        WorkerId wid,
+        std::string_view drvPath,
+        const std::vector<std::pair<std::string_view, uint64_t>> & outputs,
+        bool returned = false)
     {
         auto & wkr = workers.at(wid);
         for (auto [path, size] : outputs) {
@@ -567,15 +576,37 @@ public:
         std::erase(wkr.running, *found);
         refreshFree(wid);
         auto & slot = entries.at(*found);
-        if (slot && slot->worker == wid) {
-            retire(*found);
+        if (!slot || slot->worker != wid) {
+            return;
         }
+        if (returned && !slot->followers.empty()) {
+            // Its clients come back for it: have another worker ready for them.
+            slot->worker = noWorker;
+            slot->bouncedOff.push_back(wid);
+            sys(slot->system).queue.set(*found, prio(*slot));
+            return;
+        }
+        retire(*found);
     }
 
     void setDraining(WorkerId wid, bool draining)
     {
         workers.at(wid).draining = draining;
         refreshFree(wid);
+    }
+
+    void setFaulty(WorkerId wid, bool faulty)
+    {
+        auto & wkr = workers.at(wid);
+        if (wkr.faulty == faulty) {
+            return;
+        }
+        wkr.faulty = faulty;
+        if (faulty) {
+            faultyCount++;
+        } else {
+            faultyCount--;
+        }
     }
 
     // Requeues what still has followers; a reconnecting worker's Hello
@@ -729,6 +760,7 @@ private:
     // only, so on overflow the table is simply dropped.
     PathMap<std::pair<WorkerId, uint64_t>> lastBuilder;
     uint64_t lastAssignId = 0;
+    size_t faultyCount = 0; // workers with `faulty` set
 
     // Entry is finished or abandoned: free the slot and its id for reuse.
     void retire(DrvId drv)
@@ -857,21 +889,23 @@ private:
         return false;
     }
 
-    // Most free among workers offering system and features. O(1) without
-    // features, O(workers) with or after a bounce.
-    [[nodiscard]] auto emptiestFor(const Entry & ent) const -> std::optional<WorkerId>
+    // Most free among workers offering system and features, faulty ones only
+    // if `faultyToo`. O(1) without features, O(workers) with, after a bounce
+    // or while a worker is faulty.
+    [[nodiscard]] auto emptiestFor(const Entry & ent, bool faultyToo) const -> std::optional<WorkerId>
     {
         auto const iter = systems.find(ent.system);
         if (iter == systems.end()) {
             return std::nullopt;
         }
         const auto & fidx = iter->second.free;
-        if (ent.features.empty() && ent.bouncedOff.empty()) {
+        if (ent.features.empty() && ent.bouncedOff.empty() && faultyCount == 0) {
             return fidx.emptiest();
         }
         std::optional<WorkerId> best;
         for (WorkerId wid = 0; wid < workers.size(); wid++) {
-            if (workers.at(wid).up && fidx.get(wid) > 0 && offers(workers.at(wid), ent) && !bouncedOff(ent, wid)
+            const auto & wkr = workers.at(wid);
+            if (wkr.up && (faultyToo || !wkr.faulty) && fidx.get(wid) > 0 && offers(wkr, ent) && !bouncedOff(ent, wid)
                 && (!best || fidx.get(wid) > fidx.get(*best))) {
                 best = wid;
             }
@@ -881,7 +915,12 @@ private:
 
     [[nodiscard]] auto pick(const Entry & ent) const -> std::optional<WorkerId>
     {
-        auto best = emptiestFor(ent);
+        bool faultyToo = false;
+        auto best = emptiestFor(ent, faultyToo);
+        if (!best && faultyCount > 0) {
+            faultyToo = true;
+            best = emptiestFor(ent, faultyToo);
+        }
         if (!best) {
             return std::nullopt;
         }
@@ -897,7 +936,7 @@ private:
             }
             auto [wid, size] = iter->second;
             if (wid >= workers.size() || !workers.at(wid).up || freeOf(wid) <= 0 || !offers(workers.at(wid), ent)
-                || bouncedOff(ent, wid)) {
+                || bouncedOff(ent, wid) || (workers.at(wid).faulty && !faultyToo)) {
                 continue;
             }
             auto const cand = std::ranges::find_if(cands, [&](auto & cnd) -> bool { return cnd.first == wid; });

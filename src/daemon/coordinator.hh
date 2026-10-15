@@ -116,6 +116,10 @@ public:
         return draining_;
     }
 
+    // Every publish to the cache reports how it went. The scheduler hears
+    // when that changes, see Load.publish_failing.
+    void published(bool works);
+
     // Expire unclaimed Expects. Called from the serve loop.
     void tick();
 
@@ -151,7 +155,9 @@ private:
     mutable nix::Sync<State> state;
     mutable nix::Sync<SendFn> sendFn;
     std::atomic<bool> draining_{false};
+    std::atomic<bool> publishFailing{false};
 
+    void sendLoad() const;
     void sendDone(
         const std::string & drvPath,
         uint64_t assignId,

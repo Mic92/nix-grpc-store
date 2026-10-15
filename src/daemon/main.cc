@@ -26,6 +26,7 @@
 #include <optional>
 #include <ranges>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -98,6 +99,13 @@ volatile std::sig_atomic_t nixgrpc::stopSignal = 0;
 
 namespace {
 using nixgrpc::stopSignal;
+
+// This worker could not make paths visible to the others. Not the caller's
+// fault: it may retry on another worker.
+struct PublishFailed : std::runtime_error
+{
+    using std::runtime_error::runtime_error;
+};
 
 static_assert(static_cast<int>(nixgrpc::SpillKind::line) == static_cast<int>(nixgrpc::BuildEvent::Kind::line));
 static_assert(static_cast<int>(nixgrpc::SpillKind::phase) == static_cast<int>(nixgrpc::BuildEvent::Kind::phase));
@@ -183,6 +191,8 @@ private:
             return denied.status;
         } catch (nixgrpc::CancelledWait & err) {
             return {grpc::StatusCode::UNAVAILABLE, err.what()};
+        } catch (PublishFailed & err) {
+            return {grpc::StatusCode::UNAVAILABLE, workerName + ": " + err.what()};
         } catch (std::exception & err) {
             if (stopSignal != 0) {
                 return {grpc::StatusCode::UNAVAILABLE, std::string("worker shutting down: ") + err.what()};
@@ -213,6 +223,28 @@ private:
         return {
             coord.builder ? &*coord.builder : nullptr,
             found == metadata.end() ? "" : std::string(found->second.data(), found->second.size())};
+    }
+
+    // Makes locally valid paths visible to the other nodes, and tells the
+    // scheduler whether this worker can.
+    void publish(nix::Store & localStore, const std::vector<std::string> & paths, const nixgrpc::Cancelled & cancelled)
+    {
+        if (!coord.cache.hasRemote() || paths.empty()) {
+            return;
+        }
+        try {
+            coord.cache.publish(localStore, paths, cancelled);
+        } catch (nixgrpc::CancelledWait &) {
+            throw;
+        } catch (nix::Error & err) {
+            if (coord.builder) {
+                coord.builder->published(false);
+            }
+            throw PublishFailed(std::string("publish failed: ") + err.what());
+        }
+        if (coord.builder) {
+            coord.builder->published(true);
+        }
     }
 
     // The authorised, counted part of an RPC. done() writes the one info line per call.
@@ -338,7 +370,7 @@ public:
                 }
                 // and what only we have must become so before the client relies on it.
                 phase.next("publish");
-                coord.cache.publish(*localStore, valid, [&] -> bool { return context->IsCancelled(); });
+                publish(*localStore, valid, [&] -> bool { return context->IsCancelled(); });
             }
             return grpc::Status::OK;
         });
@@ -432,7 +464,7 @@ public:
             std::vector<std::string> imported;
             auto const stats = importUploads(*localStore, source, repair, checkSigs, imported);
             phase.next("publish");
-            coord.cache.publish(*localStore, imported, [&] -> bool { return context->IsCancelled(); });
+            publish(*localStore, imported, [&] -> bool { return context->IsCancelled(); });
             phase.done();
             rpc.done({{"paths", std::to_string(stats.paths)}, {"nar_bytes_in", std::to_string(stats.narBytes)}});
             metrics.countNarBytes("in", rpc.caller.name, stats.narBytes);
@@ -662,7 +694,8 @@ public:
             if (status.ok()) {
                 wire = done.SerializeAsString();
             } else {
-                outcome = nix::remote::Done::FAILED;
+                // Not the build's fault but this worker's: let another one have it.
+                outcome = nix::remote::Done::RETURNED;
             }
             report();
             return status;
@@ -738,12 +771,10 @@ public:
             }
             try {
                 phase.next("publish");
-                coord.cache.publish(localStore, built, cancelled);
+                publish(localStore, built, cancelled);
                 phase.done();
-            } catch (nixgrpc::CancelledWait &) {
-                throw;
-            } catch (nix::Error & err) {
-                return {grpc::StatusCode::UNAVAILABLE, std::string("publish failed: ") + err.what()};
+            } catch (PublishFailed & err) {
+                return {grpc::StatusCode::UNAVAILABLE, err.what()};
             }
             outcome = nix::remote::Done::BUILT;
         } else if (nixcompat::failureStatus(res) == nixcompat::FailureStatus::TransientFailure) {

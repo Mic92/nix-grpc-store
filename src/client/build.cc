@@ -130,14 +130,16 @@ auto workerLeft(grpc::StatusCode code) -> bool {
   }
 }
 
-// The worker never got the call or turned it down: it does not hold the build.
+// The worker never got the call, turned it down or gave it back: it does not hold the build.
 auto notTaken(const grpc::Status & status) -> bool {
   auto const & msg = status.error_message();
   switch (status.error_code()) {
   case grpc::StatusCode::FAILED_PRECONDITION: // not expected there, or the balancer sent us to another worker
     return true;
   case grpc::StatusCode::UNAVAILABLE: // draining, or the balancer could not connect to it
-    return msg.contains("worker draining") || msg.contains("connection failure") || msg.contains("connection timeout");
+    return msg.contains("worker draining") || msg.contains("connection failure") || msg.contains("connection timeout")
+           // built it but could not publish it: the worker gave it back
+           || msg.contains("publish failed");
   default:
     return false;
   }
