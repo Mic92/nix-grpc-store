@@ -50,8 +50,9 @@ What happens on a build:
   sends each build to the builder the scheduler named, and spreads
   everything else (uploads, queries, downloads) over the builders of
   the right system. An upload is answered once the paths are in the
-  binary cache. A client whose upload is cut off after the builder took
-  the paths uploads again, for as long as builders keep taking them.
+  binary cache. A client whose upload is cut off after a builder took it
+  sends again what the farm still lacks, for as long as builders keep
+  taking its uploads.
 
 The scheduler keeps nothing on disk. When it restarts, running builds
 carry on, builders and clients reconnect, and clients ask again for

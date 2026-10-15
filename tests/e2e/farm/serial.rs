@@ -859,33 +859,50 @@ fn an_upload_cut_off_after_longer_than_the_restart_grace_is_retried() {
 }
 
 #[test]
-fn an_upload_cut_off_again_and_again_after_it_landed_is_retried() {
+fn an_upload_cut_off_again_and_again_while_it_imports_is_retried() {
     farm_ready();
-    // As above: a stopped niks3 push holds every upload once it landed.
-    let push = "push --[s]tdin";
+    let tag = "import-held";
+    let top = succeed(
+        CLIENT,
+        &["nix-instantiate", &expr("JOB"), "--argstr", "tag", tag],
+    )
+    .trim()
+    .to_string();
+    // In CI the builders spent minutes completing the derivations'
+    // references from a throttled cache, before they held the paths. A held
+    // lock on one of them keeps the import from finishing here.
+    let lock = format!("{top}.lock");
     for w in WORKERS {
-        let path = succeed(
-            CLIENT,
+        // Like nix-daemon, in a mount namespace of its own with the store writable.
+        let hold = format!(
+            "mount -o remount,rw,bind /nix/store 2>/dev/null; exec flock {lock} sleep 900"
+        );
+        succeed(
+            w,
             &[
+                "systemd-run",
+                "--unit",
+                "hold-import",
+                "--setenv=PATH=/run/current-system/sw/bin",
+                "unshare",
+                "-m",
                 "sh",
                 "-c",
-                &format!("echo again-{} > /tmp/prime && nix-store --add /tmp/prime", w.0),
+                &hold,
             ],
-        )
-        .trim()
-        .to_string();
-        succeed(
-            CLIENT,
-            &["nix", "copy", "--no-check-sigs", "--to", &direct(w), &path],
         );
-        succeed(w, &["pkill", "-STOP", "-f", push]);
+        let held = format!("flock -n -E 99 {lock} true; [ $? = 99 ]");
+        wait_until_succeeds(w, &["sh", "-c", &held], 30);
     }
+    let pattern = "event=rpc_start method=AddMultipleToStore";
+    let started = || WORKERS.map(|w| journal_count(w, UNIT, pattern));
+    let mut seen = started();
     succeed(
         CLIENT,
         &[
             "systemd-run",
             "--unit",
-            "again",
+            "held-import",
             "nix",
             "build",
             "--store",
@@ -896,32 +913,31 @@ fn an_upload_cut_off_again_and_again_after_it_landed_is_retried() {
             &expr("JOB"),
             "--argstr",
             "tag",
-            "again",
+            tag,
         ],
     );
-    let uploading = |w: Node| gauge(w, r#"nix_grpc_inflight{kind="AddMultipleToStore"}"#) > 0;
-    let retries = || journal_count(CLIENT, "again", ", retrying");
+    let retries = || journal_count(CLIENT, "held-import", ", retrying");
     // In CI the builders holding it left one after the other, over longer
     // than the restart grace in all. Before, the client gave up then.
-    for cut in 0..3 {
+    for cut in 0..2 {
         let mut busy = None;
-        retry(60, "the derivations are uploading", || {
-            busy = WORKERS.into_iter().find(|&w| uploading(w));
+        retry(60, "an upload started", || {
+            let now = started();
+            busy = (0..WORKERS.len()).find(|&i| now[i] > seen[i]).map(|i| WORKERS[i]);
+            seen = now;
             busy.is_some()
         });
-        sleep(6);
-        let busy = busy.unwrap();
-        let ip = env(&format!("NGS_{}_IP", busy.0.to_uppercase()));
+        sleep(12);
+        // Like the builder's tunnel going away: "reset reason: connection termination".
+        let ip = env(&format!("NGS_{}_IP", busy.unwrap().0.to_uppercase()));
         succeed(LB, &["ss", "-tK", "dst", &ip, "dport", "=", ":50051"]);
         retry(30, "the client retried", || retries() > cut);
-        // The handler of the cut call notices within a second.
-        sleep(2);
     }
     for w in WORKERS {
-        succeed(w, &["pkill", "-CONT", "-f", push]);
+        succeed(w, &["systemctl", "stop", "hold-import"]);
     }
-    wait_unit_done("again", 180);
-    assert_unit_success("again");
+    wait_unit_done("held-import", 180);
+    assert_unit_success("held-import");
 }
 
 #[test]

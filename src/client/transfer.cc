@@ -220,16 +220,30 @@ void GrpcStore::addMultipleToStoreRouted(
     for (auto & [pathInfo, pathSource] : pathsToCopy) {
       paths.emplace_back(pathInfo, ReplayableNar(std::move(pathSource)));
     }
-    // A worker that took the paths may leave while niks3 still pushes them,
+    // A worker that took the paths may leave before they reach the cache,
     // after minutes under a busy cache. That was no failure to reach the farm.
-    retryingWithProgress("AddMultipleToStore", [&](bool & imported) -> grpc::Status {
-      return addMultipleToStoreOnce(paths, act, repair, checkSigs, headers, imported);
+    bool again = false;
+    retryingWithProgress("AddMultipleToStore", [&](bool & accepted) -> grpc::Status {
+      // A worker whose call was cut off goes on importing and publishing,
+      // so some of the paths may be in the farm by now.
+      if (std::exchange(again, true) && repair == NoRepair) {
+        StorePathSet names;
+        for (auto & [pathInfo, nar] : paths) {
+          names.insert(pathInfo.path);
+        }
+        auto const landed = queryValidPathsRouted(names, NoSubstitute, headers);
+        std::erase_if(paths, [&](const auto & item) -> bool { return landed.contains(item.first.path); });
+        if (paths.empty()) {
+          return grpc::Status::OK;
+        }
+      }
+      return addMultipleToStoreOnce(paths, act, repair, checkSigs, headers, accepted);
     });
 }
 
 auto GrpcStore::addMultipleToStoreOnce(
     std::vector<std::pair<ValidPathInfo, ReplayableNar>> & paths, Activity & act, RepairFlag repair,
-    CheckSigsFlag checkSigs, const Metadata & headers, bool & imported) -> grpc::Status
+    CheckSigsFlag checkSigs, const Metadata & headers, bool & accepted) -> grpc::Status
 {
     uint64_t bytesExpected = 0;
     for (auto & [pathInfo, nar] : paths) {
@@ -272,10 +286,11 @@ auto GrpcStore::addMultipleToStoreOnce(
         if (status.ok()) {
           throw;
         }
+        accepted = call.ctx().GetServerInitialMetadata().contains("x-nix-accepted");
         return status;
     }
     auto status = writer->Finish();
-    imported = call.ctx().GetServerInitialMetadata().contains("x-nix-imported");
+    accepted = call.ctx().GetServerInitialMetadata().contains("x-nix-accepted");
     return status;
 }
 

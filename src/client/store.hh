@@ -349,7 +349,7 @@ public:
     // The call was cut off, as opposed to answered with an error.
     static auto cutOff(const grpc::Status & status) -> bool;
 
-    // `attempt` sets `progressed` once the server took what it sent. The
+    // `attempt` sets `progressed` once the server took the call. The
     // window counts from the first failure, and anew after an attempt that
     // progressed and was then cut off: the server was reachable.
     template<typename F>
@@ -730,11 +730,10 @@ private:
         PathsSource pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs, const Metadata & headers)
 ;
 
-    // `imported`: the server has every path in its store, and only waits
-    // for them to reach the cache.
+    // `accepted`: a worker took the call, before it imports and publishes.
     auto addMultipleToStoreOnce(
         std::vector<std::pair<ValidPathInfo, ReplayableNar>> & paths, Activity & act, RepairFlag repair,
-        CheckSigsFlag checkSigs, const Metadata & headers, bool & imported) -> grpc::Status
+        CheckSigsFlag checkSigs, const Metadata & headers, bool & accepted) -> grpc::Status
 ;
 
 public:
