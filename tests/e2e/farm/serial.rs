@@ -854,7 +854,74 @@ fn an_upload_cut_off_after_longer_than_the_restart_grace_is_retried() {
     }
     wait_unit_done("held", 180);
     assert_unit_success("held");
-    assert_journal(CLIENT, "held", "upstream.*, retrying");
+    // Cut off after the builder took the paths: a reset, no envoy reply.
+    assert_journal(CLIENT, "held", ", retrying");
+}
+
+#[test]
+fn an_upload_cut_off_again_and_again_after_it_landed_is_retried() {
+    farm_ready();
+    // As above: a stopped niks3 push holds every upload once it landed.
+    let push = "push --[s]tdin";
+    for w in WORKERS {
+        let path = succeed(
+            CLIENT,
+            &[
+                "sh",
+                "-c",
+                &format!("echo again-{} > /tmp/prime && nix-store --add /tmp/prime", w.0),
+            ],
+        )
+        .trim()
+        .to_string();
+        succeed(
+            CLIENT,
+            &["nix", "copy", "--no-check-sigs", "--to", &direct(w), &path],
+        );
+        succeed(w, &["pkill", "-STOP", "-f", push]);
+    }
+    succeed(
+        CLIENT,
+        &[
+            "systemd-run",
+            "--unit",
+            "again",
+            "nix",
+            "build",
+            "--store",
+            &format!("{}&restart-grace=10", envoy()),
+            "--eval-store",
+            "auto",
+            "-f",
+            &expr("JOB"),
+            "--argstr",
+            "tag",
+            "again",
+        ],
+    );
+    let uploading = |w: Node| gauge(w, r#"nix_grpc_inflight{kind="AddMultipleToStore"}"#) > 0;
+    let retries = || journal_count(CLIENT, "again", ", retrying");
+    // In CI the builders holding it left one after the other, over longer
+    // than the restart grace in all. Before, the client gave up then.
+    for cut in 0..3 {
+        let mut busy = None;
+        retry(60, "the derivations are uploading", || {
+            busy = WORKERS.into_iter().find(|&w| uploading(w));
+            busy.is_some()
+        });
+        sleep(6);
+        let busy = busy.unwrap();
+        let ip = env(&format!("NGS_{}_IP", busy.0.to_uppercase()));
+        succeed(LB, &["ss", "-tK", "dst", &ip, "dport", "=", ":50051"]);
+        retry(30, "the client retried", || retries() > cut);
+        // The handler of the cut call notices within a second.
+        sleep(2);
+    }
+    for w in WORKERS {
+        succeed(w, &["pkill", "-CONT", "-f", push]);
+    }
+    wait_unit_done("again", 180);
+    assert_unit_success("again");
 }
 
 #[test]

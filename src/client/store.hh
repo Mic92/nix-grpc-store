@@ -343,20 +343,34 @@ public:
     static constexpr std::chrono::milliseconds maxReconnectPause{4000};
     template<typename F>
     void retrying(const char * what, const F & attempt) {
-      // From the first failure: an upload cut off after minutes still gets the whole window.
+      retryingWithProgress(what, [&](bool & /*progressed*/) -> grpc::Status { return attempt(); });
+    }
+
+    // The call was cut off, as opposed to answered with an error.
+    static auto cutOff(const grpc::Status & status) -> bool;
+
+    // `attempt` sets `progressed` once the server took what it sent. The
+    // window counts from the first failure, and anew after an attempt that
+    // progressed and was then cut off: the server was reachable.
+    template<typename F>
+    void retryingWithProgress(const char * what, const F & attempt) {
       std::optional<std::chrono::steady_clock::time_point> giveUp;
       auto pause = std::chrono::milliseconds(500); // NOLINT(*-magic-numbers)
       for (;;) {
-        auto const status = attempt();
+        bool progressed = false;
+        auto const status = attempt(progressed);
         checkInterrupt();
-        if (status.ok()) {
+        if (status.ok() || progressed) {
           everConnected = true;
         }
+        // Not when the server answered with an error after all.
+        bool const cut = progressed && cutOff(status);
         auto const now = std::chrono::steady_clock::now();
-        if (!giveUp) {
+        if (!giveUp || cut) {
           giveUp = now + (everConnected ? restartGrace() : std::chrono::seconds(config->connectTimeout.get()));
+          pause = std::chrono::milliseconds(500); // NOLINT(*-magic-numbers)
         }
-        if (!goneAway(status) || now + pause > *giveUp) {
+        if (!(goneAway(status) || cut) || now + pause > *giveUp) {
           checkStatus(status, what);
           return;
         }
@@ -716,9 +730,11 @@ private:
         PathsSource pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs, const Metadata & headers)
 ;
 
+    // `imported`: the server has every path in its store, and only waits
+    // for them to reach the cache.
     auto addMultipleToStoreOnce(
         std::vector<std::pair<ValidPathInfo, ReplayableNar>> & paths, Activity & act, RepairFlag repair,
-        CheckSigsFlag checkSigs, const Metadata & headers) -> grpc::Status
+        CheckSigsFlag checkSigs, const Metadata & headers, bool & imported) -> grpc::Status
 ;
 
 public:

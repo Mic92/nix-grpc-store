@@ -220,14 +220,16 @@ void GrpcStore::addMultipleToStoreRouted(
     for (auto & [pathInfo, pathSource] : pathsToCopy) {
       paths.emplace_back(pathInfo, ReplayableNar(std::move(pathSource)));
     }
-    retrying("AddMultipleToStore", [&] -> grpc::Status {
-      return addMultipleToStoreOnce(paths, act, repair, checkSigs, headers);
+    // A worker that took the paths may leave while niks3 still pushes them,
+    // after minutes under a busy cache. That was no failure to reach the farm.
+    retryingWithProgress("AddMultipleToStore", [&](bool & imported) -> grpc::Status {
+      return addMultipleToStoreOnce(paths, act, repair, checkSigs, headers, imported);
     });
 }
 
 auto GrpcStore::addMultipleToStoreOnce(
     std::vector<std::pair<ValidPathInfo, ReplayableNar>> & paths, Activity & act, RepairFlag repair,
-    CheckSigsFlag checkSigs, const Metadata & headers) -> grpc::Status
+    CheckSigsFlag checkSigs, const Metadata & headers, bool & imported) -> grpc::Status
 {
     uint64_t bytesExpected = 0;
     for (auto & [pathInfo, nar] : paths) {
@@ -272,7 +274,9 @@ auto GrpcStore::addMultipleToStoreOnce(
         }
         return status;
     }
-    return writer->Finish();
+    auto status = writer->Finish();
+    imported = call.ctx().GetServerInitialMetadata().contains("x-nix-imported");
+    return status;
 }
 
 } // namespace nix

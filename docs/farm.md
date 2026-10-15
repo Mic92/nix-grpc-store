@@ -49,7 +49,9 @@ What happens on a build:
 * The balancer (envoy) sends scheduler traffic to the active scheduler,
   sends each build to the builder the scheduler named, and spreads
   everything else (uploads, queries, downloads) over the builders of
-  the right system.
+  the right system. An upload is answered once the paths are in the
+  binary cache. A client whose upload is cut off after the builder took
+  the paths uploads again, for as long as builders keep taking them.
 
 The scheduler keeps nothing on disk. When it restarts, running builds
 carry on, builders and clients reconnect, and clients ask again for

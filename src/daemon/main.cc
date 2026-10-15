@@ -463,6 +463,10 @@ public:
             nixgrpc::Metrics::Phase phase(metrics, "AddMultipleToStore", "recv");
             std::vector<std::string> imported;
             auto const stats = importUploads(*localStore, source, repair, checkSigs, imported);
+            // Publishing can take minutes. A client cut off meanwhile retries
+            // without counting that against its window: the paths got here.
+            context->AddInitialMetadata("x-nix-imported", "1");
+            reader->SendInitialMetadata();
             phase.next("publish");
             publish(*localStore, imported, [&] -> bool { return context->IsCancelled(); });
             phase.done();

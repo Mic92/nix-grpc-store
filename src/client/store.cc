@@ -190,6 +190,23 @@ auto GrpcStore::goneAway(const grpc::Status & status) -> bool {
   }
 }
 
+// The call broke or its server left, as opposed to the server answering
+// with an error. gRPC reports a stream reset under it, a balancer's included,
+// as "Stream removed".
+auto GrpcStore::cutOff(const grpc::Status & status) -> bool {
+  auto const & msg = status.error_message();
+  switch (status.error_code()) {
+  case grpc::StatusCode::UNKNOWN:
+  case grpc::StatusCode::INTERNAL:
+    return msg.contains("Stream removed") || msg.contains("RST_STREAM") || msg.contains("Socket closed");
+  case grpc::StatusCode::UNAVAILABLE:
+  case grpc::StatusCode::CANCELLED:
+    return goneAway(status) && !msg.contains("publish failed");
+  default:
+    return false;
+  }
+}
+
 auto GrpcStore::isTrustedClient() -> std::optional<TrustedFlag> {
   std::call_once(trustedOnce, [&] -> void {
     remote::StoreInfoRequest const request;
