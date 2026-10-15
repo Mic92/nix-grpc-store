@@ -201,6 +201,12 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.sandboxWrite.emplace_back(next());
         } else if (arg == "--min-free") {
             options.minFree = parseSize(next());
+        } else if (arg == "--expect-timeout") {
+            auto secs = parseInt<unsigned>(next());
+            if (!secs || *secs == 0) {
+                throw nix::Error("--expect-timeout expects a positive integer");
+            }
+            options.expectTimeout = std::chrono::seconds(*secs);
         } else {
             throw nix::Error("unknown flag '%s'", arg);
         }

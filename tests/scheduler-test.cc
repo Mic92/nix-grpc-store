@@ -72,7 +72,7 @@ void testFreeIndex()
     assert(fi.get(4) == 100 && *fi.emptiest() == 4);
 }
 
-auto hello(Core & shard, std::string_view addr, uint32_t jobs, const std::vector<std::string_view> & running = {}, std::vector<std::string> features = {}, std::vector<Core::Superseded> * superseded = nullptr) -> WorkerId
+auto hello(Core & shard, std::string_view addr, uint32_t jobs, const std::vector<std::string_view> & running = {}, std::vector<std::string> features = {}, std::vector<Core::Superseded> * superseded = nullptr, bool faulty = false) -> WorkerId
 {
     std::vector<std::pair<std::string_view, uint64_t>> runs;
     runs.reserve(running.size());
@@ -80,7 +80,7 @@ auto hello(Core & shard, std::string_view addr, uint32_t jobs, const std::vector
         runs.emplace_back(drv, 7);
     }
     std::vector<Core::Superseded> ignored;
-    return shard.hello({.addr = addr, .systems = {"x"}, .features = std::move(features), .maxJobs = jobs, .running = std::move(runs)}, superseded != nullptr ? *superseded : ignored);
+    return shard.hello({.addr = addr, .systems = {"x"}, .features = std::move(features), .maxJobs = jobs, .running = std::move(runs), .faulty = faulty}, superseded != nullptr ? *superseded : ignored);
 }
 
 void testAssignAndDedup()
@@ -211,6 +211,84 @@ void testCancelAndClientGone()
     shard.clientGone(1, revokes);
     assert(revokes.size() == 1 && revokes[0].second == w0);
     assert(!shard.cancel(9, "nope.drv"));
+}
+
+// The client could not reach w0. The drv goes to w1 once w1 has a slot, and
+// back to w0 only when nobody else can run it.
+void testBouncedOff()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 1);
+    shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    auto const w1 = hello(shard, "w1", 1);
+    shard.want(1, {.drvPath = "busy.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 2 && out[0].worker == w0 && out[1].worker == w1);
+    auto const asg = out[0];
+    auto const busy = out[1];
+    // An id that is not the drv's own changes nothing.
+    auto res = shard.want(1, {.drvPath = "busy.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0, .bouncedAssignId = asg.assignId}, 0);
+    assert(res.assigned && !res.bouncedOff);
+    res = shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0, .bouncedAssignId = asg.assignId}, 0);
+    assert(!res.assigned && res.bouncedOff == w0 && shard.worker(w0).running.empty());
+    out.clear();
+    shard.dispatch(out);
+    assert(out.empty()); // w0 is free but bounced it, w1 is busy
+    shard.done(w1, shard.entry(busy.drv)->drvPath, {});
+    shard.dispatch(out);
+    assert(out.size() == 1 && out[0].worker == w1 && out[0].assignId != asg.assignId);
+    // Only w0 is left: it gets another try.
+    res = shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0, .bouncedAssignId = out[0].assignId}, 0);
+    assert(res.bouncedOff == w1);
+    shard.workerGone(w1);
+    out.clear();
+    shard.dispatch(out);
+    assert(out.size() == 1 && out[0].worker == w0);
+}
+
+// w0 built a.drv but could not publish it. The drv goes to w1, and w0 gets
+// builds only while w1 is full, until it can publish again.
+void testReturned()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 2);
+    shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    auto const w1 = hello(shard, "w1", 1);
+    assert(out.size() == 1 && out[0].worker == w0);
+    // w0 is the most free, so a.drv would go back there without this.
+    shard.setFaulty(w0, true);
+    shard.done(w0, "a.drv", {}, true);
+    assert(shard.entry(out[0].drv) && shard.worker(w0).running.empty());
+    shard.dispatch(out);
+    assert(out.size() == 2 && out[1].worker == w1 && out[1].clients == std::vector<ClientId>{1});
+    shard.want(1, {.drvPath = "b.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 3 && out[2].worker == w0); // w1 is full
+    shard.done(w0, "b.drv", {});
+    shard.done(w1, "a.drv", {});
+    shard.want(1, {.drvPath = "c.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 4 && out[3].worker == w1); // though w0 has more slots free
+    shard.setFaulty(w0, false);
+    shard.want(1, {.drvPath = "d.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.done(w1, "c.drv", {});
+    shard.dispatch(out);
+    assert(out.size() == 5 && out[4].worker == w0);
+    shard.done(w0, "d.drv", {});
+    // A reconnect carries the state.
+    hello(shard, "w0", 2, {}, {}, nullptr, true);
+    assert(shard.worker(w0).faulty);
+    // Returned with nobody waiting for it any more: forgotten.
+    shard.want(1, {.drvPath = "e.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 6 && out[5].worker == w1);
+    assert(shard.cancel(1, "e.drv") == w1);
+    shard.done(w1, "e.drv", {}, true);
+    assert(!shard.findDrv("e.drv"));
 }
 
 void testDraining()
@@ -345,6 +423,8 @@ try {
     testHelloReconciles();
     testHelloSupersedes();
     testCancelAndClientGone();
+    testBouncedOff();
+    testReturned();
     testDraining();
     testFeatures();
     testSystems();

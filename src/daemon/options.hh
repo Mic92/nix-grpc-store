@@ -45,6 +45,9 @@ struct Options
     std::string advertise;
     unsigned maxJobs = 0; // 0 = take nix's max-jobs
     uint64_t minFree = 0;
+    // An Expect whose client neither builds nor uploads for it this long is given back.
+    static constexpr std::chrono::seconds defaultExpectTimeout{60};
+    std::chrono::seconds expectTimeout = defaultExpectTimeout;
     std::string storeDir;
     bool sandbox = false;
     // Extra subtrees the sandbox lets the daemon write.

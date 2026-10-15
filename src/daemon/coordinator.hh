@@ -49,14 +49,14 @@ struct Expected
     uint64_t assignId = 0;
     Clock::time_point since;
     bool running = false;
+    unsigned uploads = 0; // the client's uploads in flight, see Builder::Uploading
 
     // Second BuildDerivation for the same drv attaches here.
     struct Shared
     {
         std::mutex mutex;
         std::condition_variable cv;
-        std::atomic<bool> revoked{false}; // scheduler moved the drv to a worker further along
-        std::atomic<unsigned> attached{0};  // callers waiting in attach(); the build outlives its first caller for them
+        std::atomic<bool> revoked{false}; // scheduler moved the drv to a worker further along, or nobody wants it
         bool finished = false;
         std::string resultWire; // BuildDerivationDone serialised
         LogSpill spill; // the owner's build log, replayed to whoever attaches
@@ -86,6 +86,10 @@ public:
     // From the scheduler.
     void onExpect(const nix::remote::Expect & exp);
     void onRevoke(const nix::remote::Revoke & rev);
+    // Gives back an Expect this worker will not build, so the scheduler
+    // places the drv anew instead of sending its client back here. A drv
+    // that already runs here is kept: true, a caller may still attach.
+    auto release(const std::string & drvPath) -> bool;
 
     // BuildDerivation entry: nullopt => FAILED_PRECONDITION. `attach` set if
     // the drv already runs. Caller then waits on it instead of building.
@@ -112,8 +116,28 @@ public:
         return draining_;
     }
 
+    // Every publish to the cache reports how it went. The scheduler hears
+    // when that changes, see Load.publish_failing.
+    void published(bool works);
+
     // Expire unclaimed Expects. Called from the serve loop.
     void tick();
+
+    // An upload for drvPath is in flight. Its client calls BuildDerivation
+    // only once the inputs are here, so the Expect does not expire meanwhile.
+    class Uploading
+    {
+        Builder * builder;
+        std::string drvPath;
+
+    public:
+        Uploading(Builder * builder, std::string drvPath);
+        Uploading(const Uploading &) = delete;
+        Uploading(Uploading &&) = delete;
+        auto operator=(const Uploading &) -> Uploading & = delete;
+        auto operator=(Uploading &&) -> Uploading & = delete;
+        ~Uploading();
+    };
 
     // Swapped by the session thread on every (re)connect.
     void setSend(SendFn send);
@@ -131,8 +155,9 @@ private:
     mutable nix::Sync<State> state;
     mutable nix::Sync<SendFn> sendFn;
     std::atomic<bool> draining_{false};
-    static constexpr std::chrono::seconds expectTimeout{60};
+    std::atomic<bool> publishFailing{false};
 
+    void sendLoad() const;
     void sendDone(
         const std::string & drvPath,
         uint64_t assignId,

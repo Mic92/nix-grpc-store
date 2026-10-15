@@ -115,6 +115,37 @@ auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & reques
   });
 }
 
+namespace {
+// The assigned worker cannot take the job (any more), the scheduler may place it elsewhere.
+auto workerLeft(grpc::StatusCode code) -> bool {
+  switch (code) {
+  case grpc::StatusCode::FAILED_PRECONDITION: // not expected there (any more)
+  case grpc::StatusCode::UNAVAILABLE:         // worker draining or gone
+  case grpc::StatusCode::UNKNOWN:             // worker died mid-stream ("Stream removed"),
+  case grpc::StatusCode::INTERNAL:            //   or RST_STREAM via the balancer,
+  case grpc::StatusCode::CANCELLED:           //   or its process went away (ours is checked first)
+    return true;
+  default:
+    return false;
+  }
+}
+
+// The worker never got the call, turned it down or gave it back: it does not hold the build.
+auto notTaken(const grpc::Status & status) -> bool {
+  auto const & msg = status.error_message();
+  switch (status.error_code()) {
+  case grpc::StatusCode::FAILED_PRECONDITION: // not expected there, or the balancer sent us to another worker
+    return true;
+  case grpc::StatusCode::UNAVAILABLE: // draining, or the balancer could not connect to it
+    return msg.contains("worker draining") || msg.contains("connection failure") || msg.contains("connection timeout")
+           // built it but could not publish it: the worker gave it back
+           || msg.contains("publish failed");
+  default:
+    return false;
+  }
+}
+} // namespace
+
 auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore) -> std::optional<BuildResult> {
   remote::BuildDerivationRequest request;
   request.set_drv_path(std::string(job.drvPath.to_string()));
@@ -132,25 +163,37 @@ auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore)
   std::optional<BuildResult> res;
   auto status = tryBuildDerivation(request, headers, res);
   if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
-    uploadDrvClosure(evalStore, {job.drvPath}, headers);
-    status = tryBuildDerivation(request, headers, res);
+    try {
+      // Keeps the assignment from expiring there however long the upload takes.
+      auto uploadHeaders = headers;
+      uploadHeaders.emplace_back("x-nix-drv", request.drv_path());
+      uploadDrvClosure(evalStore, {job.drvPath}, uploadHeaders);
+      status = tryBuildDerivation(request, headers, res);
+    } catch (GrpcStatusError & err) {
+      // The upload goes to the assigned worker as well, which may drain or
+      // die under it just like under BuildDerivation.
+      if (!workerLeft(err.status.error_code())) {
+        throw;
+      }
+      status = err.status;
+    }
   }
   // Our own cancel ends the stream CANCELLED, and a dead worker looks the same.
   if (!status.ok()) {
     checkInterrupt();
   }
-  switch (status.error_code()) {
-  case grpc::StatusCode::ABORTED: // superseded: the scheduler already sent where to go
+  if (status.error_code() == grpc::StatusCode::ABORTED) { // superseded: the scheduler already sent where to go
     return std::nullopt;
-  case grpc::StatusCode::FAILED_PRECONDITION: // not expected there (any more)
-  case grpc::StatusCode::UNAVAILABLE:         // worker draining or gone
-  case grpc::StatusCode::UNKNOWN:             // worker died mid-stream ("Stream removed"),
-  case grpc::StatusCode::INTERNAL:            //   or RST_STREAM via the balancer
-    printError("%s: %s, asking the scheduler again", job.drvPath.to_string(), firstLine(status.error_message()));
-    return std::nullopt;
-  default:
-    checkStatus(status, "BuildDerivation");
   }
+  if (workerLeft(status.error_code())) {
+    printError("%s: %s, asking the scheduler again", job.drvPath.to_string(), firstLine(status.error_message()));
+    // Tells the scheduler to place it elsewhere instead of sending us back.
+    job.bouncedId = notTaken(status) ? job.assignId : 0;
+    // Not the job's fault, so not worth a retry, the first time per worker.
+    job.freeBounce = (goneAway(status) || job.bouncedId != 0) && job.leftBy.insert(job.workerAddr).second;
+    return std::nullopt;
+  }
+  checkStatus(status, "BuildDerivation");
   if (!res) {
     throw Error("gRPC BuildDerivation stream ended without a result");
   }
@@ -211,6 +254,7 @@ struct GrpcStore::Run {
     want->set_cp_hint_ms(job.cpHintMs);
     want->set_build_mode(static_cast<uint32_t>(mode));
     want->set_system(job.drv.platform);
+    want->set_bounced_assign_id(job.bouncedId);
     debug("grpc: want %s", job.drvPath.to_string());
   }
 
@@ -267,6 +311,8 @@ struct GrpcStore::Run {
   // Under `mutex`. Bounced by the worker: hand back to the scheduler, or
   // follow a redirect it already sent.
   void requeueLocked(Job & job) {
+    bool const free = std::exchange(job.freeBounce, false);
+    std::pair left{job.workerAddr, job.assignId};
     job.workerAddr = std::exchange(job.redirectAddr, {});
     job.assignId = std::exchange(job.redirectId, 0);
     if (!job.workerAddr.empty()) {
@@ -274,10 +320,13 @@ struct GrpcStore::Run {
       cv.notify_all();
       return;
     }
-    if (++job.bounced > store.config->rescheduleRetries) {
+    if (!free && ++job.bounced > store.config->rescheduleRetries) {
       finishLocked(job, nixcompat::failed(nixcompat::FailureStatus::MiscFailure,
                                           fmt("gave up after %d reschedules", job.bounced)));
     } else {
+      if (!free && job.bouncedId == 0) {
+        job.refundable = std::move(left);
+      }
       wantable.push_back(&job);
       flushWants();
     }
@@ -377,6 +426,11 @@ struct GrpcStore::Run {
       }
       job->workerAddr = msg.assigned().worker_addr();
       job->assignId = msg.assigned().assign_id();
+      if (job->refundable == std::pair{job->workerAddr, job->assignId}) {
+        job->bounced--; // that worker still holds the build, only our stream to it broke
+      }
+      job->refundable.reset();
+      job->bouncedId = 0;
     } else if (msg.has_cached()) {
       job->result = cachedResult(*job);
     } else {

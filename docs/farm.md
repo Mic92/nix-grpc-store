@@ -38,12 +38,21 @@ What happens on a build:
   system and features it offers and how many builds it takes. The
   scheduler tells it which derivation to expect before the client shows
   up. A build nobody announced is turned away and the client asks the
-  scheduler again. A second client for a build that is already running
-  attaches to it.
+  scheduler again. So does a client the balancer could not connect to
+  that builder, and the scheduler picks another one. A second client for
+  a build that is already running attaches to it, and so does a client
+  whose stream to it broke: the build goes on until no client wants it.
+* A builder that cannot publish to the binary cache gives the build
+  back, and the scheduler places it on another builder. Until a publish
+  works there again, that builder gets builds only when no other one
+  has a free slot, and the balancer sends it nothing else.
 * The balancer (envoy) sends scheduler traffic to the active scheduler,
   sends each build to the builder the scheduler named, and spreads
   everything else (uploads, queries, downloads) over the builders of
-  the right system.
+  the right system. An upload is answered once the paths are in the
+  binary cache. A client whose upload is cut off after a builder took it
+  sends again what the farm still lacks, for as long as builders keep
+  taking its uploads.
 
 The scheduler keeps nothing on disk. When it restarts, running builds
 carry on, builders and clients reconnect, and clients ask again for

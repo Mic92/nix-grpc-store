@@ -343,8 +343,11 @@ which also requires `trustClients` (see above).
   * `restart-grace` (default 120) — once the server has answered, seconds
     to ride out a worker or scheduler restart, and to wait while the
     scheduler says no worker can take a build.
-  * `reschedule-retries` (default 8) — how often a derivation whose
-    assigned worker went away is handed back to the scheduler.
+  * `reschedule-retries` (default 8) — how often a derivation bounced by
+    its assigned worker is handed back to the scheduler. The first bounce
+    by a worker that drained, left or lost the assignment does not count,
+    nor does one after which the scheduler sends it back to the same
+    assignment, where the build still runs.
   * `max-builds` (default 64) — concurrent `BuildDerivation` streams.
   * `system` — send `x-nix-system` on every call, not just builds, so a
     balancer routes input uploads and substitution to a worker of that
@@ -364,6 +367,7 @@ which also requires `trustClients` (see above).
   * `--worker-name NAME` — name in build-log prefixes and `nix_grpc_build_info`, default hostname
   * `--role builder,scheduler`, `--scheduler ADDR`, `--scheduler-token-file FILE`, `--advertise IP:PORT`, `--max-jobs N`, `--min-free SIZE` — see [docs/farm.md](docs/farm.md). The defaults make a single node schedule onto itself
   * `--niks3 URL [--niks3-token-file FILE] [--niks3-client-cert FILE --niks3-client-key FILE] [--niks3-push CMD]` — publish build outputs and uploads to a niks3 cache; authenticate with a bearer token, a client certificate (defaults to `--tls-cert/--tls-key`), or both
+  * `--expect-timeout SECS` — a builder gives an assignment back if its client neither builds nor uploads inputs for it this long, default 60
   * `--log-level info|debug` — access log verbosity, default `info`
 
 ## Monitoring

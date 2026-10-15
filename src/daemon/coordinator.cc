@@ -109,6 +109,25 @@ void Builder::onRevoke(const nix::remote::Revoke & rev)
     sendDone(rev.drv_path(), assignId, nix::remote::Done::CANCELLED, {});
 }
 
+auto Builder::release(const std::string & drvPath) -> bool
+{
+    uint64_t assignId = 0;
+    {
+        auto lck = state.lock();
+        auto const found = lck->expected.find(drvPath);
+        if (found == lck->expected.end()) {
+            return false;
+        }
+        if (found->second.running) {
+            return true;
+        }
+        assignId = found->second.assignId;
+        lck->expected.erase(found);
+    }
+    sendDone(drvPath, assignId, nix::remote::Done::CANCELLED, {});
+    return false;
+}
+
 auto Builder::admit(const std::string & drvPath) -> std::optional<Admission>
 {
     auto lck = state.lock();
@@ -183,6 +202,7 @@ auto Builder::hello() const -> WorkerMsg
         hel->add_features(feat);
     }
     hel->set_max_jobs(draining_ ? 0 : options.maxJobs);
+    hel->set_publish_failing(publishFailing);
     auto lck = state.lock();
     for (const auto & [drv, ent] : lck->expected) {
         auto * run = hel->add_running();
@@ -194,11 +214,25 @@ auto Builder::hello() const -> WorkerMsg
 
 void Builder::setDraining(bool draining)
 {
-    if (draining_.exchange(draining) == draining) {
+    if (draining_.exchange(draining) != draining) {
+        sendLoad();
+    }
+}
+
+void Builder::published(bool works)
+{
+    if (publishFailing.exchange(!works) == !works) {
         return;
     }
+    logLine(LogLevel::info, {{"event", works ? "publishing" : "publish_failing"}});
+    sendLoad();
+}
+
+void Builder::sendLoad() const
+{
     WorkerMsg msg;
-    msg.mutable_load()->set_draining(draining);
+    msg.mutable_load()->set_draining(draining_);
+    msg.mutable_load()->set_publish_failing(publishFailing);
     send(msg);
 }
 
@@ -220,7 +254,8 @@ void Builder::tick()
         auto lck = state.lock();
         const auto now = Clock::now();
         for (auto iter = lck->expected.begin(); iter != lck->expected.end();) {
-            if (!iter->second.running && now - iter->second.since > expectTimeout) {
+            auto const & ent = iter->second;
+            if (!ent.running && ent.uploads == 0 && now - ent.since > options.expectTimeout) {
                 expired.emplace_back(iter->first, iter->second.assignId);
                 iter = lck->expected.erase(iter);
             } else {
@@ -231,6 +266,34 @@ void Builder::tick()
     for (const auto & [drv, assignId] : expired) {
         metrics.event("expect_no_show");
         sendDone(drv, assignId, nix::remote::Done::NO_SHOW, {});
+    }
+}
+
+Builder::Uploading::Uploading(Builder * builder, std::string drvPath)
+    : builder(drvPath.empty() ? nullptr : builder)
+    , drvPath(std::move(drvPath))
+{
+    if (this->builder == nullptr) {
+        return;
+    }
+    auto lck = this->builder->state.lock();
+    if (auto const found = lck->expected.find(this->drvPath); found != lck->expected.end()) {
+        found->second.uploads++;
+    } else {
+        this->builder = nullptr; // not (or no longer) expected here
+    }
+}
+
+Builder::Uploading::~Uploading()
+{
+    if (builder == nullptr) {
+        return;
+    }
+    auto lck = builder->state.lock();
+    // A revoked and re-sent Expect starts at 0 again.
+    if (auto const found = lck->expected.find(drvPath); found != lck->expected.end() && found->second.uploads > 0) {
+        found->second.uploads--;
+        found->second.since = Clock::now(); // the next upload or the build follows right away
     }
 }
 
