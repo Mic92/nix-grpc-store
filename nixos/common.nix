@@ -265,6 +265,16 @@ in
         client certificate. Re-read when the file changes.
       '';
     };
+    farmId = lib.mkOption {
+      type = lib.types.nullOr (lib.types.strMatching "[a-z0-9]([-a-z0-9]*[a-z0-9])?");
+      default = null;
+      example = "build-x86";
+      description = ''
+        Stable ID of this scheduler's independent farm. Schedulers with the
+        same ID elect one leader against niks3; `null` retains the shared
+        legacy lock. Requires a niks3 with the named leader endpoint.
+      '';
+    };
     advertise = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;

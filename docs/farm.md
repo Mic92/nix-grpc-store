@@ -58,6 +58,12 @@ one set of outputs ever exists.
 With several scheduler-role nodes, niks3 decides which one is active:
 the first to take a lock in its database, for as long as it stays
 connected. When it goes away another node has the lock within seconds.
+Two independent farms can use the same niks3 cache if one scheduler set
+passes a distinct `--farm-id` to nix-grpc-daemon. An omitted ID uses the
+original shared lock. Every scheduler in one farm must use the same ID;
+the farms still have separate queues and workers. Upgrade niks3 to a version
+with the named leader endpoint before enabling a nonempty ID. On NixOS set
+`services.nix-grpc-daemon.farmId` on the scheduler nodes.
 
 When a builder restarts, its builds fail and the scheduler sends them
 elsewhere.

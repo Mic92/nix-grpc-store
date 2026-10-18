@@ -38,6 +38,8 @@ struct Options
 
     bool builder = true;
     bool scheduler = true;
+    // Empty elects against the legacy shared niks3 lock.
+    std::string farmId;
     // Empty: in-process scheduler. Else the balancer URL (host:port) to dial.
     std::string schedulerAddr;
     std::string schedulerTokenFile; // bearer towards a remote scheduler, optional
