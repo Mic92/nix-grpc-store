@@ -5,6 +5,12 @@
 {{- $w := mustMergeOverwrite (deepCopy $root.Values.workerDefaults) ($overrides | default dict) }}
 {{- $svc := include "farm.workerService" (dict "root" $root "group" $g) }}
 {{- $sel := include "farm.workerSelectorLabels" (dict "root" $root "group" $g) }}
+{{- if and $w.advertise (not $w.hostPort) }}{{ fail (printf "workers.%s.advertise needs hostPort" $g) }}{{ end }}
+{{- $affinity := deepCopy ($w.affinity | default dict) }}
+{{- if $w.advertise }}
+{{- if hasKey $affinity "nodeAffinity" }}{{ fail (printf "workers.%s: advertise sets the nodeAffinity, drop affinity.nodeAffinity" $g) }}{{ end }}
+{{- $_ := set $affinity "nodeAffinity" (dict "requiredDuringSchedulingIgnoredDuringExecution" (dict "nodeSelectorTerms" (list (dict "matchExpressions" (list (dict "key" "kubernetes.io/hostname" "operator" "In" "values" (keys $w.advertise | sortAlpha))))))) }}
+{{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -61,7 +67,12 @@ spec:
     matchLabels: {{- $sel | nindent 6 }}
   strategy:
     type: RollingUpdate
+    {{- if $w.hostPort }}
+    # The new pod needs the old one's node port.
+    rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+    {{- else }}
     rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+    {{- end }}
   template:
     metadata:
       annotations:
@@ -98,7 +109,7 @@ spec:
       {{- with $w.tolerations }}
       tolerations: {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with $w.affinity }}
+      {{- with $affinity }}
       affinity: {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- include "farm.spread" (dict "spread" $w.spread "selector" $sel) | nindent 6 }}
@@ -158,12 +169,29 @@ spec:
         - name: nix-grpc-daemon
           image: {{ include "farm.image" $root }}
           imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          {{- if $w.advertise }}
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              case "$NODE_NAME" in
+              {{- range $node, $ip := $w.advertise }}
+                {{ $node }}) host={{ $ip }} ;;
+              {{- end }}
+                *) echo "no advertise address for node $NODE_NAME" >&2; exit 1 ;;
+              esac
+              exec /bin/nix-grpc-daemon --advertise="$host:{{ $w.hostPort }}" "$@"
+            - nix-grpc-daemon
+          {{- else }}
           command: [/bin/nix-grpc-daemon]
+          {{- end }}
           args:
             - --role=builder
             - --listen=[::]:50051
-            # What envoy resolves the headless Service to, so x-nix-worker pins here.
-            - --advertise=$(POD_IP):50051
+            {{- if not $w.advertise }}
+            # What the balancer reaches this pod at, so x-nix-worker pins here.
+            - --advertise=$({{ if $w.hostPort }}HOST_IP):{{ $w.hostPort }}{{ else }}POD_IP):50051{{ end }}
+            {{- end }}
             - --scheduler={{ if not (include "farm.tlsSecret" (list $root "worker")) }}http://{{ end }}{{ include "farm.schedulerFor" $root }}
             # civetweb binds [::] v6-only. Pod IPs are v4 on most clusters.
             - --metrics-listen=0.0.0.0:9464
@@ -201,6 +229,8 @@ spec:
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
             - name: POD_IP
               valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: HOST_IP
+              valueFrom: {fieldRef: {fieldPath: status.hostIP}}
             - {name: TMPDIR, value: /spool}
           securityContext:
             runAsUser: 990
@@ -208,7 +238,11 @@ spec:
             allowPrivilegeEscalation: false
             capabilities: {drop: [ALL]}
           ports:
-            - {name: grpc, containerPort: 50051}
+            - name: grpc
+              containerPort: 50051
+              {{- with $w.hostPort }}
+              hostPort: {{ . }}
+              {{- end }}
             - {name: metrics, containerPort: 9464}
           {{- /* kubelet gRPC probes are plaintext; with TLS fall back to TCP and let envoy judge health. */}}
           {{- $probe := ternary (dict "tcpSocket" (dict "port" 50051)) (dict "grpc" (dict "port" 50051)) (not (empty (include "farm.tlsSecret" (list $root "worker")))) }}

@@ -84,9 +84,18 @@ let
     };
     auth.accessRules = [ ];
   };
-  # Workers of a farm whose scheduler and balancer run outside the cluster.
+  # Workers of a farm whose scheduler and balancer run outside the cluster,
+  # reached through a port on their node.
   valuesExternal = lib.recursiveUpdate values {
     scheduler.external = "farm.example.com:50051";
+    workers.x86 = {
+      hostPort = 50052;
+      advertise = {
+        n1 = "10.0.0.1";
+        n2 = "10.0.0.2";
+      };
+    };
+    workers.arm.hostPort = 50052;
   };
   # formats.yaml emits a %YAML directive that helm rejects. JSON is YAML.
   json = pkgs.formats.json { };
@@ -237,12 +246,30 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
     test "$(envoyCerts public-secret.yaml)" = '["public",["lb"]]'
     test "$(pick Deployment t-nix-grpc-farm-lb '.spec.template.spec.volumes[] | select(.name == "tls-public") | .secret.secretName' public-secret.yaml)" = public
 
-    # External scheduler: no scheduler or balancer of our own.
+    # External scheduler: no scheduler or balancer of our own, workers on a node port.
     helm template t chart -f ${json.generate "values.json" valuesExternal} --api-versions monitoring.coreos.com/v1/PodMonitor > ext.yaml
     test "$(yq ea '[select(.kind == "Deployment") | .metadata.name] | sort | join(" ")' ext.yaml)" = 't-nix-grpc-farm-worker-arm t-nix-grpc-farm-worker-x86'
     ! grep -q 't-nix-grpc-farm-lb' ext.yaml
     daemon() { pick Deployment "t-nix-grpc-farm-worker-$1" ".spec.template.spec.containers[] | select(.name == \"nix-grpc-daemon\") | $2" ext.yaml; }
     daemon x86 '.args[]' | grep -qx -- --scheduler=farm.example.com:50051
+    test "$(daemon x86 '.ports[] | select(.name == "grpc") | .hostPort')" = 50052
+    test "$(daemon x86 '.command[0]')" = /bin/sh
+    # The case script must pick each node's address and refuse unknown nodes.
+    script=$(daemon x86 '.command[2]')
+    for n in n1:10.0.0.1 n2:10.0.0.2 n3:; do
+      got=$(NODE_NAME=''${n%%:*} sh -c "''${script/exec \/bin\/nix-grpc-daemon/echo}" sh 2>&1 || true)
+      if [ -n "''${n#*:}" ]; then
+        test "$got" = "--advertise=''${n#*:}:50052"
+      else
+        echo "$got" | grep -q 'no advertise address'
+      fi
+    done
+    test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values | join(",")' ext.yaml)" = n1,n2
+    # A second pod cannot take the port on the same node, so no surge.
+    test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.strategy.rollingUpdate.maxSurge' ext.yaml)" = 0
+    # Without a map the node's InternalIP is the address.
+    daemon arm '.args[]' | grep -qx -- '--advertise=$(HOST_IP):50052'
+    test "$(daemon arm '.command[0]')" = /bin/nix-grpc-daemon
 
     touch $out
   ''

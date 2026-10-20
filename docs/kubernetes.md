@@ -349,6 +349,39 @@ proxy reads the list over its own connection to the scheduler and answers
 that path from clients with an error.
 `nixos/lb.nix` and the chart's `_envoy.tpl` are working references.
 
+### Add workers to a farm outside the cluster
+
+The chart can run only workers that join a scheduler outside the cluster,
+for example a farm deployed with the NixOS modules. The external balancer
+cannot reach pod IPs, so each worker takes a port on its node and
+advertises the node's address:
+
+```yaml
+scheduler:
+  external: farm.example.com:50051 # the farm's balancer
+workers:
+  x86-64:
+    system: x86_64-linux
+    replicas: 3
+    spread: required
+    hostPort: 50052
+    advertise: # node name -> IP the balancer reaches it at
+      node-1: 10.0.0.1
+      node-2: 10.0.0.2
+      node-3: 10.0.0.3
+tls: # certificates from the farm's CA, CN matching its workers' rule
+  clientCA: {existingSecret: farm-ca}
+  worker: {existingSecret: farm-worker-tls}
+auth:
+  trustedProxies: ["lb-*"] # the farm balancer's certificate CN
+```
+
+The release then has no scheduler and no balancer. `advertise` also
+restricts the pods to the listed nodes. Without it they advertise the
+node's InternalIP and can run on any node. The port needs the CNI
+`portmap` plugin. Since two pods cannot hold the same node port, a
+rollout replaces workers one at a time instead of surging.
+
 ## Step 2: Connect CI jobs in the cluster
 
 Pods in the cluster authenticate with their Kubernetes service account
