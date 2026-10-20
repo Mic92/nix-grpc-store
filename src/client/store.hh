@@ -55,6 +55,7 @@
 #include <openssl/x509.h>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <string>
 #include <string_view>
 #include <stop_token>
@@ -212,6 +213,20 @@ public:
     auto openStore() const -> ref<Store> override;
 };
 
+// A failed RPC. Keeps the status so a caller can tell a departed worker from
+// a real error.
+struct GrpcStatusError : Error
+{
+    grpc::Status status;
+
+    template<typename... Args>
+    explicit GrpcStatusError(grpc::Status status, const std::string & format, const Args &... args)
+        : Error(format, args...)
+        , status(std::move(status))
+    {
+    }
+};
+
 // NOLINTNEXTLINE(misc-multiple-inheritance): inherited from Nix's store hierarchy
 struct GrpcStore : virtual RemoteStore
 {
@@ -263,7 +278,7 @@ private:
     auto connectHint(const std::string & msg) const -> std::string
 ;
 
-    auto statusError(const grpc::Status & status, const char * opName) const -> Error
+    auto statusError(const grpc::Status & status, const char * opName) const -> GrpcStatusError
 ;
 
     void checkStatus(const grpc::Status & status, const char * opName) const
@@ -328,16 +343,34 @@ public:
     static constexpr std::chrono::milliseconds maxReconnectPause{4000};
     template<typename F>
     void retrying(const char * what, const F & attempt) {
-      auto const giveUp = std::chrono::steady_clock::now()
-                    + (everConnected ? restartGrace() : std::chrono::seconds(config->connectTimeout.get()));
+      retryingWithProgress(what, [&](bool & /*progressed*/) -> grpc::Status { return attempt(); });
+    }
+
+    // The call was cut off, as opposed to answered with an error.
+    static auto cutOff(const grpc::Status & status) -> bool;
+
+    // `attempt` sets `progressed` once the server took the call. The
+    // window counts from the first failure, and anew after an attempt that
+    // progressed and was then cut off: the server was reachable.
+    template<typename F>
+    void retryingWithProgress(const char * what, const F & attempt) {
+      std::optional<std::chrono::steady_clock::time_point> giveUp;
       auto pause = std::chrono::milliseconds(500); // NOLINT(*-magic-numbers)
       for (;;) {
-        auto const status = attempt();
+        bool progressed = false;
+        auto const status = attempt(progressed);
         checkInterrupt();
-        if (status.ok()) {
+        if (status.ok() || progressed) {
           everConnected = true;
         }
-        if (!goneAway(status) || std::chrono::steady_clock::now() + pause > giveUp) {
+        // Not when the server answered with an error after all.
+        bool const cut = progressed && cutOff(status);
+        auto const now = std::chrono::steady_clock::now();
+        if (!giveUp || cut) {
+          giveUp = now + (everConnected ? restartGrace() : std::chrono::seconds(config->connectTimeout.get()));
+          pause = std::chrono::milliseconds(500); // NOLINT(*-magic-numbers)
+        }
+        if (!(goneAway(status) || cut) || now + pause > *giveUp) {
           checkStatus(status, what);
           return;
         }
@@ -483,6 +516,14 @@ public:
       size_t waiting = 0;
       uint64_t cpHintMs = 0;
       unsigned bounced = 0;
+      // Workers that drained, vanished or lost the assignment under this job.
+      std::set<std::string> leftBy;
+      bool freeBounce = false; // the last bounce does not count against reschedule-retries
+      // The assignment whose worker did not take the job, for the next Want.
+      uint64_t bouncedId = 0;
+      // A counted bounce off this worker and assignment. Refunded if the
+      // scheduler sends us back to it: the build there outlived our stream.
+      std::optional<std::pair<std::string, uint64_t>> refundable;
       std::optional<StorePath> failedInput;
       std::optional<BuildResult> result;
       // Set by the reader thread, consumed by a build thread.
@@ -689,9 +730,10 @@ private:
         PathsSource pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs, const Metadata & headers)
 ;
 
+    // `accepted`: a worker took the call, before it imports and publishes.
     auto addMultipleToStoreOnce(
         std::vector<std::pair<ValidPathInfo, ReplayableNar>> & paths, Activity & act, RepairFlag repair,
-        CheckSigsFlag checkSigs, const Metadata & headers) -> grpc::Status
+        CheckSigsFlag checkSigs, const Metadata & headers, bool & accepted) -> grpc::Status
 ;
 
 public:

@@ -160,7 +160,7 @@ auto GrpcStore::connectHint(const std::string & msg) const -> std::string
   return more.empty() ? "" : "\nhint:" + more;
 }
 
-auto GrpcStore::statusError(const grpc::Status & status, const char * opName) const -> Error
+auto GrpcStore::statusError(const grpc::Status & status, const char * opName) const -> GrpcStatusError
 {
   std::string hint;
   auto const code = status.error_code();
@@ -169,18 +169,39 @@ auto GrpcStore::statusError(const grpc::Status & status, const char * opName) co
     hint = connectHint(status.error_message());
   }
   // NOLINTNEXTLINE(modernize-return-braced-init-list): Error ctor is explicit
-  return Error("gRPC %s on '%s' failed: %s%s", opName, config->authority.to_string(),
-               status.error_message(), hint);
+  return GrpcStatusError(status, "gRPC %s on '%s' failed: %s%s", opName, config->authority.to_string(),
+                         status.error_message(), hint);
 }
 
+// A server that shuts down ends the calls it still has with "Cancelling all calls".
 auto GrpcStore::goneAway(const grpc::Status & status) -> bool {
   switch (status.error_code()) {
   case grpc::StatusCode::UNAVAILABLE:
     return transportError(status.error_message()) || status.error_message().contains("upstream")
            || status.error_message().contains("shutting down")
-           || status.error_message().contains("local nix-daemon connection lost");
+           || status.error_message().contains("Cancelling all calls")
+           || status.error_message().contains("local nix-daemon connection lost")
+           // that worker cannot reach the cache, the balancer takes it out
+           || status.error_message().contains("publish failed");
   case grpc::StatusCode::CANCELLED:
     return status.error_message().contains("Cancelling all calls");
+  default:
+    return false;
+  }
+}
+
+// The call broke or its server left, as opposed to the server answering
+// with an error. gRPC reports a stream reset under it, a balancer's included,
+// as "Stream removed".
+auto GrpcStore::cutOff(const grpc::Status & status) -> bool {
+  auto const & msg = status.error_message();
+  switch (status.error_code()) {
+  case grpc::StatusCode::UNKNOWN:
+  case grpc::StatusCode::INTERNAL:
+    return msg.contains("Stream removed") || msg.contains("RST_STREAM") || msg.contains("Socket closed");
+  case grpc::StatusCode::UNAVAILABLE:
+  case grpc::StatusCode::CANCELLED:
+    return goneAway(status) && !msg.contains("publish failed");
   default:
     return false;
   }

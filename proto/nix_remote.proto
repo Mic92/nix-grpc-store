@@ -157,6 +157,11 @@ message Want {
   repeated string required_features = 6;
   // drv.platform; empty means the scheduler's own system.
   string system = 7;
+  // Asking again because the worker of this assignment was not reached or
+  // does not expect the drv. Unless the drv was placed anew meanwhile, the
+  // scheduler takes it back from that worker and places it on another one
+  // that can run it, if there is any.
+  uint64 bounced_assign_id = 8;
 }
 
 message Cancel {
@@ -220,6 +225,8 @@ message Hello {
   // Builds in progress and Expects not yet claimed, so a restarted scheduler
   // neither double-assigns them nor counts their slots as free.
   repeated RunningBuild running = 5;
+  // See Load.
+  bool publish_failing = 6;
 }
 
 message Done {
@@ -229,6 +236,10 @@ message Done {
     CANCELLED = 2;
     // Expect expired without a BuildDerivation arriving.
     NO_SHOW = 3;
+    // The worker could not finish it (could not publish the outputs, could
+    // not get an input): the scheduler places it on another worker, or on
+    // this one again if no other can run it.
+    RETURNED = 4;
   }
   string drv_path = 1;
   uint64 assign_id = 2;
@@ -238,6 +249,10 @@ message Done {
 
 message Load {
   bool draining = 1;
+  // Its last publish to the binary cache failed. The scheduler sends it
+  // builds only if no other worker has a free slot, and the balancer sends
+  // it nothing else, until a publish succeeds again.
+  bool publish_failing = 2;
 }
 
 message WorkerMsg {

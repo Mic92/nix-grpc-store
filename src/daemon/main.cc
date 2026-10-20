@@ -26,6 +26,7 @@
 #include <optional>
 #include <ranges>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -98,6 +99,13 @@ volatile std::sig_atomic_t nixgrpc::stopSignal = 0;
 
 namespace {
 using nixgrpc::stopSignal;
+
+// This worker could not make paths visible to the others. Not the caller's
+// fault: it may retry on another worker.
+struct PublishFailed : std::runtime_error
+{
+    using std::runtime_error::runtime_error;
+};
 
 static_assert(static_cast<int>(nixgrpc::SpillKind::line) == static_cast<int>(nixgrpc::BuildEvent::Kind::line));
 static_assert(static_cast<int>(nixgrpc::SpillKind::phase) == static_cast<int>(nixgrpc::BuildEvent::Kind::phase));
@@ -183,6 +191,8 @@ private:
             return denied.status;
         } catch (nixgrpc::CancelledWait & err) {
             return {grpc::StatusCode::UNAVAILABLE, err.what()};
+        } catch (PublishFailed & err) {
+            return {grpc::StatusCode::UNAVAILABLE, workerName + ": " + err.what()};
         } catch (std::exception & err) {
             if (stopSignal != 0) {
                 return {grpc::StatusCode::UNAVAILABLE, std::string("worker shutting down: ") + err.what()};
@@ -204,6 +214,38 @@ private:
     }
 
     using Fields = std::vector<nixgrpc::LogField>;
+
+    // A client uploads the inputs of the drv in x-nix-drv before it builds it here.
+    auto uploading(const grpc::ServerContext & context) -> nixgrpc::Builder::Uploading
+    {
+        auto const & metadata = context.client_metadata();
+        auto const found = metadata.find("x-nix-drv");
+        return {
+            coord.builder ? &*coord.builder : nullptr,
+            found == metadata.end() ? "" : std::string(found->second.data(), found->second.size())};
+    }
+
+    // Makes locally valid paths visible to the other nodes, and tells the
+    // scheduler whether this worker can.
+    void publish(nix::Store & localStore, const std::vector<std::string> & paths, const nixgrpc::Cancelled & cancelled)
+    {
+        if (!coord.cache.hasRemote() || paths.empty()) {
+            return;
+        }
+        try {
+            coord.cache.publish(localStore, paths, cancelled);
+        } catch (nixgrpc::CancelledWait &) {
+            throw;
+        } catch (nix::Error & err) {
+            if (coord.builder) {
+                coord.builder->published(false);
+            }
+            throw PublishFailed(std::string("publish failed: ") + err.what());
+        }
+        if (coord.builder) {
+            coord.builder->published(true);
+        }
+    }
 
     // The authorised, counted part of an RPC. done() writes the one info line per call.
     struct Rpc
@@ -306,6 +348,7 @@ public:
     {
         return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "QueryValidPaths", nixgrpc::Role::readOnly);
+            auto const keep = uploading(*context);
             nixgrpc::Metrics::Held const held(metrics, "QueryValidPaths");
             auto const localStore = getStore();
             nix::StorePathSet paths;
@@ -327,7 +370,7 @@ public:
                 }
                 // and what only we have must become so before the client relies on it.
                 phase.next("publish");
-                coord.cache.publish(*localStore, valid, [&] -> bool { return context->IsCancelled(); });
+                publish(*localStore, valid, [&] -> bool { return context->IsCancelled(); });
             }
             return grpc::Status::OK;
         });
@@ -395,12 +438,18 @@ public:
     {
         return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "AddMultipleToStore", nixgrpc::Role::write);
+            auto const keep = uploading(*context);
             auto localStore = openScopedStore();
 
             nix::remote::AddMultipleChunk first;
             if (!reader->Read(&first)) {
                 return {grpc::StatusCode::INVALID_ARGUMENT, "empty AddMultipleToStore stream"};
             }
+            // Importing and publishing can take minutes. A client cut off
+            // meanwhile retries without counting that against its window:
+            // it reached the farm.
+            context->AddInitialMetadata("x-nix-accepted", "1");
+            reader->SendInitialMetadata();
             auto repair = first.repair() ? nix::Repair : nix::NoRepair;
             // The nix-daemon downgrades this to CheckSigs if we are not a
             // trusted user, same as for the tunnelled protocol.
@@ -420,7 +469,7 @@ public:
             std::vector<std::string> imported;
             auto const stats = importUploads(*localStore, source, repair, checkSigs, imported);
             phase.next("publish");
-            coord.cache.publish(*localStore, imported, [&] -> bool { return context->IsCancelled(); });
+            publish(*localStore, imported, [&] -> bool { return context->IsCancelled(); });
             phase.done();
             rpc.done({{"paths", std::to_string(stats.paths)}, {"nar_bytes_in", std::to_string(stats.narBytes)}});
             metrics.countNarBytes("in", rpc.caller.name, stats.narBytes);
@@ -564,14 +613,12 @@ public:
         -> std::optional<std::string>
     {
         log({.text = "attached to the build already running on this worker"});
-        shared.attached++;
         auto const completed = nixgrpc::followSpill(
             shared.spill, shared.mutex, shared.cv, shared.finished, nixgrpc::cancelPoll,
             [&] -> bool { return context.IsCancelled() || stopSignal >= nixgrpc::kCancelBuilds; },
             [&](nixgrpc::SpillKind kind, std::string_view text) -> void {
                 log({.kind = static_cast<nixgrpc::BuildEvent::Kind>(kind), .text = std::string(text)});
             });
-        shared.attached--;
         if (!completed) {
             return std::nullopt;
         }
@@ -646,14 +693,14 @@ public:
         try {
             auto status =
                 buildExpected(
-                    context, *adm->shared, localStore, drvPath, drv, mode, limits, tee, inputs, outPaths, done, outcome,
-                    outputs);
+                    *adm->shared, localStore, drvPath, drv, mode, limits, tee, inputs, outPaths, done, outcome, outputs);
             // No result to share unless the build produced one: attachers of a
             // failed owner must retry, not return an empty Done as success.
             if (status.ok()) {
                 wire = done.SerializeAsString();
             } else {
-                outcome = nix::remote::Done::FAILED;
+                // Not the build's fault but this worker's: let another one have it.
+                outcome = nix::remote::Done::RETURNED;
             }
             report();
             return status;
@@ -672,7 +719,6 @@ public:
     }
 
     auto buildExpected(
-        grpc::ServerContext & context,
         nixgrpc::Expected::Shared & shared,
         nix::Store & localStore,
         const nix::StorePath & drvPath,
@@ -686,9 +732,9 @@ public:
         nix::remote::Done::Outcome & outcome,
         std::vector<std::pair<std::string, uint64_t>> & outputs) -> grpc::Status
     {
-        auto const cancelled = [&] -> bool {
-            return (context.IsCancelled() && shared.attached == 0) || shared.revoked || stopSignal >= nixgrpc::kCancelBuilds;
-        };
+        // Not when our caller's stream breaks: the scheduler sends it back here
+        // to attach. It revokes the build once no client wants it any more.
+        auto const cancelled = [&] -> bool { return shared.revoked || stopSignal >= nixgrpc::kCancelBuilds; };
         nixgrpc::Metrics::Held const held(metrics, "BuildDerivation");
         nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "substitute");
         // Roots inputs and outputs until publish is done.
@@ -730,12 +776,10 @@ public:
             }
             try {
                 phase.next("publish");
-                coord.cache.publish(localStore, built, cancelled);
+                publish(localStore, built, cancelled);
                 phase.done();
-            } catch (nixgrpc::CancelledWait &) {
-                throw;
-            } catch (nix::Error & err) {
-                return {grpc::StatusCode::UNAVAILABLE, std::string("publish failed: ") + err.what()};
+            } catch (PublishFailed & err) {
+                return {grpc::StatusCode::UNAVAILABLE, err.what()};
             }
             outcome = nix::remote::Done::BUILT;
         } else if (nixcompat::failureStatus(res) == nixcompat::FailureStatus::TransientFailure) {
@@ -757,7 +801,10 @@ public:
                 || request->build_mode() > static_cast<uint32_t>(nix::bmCheck)) {
                 return {grpc::StatusCode::INVALID_ARGUMENT, "unsupported build protocol or mode"};
             }
-            if (stopSignal != 0) {
+            // Draining takes no new builds. A caller whose stream to a build
+            // already running here broke still attaches to it: the scheduler
+            // sends it back here for as long as that build runs.
+            if (stopSignal != 0 && (!coord.builder || !coord.builder->release(request->drv_path()))) {
                 return {grpc::StatusCode::UNAVAILABLE, "worker draining"};
             }
             auto const localStore = getStore();
@@ -858,8 +905,10 @@ public:
 
 namespace {
 // Returns on idle timeout or SIGTERM. A builder's first SIGTERM only stops
-// taking builds and this returns once those in flight have reported. The
-// supervisor's stop timeout or a second signal bounds that.
+// taking builds and this returns once those in flight have reported, and
+// uploads in flight have landed: Shutdown() would cut them off and fail the
+// client's build instead of bouncing it. The supervisor's stop timeout or a
+// second signal bounds that.
 void serve(
     grpc::Server const & server,
     const nixgrpc::Options & options,
@@ -878,7 +927,9 @@ void serve(
                 return;
             }
             coord.tick();
-        } else if (stopSignal >= nixgrpc::kCancelBuilds || !coord.builder || metrics.inflightNow("BuildDerivation") == 0) {
+        } else if (
+            stopSignal >= nixgrpc::kCancelBuilds || !coord.builder
+            || metrics.inflightNow("BuildDerivation") + metrics.inflightNow("AddMultipleToStore") == 0) {
             return;
         } else if (!draining) {
             draining = true;

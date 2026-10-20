@@ -117,6 +117,11 @@ let
         ];
         oidc = oidcConfig;
         minFree = "200M";
+        # Uploads slower than this stay cheap to test.
+        extraFlags = [
+          "--expect-timeout"
+          "10"
+        ];
         niks3 = {
           package = niks3Pkgs.niks3;
           url = niks3Url;
@@ -178,10 +183,11 @@ let
     }
   '';
   slowExpr = pkgs.writeText "slow.nix" ''
-    { tag }:
+    { tag, features ? [ ] }:
     derivation {
       name = "slow-''${tag}";
       system = builtins.currentSystem;
+      requiredSystemFeatures = features;
       builder = "/bin/sh";
       # Inner sh so a test can pkill it to let the build succeed early.
       args = [ "-c" "/bin/sh -c 'read -t 90 x < /dev/zero'; echo ''${tag} > $out" ];
