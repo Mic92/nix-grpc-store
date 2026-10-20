@@ -197,6 +197,38 @@ workers:
       requests: {cpu: 250m, memory: 256Mi}
 ```
 
+### Run KVM builds
+
+NixOS tests and other builds with `requiredSystemFeatures = ["kvm"]` need
+`/dev/kvm`. Pods only get host devices from a device plugin, for example
+[generic-device-plugin](https://github.com/squat/generic-device-plugin):
+
+```yaml
+# generic-device-plugin chart values
+devices:
+  - name: kvm
+    groups:
+      - count: 8 # pods per node that may use it
+        paths:
+          - path: /dev/kvm
+```
+
+Then request the device for the `nix-daemon` container and add the
+features. Nix binds `/dev/kvm` into the sandbox only when `kvm` is in
+`features`.
+
+```yaml
+workers:
+  x86-64:
+    features: [big-parallel, kvm, nixos-test]
+    resources:
+      limits: {devic.es/kvm: 1} # <--domain>/<device name>
+```
+
+With the default sandbox (`hostUsers: false`), the build users map to
+unprivileged host UIDs. They can open `/dev/kvm` only if the device is
+world read-write (mode `0666`, which NixOS and most distributions use).
+
 ### Certificates
 
 If cert-manager is installed, let the chart use it:
