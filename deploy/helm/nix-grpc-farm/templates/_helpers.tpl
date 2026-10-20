@@ -71,7 +71,9 @@ app.kubernetes.io/component: lb
 
 {{/* --scheduler for builders: direct, or via the balancer with replicas > 1. */}}
 {{- define "farm.schedulerFor" -}}
-{{- if gt (int (.Values.scheduler.replicas | default 1)) 1 -}}
+{{- if .Values.scheduler.external -}}
+{{ .Values.scheduler.external }}
+{{- else if gt (int (.Values.scheduler.replicas | default 1)) 1 -}}
 {{ include "farm.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.lb.service.port }}
 {{- else -}}
 {{ include "farm.schedulerService" . }}.{{ .Release.Namespace }}.svc:50051
@@ -94,8 +96,13 @@ app.kubernetes.io/component: scheduler
 {{- if empty .Values.workers }}{{ fail "workers is empty, add e.g. workers.x86-64: {system: x86_64-linux, replicas: 2}" }}{{ end }}
 {{- if and (or .Values.auth.accessRules .Values.auth.anonymousRole) (not (or (include "farm.tlsSecret" (list . "clientCA")) (include "farm.oidcProviders" .))) }}{{ fail "auth.accessRules/anonymousRole need tls.clientCA or an OIDC provider" }}{{ end }}
 {{- if and (include "farm.tlsSecret" (list . "clientCA")) (not (include "farm.tlsSecret" (list . "worker"))) }}{{ fail "tls.clientCA requires tls.worker (workers verify the balancer over TLS)" }}{{ end }}
-{{- if and .Values.lb.enabled (include "farm.tlsSecret" (list . "clientCA")) (not (include "farm.tlsSecret" (list . "lb"))) }}{{ fail "tls.clientCA requires tls.lb (the balancer presents it to clients and workers)" }}{{ end }}
+{{- if and (include "farm.lbEnabled" .) (include "farm.tlsSecret" (list . "clientCA")) (not (include "farm.tlsSecret" (list . "lb"))) }}{{ fail "tls.clientCA requires tls.lb (the balancer presents it to clients and workers)" }}{{ end }}
 {{- with .Values.defaultGroup }}{{ if not (hasKey $.Values.workers .) }}{{ fail (printf "defaultGroup %q is not a key of workers" .) }}{{ end }}{{ end }}
+{{- end }}
+
+{{/* Non-empty when this release runs the balancer: an external scheduler brings its own. */}}
+{{- define "farm.lbEnabled" -}}
+{{- if and .Values.lb.enabled (not .Values.scheduler.external) }}true{{ end }}
 {{- end }}
 
 {{- define "farm.defaultGroup" -}}

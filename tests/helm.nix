@@ -84,6 +84,10 @@ let
     };
     auth.accessRules = [ ];
   };
+  # Workers of a farm whose scheduler and balancer run outside the cluster.
+  valuesExternal = lib.recursiveUpdate values {
+    scheduler.external = "farm.example.com:50051";
+  };
   # formats.yaml emits a %YAML directive that helm rejects. JSON is YAML.
   json = pkgs.formats.json { };
   valuesFile = json.generate "values.json" values;
@@ -94,6 +98,7 @@ let
       valuesCertManager
       valuesPublicCertManager
       valuesPublicSecret
+      valuesExternal
     ]
     ++ extraValues
   );
@@ -231,6 +236,13 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
     helm template t chart -f ${json.generate "values.json" valuesPublicSecret} --api-versions monitoring.coreos.com/v1/PodMonitor > public-secret.yaml
     test "$(envoyCerts public-secret.yaml)" = '["public",["lb"]]'
     test "$(pick Deployment t-nix-grpc-farm-lb '.spec.template.spec.volumes[] | select(.name == "tls-public") | .secret.secretName' public-secret.yaml)" = public
+
+    # External scheduler: no scheduler or balancer of our own.
+    helm template t chart -f ${json.generate "values.json" valuesExternal} --api-versions monitoring.coreos.com/v1/PodMonitor > ext.yaml
+    test "$(yq ea '[select(.kind == "Deployment") | .metadata.name] | sort | join(" ")' ext.yaml)" = 't-nix-grpc-farm-worker-arm t-nix-grpc-farm-worker-x86'
+    ! grep -q 't-nix-grpc-farm-lb' ext.yaml
+    daemon() { pick Deployment "t-nix-grpc-farm-worker-$1" ".spec.template.spec.containers[] | select(.name == \"nix-grpc-daemon\") | $2" ext.yaml; }
+    daemon x86 '.args[]' | grep -qx -- --scheduler=farm.example.com:50051
 
     touch $out
   ''

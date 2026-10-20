@@ -123,6 +123,8 @@ defaultGroup: ""
 
 # The one scheduler pod (all systems). Holds only soft state.
 scheduler:
+  # host:port of a scheduler outside this release; then only workers run here.
+  external: ""
   # >1 adds standby schedulers on separate nodes. niks3 picks the active one
   # through a lock in its database, so this needs a `niks3` no other farm
   # elects against.

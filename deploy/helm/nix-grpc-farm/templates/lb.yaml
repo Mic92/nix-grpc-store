@@ -1,4 +1,4 @@
-{{- if .Values.lb.enabled }}
+{{- if include "farm.lbEnabled" . }}
 {{- $sel := include "farm.lbSelectorLabels" . }}
 apiVersion: v1
 kind: ConfigMap

@@ -1,5 +1,6 @@
 {{- /* One Deployment+Service per scheduler replica so envoy can health-check
      each. Soft state: a restart loses the queue, peers reconnect and resend. */}}
+{{- if not .Values.scheduler.external }}
 {{- $root := . }}
 {{- $oidc := include "farm.oidcProviders" . }}
 {{- $s := .Values.scheduler }}
@@ -164,5 +165,6 @@ spec:
           secret:
             secretName: {{ include "farm.fullname" . }}-oidc
         {{- end }}
+{{- end }}
 {{- end }}
 {{- end }}

@@ -1,3 +1,7 @@
+{{- if .Values.scheduler.external }}
+Workers joined the scheduler at {{ .Values.scheduler.external }}. Build through
+the farm that scheduler belongs to; this release runs no balancer.
+{{- else }}
 {{- $svc := include "farm.fullname" . -}}
 {{- $tls := "" -}}
 {{- if (include "farm.tlsSecret" (list . "public")) }}{{ $tls = "?client-cert=/path/client.crt&client-key=/path/client.key" }}
@@ -74,4 +78,5 @@ In the job: nix-fast-build --store "$FARM" --no-download --skip-cached
 
 Workers authenticate to niks3 as {{ .Release.Namespace }}:{{ include "farm.serviceAccountName" . }}.
 Add that to the niks3 chart's auth.workloadIdentity.allowedServiceAccounts with scope `write`.
+{{- end }}
 {{- end }}
