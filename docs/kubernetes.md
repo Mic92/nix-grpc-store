@@ -381,6 +381,8 @@ restricts the pods to the listed nodes. Without it they advertise the
 node's InternalIP and can run on any node. The port needs the CNI
 `portmap` plugin. Since two pods cannot hold the same node port, a
 rollout replaces workers one at a time instead of surging.
+`metricsHostPort` publishes the metrics port the same way, for a scraper
+outside the cluster.
 
 ## Step 2: Connect CI jobs in the cluster
 

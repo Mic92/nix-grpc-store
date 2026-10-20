@@ -90,6 +90,7 @@ let
     scheduler.external = "farm.example.com:50051";
     workers.x86 = {
       hostPort = 50052;
+      metricsHostPort = 9465;
       advertise = {
         n1 = "10.0.0.1";
         n2 = "10.0.0.2";
@@ -254,6 +255,8 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
     daemon x86 '.args[]' | grep -qx -- --scheduler=farm.example.com:50051
     test "$(daemon x86 '.ports[] | select(.name == "grpc") | .hostPort')" = 50052
     test "$(daemon x86 '.command[0]')" = /bin/sh
+    test "$(daemon x86 '.ports[] | select(.name == "metrics") | .hostPort')" = 9465
+    test "$(daemon arm '.ports[] | select(.name == "metrics") | .hostPort')" = null
     # The case script must pick each node's address and refuse unknown nodes.
     script=$(daemon x86 '.command[2]')
     for n in n1:10.0.0.1 n2:10.0.0.2 n3:; do

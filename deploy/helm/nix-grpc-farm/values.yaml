@@ -119,6 +119,8 @@ workerDefaults:
   # With hostPort: node name -> IP the balancer reaches it at; pins pods to
   # these nodes. Empty: the node's InternalIP.
   advertise: {}
+  # Node port for scrapers outside the cluster.
+  metricsHostPort: null
 # One Deployment per entry, the key names the group. E.g.
 #   x86-64: {system: x86_64-linux, replicas: 4, nodeSelector: {kubernetes.io/arch: amd64}}
 #   aarch64: {system: aarch64-linux, replicas: 2, nodeSelector: {kubernetes.io/arch: arm64}}

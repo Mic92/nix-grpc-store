@@ -243,7 +243,11 @@ spec:
               {{- with $w.hostPort }}
               hostPort: {{ . }}
               {{- end }}
-            - {name: metrics, containerPort: 9464}
+            - name: metrics
+              containerPort: 9464
+              {{- with $w.metricsHostPort }}
+              hostPort: {{ . }}
+              {{- end }}
           {{- /* kubelet gRPC probes are plaintext; with TLS fall back to TCP and let envoy judge health. */}}
           {{- $probe := ternary (dict "tcpSocket" (dict "port" 50051)) (dict "grpc" (dict "port" 50051)) (not (empty (include "farm.tlsSecret" (list $root "worker")))) }}
           # Covers the store seed and niks3 becoming reachable.
