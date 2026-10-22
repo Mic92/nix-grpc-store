@@ -43,7 +43,11 @@ app.kubernetes.io/component: lb
 {{- end }}
 
 {{- define "farm.image" -}}
+{{- if .Values.image.digest -}}
+{{ .Values.image.repository }}@{{ .Values.image.digest }}
+{{- else -}}
 {{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}
+{{- end -}}
 {{- end }}
 
 {{- define "farm.lbImage" -}}

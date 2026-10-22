@@ -234,11 +234,14 @@ class WorkerSessionReactor final
     : public SchedReactorBase<nix::remote::WorkerMsgs, nix::remote::SchedCmd, nix::remote::SchedCmds>
 {
 public:
-    WorkerSessionReactor(grpc::CallbackServerContext * ctx, Dispatcher & disp, IdleTracker & idle)
+    WorkerSessionReactor(grpc::CallbackServerContext * ctx, Dispatcher & disp, IdleTracker & idle,
+                         std::string verifiedPodId = {},
+                         std::chrono::system_clock::time_point credentialExpiresAt = {})
         : SchedReactorBase(ctx)
         , active(idle)
         , disp(disp)
-        , worker{.send = sender(disp), .abort = [ctx] -> void { ctx->TryCancel(); }}
+        , worker{.send = sender(disp), .abort = [ctx] -> void { ctx->TryCancel(); },
+                 .verifiedPodId = std::move(verifiedPodId), .credentialExpiresAt = credentialExpiresAt}
     {
         start();
     }

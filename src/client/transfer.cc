@@ -227,7 +227,8 @@ void GrpcStore::addMultipleToStoreRouted(
 
 auto GrpcStore::addMultipleToStoreOnce(
     std::vector<std::pair<ValidPathInfo, ReplayableNar>> & paths, Activity & act, RepairFlag repair,
-    CheckSigsFlag checkSigs, const Metadata & headers) -> grpc::Status
+    CheckSigsFlag checkSigs, const Metadata & headers,
+    const std::optional<std::pair<std::string, uint64_t>> & reverseAssignment) -> grpc::Status
 {
     uint64_t bytesExpected = 0;
     for (auto & [pathInfo, nar] : paths) {
@@ -238,6 +239,42 @@ auto GrpcStore::addMultipleToStoreOnce(
     nixgrpc::Call call;
     addHeaders(call.ctx(), headers);
     remote::AddMultipleReply reply;
+    if (reverseAssignment) {
+      auto writer = stub->UploadBuildInputs(&call.ctx(), &reply);
+      struct AssignedWriter {
+        grpc::ClientWriter<remote::UploadBuildInputsChunk> & writer;
+        auto Write(const remote::AddMultipleChunk & data) -> bool {
+          remote::UploadBuildInputsChunk frame;
+          *frame.mutable_chunk() = data;
+          return writer.Write(frame);
+        }
+      } assigned{*writer};
+      try {
+        remote::UploadBuildInputsChunk first;
+        first.set_drv_path(reverseAssignment->first);
+        first.set_assign_id(reverseAssignment->second);
+        first.mutable_chunk()->set_repair(repair == Repair);
+        first.mutable_chunk()->set_check_sigs(checkSigs == CheckSigs);
+        if (!writer->Write(first)) throw Error("reverse upload closed before header");
+        nixgrpc::ZstdWriterSink<AssignedWriter, remote::AddMultipleChunk> sink(assigned);
+        sink << paths.size();
+        size_t done = 0;
+        for (auto & [pathInfo, nar] : paths) {
+          act.progress(done, paths.size(), static_cast<size_t>(1), static_cast<size_t>(0));
+          WorkerProto::Serialise<ValidPathInfo>::write(
+              *this, WorkerProto::WriteConn{.to = sink, .version = nixcompat::infoProtocolVersion()}, pathInfo);
+          nar.drainInto(sink);
+          act.progress(++done, paths.size(), static_cast<size_t>(0), static_cast<size_t>(0));
+        }
+        sink.finish();
+        writer->WritesDone();
+      } catch (...) {
+        auto status = writer->Finish();
+        if (status.ok()) throw;
+        return status;
+      }
+      return writer->Finish();
+    }
     auto writer = stub->AddMultipleToStore(&call.ctx(), &reply);
 
     try {

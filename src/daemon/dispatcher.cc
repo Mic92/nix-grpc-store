@@ -313,7 +313,7 @@ void Dispatcher::exportStats(bool force)
 // The entry moved to a reconnecting worker that was already building it.
 // Stop the copy we started and send its clients after the original.
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-void Dispatcher::supersede(sched::DrvId drv, sched::WorkerId loser)
+void Dispatcher::supersede(sched::DrvId drv, sched::WorkerId loser, uint64_t loserAssignId)
 {
     const auto & ent = core.entry(drv);
     if (!ent) {
@@ -323,7 +323,7 @@ void Dispatcher::supersede(sched::DrvId drv, sched::WorkerId loser)
     if (loser == sched::noWorker) {
         return; // was queued: only the followers need telling
     }
-    revokeOn(loser, ent->drvPath);
+    revokeOn(loser, ent->drvPath, loserAssignId);
     metrics.event("superseded");
     logLine(
         LogLevel::info,
@@ -333,11 +333,12 @@ void Dispatcher::supersede(sched::DrvId drv, sched::WorkerId loser)
          {"revoke", core.worker(loser).addr}});
 }
 
-void Dispatcher::revokeOn(sched::WorkerId wid, const std::string & drvPath)
+void Dispatcher::revokeOn(sched::WorkerId wid, const std::string & drvPath, uint64_t assignId)
 {
     if (auto const wit = workers.find(wid); wit != workers.end()) {
         SchedCmd cmd;
         cmd.mutable_revoke()->set_drv_path(drvPath);
+        cmd.mutable_revoke()->set_assign_id(assignId);
         wit->second->send(cmd);
     }
 }
@@ -351,7 +352,7 @@ void Dispatcher::revokeOrphans()
         }
         const auto & ent = core.entry(orphan.drv);
         if (ent && ent->assignId == orphan.assignId && ent->worker != sched::noWorker && ent->followers.empty()) {
-            revokeOn(ent->worker, ent->drvPath);
+            revokeOn(ent->worker, ent->drvPath, ent->assignId);
         }
         return true;
     });
@@ -371,6 +372,10 @@ auto Dispatcher::assignedMsg(sched::DrvId drv) const -> SchedMsg
     asg->set_assign_id(ent->assignId);
     // The balancer routes on it: the drv's own system may be one only some of the worker's peers offer.
     asg->set_worker_system(wkr.systems.empty() ? std::string() : wkr.systems.front());
+    // Reached through its data session at the scheduler, not by x-nix-worker.
+    if (auto const owner = workers.find(ent->worker); owner != workers.end()) {
+        asg->set_reverse(!owner->second->verifiedPodId.empty());
+    }
     return msg;
 }
 
@@ -560,7 +565,9 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
 void Dispatcher::onCancel(Client & client, const nix::remote::Cancel & cancel)
 {
     if (auto wid = core.cancel(client.id, cancel.drv_path())) {
-        revokeOn(*wid, cancel.drv_path());
+        if (auto drv = core.findDrv(cancel.drv_path()); drv && core.entry(*drv)) {
+            revokeOn(*wid, cancel.drv_path(), core.entry(*drv)->assignId);
+        }
     }
 }
 
@@ -583,16 +590,78 @@ void Dispatcher::clientGone(const ClientPtr & clientPtr)
 
 // ------------------------------------------------------------------ workers
 
+auto Dispatcher::ownsAssignment(std::string_view workerAddr, std::string_view drvPath, uint64_t assignId) const -> bool
+{
+    auto selected = assignmentWorker(drvPath, assignId);
+    return selected && *selected == workerAddr;
+}
+
+auto Dispatcher::assignmentWorker(std::string_view drvPath, uint64_t assignId) const -> std::optional<std::string>
+{
+    if (drvPath.empty() || assignId == 0) {
+        return std::nullopt;
+    }
+    const absl::MutexLock lock(mutex);
+    auto const drv = core.findDrv(drvPath);
+    if (!drv) {
+        return std::nullopt;
+    }
+    const auto & slot = core.entry(*drv);
+    if (!slot || slot->followers.empty() || slot->worker == sched::noWorker || slot->assignId != assignId
+        || slot->drvPath != drvPath) {
+        return std::nullopt;
+    }
+    const auto & worker = core.worker(slot->worker);
+    if (!worker.up || !workers.contains(slot->worker)) {
+        return std::nullopt;
+    }
+    return worker.addr;
+}
+
+auto Dispatcher::assignmentPod(std::string_view drvPath, uint64_t assignId) const -> std::optional<std::string>
+{
+    if (drvPath.empty() || assignId == 0) {
+        return std::nullopt;
+    }
+    const absl::MutexLock lock(mutex);
+    auto const it = core.findDrv(drvPath);
+    if (!it) {
+        return std::nullopt;
+    }
+    auto const & slot = core.entry(*it);
+    if (!slot || slot->followers.empty() || slot->worker == sched::noWorker || slot->assignId != assignId
+        || slot->drvPath != drvPath || !core.worker(slot->worker).up) {
+        return std::nullopt;
+    }
+    auto const connected = workers.find(slot->worker);
+    if (connected == workers.end() || connected->second->verifiedPodId.empty()
+        || connected->second->credentialExpiresAt <= std::chrono::system_clock::now()) {
+        return std::nullopt;
+    }
+    return connected->second->verifiedPodId;
+}
+
+auto Dispatcher::podOwnsAssignment(std::string_view podId, std::string_view drvPath, uint64_t assignId) const -> bool
+{
+    auto selected = assignmentPod(drvPath, assignId);
+    return selected && *selected == podId;
+}
+
 void Dispatcher::workerMsgs(Worker & worker, const nix::remote::WorkerMsgs & msgs)
 {
     if (msgs.msgs().empty()) {
         return;
     }
     const Lock lock(*this);
-    if (!worker.id && !msgs.msgs(0).has_hello()) {
-        throw nix::Error("WorkerSession: first message must be Hello");
-    }
     for (const auto & msg : msgs.msgs()) {
+        if (worker.id) {
+            const auto current = workers.find(*worker.id);
+            if (current == workers.end() || current->second != &worker) {
+                throw nix::Error("WorkerSession: replaced by a newer session");
+            }
+        } else if (!msg.has_hello()) {
+            throw nix::Error("WorkerSession: first message must be Hello");
+        }
         workerMsgLocked(worker, msg);
     }
     dispatchLocked();
@@ -602,6 +671,29 @@ void Dispatcher::workerMsgs(Worker & worker, const nix::remote::WorkerMsgs & msg
 
 void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
 {
+    if (worker.verifiedPodId != hel.reverse_worker_id()) {
+        throw nix::Error("WorkerSession: reverse identity does not match verified pod credential");
+    }
+    if (!worker.id) {
+        // A replacement control stream must not adopt another pod's
+        // address, even if it knows that address and has a valid token.
+        // Neither a cert-only stream nor a different verified pod may
+        // replace a live owner. An unverified direct worker is protected
+        // from takeover by a reverse-capable worker as well.
+        if (auto const previous = core.findWorker(hel.addr())) {
+            auto const current = workers.find(*previous);
+            if (current != workers.end() && current->second->verifiedPodId != worker.verifiedPodId
+                && (!current->second->verifiedPodId.empty() || !worker.verifiedPodId.empty())) {
+                throw nix::Error("WorkerSession: advertised address belongs to another verified pod");
+            }
+        }
+    }
+    if (!worker.verifiedPodId.empty() && worker.credentialExpiresAt <= std::chrono::system_clock::now()) {
+        throw nix::Error("WorkerSession: reverse control credential expired");
+    }
+    if (worker.id && core.worker(*worker.id).addr != hel.addr()) {
+        throw nix::Error("WorkerSession: cannot change address on an open session");
+    }
     std::vector<std::pair<std::string_view, uint64_t>> running;
     running.reserve(static_cast<size_t>(hel.running_size()));
     for (const auto & run : hel.running()) {
@@ -636,7 +728,7 @@ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
     workers[*worker.id] = &worker;
     membershipChangedLocked();
     for (auto const sup : superseded) {
-        supersede(sup.drv, sup.loser);
+        supersede(sup.drv, sup.loser, sup.loserAssignId);
     }
     placeabilityChangedLocked();
     logLine(
@@ -663,7 +755,9 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
             outputs.emplace_back(out.path(), out.nar_size());
         }
     }
-    core.done(wid, done.drv_path(), outputs);
+    if (!core.done(wid, done.drv_path(), done.assign_id(), outputs)) {
+        metrics.event("done_stale");
+    }
 }
 
 void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg)
@@ -685,6 +779,11 @@ void Dispatcher::workerGone(Worker & worker)
 {
     const Lock lock(*this);
     if (!worker.id) {
+        return;
+    }
+    const auto current = workers.find(*worker.id);
+    if (current == workers.end() || current->second != &worker) {
+        worker.id.reset();
         return;
     }
     logLine(LogLevel::info, {{"event", "worker_gone"}, {"addr", core.worker(*worker.id).addr}});

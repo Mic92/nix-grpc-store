@@ -10,6 +10,7 @@
 #include <map>
 #include <atomic>
 #include <chrono>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -84,11 +85,26 @@ public:
         WorkerSend send;
         std::function<void()> abort; // ends the stream when a newer session replaces it
         std::optional<sched::WorkerId> id; // under Dispatcher::mutex; reset when replaced
+        // Set only by a verified WorkerSession credential, never by Hello.
+        std::string verifiedPodId;
+        std::chrono::system_clock::time_point credentialExpiresAt{};
     };
 
     // Throws on protocol violations; the caller closes the stream.
     void workerMsgs(Worker & worker, const nix::remote::WorkerMsgs & msgs);
     void workerGone(Worker & worker);
+
+    // Control-plane-only build route: require the exact live Expect, a
+    // follower, and the current WorkerSession owner. Never infer this from
+    // request metadata. Caller still has to recheck before enqueueing.
+    [[nodiscard]] auto ownsAssignment(std::string_view workerAddr, std::string_view drvPath, uint64_t assignId) const
+        -> bool;
+    // A build gateway must derive the destination from the scheduler, not
+    // from x-nix-worker. Missing/revoked/displaced assignments have no route.
+    [[nodiscard]] auto assignmentWorker(std::string_view drvPath, uint64_t assignId) const -> std::optional<std::string>;
+    [[nodiscard]] auto assignmentPod(std::string_view drvPath, uint64_t assignId) const -> std::optional<std::string>;
+    [[nodiscard]] auto podOwnsAssignment(std::string_view podId, std::string_view drvPath, uint64_t assignId) const
+        -> bool;
 
     // For send closures, which run under the mutex: queue `fn` (e.g. the
     // transport's write kick) to run right after it is released.
@@ -137,7 +153,7 @@ private:
     Metrics & metrics;
     prometheus::Counter & assignedCtr;
     const Clock::time_point epoch = Clock::now();
-    absl::Mutex mutex;
+    mutable absl::Mutex mutex;
     std::vector<std::function<void()>> deferred ABSL_GUARDED_BY(mutex);
     sched::Core core ABSL_GUARDED_BY(mutex);
     std::unordered_map<sched::ClientId, ClientSend> clients ABSL_GUARDED_BY(mutex);
@@ -193,13 +209,13 @@ private:
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void wakeWatchersLocked();
     // Per-system gauges. O(entries), so at most once a second unless forced.
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void exportStats(bool force);
-    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOn(sched::WorkerId wid, const std::string & drvPath);
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOn(sched::WorkerId wid, const std::string & drvPath, uint64_t assignId);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOrphans();
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void placeabilityChangedLocked();
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void sendToFollowers(sched::DrvId drv, const nix::remote::SchedMsg & msg);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto assignedMsg(sched::DrvId drv) const -> nix::remote::SchedMsg;
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto unplaceableMsg(const sched::Entry & ent) const -> nix::remote::SchedMsg;
-    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void supersede(sched::DrvId drv, sched::WorkerId loser);
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void supersede(sched::DrvId drv, sched::WorkerId loser, uint64_t loserAssignId);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onDone(sched::WorkerId wid, const nix::remote::Done & done);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onHello(Worker & worker, const nix::remote::Hello & hel);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg);
