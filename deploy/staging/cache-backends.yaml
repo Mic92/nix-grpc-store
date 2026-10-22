@@ -1,0 +1,101 @@
+# Ephemeral, internal-only backends for the build1 staging farm.
+# Both databases and cache objects disappear when their pods are replaced.
+apiVersion: v1
+kind: Service
+metadata:
+  name: staging-postgres
+  namespace: nix-build-farm-staging
+  labels: {app.kubernetes.io/part-of: nix-build-farm-staging}
+spec:
+  selector: {app: staging-postgres}
+  ports:
+    - {name: postgres, port: 5432, targetPort: 5432}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: staging-postgres
+  namespace: nix-build-farm-staging
+  labels: {app.kubernetes.io/part-of: nix-build-farm-staging}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: staging-postgres}
+  template:
+    metadata:
+      labels: {app: staging-postgres, app.kubernetes.io/part-of: nix-build-farm-staging}
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          env:
+            - {name: POSTGRES_DB, value: staging_niks3}
+            - {name: POSTGRES_USER, value: staging_niks3}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: staging-cache-credentials, key: pg-password}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports:
+            - {name: postgres, containerPort: 5432}
+          readinessProbe:
+            exec: {command: [pg_isready, -U, staging_niks3, -d, staging_niks3]}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi, ephemeral-storage: 1Gi}
+            limits: {memory: 1Gi, ephemeral-storage: 4Gi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+      volumes:
+        - name: data
+          emptyDir: {sizeLimit: 4Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: staging-rustfs
+  namespace: nix-build-farm-staging
+  labels: {app.kubernetes.io/part-of: nix-build-farm-staging}
+spec:
+  selector: {app: staging-rustfs}
+  ports:
+    - {name: s3, port: 9000, targetPort: 9000}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: staging-rustfs
+  namespace: nix-build-farm-staging
+  labels: {app.kubernetes.io/part-of: nix-build-farm-staging}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: staging-rustfs}
+  template:
+    metadata:
+      labels: {app: staging-rustfs, app.kubernetes.io/part-of: nix-build-farm-staging}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001}
+      containers:
+        - name: rustfs
+          image: rustfs/rustfs:1.0.0
+          args: [/data]
+          env:
+            - {name: RUSTFS_ADDRESS, value: ":9000"}
+            - {name: RUSTFS_CONSOLE_ENABLE, value: "false"}
+            - {name: RUSTFS_ACCESS_KEY, value: staging-cache}
+            - name: RUSTFS_SECRET_KEY
+              valueFrom: {secretKeyRef: {name: staging-cache-credentials, key: s3-secret-key}}
+          ports:
+            - {name: s3, containerPort: 9000}
+          readinessProbe:
+            httpGet: {path: /health, port: s3}
+          resources:
+            requests: {cpu: 100m, memory: 512Mi, ephemeral-storage: 1Gi}
+            limits: {memory: 2Gi, ephemeral-storage: 16Gi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        - name: data
+          emptyDir: {sizeLimit: 16Gi}

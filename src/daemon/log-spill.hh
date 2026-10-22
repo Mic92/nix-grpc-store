@@ -152,7 +152,7 @@ public:
                 return end;
             }
             std::array<std::byte, sizeof(std::uint32_t)> raw{};
-            std::ranges::copy(std::span(header).subspan<1>(), raw.begin());
+            std::ranges::copy(std::span(header).subspan(1), raw.begin());
             auto const len = std::bit_cast<std::uint32_t>(raw);
             auto const kind = std::to_integer<std::uint8_t>(header.front());
             if (len > kMaxText || kind > static_cast<std::uint8_t>(SpillKind::phase)) {

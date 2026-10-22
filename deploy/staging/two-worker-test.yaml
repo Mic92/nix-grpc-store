@@ -1,0 +1,71 @@
+# Fresh concurrent builds, each pinned by the scheduler to its assigned worker.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: staging-two-worker-build
+  namespace: nix-build-farm-staging
+  labels: {app.kubernetes.io/part-of: nix-build-farm-staging}
+data:
+  job.nix: |
+    { tag }:
+    derivation {
+      name = "staging-two-worker-failover-${tag}";
+      system = "aarch64-linux";
+      builder = "/bin/sh";
+      args = [ "-c" "read -t 15 x < /dev/zero; echo ${tag} > $out" ];
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: staging-two-worker-build
+  namespace: nix-build-farm-staging
+  labels: {app.kubernetes.io/part-of: nix-build-farm-staging}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: {app.kubernetes.io/part-of: nix-build-farm-staging}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: client
+          image: ghcr.io/mic92/nix-grpc-farm-client:0.2.1
+          command: [/bin/sh, -euc]
+          args:
+            - |
+              store="grpc://nix-build-farm-staging-nix-grpc-farm.nix-build-farm-staging.svc:50051?ca-cert=/secrets/ca/ca.crt&client-cert=/secrets/client/tls.crt&client-key=/secrets/client/tls.key"
+              nix build -L --store "$store" --eval-store auto --no-link \
+                -f /job/job.nix --argstr tag a > /tmp/a.log 2>&1 &
+              a_pid=$!
+              nix build -L --store "$store" --eval-store auto --no-link \
+                -f /job/job.nix --argstr tag b > /tmp/b.log 2>&1 &
+              b_pid=$!
+              wait "$a_pid" || { cat /tmp/a.log /tmp/b.log; exit 1; }
+              wait "$b_pid" || { cat /tmp/a.log /tmp/b.log; exit 1; }
+              a=$(grep -o 'worker-arm64-[[:alnum:]]*' /tmp/a.log | head -n 1)
+              b=$(grep -o 'worker-arm64-[[:alnum:]]*' /tmp/b.log | head -n 1)
+              cat /tmp/a.log /tmp/b.log
+              test -n "$a" && test -n "$b" && test "$a" != "$b"
+              echo "Distinct assigned workers: $a $b"
+              for tag in a b; do
+                out=$(nix eval --impure --raw --expr "(import /job/job.nix { tag = \"$tag\"; }).outPath")
+                nix copy --from http://niks3-staging "$out" \
+                  --option trusted-public-keys 'nix-build-farm-staging-1:obp0+2oZlbj3iIJBu8GZJcivoLcfQ8j+caE+LOHGv9s='
+                test "$(cat "$out")" = "$tag"
+              done
+          volumeMounts:
+            - {name: ca, mountPath: /secrets/ca, readOnly: true}
+            - {name: client, mountPath: /secrets/client, readOnly: true}
+            - {name: job, mountPath: /job, readOnly: true}
+      volumes:
+        - name: ca
+          secret:
+            secretName: nix-build-farm-staging-nix-grpc-farm-ca
+            items: [{key: ca.crt, path: ca.crt}]
+        - name: client
+          secret: {secretName: staging-client-tls}
+        - name: job
+          configMap: {name: staging-two-worker-build}

@@ -3,6 +3,7 @@ set -eu
 bin=$1
 dir=$(mktemp -d)
 mkdir -p "$dir/.well-known"
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$dir/server.key" -out "$dir/server.crt" -subj /CN=localhost -addext subjectAltName=DNS:localhost -days 1 >"$dir/cert.log" 2>&1
 trap 'kill "$pid" 2>/dev/null; rm -rf "$dir"' EXIT
 python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$dir" >"$dir/log" 2>&1 &
 pid=$!

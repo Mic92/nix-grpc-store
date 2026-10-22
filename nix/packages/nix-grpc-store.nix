@@ -68,6 +68,19 @@ stdenv.mkDerivation {
         ../../tests/call-test.cc
         ../../tests/nar-fetcher-test.cc
         ../../tests/scheduler-test.cc
+        ../../tests/dispatcher-session-test.cc
+        ../../tests/reverse-registry-test.cc
+        ../../tests/reverse-frames-test.cc
+        ../../tests/reverse-capability-test.cc
+        ../../tests/reverse-inbound-test.cc
+        ../../tests/reverse-request-test.cc
+        ../../tests/reverse-worker-test.cc
+        ../../tests/reverse-upload-test.cc
+        ../../tests/reverse-import-test.cc
+        ../../tests/reverse-responses-test.cc
+        ../../tests/reverse-roundtrip-test.cc
+        ../../tests/reverse-gateway-test.cc
+        ../../tests/reverse-gateway-test.sh
         ../../tests/dispatcher-bench.cc
         ../../tests/scheduler-grpc-bench.cc
       ]
@@ -75,9 +88,12 @@ stdenv.mkDerivation {
   };
 
   mesonFlags = lib.optional (!server) "-Dcomponents=plugin";
+  # ld64 can silently omit Meson test executables when generating a UUID on
+  # Darwin. This is a linker (not clang -Wl) flag passed through the Nix wrapper.
+  NIX_LDFLAGS = lib.optionalString stdenv.hostPlatform.isDarwin "-no_uuid";
 
   doCheck = server;
-  nativeCheckInputs = [ python3 ];
+  nativeCheckInputs = [ python3 openssl ];
   # The tests bind loopback mock servers.
   __darwinAllowLocalNetworking = true;
 

@@ -1,0 +1,72 @@
+# Imperative, build1-only canary. NOT wired to production niks3 or Tailscale.
+# ARM64 image built from the path-based working tree (includes local session fencing).
+image:
+  repository: europe-west4-docker.pkg.dev/mistral-science/mistralai/nix-grpc-farm-staging-3f47ea5-20261021133401
+  digest: sha256:e81611b0a3fe67761f7c511dac86de05cadd3f47c84db58872c217daca8a4692
+lbImage:
+  repository: ghcr.io/mic92/nix-grpc-farm-lb
+  tag: 0.2.1
+imagePullSecrets:
+  - name: staging-gar-pull
+
+niks3:
+  serverURL: http://niks3-staging.nix-build-farm-staging.svc.cluster.local
+  cacheURL: http://niks3-staging.nix-build-farm-staging.svc.cluster.local
+  publicKeys:
+    - nix-build-farm-staging-1:obp0+2oZlbj3iIJBu8GZJcivoLcfQ8j+caE+LOHGv9s=
+  auth:
+    existingSecret: staging-farm-cache-token
+
+tls:
+  certManager:
+    enabled: true
+
+auth:
+  # Only the dedicated staging test client may access the farm.
+  accessRules:
+    - cn: staging-client
+      role: trusted
+
+workerDefaults:
+  maxJobs: 1
+  cores: 2
+  minFree: 2G
+  store:
+    sizeLimit: 20Gi
+  spool:
+    sizeLimit: 10Gi
+  buildDir:
+    sizeLimit: 10Gi
+  resources:
+    requests:
+      cpu: 2
+      memory: 4Gi
+      ephemeral-storage: 40Gi
+    limits:
+      memory: 8Gi
+      ephemeral-storage: 50Gi
+
+workers:
+  arm64:
+    system: aarch64-linux
+    replicas: 2
+    spread: required
+    nodeSelector:
+      kubernetes.io/arch: arm64
+defaultGroup: arm64
+
+scheduler:
+  replicas: 2
+lb:
+  replicas: 1
+  service:
+    type: ClusterIP
+
+gc:
+  ensureFree: 4G
+
+metrics:
+  podMonitor:
+    enabled: false
+grafanaDashboard:
+  enabled: false

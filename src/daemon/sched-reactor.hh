@@ -231,10 +231,12 @@ class WorkerSessionReactor final
     : public SchedReactorBase<nix::remote::WorkerMsgs, nix::remote::SchedCmd, nix::remote::SchedCmds>
 {
 public:
-    WorkerSessionReactor(grpc::CallbackServerContext * ctx, Dispatcher & disp)
+    WorkerSessionReactor(grpc::CallbackServerContext * ctx, Dispatcher & disp, std::string verifiedPodId = {},
+                         std::chrono::system_clock::time_point credentialExpiresAt = {})
         : SchedReactorBase(ctx)
         , disp(disp)
-        , worker{.send = sender(disp)}
+        , worker{.send = sender(disp), .verifiedPodId = std::move(verifiedPodId),
+                 .credentialExpiresAt = credentialExpiresAt}
     {
         start();
     }

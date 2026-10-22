@@ -38,8 +38,11 @@
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
 #include "options.hh"
+#include "reverse-registry.hh"
+#include "reverse-request.hh"
 
 namespace nixgrpc {
+class WorkerIdentity;
 
 using Clock = std::chrono::steady_clock;
 
@@ -87,8 +90,9 @@ public:
     void onExpect(const nix::remote::Expect & exp);
     void onRevoke(const nix::remote::Revoke & rev);
 
-    // BuildDerivation entry: nullopt => FAILED_PRECONDITION. `attach` set if
-    // the drv already runs. Caller then waits on it instead of building.
+    // BuildDerivation entry: nullopt => FAILED_PRECONDITION. A stale assignment
+    // must not attach to a newer build of the same drv. `attach` set if the
+    // matching assignment already runs.
     struct Admission
     {
         std::shared_ptr<Expected::Shared> shared;
@@ -96,12 +100,16 @@ public:
         bool attach = false;
     };
 
-    auto admit(const std::string & drvPath) -> std::optional<Admission>;
+    auto admit(const std::string & drvPath, uint64_t assignId) -> std::optional<Admission>;
+    // Read-only admission for an input upload: never consume the Expect.
+    [[nodiscard]] auto expects(const std::string & drvPath, uint64_t assignId) const -> bool;
     void finished(
         const std::string & drvPath,
+        uint64_t assignId,
         nix::remote::Done::Outcome outcome,
         const std::vector<std::pair<std::string, uint64_t>> & outputs,
-        std::string resultWire);
+        std::string resultWire,
+        std::function<void()> * deferredDone = nullptr);
 
     // Hello reflecting current state. Sent on every (re)connect.
     auto hello() const -> nix::remote::WorkerMsg;
@@ -145,6 +153,7 @@ class SchedulerService final : public nix::remote::Scheduler::CallbackService
 {
 public:
     SchedulerService(Dispatcher & dispatcher, Auth & auth);
+    void setReverseIdentity(WorkerIdentity & identity) { reverseIdentity = &identity; }
 
     auto Schedule(grpc::CallbackServerContext * context)
         -> grpc::ServerBidiReactor<nix::remote::ClientMsgs, nix::remote::SchedMsgs> * override;
@@ -163,6 +172,7 @@ public:
 private:
     Dispatcher * dispatcher;
     Auth * auth;
+    WorkerIdentity * reverseIdentity = nullptr;
     std::atomic<bool> active_{true};
 };
 
@@ -170,6 +180,13 @@ private:
 class Coordinator
 {
 public:
+    using ReverseEmit = std::function<bool(const nix::remote::BuildDerivationChunk &)>;
+    using ReverseBuild = std::function<grpc::Status(const ReverseRequest::Ready &, const ReverseEmit &,
+                                                     const std::function<bool()> &, std::function<void()> &)>;
+    void setReverseBuild(ReverseBuild handler) { reverseBuild = std::move(handler); }
+    using ReverseUpload = std::function<grpc::Status(const ReverseRequest::Upload &,
+                                                      const std::function<bool()> &)>;
+    void setReverseUpload(ReverseUpload handler) { reverseUpload = std::move(handler); }
     Coordinator(const Options & options, Auth & auth, Metrics & metrics);
     ~Coordinator();
     Coordinator(const Coordinator &) = delete;
@@ -184,6 +201,8 @@ public:
     std::optional<Dispatcher> dispatcher;
     std::unique_ptr<SchedulerService> scheduler;
     std::unique_ptr<EdsService> eds;
+    // Generation-fenced data-session registry, usable only on the leader.
+    ReverseRegistry reverseRegistry;
     // NOLINTEND(*-non-private-member-variables-in-classes)
 
     void start(grpc::Server & server);
@@ -196,11 +215,15 @@ public:
 private:
     const Options & options;
     std::jthread sessionThread; // remote WorkerSession client
+    std::jthread reverseThread; // opt-in remote ReverseSession client
     std::optional<Elector> elector;
     grpc::HealthCheckServiceInterface * health = nullptr;
     std::atomic<bool> lastHealthy{true};
+    ReverseBuild reverseBuild;
+    ReverseUpload reverseUpload;
     void setSchedulerActive(bool active);
     void runRemoteSession(Builder & bld, const std::stop_token & stop);
+    void runReverseSession(const std::stop_token & stop);
 };
 
 } // namespace nixgrpc

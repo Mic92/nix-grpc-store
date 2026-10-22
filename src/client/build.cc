@@ -61,10 +61,16 @@ auto GrpcStore::routingFor(const BasicDerivation & drv, const std::string & work
   return meta;
 }
 
-void GrpcStore::uploadDrvClosure(Store & evalStore, const StorePath & drvPath, const Metadata & headers) {
+auto GrpcStore::uploadDrvClosure(Store & evalStore, const StorePath & drvPath, const Metadata & headers,
+                                 std::optional<uint64_t> reverseAssignment) -> grpc::Status {
   StorePathSet closure;
   evalStore.computeFSClosure(drvPath, closure);
-  auto const present = queryValidPathsRouted(closure, NoSubstitute, headers);
+  // The scheduler's store cannot answer what a reverse worker has locally.
+  // Upload the entire closure to the pinned worker; duplicate paths are
+  // handled by the worker importer. Never query/transfer through a direct
+  // worker or the scheduler store for this assignment. The worker still
+  // verifies signatures for write-role clients, as for direct uploads.
+  auto const present = reverseAssignment ? StorePathSet{} : queryValidPathsRouted(closure, NoSubstitute, headers);
   StorePathSet missing;
   for (const auto & path : closure) {
     if (!present.contains(path)) {
@@ -72,7 +78,7 @@ void GrpcStore::uploadDrvClosure(Store & evalStore, const StorePath & drvPath, c
     }
   }
   if (missing.empty()) {
-    return;
+    return grpc::Status::OK;
   }
   PathsSource sources;
   // addMultipleToStore wants references before referrers.
@@ -96,7 +102,15 @@ void GrpcStore::uploadDrvClosure(Store & evalStore, const StorePath & drvPath, c
       evalStore.narFromPath(info->path, tee);
     }));
   }
-  addMultipleToStoreRouted(std::move(sources), act, NoRepair, CheckSigs, headers);
+  if (!reverseAssignment) {
+    addMultipleToStoreRouted(std::move(sources), act, NoRepair, CheckSigs, headers);
+    return grpc::Status::OK;
+  }
+  std::vector<std::pair<ValidPathInfo, ReplayableNar>> paths;
+  paths.reserve(sources.size());
+  for (auto & [info, nar] : sources) paths.emplace_back(info, ReplayableNar(std::move(nar)));
+  return addMultipleToStoreOnce(paths, act, NoRepair, CheckSigs, headers,
+                                std::pair{std::string(drvPath.to_string()), *reverseAssignment});
 }
 
 auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & request, const Metadata & headers,
@@ -130,11 +144,25 @@ auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore)
     nixcompat::writeDrv(sink, *this, job.drv);
     *request.mutable_drv() = std::move(sink.s);
   }
-  auto const headers = routingFor(job.drv, job.workerAddr);
+  auto headers = routingFor(job.drv, job.reverse ? "" : job.workerAddr);
+  if (job.reverse) {
+    headers.emplace_back("x-nix-reverse", "1"); // Envoy route only; server uses the live assignment.
+  }
   std::optional<BuildResult> res;
   auto status = tryBuildDerivation(request, headers, res);
   if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
-    uploadDrvClosure(evalStore, job.drvPath, headers);
+    // Do not activate the client retry until a real pinned build and
+    // readback through the production path have passed an integration test.
+    // In particular, a scheduler-store upload cannot repair this assignment.
+    if (job.reverse) {
+      throw Error("reverse worker is missing build inputs; pinned build proof is required before retry");
+    }
+    auto upload = uploadDrvClosure(evalStore, job.drvPath, headers,
+                                    std::nullopt);
+    if (!upload.ok()) {
+      checkInterrupt();
+      checkStatus(upload, "AddMultipleToStore");
+    }
     status = tryBuildDerivation(request, headers, res);
   }
   // Our own cancel ends the stream CANCELLED, and a dead worker looks the same.
@@ -270,6 +298,7 @@ struct GrpcStore::Run {
   // follow a redirect it already sent.
   void requeueLocked(Job & job) {
     job.workerAddr = std::exchange(job.redirectAddr, {});
+    job.reverse = std::exchange(job.redirectReverse, false);
     job.assignId = std::exchange(job.redirectId, 0);
     if (!job.workerAddr.empty()) {
       ready.push_back(&job);
@@ -366,8 +395,11 @@ struct GrpcStore::Run {
       return;
     }
     if (!job->workerAddr.empty()) {
-      if (msg.has_assigned() && msg.assigned().worker_addr() != job->workerAddr) {
+      if (msg.has_assigned() && (msg.assigned().worker_addr() != job->workerAddr ||
+                                 msg.assigned().assign_id() != job->assignId ||
+                                 msg.assigned().reverse() != job->reverse)) {
         job->redirectAddr = msg.assigned().worker_addr();
+        job->redirectReverse = msg.assigned().reverse();
         job->redirectId = msg.assigned().assign_id();
       }
       return;
@@ -378,6 +410,7 @@ struct GrpcStore::Run {
         return;
       }
       job->workerAddr = msg.assigned().worker_addr();
+      job->reverse = msg.assigned().reverse();
       job->assignId = msg.assigned().assign_id();
     } else if (msg.has_cached()) {
       job->result = cachedResult(*job);

@@ -447,8 +447,10 @@ public:
       }
     }
 
-    // Same headers on every RPC so the balancer keeps us on that worker.
-    void uploadDrvClosure(Store & evalStore, const StorePath & drvPath, const Metadata & headers);
+    // Direct uploads retain worker routing; reverse uploads use an assignment
+    // in the request body, validated against the scheduler's live placement.
+    auto uploadDrvClosure(Store & evalStore, const StorePath & drvPath, const Metadata & headers,
+                          std::optional<uint64_t> reverseAssignment = std::nullopt) -> grpc::Status;
 
     // Relays log/phase chunks, hands `done` to onDone, keeps the output infos for queryPathInfo.
     template<typename Chunk, typename F>
@@ -487,10 +489,12 @@ public:
       std::optional<BuildResult> result;
       // Set by the reader thread, consumed by a build thread.
       std::string workerAddr;
+      bool reverse = false;
       uint64_t assignId = 0;
       // A second Assigned while building: the scheduler moved the drv to a
       // worker that was already at it. Followed when the current one bounces.
       std::string redirectAddr;
+      bool redirectReverse = false;
       uint64_t redirectId = 0;
       bool lost = false; // scheduler stream gone before assignment
       // Set on Unplaceable, cleared on Assigned. reapUnplaceable fails the
@@ -691,7 +695,8 @@ private:
 
     auto addMultipleToStoreOnce(
         std::vector<std::pair<ValidPathInfo, ReplayableNar>> & paths, Activity & act, RepairFlag repair,
-        CheckSigsFlag checkSigs, const Metadata & headers) -> grpc::Status
+        CheckSigsFlag checkSigs, const Metadata & headers,
+        const std::optional<std::pair<std::string, uint64_t>> & reverseAssignment = std::nullopt) -> grpc::Status
 ;
 
 public:

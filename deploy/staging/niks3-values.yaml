@@ -1,0 +1,28 @@
+# Secrets are created out of band; no credentials go into Helm release history.
+image:
+  repository: ghcr.io/mic92/niks3
+  tag: v1.12.0-beta.3
+replicaCount: 1
+database:
+  existingSecret: staging-niks3-db
+  secretKey: uri
+s3:
+  endpoint: staging-rustfs.nix-build-farm-staging.svc.cluster.local:9000
+  bucket: staging-nix-cache
+  region: us-east-1
+  useSSL: false
+  bucketLookup: path
+  existingSecret: staging-niks3-s3
+auth:
+  existingSecret: staging-farm-cache-token
+signing:
+  existingSecret: staging-niks3-signing
+  keys: [staging.secret]
+cacheURL: http://niks3-staging.nix-build-farm-staging.svc.cluster.local
+readProxy:
+  enabled: true
+gc:
+  enabled: false
+resources:
+  requests: {cpu: 100m, memory: 256Mi}
+  limits: {memory: 1Gi}

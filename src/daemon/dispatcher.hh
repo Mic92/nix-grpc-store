@@ -10,6 +10,7 @@
 #include <map>
 #include <atomic>
 #include <chrono>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -83,11 +84,26 @@ public:
     {
         WorkerSend send;
         std::optional<sched::WorkerId> id;
+        // Set only by a verified WorkerSession credential, never by Hello.
+        std::string verifiedPodId;
+        std::chrono::system_clock::time_point credentialExpiresAt{};
     };
 
     // Throws on protocol violations; the caller closes the stream.
     void workerMsgs(Worker & worker, const nix::remote::WorkerMsgs & msgs);
     void workerGone(Worker & worker);
+
+    // Control-plane-only build route: require the exact live Expect, a
+    // follower, and the current WorkerSession owner. Never infer this from
+    // request metadata. Caller still has to recheck before enqueueing.
+    [[nodiscard]] auto ownsAssignment(std::string_view workerAddr, std::string_view drvPath, uint64_t assignId) const
+        -> bool;
+    // A build gateway must derive the destination from the scheduler, not
+    // from x-nix-worker. Missing/revoked/displaced assignments have no route.
+    [[nodiscard]] auto assignmentWorker(std::string_view drvPath, uint64_t assignId) const -> std::optional<std::string>;
+    [[nodiscard]] auto assignmentPod(std::string_view drvPath, uint64_t assignId) const -> std::optional<std::string>;
+    [[nodiscard]] auto podOwnsAssignment(std::string_view podId, std::string_view drvPath, uint64_t assignId) const
+        -> bool;
 
     // For send closures, which run under the mutex: queue `fn` (e.g. the
     // transport's write kick) to run right after it is released.
@@ -136,11 +152,18 @@ private:
     Metrics & metrics;
     prometheus::Counter & assignedCtr;
     const Clock::time_point epoch = Clock::now();
-    absl::Mutex mutex;
+    mutable absl::Mutex mutex;
     std::vector<std::function<void()>> deferred ABSL_GUARDED_BY(mutex);
     sched::Core core ABSL_GUARDED_BY(mutex);
     std::unordered_map<sched::ClientId, ClientSend> clients ABSL_GUARDED_BY(mutex);
-    std::unordered_map<sched::WorkerId, WorkerSend> workers ABSL_GUARDED_BY(mutex);
+    struct ConnectedWorker
+    {
+        Worker * owner;
+        WorkerSend send;
+        std::string podId;
+        std::chrono::system_clock::time_point credentialExpiresAt{};
+    };
+    std::unordered_map<sched::WorkerId, ConnectedWorker> workers ABSL_GUARDED_BY(mutex);
     bool lettingGo ABSL_GUARDED_BY(mutex) = false;
     std::optional<double> statsAtMs ABSL_GUARDED_BY(mutex);
     std::map<sched::Core::StatsKey, std::vector<prometheus::Gauge *>> statGauges ABSL_GUARDED_BY(mutex);
@@ -183,8 +206,8 @@ private:
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void wakeWatchersLocked();
     // Per-system gauges. O(entries), so at most once a second unless forced.
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void exportStats(bool force);
-    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOn(sched::WorkerId wid, const std::string & drvPath);
-    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void supersede(sched::DrvId drv, sched::WorkerId loser);
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOn(sched::WorkerId wid, const std::string & drvPath, uint64_t assignId);
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void supersede(sched::DrvId drv, sched::WorkerId loser, uint64_t loserAssignId);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onWant(Client & client, const nix::remote::Want & want, bool cached);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onCancel(Client & client, const nix::remote::Cancel & cancel);

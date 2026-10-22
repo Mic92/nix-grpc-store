@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <random>
 #include <optional>
 #include <set>
 #include <string>
@@ -308,6 +309,11 @@ public:
     explicit Core(Config cfg = {})
         : cfg(cfg)
     {
+        // A new leader reconstructs running assignments from Hello. Give new
+        // assignments a different generation so an RPC from the old leader
+        // cannot match a reused small counter on this one.
+        std::random_device entropy;
+        lastAssignId = (static_cast<uint64_t>(entropy()) << 32) | entropy();
         drvIds.reserve(initialEntries);
         entries.reserve(initialEntries);
         // To its cap so it never grows: even a flat rehash of 2^18 slots is
@@ -351,6 +357,12 @@ public:
         workers.push_back(Worker{.addr = std::string(addr)});
         workerIds.emplace(std::string(addr), wid);
         return wid;
+    }
+
+    [[nodiscard]] auto findWorker(std::string_view addr) const -> std::optional<WorkerId>
+    {
+        auto const it = workerIds.find(std::string(addr));
+        return it == workerIds.end() ? std::nullopt : std::optional(it->second);
     }
 
     [[nodiscard]] auto entry(DrvId drv) const -> const std::optional<Entry> &
@@ -497,6 +509,7 @@ public:
     {
         DrvId drv;
         WorkerId loser;
+        uint64_t loserAssignId;
     };
 
     auto hello(const HelloInfo & info, std::vector<Superseded> & superseded) -> WorkerId
@@ -526,7 +539,7 @@ public:
             }
             if (slot->worker != noWorker && slot->worker != wid) {
                 // Placed since our restart, seconds old. The reporter is further along.
-                superseded.push_back({.drv = drv, .loser = slot->worker});
+                superseded.push_back({.drv = drv, .loser = slot->worker, .loserAssignId = slot->assignId});
                 std::erase(workers.at(slot->worker).running, drv);
                 refreshFree(slot->worker);
             }
@@ -541,23 +554,27 @@ public:
         return wid;
     }
 
-    void
-    done(WorkerId wid, std::string_view drvPath, const std::vector<std::pair<std::string_view, uint64_t>> & outputs)
+    // A late Done must not retire a later placement of the same drv, nor
+    // claim its output paths as local to an unrelated worker.
+    auto done(WorkerId wid, std::string_view drvPath, uint64_t assignId,
+        const std::vector<std::pair<std::string_view, uint64_t>> & outputs) -> bool
     {
+        auto found = findDrv(drvPath);
+        if (!found) {
+            return false;
+        }
+        auto & slot = entries.at(*found);
+        if (!slot || slot->worker != wid || slot->assignId != assignId) {
+            return false;
+        }
         auto & wkr = workers.at(wid);
         for (auto [path, size] : outputs) {
             rememberBuilder(path, wid, size);
         }
-        auto found = findDrv(drvPath);
-        if (!found) {
-            return;
-        }
         std::erase(wkr.running, *found);
         refreshFree(wid);
-        auto & slot = entries.at(*found);
-        if (slot && slot->worker == wid) {
-            retire(*found);
-        }
+        retire(*found);
+        return true;
     }
 
     void setDraining(WorkerId wid, bool draining)

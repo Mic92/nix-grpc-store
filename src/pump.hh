@@ -271,6 +271,7 @@ class ZstdReaderSource : public nix::Source
     Msg msg;
     // Always points into msg.data(); reset whenever msg is replaced.
     ZSTD_inBuffer zin{.src = nullptr, .size = 0, .pos = 0};
+    size_t remaining = 1;
     std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx{ZSTD_createDCtx(), ZSTD_freeDCtx};
 
     static auto makeInitialMsg(std::string initial) -> Msg
@@ -297,7 +298,8 @@ public:
             // previous call whose destination buffer was smaller than the
             // decompressed data, even when all input has been consumed.
             ZSTD_outBuffer zout{.dst = data, .size = len, .pos = 0};
-            zstdCheck(ZSTD_decompressStream(dctx.get(), &zout, &zin), "decompress");
+            remaining = ZSTD_decompressStream(dctx.get(), &zout, &zin);
+            zstdCheck(remaining, "decompress");
             if (zout.pos != 0) {
                 return zout.pos;
             }
@@ -308,6 +310,25 @@ public:
                 zin = {.src = msg.data().data(), .size = msg.data().size(), .pos = 0};
             }
         }
+    }
+
+    // Used after decoding a length-delimited upload body. No compressed
+    // continuation, second frame, or extra uncompressed byte is permitted.
+    // Do not use read() to probe for EOF: it accepts concatenated zstd frames.
+    void finishFrame()
+    {
+        char extra;
+        while (remaining != 0) {
+            if (zin.pos == zin.size) {
+                if (!reader->Read(&msg)) throw nix::EndOfFile("incomplete zstd frame");
+                zin = {.src = msg.data().data(), .size = msg.data().size(), .pos = 0};
+            }
+            ZSTD_outBuffer out{.dst = &extra, .size = 1, .pos = 0};
+            remaining = ZSTD_decompressStream(dctx.get(), &out, &zin);
+            zstdCheck(remaining, "decompress");
+            if (out.pos != 0) throw nix::Error("trailing decompressed upload data");
+        }
+        if (zin.pos != zin.size) throw nix::Error("trailing compressed upload data");
     }
 };
 

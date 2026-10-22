@@ -1,6 +1,7 @@
 image:
   repository: ghcr.io/mic92/nix-grpc-farm
   tag: "" # defaults to appVersion
+  digest: "" # optional sha256 digest; takes precedence over tag
   pullPolicy: IfNotPresent
 lbImage:
   repository: ghcr.io/mic92/nix-grpc-farm-lb

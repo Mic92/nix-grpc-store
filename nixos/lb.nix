@@ -1,7 +1,9 @@
 # Envoy in front of the nodes. `/nix.remote.Scheduler/*` goes to the one
 # scheduler node (cluster `sched`, gRPC health service "nix.scheduler").
-# Everything else goes to the per-system worker cluster: BuildDerivation to
-# the worker named in x-nix-worker (override_host), the rest least-request.
+# Reverse BuildDerivation goes to the scheduler after matching the client route
+# hint; pinned UploadBuildInputs always goes there. The daemon checks the live
+# assignment independently. Everything else
+# goes to the per-system worker cluster: direct builds use x-nix-worker.
 # The members of the worker clusters come from the active scheduler over EDS.
 {
   config,
@@ -217,6 +219,36 @@ let
   schedRoute = {
     match = {
       prefix = "/nix.remote.Scheduler/";
+      grpc = { };
+    };
+    route = {
+      cluster = "sched";
+      timeout = "0s";
+      retry_policy = retryDeadHost;
+    };
+  };
+
+  reverseBuildRoute = {
+    match = {
+      path = "/nix.remote.NixRemote/BuildDerivation";
+      grpc = { };
+      headers = [
+        {
+          name = "x-nix-reverse";
+          string_match.exact = "1";
+        }
+      ];
+    };
+    route = {
+      cluster = "sched";
+      timeout = "0s";
+      retry_policy = retryDeadHost;
+    };
+  };
+
+  uploadBuildInputsRoute = {
+    match = {
+      path = "/nix.remote.NixRemote/UploadBuildInputs";
       grpc = { };
     };
     route = {
@@ -465,7 +497,7 @@ in
                           {
                             name = "farm";
                             domains = [ "*" ];
-                            routes = [ edsRoute schedRoute ] ++ lib.concatMap routesFor ordered;
+                            routes = [ edsRoute schedRoute uploadBuildInputsRoute reverseBuildRoute ] ++ lib.concatMap routesFor ordered;
                           }
                         ];
                         http_filters = [

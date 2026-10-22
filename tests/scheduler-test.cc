@@ -97,8 +97,47 @@ void testAssignAndDedup()
     // third client after assignment: immediate
     auto res = shard.want(3, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
     assert(res.assigned && res.assigned->first == w0 && res.assigned->second == out[0].assignId);
-    shard.done(w0, "a.drv", {{"/nix/store/a-out", 100}});
+    shard.done(w0, "a.drv", out[0].assignId, {{"/nix/store/a-out", 100}});
     assert(!shard.entry(out[0].drv));
+}
+
+void testAssignmentGeneration()
+{
+    Core first;
+    Core successor;
+    std::vector<Assign> a;
+    std::vector<Assign> b;
+    hello(first, "w", 1);
+    hello(successor, "w", 1);
+    first.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    successor.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    first.dispatch(a);
+    successor.dispatch(b);
+    assert(a.size() == 1 && b.size() == 1);
+    assert(a[0].assignId != b[0].assignId);
+}
+
+void testStaleAssignmentDone()
+{
+    Core shard;
+    hello(shard, "w0", 1);
+    hello(shard, "w1", 1);
+    shard.want(1, {.drvPath = "a.drv", .system = "x"}, 0);
+    std::vector<Assign> out;
+    shard.dispatch(out);
+    assert(out.size() == 1);
+    const auto first = out.back();
+    shard.workerGone(first.worker);
+    out.clear();
+    shard.dispatch(out);
+    assert(out.size() == 1 && out.back().worker != first.worker);
+    const auto second = out.back();
+    assert(!shard.done(second.worker, "a.drv", first.assignId, {{"/nix/store/stale", 100}}));
+    assert(!shard.done(first.worker, "a.drv", first.assignId, {}));
+    assert(shard.entry(second.drv)->assignId == second.assignId);
+    assert(shard.worker(second.worker).running.size() == 1);
+    assert(shard.done(second.worker, "a.drv", second.assignId, {}));
+    assert(!shard.entry(second.drv));
 }
 
 void testMostFreeAndLocality()
@@ -108,11 +147,12 @@ void testMostFreeAndLocality()
     auto const w0 = hello(shard, "w0", 4);
     auto const w1 = hello(shard, "w1", 4);
     // w1 produced a big input
-    shard.done(w1, "x.drv", {{"/nix/store/big", 1'000'000'000}});
+    hello(shard, "w1", 4, {"x.drv"});
+    shard.done(w1, "x.drv", 7, {{"/nix/store/big", 1'000'000'000}});
     shard.want(1, {.drvPath = "b.drv", .inputs = {"/nix/store/big"}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
     shard.dispatch(out);
     assert(out.size() == 1 && out[0].worker == w1);
-    // without locality: most free (w0 has 4, w1 has 3)
+    // Without locality the two workers have the same number of free slots.
     shard.want(1, {.drvPath = "c.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
     shard.dispatch(out);
     assert(out.size() == 2 && out[1].worker == w0);
@@ -132,7 +172,7 @@ void testPriority()
     hello(shard, "w", 1);
     shard.dispatch(out);
     assert(out.size() == 1 && shard.entry(out[0].drv)->drvPath == "fan.drv");
-    shard.done(0, "fan.drv", {});
+    shard.done(0, "fan.drv", out[0].assignId, {});
     shard.dispatch(out);
     assert(out.size() == 2 && shard.entry(out[1].drv)->drvPath == "high.drv");
 }
@@ -164,7 +204,7 @@ void testHelloReconciles()
     shard.want(1, {.drvPath = "c.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
     shard.dispatch(out);
     assert(out.size() == 1); // only one slot left
-    shard.done(w0, "a.drv", {});
+    shard.done(w0, "a.drv", 7, {});
     shard.dispatch(out);
     assert(out.size() == 2);
 }
@@ -182,7 +222,7 @@ void testHelloSupersedes()
     assert(out.size() == 1 && out[0].worker == w0);
     std::vector<Core::Superseded> sup;
     auto const w1 = hello(shard, "w1", 1, {"a.drv"}, {}, &sup);
-    assert(sup.size() == 1 && sup[0].loser == w0);
+    assert(sup.size() == 1 && sup[0].loser == w0 && sup[0].loserAssignId == out[0].assignId);
     const auto & ent = shard.entry(sup[0].drv);
     assert(ent && ent->worker == w1 && ent->assignId == 7);
     assert(ent->followers.size() == 1 && ent->followers[0] == 1);
@@ -249,7 +289,7 @@ void testFeatures()
     assert(shard.entry(out[0].drv)->drvPath == "vm.drv" && out[0].worker == kvm);
     assert(shard.entry(out[1].drv)->drvPath == "a.drv" && out[1].worker == plain);
     assert(shard.queued() == 2);
-    shard.done(kvm, "vm.drv", {});
+    shard.done(kvm, "vm.drv", out[0].assignId, {});
     shard.dispatch(out);
     assert(out.size() == 3 && out[2].worker == kvm);
     hello(shard, "gpu", 1, {}, {"cuda", "kvm"});
@@ -305,7 +345,8 @@ void testSystems()
     assert(shard.queued() == 2);
     checkStats(shard);
     // Slot on `both` frees: the other x86-ish drv goes there.
-    shard.done(both, shard.entry(out[0].worker == both ? out[0].drv : out[1].drv)->drvPath, {});
+    const auto & assignmentOnBoth = out[0].worker == both ? out[0] : out[1];
+    shard.done(both, shard.entry(assignmentOnBoth.drv)->drvPath, assignmentOnBoth.assignId, {});
     out.clear();
     shard.dispatch(out);
     assert(out.size() == 1 && out[0].worker == both);
@@ -315,8 +356,8 @@ void testStaleDoneAndUnknown()
 {
     Core shard;
     auto const w0 = hello(shard, "w0", 1);
-    shard.done(w0, "never.drv", {});
-    shard.done(w0, "never.drv", {});
+    shard.done(w0, "never.drv", 0, {});
+    shard.done(w0, "never.drv", 0, {});
     shard.workerGone(w0);
     shard.workerGone(w0);
     hello(shard, "w0", 1);
@@ -339,6 +380,8 @@ try {
     testHeapAgainstMap();
     testFreeIndex();
     testAssignAndDedup();
+    testAssignmentGeneration();
+    testStaleAssignmentDone();
     testMostFreeAndLocality();
     testPriority();
     testWorkerGoneRequeues();

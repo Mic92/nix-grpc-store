@@ -191,6 +191,7 @@ if build_server
     'src/daemon/auth.cc',
     'src/daemon/backend.cc',
     'src/daemon/coordinator.cc',
+    'src/daemon/scheduler-service.cc',
     'src/daemon/eds.cc',
     'src/daemon/options.cc',
     {'darwin': 'src/daemon/sandbox-darwin.cc', 'linux': 'src/daemon/sandbox-linux.cc'}.get(host_machine.system(), 'src/daemon/sandbox-unsupported.cc'),
@@ -239,9 +240,10 @@ if build_server
   )
 
   oidc_test = executable('oidc-test',
-    sources : ['tests/oidc-test.cc'],
-    include_directories : [src_inc, include_directories('src/daemon')],
-    dependencies : [nix_util_dep, curl_dep, json_dep, openssl_dep, grpc_dep, threads_dep],
+    sources : ['tests/oidc-test.cc', 'src/daemon/scheduler-service.cc', 'src/daemon/auth.cc', gen],
+    include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
+    dependencies : [dispatcher_dep, nix_store_dep, curl_dep, json_dep, openssl_dep, grpc_dep, protobuf_dep, threads_dep, jemalloc_dep],
+    cpp_args : nix_compat_args,
   )
   test('oidc', find_program('tests/oidc-test.sh'), args : [oidc_test], timeout : 60)
 
@@ -251,6 +253,105 @@ if build_server
     dependencies : [nix_util_dep] + absl_dep,
     cpp_args : ['-UNDEBUG'],
   ))
+
+  test('dispatcher-session', executable('dispatcher-session-test',
+    sources : ['tests/dispatcher-session-test.cc'],
+    dependencies : [dispatcher_dep, jemalloc_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
+
+  test('reverse-registry', executable('reverse-registry-test',
+    sources : ['tests/reverse-registry-test.cc', gen],
+    include_directories : [gen_inc, include_directories('src/daemon')],
+    dependencies : [grpc_dep, protobuf_dep, threads_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
+
+  test('reverse-frames', executable('reverse-frames-test',
+    sources : ['tests/reverse-frames-test.cc', gen],
+    include_directories : [gen_inc, include_directories('src/daemon')],
+    dependencies : [grpc_dep, protobuf_dep, threads_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
+
+  test('reverse-capability', executable('reverse-capability-test',
+    sources : ['tests/reverse-capability-test.cc', gen],
+    include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
+    dependencies : [nix_store_dep, nix_util_dep, grpc_dep, protobuf_dep, openssl_dep, threads_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
+
+  test('reverse-inbound', executable('reverse-inbound-test',
+    sources : ['tests/reverse-inbound-test.cc', gen],
+    include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
+    dependencies : [nix_store_dep, nix_util_dep, grpc_dep, protobuf_dep, openssl_dep, threads_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
+
+  test('reverse-request', executable('reverse-request-test',
+    sources : ['tests/reverse-request-test.cc', gen],
+    include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
+    dependencies : [nix_store_dep, nix_util_dep, grpc_dep, protobuf_dep, openssl_dep, zstd_dep, threads_dep],
+    cpp_args : nix_compat_args + ['-UNDEBUG'],
+  ))
+
+  test('reverse-worker', executable('reverse-worker-test',
+    sources : ['tests/reverse-worker-test.cc', gen],
+    include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
+    dependencies : [nix_store_dep, nix_util_dep, grpc_dep, protobuf_dep, openssl_dep, threads_dep],
+    cpp_args : nix_compat_args + ['-UNDEBUG'],
+  ))
+
+  test('reverse-upload', executable('reverse-upload-test',
+    sources : ['tests/reverse-upload-test.cc', gen],
+    include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
+    dependencies : [nix_store_dep, nix_util_dep, grpc_dep, protobuf_dep, openssl_dep, threads_dep],
+    cpp_args : nix_compat_args + ['-UNDEBUG'],
+  ))
+
+  test('reverse-import', executable('reverse-import-test',
+    sources : ['tests/reverse-import-test.cc', gen],
+    include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
+    dependencies : [nix_store_dep, nix_util_dep, grpc_dep, protobuf_dep, openssl_dep, zstd_dep, threads_dep],
+    cpp_args : nix_compat_args + ['-UNDEBUG'],
+  ))
+
+  reverse_production_test = executable('reverse-production-test',
+    sources : ['tests/reverse-production-test.cc', 'src/client/channel.cc',
+               'src/daemon/elector.cc', 'src/daemon/auth.cc', 'src/daemon/backend.cc',
+               'src/daemon/coordinator.cc', 'src/daemon/scheduler-service.cc',
+               'src/daemon/eds.cc', 'src/daemon/options.cc',
+               {'darwin': 'src/daemon/sandbox-darwin.cc', 'linux': 'src/daemon/sandbox-linux.cc'}.get(host_machine.system(), 'src/daemon/sandbox-unsupported.cc'),
+               gen, eds_gen] + (host_machine.system() == 'darwin' ? ['src/daemon/sbpl.cc'] : []),
+    include_directories : [gen_inc, src_inc],
+    cpp_pch : do_pch ? ['pch/daemon_pch.hh'] : [],
+    cpp_args : nix_compat_args + ['-UNDEBUG', '-DNIX_GRPC_DAEMON_EMBED_TEST'],
+    dependencies : common_deps + prometheus_dep + [dispatcher_dep, nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep, jemalloc_dep],
+  )
+  test('reverse-production', find_program('tests/reverse-production-test.sh'),
+    args : [reverse_production_test], timeout : 120)
+
+  test('reverse-responses', executable('reverse-responses-test',
+    sources : ['tests/reverse-responses-test.cc', gen],
+    include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
+    dependencies : [nix_store_dep, nix_util_dep, grpc_dep, protobuf_dep, threads_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
+
+  test('reverse-roundtrip', executable('reverse-roundtrip-test',
+    sources : ['tests/reverse-roundtrip-test.cc', gen],
+    include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
+    dependencies : [nix_store_dep, nix_util_dep, grpc_dep, protobuf_dep, openssl_dep, threads_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
+
+  reverse_gateway_test = executable('reverse-gateway-test',
+    sources : ['tests/reverse-gateway-test.cc', 'src/daemon/auth.cc', gen],
+    include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
+    dependencies : [nix_store_dep, nix_util_dep, grpc_dep, protobuf_dep, openssl_dep, curl_dep, json_dep, threads_dep],
+    cpp_args : ['-UNDEBUG'],
+  )
+  test('reverse-gateway', find_program('tests/reverse-gateway-test.sh'), args : [reverse_gateway_test])
 
   test('sbpl', executable('sbpl-test',
     sources : ['tests/sbpl-test.cc', 'src/daemon/sbpl.cc'],
