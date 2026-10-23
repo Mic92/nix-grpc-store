@@ -399,6 +399,26 @@ template <typename F> void forInputDrvs(const nix::Derivation &drv, const F &vis
 #endif
 }
 
+// Every output of a static input derivation the derivation uses, as
+// visit(drvPath, outputName).
+template <typename F> void forInputOutputs(const nix::Derivation &drv, const F &visit) {
+#if NIX_COMPAT_TEMPLATED_DRV
+  for (const auto &input : drv.inputs) {
+    if (const auto *built = std::get_if<nix::SingleDerivedPath::Built>(&input.raw())) {
+      if (const auto *dep = std::get_if<nix::SingleDerivedPath::Opaque>(&built->drvPath->raw())) {
+        visit(dep->path, built->output);
+      }
+    }
+  }
+#else
+  for (const auto &[drvPath, node] : drv.inputDrvs.map) {
+    for (const auto &output : node.value) {
+      visit(drvPath, output);
+    }
+  }
+#endif
+}
+
 inline auto requiredSystemFeatures(const nix::StoreDirConfig &store,
                                    const nix::BasicDerivation &drv) -> nix::StringSet {
   const auto *attrs = drv.structuredAttrs ? &*drv.structuredAttrs : nullptr;

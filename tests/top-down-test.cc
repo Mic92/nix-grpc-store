@@ -134,16 +134,16 @@ void aNodeWithoutKeysIsMissing()
     assert((missing == std::set<int>{1}));
 }
 
-// b builds on a. Each has the keys "-out" and "-man"; held lists keys.
-auto runBuild(const std::map<std::string, std::vector<std::string>> & roots, const Names & held,
+// Each node has the keys "-out" and "-man". Uses maps a node to the nodes it
+// builds on, with the keys it needs of each; held lists keys.
+using Uses = std::map<std::string, std::vector<std::pair<std::string, std::vector<std::string>>>>;
+
+auto runBuild(const Uses & uses, const std::map<std::string, std::vector<std::string>> & roots, const Names & held,
               bool rebuildRoots) -> Result
 {
-    Graph const graph{{"b", {"a"}}, {"a", {}}};
     Result result;
     result.missing = nixgrpc::missingForBuild(
-        roots, rebuildRoots,
-        [](const std::string & node) -> std::vector<std::string> { return {node + "-out", node + "-man"}; },
-        [&](const std::string & node) -> std::vector<std::string> { return graph.at(node); },
+        roots, rebuildRoots, [&](const std::string & node) -> Uses::mapped_type { return uses.at(node); },
         [&](const std::set<std::string> & keys) -> std::set<std::string> {
             result.calls.emplace_back(keys.begin(), keys.end());
             Names answer;
@@ -154,24 +154,59 @@ auto runBuild(const std::map<std::string, std::vector<std::string>> & roots, con
     return result;
 }
 
+// b builds on a's out.
+auto bOnA() -> Uses
+{
+    return {{"b", {{"a", {"a-out"}}}}, {"a", {}}};
+}
+
 void aRootNeedsOnlyTheKeysAskedOfIt()
 {
-    auto const result = runBuild({{"b", {"b-out"}}}, {"b-out"}, false);
+    auto const result = runBuild(bOnA(), {{"b", {"b-out"}}}, {"b-out"}, false);
     assert(result.missing.empty());
     assert((result.calls == Calls{{"b-out"}}));
 }
 
 void aRebuiltRootIsMissingWhatTheStoreHolds()
 {
-    auto const result = runBuild({{"b", {"b-out"}}}, {"b-out", "b-man", "a-out", "a-man"}, true);
+    auto const result = runBuild(bOnA(), {{"b", {"b-out"}}}, {"b-out", "b-man", "a-out", "a-man"}, true);
     assert((result.missing == Names{"b"}));
-    assert((result.calls == Calls{{"a-man", "a-out"}}));
+    assert((result.calls == Calls{{"a-out"}}));
 }
 
-void aRootThatAnotherBuildsOnNeedsAllItsKeys()
+void anInputNeedsOnlyTheKeysItsDependantsUse()
 {
-    auto const result = runBuild({{"b", {"b-out"}}, {"a", {"a-out"}}}, {"a-out"}, false);
-    assert((result.missing == Names{"a", "b"}));
+    auto const result = runBuild(bOnA(), {{"b", {"b-out"}}}, {"a-out"}, false);
+    assert((result.missing == Names{"b"}));
+    assert((result.calls == Calls{{"b-out"}, {"a-out"}}));
+}
+
+void anInputNeedsTheKeysOfAllItsDependants()
+{
+    // x builds on a's out and c's out, c on b's out, b on a's man. b is
+    // further down than a, so a is decided only after b.
+    Uses const uses{{"x", {{"a", {"a-out"}}, {"c", {"c-out"}}}},
+                    {"c", {{"b", {"b-out"}}}},
+                    {"b", {{"a", {"a-man"}}}},
+                    {"a", {}}};
+    auto const result = runBuild(uses, {{"x", {"x-out"}}}, {"a-out"}, false);
+    assert((result.missing == Names{"x", "c", "b", "a"}));
+}
+
+// b is held, so it is not built and a need not have the man it uses.
+void anInputUsedOnlyByAHeldNodeIsNotNeeded()
+{
+    Uses const uses{{"x", {{"a", {"a-out"}}, {"b", {"b-out"}}}}, {"b", {{"a", {"a-man"}}}}, {"a", {}}};
+    auto const result = runBuild(uses, {{"x", {"x-out"}}}, {"a-out", "b-out"}, false);
+    assert((result.missing == Names{"x"}));
+}
+
+void aRootAnotherBuildsOnNeedsWhatBothAsk()
+{
+    auto const held = runBuild(bOnA(), {{"b", {"b-out"}}, {"a", {"a-out"}}}, {"a-out"}, false);
+    assert((held.missing == Names{"b"}));
+    auto const missing = runBuild(bOnA(), {{"b", {"b-out"}}, {"a", {"a-man"}}}, {"a-man"}, false);
+    assert((missing.missing == Names{"a", "b"}));
 }
 
 } // namespace
@@ -189,7 +224,10 @@ try {
     aNodeWithoutKeysIsMissingAndItsChildrenAreWalked();
     aRootNeedsOnlyTheKeysAskedOfIt();
     aRebuiltRootIsMissingWhatTheStoreHolds();
-    aRootThatAnotherBuildsOnNeedsAllItsKeys();
+    anInputNeedsOnlyTheKeysItsDependantsUse();
+    anInputNeedsTheKeysOfAllItsDependants();
+    anInputUsedOnlyByAHeldNodeIsNotNeeded();
+    aRootAnotherBuildsOnNeedsWhatBothAsk();
     return 0;
 } catch (const std::exception & err) {
     std::cerr << "top-down-test: " << err.what() << '\n';

@@ -735,7 +735,7 @@ auto GrpcStore::basicForFarm(Store & evalStore, const StorePath & drvPath, const
   return std::move(*basic);
 }
 
-// Inputs whose outputs the farm already has or can substitute are not
+// Inputs whose used outputs the farm already has or can substitute are not
 // jobs: the worker fetches them when it builds the dependant. Nor is a top
 // whose requested outputs it has, unless --repair or --check asks to rebuild.
 //
@@ -765,21 +765,26 @@ auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, BuildMod
       collect(built->drvPath->getBaseStorePath());
     }
   }
+  std::map<StorePath, std::map<std::string, std::optional<StorePath>>> outputs;
+  auto const outputPath = [&](const StorePath & drvPath, const std::string & name) -> std::optional<StorePath> {
+    auto found = outputs.find(drvPath);
+    if (found == outputs.end()) {
+      found = outputs.emplace(drvPath, evalStore.queryStaticPartialDerivationOutputMap(drvPath)).first;
+    }
+    auto const path = found->second.find(name);
+    return path == found->second.end() ? std::nullopt : path->second;
+  };
   return nixgrpc::missingForBuild(
       tops, buildMode != bmNormal,
-      [&](const StorePath & drvPath) -> std::vector<StorePath> {
-        std::vector<StorePath> outs;
-        for (auto & [name, path] : evalStore.queryStaticPartialDerivationOutputMap(drvPath)) {
-          if (path) {
-            outs.push_back(*path);
+      [&](const StorePath & drvPath) -> std::map<StorePath, std::vector<StorePath>> {
+        std::map<StorePath, std::vector<StorePath>> used;
+        nixcompat::forInputOutputs(drvs.at(drvPath), [&](const StorePath & input, const std::string & name) -> void {
+          auto & paths = used[input];
+          if (auto path = outputPath(input, name)) {
+            paths.push_back(std::move(*path));
           }
-        }
-        return outs;
-      },
-      [&](const StorePath & drvPath) -> std::vector<StorePath> {
-        std::vector<StorePath> inputs;
-        nixcompat::forInputDrvs(drvs.at(drvPath), [&](const StorePath & input) -> void { inputs.push_back(input); });
-        return inputs;
+        });
+        return used;
       },
       [&](const StorePathSet & paths) -> StorePathSet { return queryValidPaths(paths, NoSubstitute); });
 }
