@@ -115,10 +115,10 @@ auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & reques
   });
 }
 
-auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore) -> std::optional<BuildResult> {
+auto GrpcStore::buildAssigned(Job & job, Store & evalStore) -> std::optional<BuildResult> {
   remote::BuildDerivationRequest request;
   request.set_drv_path(std::string(job.drvPath.to_string()));
-  request.set_build_mode(static_cast<uint32_t>(buildMode));
+  request.set_build_mode(static_cast<uint32_t>(job.mode));
   request.set_protocol(nixcompat::kBuildProtocolWire);
   request.set_assign_id(job.assignId);
   request.set_build_timeout(static_cast<uint64_t>(nixcompat::buildTimeout()));
@@ -171,7 +171,6 @@ auto GrpcStore::localEvalStore(const StorePathSet & drvPaths) -> std::shared_ptr
 // Shared between the Schedule reader and the build threads.
 struct GrpcStore::Run {
   GrpcStore & store;
-  BuildMode mode;
   Store & evalStore;
   std::map<StorePath, Job> & jobs;
 
@@ -209,7 +208,7 @@ struct GrpcStore::Run {
       want->add_required_features(feat);
     }
     want->set_cp_hint_ms(job.cpHintMs);
-    want->set_build_mode(static_cast<uint32_t>(mode));
+    want->set_build_mode(static_cast<uint32_t>(job.mode));
     want->set_system(job.drv.platform);
     debug("grpc: want %s", job.drvPath.to_string());
   }
@@ -298,7 +297,7 @@ struct GrpcStore::Run {
     if (job.result) { // Cached / Unplaceable
       return std::exchange(job.result, std::nullopt);
     }
-    return store.buildAssigned(job, mode, evalStore);
+    return store.buildAssigned(job, evalStore);
   }
 
   // Build thread body.
@@ -541,11 +540,11 @@ auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::
   }
 }
 
-void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, BuildMode buildMode, Store & evalStore) {
+void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, Store & evalStore) {
   if (jobs.empty()) {
     return;
   }
-  Run run{.store = *this, .mode = buildMode, .evalStore = evalStore, .jobs = jobs, .remaining = jobs.size()};
+  Run run{.store = *this, .evalStore = evalStore, .jobs = jobs, .remaining = jobs.size()};
   for (auto & [drvPath, job] : jobs) {
     run.byName.emplace(std::string(drvPath.to_string()), &job);
     if (job.waiting == 0) {
@@ -579,6 +578,19 @@ void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, BuildMode buildMode, St
   }
 }
 
+namespace {
+// The outputs `built` asks for, by name.
+auto wantedOutputs(Store & evalStore, const DerivedPath::Built & built) -> std::map<std::string, StorePath> {
+  std::map<std::string, StorePath> wanted;
+  for (auto & [name, path] : evalStore.queryStaticPartialDerivationOutputMap(built.drvPath->getBaseStorePath())) {
+    if (path && built.outputs.contains(name)) {
+      wanted.emplace(name, *path);
+    }
+  }
+  return wanted;
+}
+} // namespace
+
 auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
                    const std::shared_ptr<Store> & evalStoreIn) -> std::vector<KeyedBuildResult> {
   Store * evalStore = evalStoreIn.get();
@@ -597,8 +609,8 @@ auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode b
   }
   std::map<StorePath, Job> jobs;
   if (evalStore != nullptr) {
-    loadJobs(reqs, *evalStore, jobs);
-    runJobs(jobs, buildMode, *evalStore);
+    loadJobs(reqs, buildMode, *evalStore, jobs);
+    runJobs(jobs, *evalStore);
   }
 
   // Opaque paths: "building" them means making them valid, i.e. substituting.
@@ -615,9 +627,12 @@ auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode b
   for (const auto & req : reqs) {
     KeyedBuildResult res{{}, req};
     if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
-      auto & job = jobs.at(built->drvPath->getBaseStorePath());
-      if (job.result) {
-        static_cast<BuildResult &>(res) = *job.result;
+      auto const drvPath = built->drvPath->getBaseStorePath();
+      if (auto const job = jobs.find(drvPath); job == jobs.end()) {
+        // No job: the server holds the outputs asked for.
+        static_cast<BuildResult &>(res) = nixcompat::alreadyValid(drvPath, wantedOutputs(*evalStore, *built));
+      } else if (job->second.result) {
+        static_cast<BuildResult &>(res) = *job->second.result;
       }
     } else if (validOpaque.contains(std::get<DerivedPath::Opaque>(req.raw()).path)) {
       nixcompat::setAlreadyValid(res);
@@ -639,8 +654,8 @@ auto GrpcStore::buildOne(const StorePath & drvPath, const BasicDerivation & drv,
     evalStore = local.get();
   }
   std::map<StorePath, Job> jobs;
-  jobs.emplace(drvPath, Job{.drvPath = drvPath, .drv = drv});
-  runJobs(jobs, buildMode, *evalStore);
+  jobs.emplace(drvPath, Job{.drvPath = drvPath, .drv = drv, .mode = buildMode});
+  runJobs(jobs, *evalStore);
   auto & job = jobs.begin()->second;
   if (!job.result) {
     throw Error("'%s' was not built", printStorePath(drvPath));
@@ -668,16 +683,20 @@ auto GrpcStore::basicForFarm(Store & evalStore, const StorePath & drvPath, const
   return std::move(*basic);
 }
 
-// Inputs whose outputs the farm already has or can substitute are not
-// jobs: the worker fetches them when it builds the dependant.
+// Inputs whose used outputs the farm already has or can substitute are not
+// jobs: the worker fetches them when it builds the dependant. Nor is a top
+// whose requested outputs it has, unless --repair or --check asks to rebuild.
 //
 // The server is queried top-down. One QueryValidPaths for the whole closure is
 // slow: with a remote cache configured, the daemon publishes every path it
 // holds before it answers.
 //
-// NoSubstitute: the daemon still reports what its substituters offer, but
-// does not fetch anything just to answer.
-auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, Store & evalStore) -> StorePathSet {
+// NoSubstitute: a daemon with a shared cache also reports what its
+// substituters offer, without fetching it just to answer. Substitute: what a
+// needed derivation still lacks, the server fetches, as nix does before it
+// builds. What it cannot fetch, e.g. for an untrusted signature, is built.
+auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, BuildMode buildMode, Store & evalStore)
+    -> StorePathSet {
   std::map<StorePath, Derivation> drvs;
   std::function<void(const StorePath &)> collect = [&](const StorePath & drvPath) -> void {
     if (drvs.contains(drvPath)) {
@@ -686,45 +705,52 @@ auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, Store & 
     auto const & full = drvs.emplace(drvPath, evalStore.readDerivation(drvPath)).first->second;
     nixcompat::forInputDrvs(full, collect);
   };
-  StorePathSet tops;
+  std::map<StorePath, std::vector<StorePath>> tops;
   for (const auto & req : reqs) {
     if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
-      tops.insert(built->drvPath->getBaseStorePath());
+      auto & wanted = tops[built->drvPath->getBaseStorePath()];
+      for (auto & [name, path] : wantedOutputs(evalStore, *built)) {
+        wanted.push_back(std::move(path));
+      }
       collect(built->drvPath->getBaseStorePath());
     }
   }
-  return nixgrpc::missingTopDown(
-      std::vector(tops.begin(), tops.end()),
-      [&](const StorePath & drvPath) -> std::vector<StorePath> {
-        std::vector<StorePath> outs;
-        if (tops.contains(drvPath)) {
-          return outs;
-        }
-        for (auto & [name, path] : evalStore.queryStaticPartialDerivationOutputMap(drvPath)) {
-          if (path) {
-            outs.push_back(*path);
+  std::map<StorePath, std::map<std::string, std::optional<StorePath>>> outputs;
+  auto const outputPath = [&](const StorePath & drvPath, const std::string & name) -> std::optional<StorePath> {
+    auto found = outputs.find(drvPath);
+    if (found == outputs.end()) {
+      found = outputs.emplace(drvPath, evalStore.queryStaticPartialDerivationOutputMap(drvPath)).first;
+    }
+    auto const path = found->second.find(name);
+    return path == found->second.end() ? std::nullopt : path->second;
+  };
+  return nixgrpc::missingForBuild(
+      tops, buildMode != bmNormal,
+      [&](const StorePath & drvPath) -> std::map<StorePath, std::vector<StorePath>> {
+        std::map<StorePath, std::vector<StorePath>> used;
+        nixcompat::forInputOutputs(drvs.at(drvPath), [&](const StorePath & input, const std::string & name) -> void {
+          auto & paths = used[input];
+          if (auto path = outputPath(input, name)) {
+            paths.push_back(std::move(*path));
           }
-        }
-        return outs;
+        });
+        return used;
       },
-      [&](const StorePath & drvPath) -> std::vector<StorePath> {
-        std::vector<StorePath> inputs;
-        nixcompat::forInputDrvs(drvs.at(drvPath), [&](const StorePath & input) -> void { inputs.push_back(input); });
-        return inputs;
-      },
-      [&](const StorePathSet & paths) -> StorePathSet { return queryValidPaths(paths, NoSubstitute); });
+      [&](const StorePathSet & paths) -> StorePathSet { return queryValidPaths(paths, NoSubstitute); },
+      [&](const StorePathSet & paths) -> StorePathSet { return queryValidPaths(paths, Substitute); });
 }
 
-void GrpcStore::loadJobs(const std::vector<DerivedPath> & reqs, Store & evalStore,
+void GrpcStore::loadJobs(const std::vector<DerivedPath> & reqs, BuildMode buildMode, Store & evalStore,
                   std::map<StorePath, Job> & jobs) {
-  auto const missing = missingInputDrvs(reqs, evalStore);
+  auto const missing = missingInputDrvs(reqs, buildMode, evalStore);
   std::function<Job &(const StorePath &)> load = [&](const StorePath & drvPath) -> Job & {
     if (auto const found = jobs.find(drvPath); found != jobs.end()) {
       return found->second;
     }
     auto const full = evalStore.readDerivation(drvPath);
     auto & job = jobs.emplace(drvPath, Job{.drvPath = drvPath,
-                                           .drv = basicForFarm(evalStore, drvPath, full)})
+                                           .drv = basicForFarm(evalStore, drvPath, full),
+                                           .mode = nixcompat::inputBuildMode(buildMode)})
                      .first->second;
     nixcompat::forInputDrvs(full, [&](const StorePath & input) -> void {
       if (!missing.contains(input)) {
@@ -740,7 +766,9 @@ void GrpcStore::loadJobs(const std::vector<DerivedPath> & reqs, Store & evalStor
   for (const auto & req : reqs) {
     if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
       if (const auto * opaque = std::get_if<SingleDerivedPath::Opaque>(&built->drvPath->raw())) {
-        load(opaque->path);
+        if (missing.contains(opaque->path)) {
+          load(opaque->path).mode = buildMode;
+        }
       } else {
         throw Error("'%s': dynamic derivations are not supported", req.to_string(*this));
       }

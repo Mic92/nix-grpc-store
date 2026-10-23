@@ -66,6 +66,7 @@ stdenv.mkDerivation {
         ../../tests/plugin-loader-test.cc
         ../../tests/upload-claims-test.cc
         ../../tests/top-down-test.cc
+        ../../tests/nix-compat-test.cc
         ../../tests/upload-spool-test.cc
         ../../tests/call-test.cc
         ../../tests/nar-fetcher-test.cc

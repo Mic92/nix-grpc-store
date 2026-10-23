@@ -372,6 +372,13 @@ auto toBasicDrv(const nix::Derivation &drv, const OutputOf &outputOf)
   return basic;
 }
 
+// The mode nix builds the inputs of a derivation built in `mode`
+// (DerivationResolutionGoal): --repair repairs them too, --check only
+// checks the derivation itself.
+inline auto inputBuildMode(nix::BuildMode mode) -> nix::BuildMode {
+  return mode == nix::bmRepair ? nix::bmRepair : nix::bmNormal;
+}
+
 // Every input derivation path (static ones only, see toBasicDrv).
 template <typename F> void forInputDrvs(const nix::Derivation &drv, const F &visit) {
 #if NIX_COMPAT_TEMPLATED_DRV
@@ -384,6 +391,26 @@ template <typename F> void forInputDrvs(const nix::Derivation &drv, const F &vis
   for (const auto &[drvPath, node] : drv.inputDrvs.map) {
     (void)node;
     visit(drvPath);
+  }
+#endif
+}
+
+// Every output of a static input derivation the derivation uses, as
+// visit(drvPath, outputName).
+template <typename F> void forInputOutputs(const nix::Derivation &drv, const F &visit) {
+#if NIX_COMPAT_TEMPLATED_DRV
+  for (const auto &input : drv.inputs) {
+    if (const auto *built = std::get_if<nix::SingleDerivedPath::Built>(&input.raw())) {
+      if (const auto *dep = std::get_if<nix::SingleDerivedPath::Opaque>(&built->drvPath->raw())) {
+        visit(dep->path, built->output);
+      }
+    }
+  }
+#else
+  for (const auto &[drvPath, node] : drv.inputDrvs.map) {
+    for (const auto &output : node.value) {
+      visit(drvPath, output);
+    }
   }
 #endif
 }
