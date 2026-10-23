@@ -630,6 +630,19 @@ void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, BuildMode buildMode, St
   run.collectResults();
 }
 
+namespace {
+// The outputs `built` asks for, by name.
+auto wantedOutputs(Store & evalStore, const DerivedPath::Built & built) -> std::map<std::string, StorePath> {
+  std::map<std::string, StorePath> wanted;
+  for (auto & [name, path] : evalStore.queryStaticPartialDerivationOutputMap(built.drvPath->getBaseStorePath())) {
+    if (path && built.outputs.contains(name)) {
+      wanted.emplace(name, *path);
+    }
+  }
+  return wanted;
+}
+} // namespace
+
 auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
                    const std::shared_ptr<Store> & evalStoreIn) -> std::vector<KeyedBuildResult> {
   Store * evalStore = evalStoreIn.get();
@@ -648,7 +661,7 @@ auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode b
   }
   std::map<StorePath, Job> jobs;
   if (evalStore != nullptr) {
-    loadJobs(reqs, *evalStore, jobs);
+    loadJobs(reqs, buildMode, *evalStore, jobs);
     runJobs(jobs, buildMode, *evalStore);
   }
 
@@ -666,9 +679,12 @@ auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode b
   for (const auto & req : reqs) {
     KeyedBuildResult res{{}, req};
     if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
-      auto & job = jobs.at(built->drvPath->getBaseStorePath());
-      if (job.result) {
-        static_cast<BuildResult &>(res) = *job.result;
+      auto const drvPath = built->drvPath->getBaseStorePath();
+      if (auto const job = jobs.find(drvPath); job == jobs.end()) {
+        // No job: the server holds the outputs asked for.
+        static_cast<BuildResult &>(res) = nixcompat::alreadyValid(drvPath, wantedOutputs(*evalStore, *built));
+      } else if (job->second.result) {
+        static_cast<BuildResult &>(res) = *job->second.result;
       }
     } else if (validOpaque.contains(std::get<DerivedPath::Opaque>(req.raw()).path)) {
       nixcompat::setAlreadyValid(res);
@@ -720,7 +736,8 @@ auto GrpcStore::basicForFarm(Store & evalStore, const StorePath & drvPath, const
 }
 
 // Inputs whose outputs the farm already has or can substitute are not
-// jobs: the worker fetches them when it builds the dependant.
+// jobs: the worker fetches them when it builds the dependant. Nor is a top
+// whose requested outputs it has, unless --repair or --check asks to rebuild.
 //
 // The server is queried top-down. One QueryValidPaths for the whole closure is
 // slow: with a remote cache configured, the daemon publishes every path it
@@ -728,7 +745,8 @@ auto GrpcStore::basicForFarm(Store & evalStore, const StorePath & drvPath, const
 //
 // NoSubstitute: the daemon still reports what its substituters offer, but
 // does not fetch anything just to answer.
-auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, Store & evalStore) -> StorePathSet {
+auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, BuildMode buildMode, Store & evalStore)
+    -> StorePathSet {
   std::map<StorePath, Derivation> drvs;
   std::function<void(const StorePath &)> collect = [&](const StorePath & drvPath) -> void {
     if (drvs.contains(drvPath)) {
@@ -737,20 +755,20 @@ auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, Store & 
     auto const & full = drvs.emplace(drvPath, evalStore.readDerivation(drvPath)).first->second;
     nixcompat::forInputDrvs(full, collect);
   };
-  StorePathSet tops;
+  std::map<StorePath, std::vector<StorePath>> tops;
   for (const auto & req : reqs) {
     if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
-      tops.insert(built->drvPath->getBaseStorePath());
+      auto & wanted = tops[built->drvPath->getBaseStorePath()];
+      for (auto & [name, path] : wantedOutputs(evalStore, *built)) {
+        wanted.push_back(std::move(path));
+      }
       collect(built->drvPath->getBaseStorePath());
     }
   }
-  return nixgrpc::missingTopDown(
-      std::vector(tops.begin(), tops.end()),
+  return nixgrpc::missingForBuild(
+      tops, buildMode != bmNormal,
       [&](const StorePath & drvPath) -> std::vector<StorePath> {
         std::vector<StorePath> outs;
-        if (tops.contains(drvPath)) {
-          return outs;
-        }
         for (auto & [name, path] : evalStore.queryStaticPartialDerivationOutputMap(drvPath)) {
           if (path) {
             outs.push_back(*path);
@@ -782,9 +800,9 @@ auto GrpcStore::farmJob(Store & evalStore, const StorePath & drvPath, const Deri
   return job;
 }
 
-void GrpcStore::loadJobs(const std::vector<DerivedPath> & reqs, Store & evalStore,
+void GrpcStore::loadJobs(const std::vector<DerivedPath> & reqs, BuildMode buildMode, Store & evalStore,
                   std::map<StorePath, Job> & jobs) {
-  auto const missing = missingInputDrvs(reqs, evalStore);
+  auto const missing = missingInputDrvs(reqs, buildMode, evalStore);
   std::function<Job &(const StorePath &)> load = [&](const StorePath & drvPath) -> Job & {
     if (auto const found = jobs.find(drvPath); found != jobs.end()) {
       return found->second;
@@ -805,7 +823,9 @@ void GrpcStore::loadJobs(const std::vector<DerivedPath> & reqs, Store & evalStor
   for (const auto & req : reqs) {
     if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
       if (const auto * opaque = std::get_if<SingleDerivedPath::Opaque>(&built->drvPath->raw())) {
-        load(opaque->path);
+        if (missing.contains(opaque->path)) {
+          load(opaque->path);
+        }
       } else {
         throw Error("'%s': dynamic derivations are not supported", req.to_string(*this));
       }

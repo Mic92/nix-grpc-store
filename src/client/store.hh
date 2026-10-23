@@ -528,8 +528,9 @@ public:
         auto farmJob(Store & evalStore, const StorePath & drvPath, const Derivation & full,
                  const std::function<bool(const StorePath &)> & isJob) -> Job;
 
-    auto missingInputDrvs(const std::vector<nix::DerivedPath> & reqs, nix::Store & evalStore) -> nix::StorePathSet;
-    void loadJobs(const std::vector<DerivedPath> & reqs, Store & evalStore,
+    auto missingInputDrvs(const std::vector<nix::DerivedPath> & reqs, nix::BuildMode buildMode,
+                          nix::Store & evalStore) -> nix::StorePathSet;
+    void loadJobs(const std::vector<DerivedPath> & reqs, BuildMode buildMode, Store & evalStore,
                   std::map<StorePath, Job> & jobs);
 
     void throwOnFailedBuilds(std::vector<KeyedBuildResult> & results);

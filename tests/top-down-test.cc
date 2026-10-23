@@ -1,7 +1,9 @@
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <exception>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <set>
 #include <string>
@@ -132,6 +134,46 @@ void aNodeWithoutKeysIsMissing()
     assert((missing == std::set<int>{1}));
 }
 
+// b builds on a. Each has the keys "-out" and "-man"; held lists keys.
+auto runBuild(const std::map<std::string, std::vector<std::string>> & roots, const Names & held,
+              bool rebuildRoots) -> Result
+{
+    Graph const graph{{"b", {"a"}}, {"a", {}}};
+    Result result;
+    result.missing = nixgrpc::missingForBuild(
+        roots, rebuildRoots,
+        [](const std::string & node) -> std::vector<std::string> { return {node + "-out", node + "-man"}; },
+        [&](const std::string & node) -> std::vector<std::string> { return graph.at(node); },
+        [&](const std::set<std::string> & keys) -> std::set<std::string> {
+            result.calls.emplace_back(keys.begin(), keys.end());
+            Names answer;
+            std::ranges::set_intersection(keys, held, std::inserter(answer, answer.end()));
+            return answer;
+        },
+        1);
+    return result;
+}
+
+void aRootNeedsOnlyTheKeysAskedOfIt()
+{
+    auto const result = runBuild({{"b", {"b-out"}}}, {"b-out"}, false);
+    assert(result.missing.empty());
+    assert((result.calls == Calls{{"b-out"}}));
+}
+
+void aRebuiltRootIsMissingWhatTheStoreHolds()
+{
+    auto const result = runBuild({{"b", {"b-out"}}}, {"b-out", "b-man", "a-out", "a-man"}, true);
+    assert((result.missing == Names{"b"}));
+    assert((result.calls == Calls{{"a-man", "a-out"}}));
+}
+
+void aRootThatAnotherBuildsOnNeedsAllItsKeys()
+{
+    auto const result = runBuild({{"b", {"b-out"}}, {"a", {"a-out"}}}, {"a-out"}, false);
+    assert((result.missing == Names{"a", "b"}));
+}
+
 } // namespace
 
 auto main() -> int
@@ -145,6 +187,9 @@ try {
     aHeldNodeBelowAMissingOneIsFoundByAWideCall();
     aNodeWithoutKeysIsMissing();
     aNodeWithoutKeysIsMissingAndItsChildrenAreWalked();
+    aRootNeedsOnlyTheKeysAskedOfIt();
+    aRebuiltRootIsMissingWhatTheStoreHolds();
+    aRootThatAnotherBuildsOnNeedsAllItsKeys();
     return 0;
 } catch (const std::exception & err) {
     std::cerr << "top-down-test: " << err.what() << '\n';
