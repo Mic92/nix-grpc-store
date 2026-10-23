@@ -139,11 +139,14 @@ auto missingTopDown(std::vector<Node> roots, Keys keys, Children children, Query
 // As in nix, a node is needed if it is requested or a node that is built uses
 // it, and it needs the keys asked of it and those such nodes use. So a node is
 // decided only once every node that uses it is, and one used only by held
-// nodes is not needed. With rebuildRoots (--repair, --check) the roots count as
-// lacking whatever the store holds.
-template <class Node, class Key, class Uses, class Query> class BuildWalk
+// nodes is not needed. As nix substitutes before it builds, fetch(keys) gets
+// what a needed node lacks before the node counts as lacking. With
+// rebuildRoots (--repair, --check) the roots count as lacking whatever the
+// store holds.
+template <class Node, class Key, class Uses, class Query, class Fetch> class BuildWalk
 {
     Query query;
+    Fetch fetch;
     std::size_t budget;
     std::set<Node> rebuilt;
     // The graph below the roots, and how many nodes use each node.
@@ -182,6 +185,19 @@ template <class Node, class Key, class Uses, class Query> class BuildWalk
         }
     }
 
+    void fetchLacking(const std::vector<Node> & needed)
+    {
+        std::set<Key> lacking;
+        for (const auto & node : needed) {
+            if (!rebuilt.contains(node)) {
+                std::ranges::set_difference(needs.at(node), valid, std::inserter(lacking, lacking.end()));
+            }
+        }
+        if (!lacking.empty()) {
+            valid.merge(fetch(lacking));
+        }
+    }
+
     // Decides the nodes of the level, and returns the nodes whose users are
     // all decided now.
     auto decide() -> std::vector<Node>
@@ -204,9 +220,10 @@ template <class Node, class Key, class Uses, class Query> class BuildWalk
     }
 
 public:
-    BuildWalk(const std::map<Node, std::vector<Key>> & roots, bool rebuildRoots, Uses uses, Query query,
+    BuildWalk(const std::map<Node, std::vector<Key>> & roots, bool rebuildRoots, Uses uses, Query query, Fetch fetch,
               std::size_t budget)
         : query(std::move(query))
+        , fetch(std::move(fetch))
         , budget(budget)
     {
         std::vector<Node> todo;
@@ -246,17 +263,20 @@ public:
             std::ranges::copy_if(level, std::back_inserter(needed),
                                  [&](const Node & node) -> bool { return needs.contains(node); });
             queryAhead(needed);
+            fetchLacking(needed);
             level = decide();
         }
         return std::move(missing);
     }
 };
 
-template <class Node, class Key, class Uses, class Query>
+template <class Node, class Key, class Uses, class Query, class Fetch>
 auto missingForBuild(const std::map<Node, std::vector<Key>> & roots, bool rebuildRoots, Uses uses, Query query,
-                     std::size_t budget = topDownBudget) -> std::set<Node>
+                     Fetch fetch, std::size_t budget = topDownBudget) -> std::set<Node>
 {
-    return BuildWalk<Node, Key, Uses, Query>(roots, rebuildRoots, std::move(uses), std::move(query), budget).run();
+    return BuildWalk<Node, Key, Uses, Query, Fetch>(roots, rebuildRoots, std::move(uses), std::move(query),
+                                                    std::move(fetch), budget)
+        .run();
 }
 
 } // namespace nixgrpc

@@ -150,7 +150,7 @@ auto runBuild(const Uses & uses, const std::map<std::string, std::vector<std::st
             std::ranges::set_intersection(keys, held, std::inserter(answer, answer.end()));
             return answer;
         },
-        1);
+        [](const Names &) -> Names { return {}; }, 1);
     return result;
 }
 
@@ -209,6 +209,72 @@ void aRootAnotherBuildsOnNeedsWhatBothAsk()
     assert((missing.missing == Names{"a", "b"}));
 }
 
+// A store that holds valid and can fetch fetchable, like a server that
+// substitutes what a trusted key signed. Records each call.
+struct Fetching
+{
+    Names valid;
+    Names fetchable;
+    Calls queried;
+    Calls fetched;
+
+    auto plan(const std::map<std::string, std::vector<std::string>> & roots, std::size_t budget) -> Names
+    {
+        // t builds on x's out, x on w's out.
+        Uses const uses{{"t", {{"x", {"x-out"}}}}, {"x", {{"w", {"w-out"}}}}, {"w", {}}};
+        return nixgrpc::missingForBuild(
+            roots, false, [&](const std::string & node) -> Uses::mapped_type { return uses.at(node); },
+            [&](const Names & keys) -> Names {
+                queried.emplace_back(keys.begin(), keys.end());
+                Names answer;
+                std::ranges::set_intersection(keys, valid, std::inserter(answer, answer.end()));
+                return answer;
+            },
+            [&](const Names & keys) -> Names {
+                fetched.emplace_back(keys.begin(), keys.end());
+                Names answer;
+                std::ranges::set_intersection(keys, fetchable, std::inserter(answer, answer.end()));
+                valid.insert(answer.begin(), answer.end());
+                return answer;
+            },
+            budget);
+    }
+};
+
+void aFetchableInputIsNotBuilt()
+{
+    Fetching store{.valid = {}, .fetchable = {"x-out"}};
+    assert((store.plan({{"t", {"t-out"}}}, 1) == Names{"t"}));
+    assert((store.queried == Calls{{"t-out"}, {"x-out"}}));
+    assert((store.fetched == Calls{{"t-out"}, {"x-out"}}));
+}
+
+// A lookup of the substituters lists an input signed by an untrusted key,
+// but the server will not fetch it, so it is built.
+void anInputTheStoreCannotFetchIsBuilt()
+{
+    Fetching store{.valid = {}, .fetchable = {}};
+    assert((store.plan({{"t", {"t-out"}}}, 1) == Names{"t", "x", "w"}));
+    assert((store.fetched == Calls{{"t-out"}, {"x-out"}, {"w-out"}}));
+}
+
+void aFetchableRootIsNotBuilt()
+{
+    Fetching store{.valid = {}, .fetchable = {"t-out", "x-out"}};
+    assert(store.plan({{"t", {"t-out"}}}, 1).empty());
+    assert((store.fetched == Calls{{"t-out"}}));
+}
+
+// A call also queries the levels below, but what they lack is fetched only
+// once the walk reaches them.
+void aHeldRootFetchesNothingBelowIt()
+{
+    Fetching store{.valid = {"t-out"}, .fetchable = {"x-out", "w-out"}};
+    assert(store.plan({{"t", {"t-out"}}}, 64).empty());
+    assert((store.queried == Calls{{"t-out", "w-out", "x-out"}}));
+    assert(store.fetched.empty());
+}
+
 } // namespace
 
 auto main() -> int
@@ -228,6 +294,10 @@ try {
     anInputNeedsTheKeysOfAllItsDependants();
     anInputUsedOnlyByAHeldNodeIsNotNeeded();
     aRootAnotherBuildsOnNeedsWhatBothAsk();
+    aFetchableInputIsNotBuilt();
+    anInputTheStoreCannotFetchIsBuilt();
+    aFetchableRootIsNotBuilt();
+    aHeldRootFetchesNothingBelowIt();
     return 0;
 } catch (const std::exception & err) {
     std::cerr << "top-down-test: " << err.what() << '\n';
