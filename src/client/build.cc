@@ -733,10 +733,10 @@ auto GrpcStore::basicForFarm(Store & evalStore, const StorePath & drvPath, const
   return std::move(*basic);
 }
 
-// Inputs whose outputs the farm already has or can substitute are not
-// jobs: the worker fetches them when it builds the dependant. Neither is a
-// requested derivation whose requested outputs the farm has, unless
-// --repair or --check forces a rebuild.
+// Inputs are not jobs if the farm already has (or can substitute) the outputs
+// their dependants use: the worker fetches them when it builds the dependant.
+// Neither is a requested derivation whose requested outputs the farm has,
+// unless --repair or --check forces a rebuild.
 //
 // The server is queried top-down. One QueryValidPaths for the whole closure is
 // slow: with a remote cache configured, the daemon publishes every path it
@@ -747,10 +747,12 @@ auto GrpcStore::basicForFarm(Store & evalStore, const StorePath & drvPath, const
 auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, BuildMode buildMode, Store & evalStore)
     -> StorePathSet {
   std::map<StorePath, Derivation> drvs;
+  std::map<StorePath, std::map<std::string, std::optional<StorePath>>> outputs;
   std::function<void(const StorePath &)> collect = [&](const StorePath & drvPath) -> void {
     if (drvs.contains(drvPath)) {
       return;
     }
+    outputs.emplace(drvPath, evalStore.queryStaticPartialDerivationOutputMap(drvPath));
     auto const & full = drvs.emplace(drvPath, evalStore.readDerivation(drvPath)).first->second;
     nixcompat::forInputDrvs(full, collect);
   };
@@ -766,19 +768,15 @@ auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, BuildMod
   }
   return nixgrpc::missingForBuild(
       tops, buildMode != bmNormal,
-      [&](const StorePath & drvPath) -> std::vector<StorePath> {
-        std::vector<StorePath> outs;
-        for (auto & [name, path] : evalStore.queryStaticPartialDerivationOutputMap(drvPath)) {
-          if (path) {
-            outs.push_back(*path);
+      [&](const StorePath & drvPath) -> std::map<StorePath, std::vector<StorePath>> {
+        std::map<StorePath, std::vector<StorePath>> used;
+        nixcompat::forInputOutputs(drvs.at(drvPath), [&](const StorePath & input, const std::string & name) -> void {
+          auto & paths = used[input];
+          if (auto const path = outputs.at(input).find(name); path != outputs.at(input).end() && path->second) {
+            paths.push_back(*path->second);
           }
-        }
-        return outs;
-      },
-      [&](const StorePath & drvPath) -> std::vector<StorePath> {
-        std::vector<StorePath> inputs;
-        nixcompat::forInputDrvs(drvs.at(drvPath), [&](const StorePath & input) -> void { inputs.push_back(input); });
-        return inputs;
+        });
+        return used;
       },
       [&](const StorePathSet & paths) -> StorePathSet { return queryValidPaths(paths, NoSubstitute); });
 }
