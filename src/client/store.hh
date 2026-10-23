@@ -490,6 +490,7 @@ public:
     struct Job {
       StorePath drvPath;
       BasicDerivation drv;
+      BuildMode mode = bmNormal;
       std::vector<Job *> dependants; // for the critical-path hint
       std::vector<Job *> inputs;
       uint64_t cpHintMs = 0;
@@ -509,14 +510,13 @@ public:
 
     // One BuildDerivation against the assigned worker. NOT_FOUND: upload the
     // drv closure there and ask again.
-    auto buildAssigned(const Job & job, const nixgrpc::exec::Placement & where, BuildMode buildMode, Store & evalStore)
-        -> Attempt;
+    auto buildAssigned(const Job & job, const nixgrpc::exec::Placement & where, Store & evalStore) -> Attempt;
 
     // The build hook and plain `--store grpc://` pass no eval store but
     // usually have the derivations in the local store.
     auto localEvalStore(const StorePathSet & drvPaths) -> std::shared_ptr<Store>;
 
-    auto runJobs(std::map<StorePath, Job> & jobs, BuildMode buildMode, Store & evalStore) -> void;
+    auto runJobs(std::map<StorePath, Job> & jobs, Store & evalStore) -> void;
     auto scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::Status;
 
     // Single drv without a DAG (build hook, legacy buildDerivation callers).

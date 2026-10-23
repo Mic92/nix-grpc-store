@@ -126,11 +126,11 @@ auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & reques
   return status;
 }
 
-auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & where, BuildMode buildMode,
-                              Store & evalStore) -> Attempt {
+auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & where, Store & evalStore)
+    -> Attempt {
   remote::BuildDerivationRequest request;
   request.set_drv_path(std::string(job.drvPath.to_string()));
-  request.set_build_mode(static_cast<uint32_t>(buildMode));
+  request.set_build_mode(static_cast<uint32_t>(job.mode));
   request.set_protocol(nixcompat::kBuildProtocolWire);
   request.set_assign_id(where.assignId);
   request.set_build_timeout(static_cast<uint64_t>(nixcompat::buildTimeout()));
@@ -195,7 +195,6 @@ struct GrpcStore::Run {
   using JobId = nixgrpc::exec::JobId;
 
   GrpcStore & store;
-  BuildMode mode;
   Store & evalStore;
   std::map<StorePath, Job> & jobs;
 
@@ -208,8 +207,8 @@ struct GrpcStore::Run {
   bool closed = false;           // WritesDone sent
   grpc::ClientReaderWriter<remote::ClientMsgs, remote::SchedMsgs> * stream = nullptr;
 
-  Run(GrpcStore & store, BuildMode mode, Store & evalStore, std::map<StorePath, Job> & jobs, size_t threads)
-      : store(store), mode(mode), evalStore(evalStore), jobs(jobs),
+  Run(GrpcStore & store, Store & evalStore, std::map<StorePath, Job> & jobs, size_t threads)
+      : store(store), evalStore(evalStore), jobs(jobs),
         exe({.threads = threads,
              .rescheduleRetries = store.config->rescheduleRetries,
              .keepGoing = nixcompat::keepGoing()}) {
@@ -272,7 +271,7 @@ struct GrpcStore::Run {
       want->add_required_features(feat);
     }
     want->set_cp_hint_ms(job.cpHintMs);
-    want->set_build_mode(static_cast<uint32_t>(mode));
+    want->set_build_mode(static_cast<uint32_t>(job.mode));
     want->set_system(job.drv.platform);
     debug("grpc: want %s", job.drvPath.to_string());
   }
@@ -325,7 +324,7 @@ struct GrpcStore::Run {
         if (isInterrupted()) {
           throw Interrupted("interrupted");
         }
-        res = store.buildAssigned(*work->job, work->where, mode, evalStore);
+        res = store.buildAssigned(*work->job, work->where, evalStore);
       } catch (Interrupted &) {
         res = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, "interrupted");
       } catch (std::exception & err) {
@@ -595,12 +594,12 @@ auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::
   }
 }
 
-void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, BuildMode buildMode, Store & evalStore) {
+void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, Store & evalStore) {
   if (jobs.empty()) {
     return;
   }
   auto const threadCount = std::min<size_t>(config->maxBuilds, jobs.size());
-  Run run(*this, buildMode, evalStore, jobs, threadCount);
+  Run run(*this, evalStore, jobs, threadCount);
   auto const headers = routingFor(jobs.begin()->second.drv);
   // Uploading here keeps a build from waiting on the upload of its inputs' derivations.
   std::vector<StorePath> drvPaths;
@@ -662,7 +661,7 @@ auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode b
   std::map<StorePath, Job> jobs;
   if (evalStore != nullptr) {
     loadJobs(reqs, buildMode, *evalStore, jobs);
-    runJobs(jobs, buildMode, *evalStore);
+    runJobs(jobs, *evalStore);
   }
 
   // Opaque paths: "building" them means making them valid, i.e. substituting.
@@ -706,8 +705,8 @@ auto GrpcStore::buildOne(const StorePath & drvPath, const BasicDerivation & drv,
     evalStore = local.get();
   }
   std::map<StorePath, Job> jobs;
-  jobs.emplace(drvPath, Job{.drvPath = drvPath, .drv = drv});
-  runJobs(jobs, buildMode, *evalStore);
+  jobs.emplace(drvPath, Job{.drvPath = drvPath, .drv = drv, .mode = buildMode});
+  runJobs(jobs, *evalStore);
   auto & job = jobs.begin()->second;
   if (!job.result) {
     throw Error("'%s' was not built", printStorePath(drvPath));
@@ -815,6 +814,7 @@ void GrpcStore::loadJobs(const std::vector<DerivedPath> & reqs, BuildMode buildM
     auto const full = evalStore.readDerivation(drvPath);
     auto const isJob = [&](const StorePath & input) -> bool { return missing.contains(input); };
     auto & job = jobs.emplace(drvPath, farmJob(evalStore, drvPath, full, isJob)).first->second;
+    job.mode = nixcompat::inputBuildMode(buildMode);
     nixcompat::forInputDrvs(full, [&](const StorePath & input) -> void {
       if (!isJob(input)) {
         return;
@@ -829,7 +829,7 @@ void GrpcStore::loadJobs(const std::vector<DerivedPath> & reqs, BuildMode buildM
     if (const auto * built = std::get_if<DerivedPath::Built>(&req.raw())) {
       if (const auto * opaque = std::get_if<SingleDerivedPath::Opaque>(&built->drvPath->raw())) {
         if (missing.contains(opaque->path)) {
-          load(opaque->path);
+          load(opaque->path).mode = buildMode;
         }
       } else {
         throw Error("'%s': dynamic derivations are not supported", req.to_string(*this));
