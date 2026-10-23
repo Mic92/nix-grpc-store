@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <map>
 #include <set>
 #include <utility>
 #include <vector>
@@ -127,6 +128,41 @@ auto missingTopDown(std::vector<Node> roots, Keys keys, Children children, Query
     return TopDownWalk<Node, Keys, Children, Query>(
                std::move(keys), std::move(children), std::move(query), budget)
         .run(std::move(roots));
+}
+
+// Like missingTopDown, but `roots` maps each requested node to the keys the
+// caller asked for. A root only needs those keys, unless another node depends
+// on it, in which case it needs all of keys(n). With rebuildRoots (--repair,
+// --check) roots are always missing.
+template <class Node, class Key, class Keys, class Children, class Query>
+auto missingForBuild(const std::map<Node, std::vector<Key>> & roots, bool rebuildRoots, Keys keys,
+                     Children children, Query query, std::size_t budget = topDownBudget) -> std::set<Node>
+{
+    std::vector<Node> level;
+    level.reserve(roots.size());
+    for (const auto & [root, wanted] : roots) {
+        level.push_back(root);
+    }
+    std::set<Node> below;
+    for (auto todo = level; !todo.empty();) {
+        auto const node = std::move(todo.back());
+        todo.pop_back();
+        for (auto & child : children(node)) {
+            if (below.insert(child).second) {
+                todo.push_back(std::move(child));
+            }
+        }
+    }
+    return missingTopDown(
+        std::move(level),
+        [&](const Node & node) -> std::vector<Key> {
+            auto const root = roots.find(node);
+            if (root == roots.end() || (!rebuildRoots && below.contains(node))) {
+                return keys(node);
+            }
+            return rebuildRoots ? std::vector<Key>{} : root->second;
+        },
+        std::move(children), std::move(query), budget);
 }
 
 } // namespace nixgrpc
