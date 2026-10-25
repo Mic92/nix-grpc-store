@@ -18,6 +18,13 @@ pub fn cert_store(name: &str) -> String {
     )
 }
 
+pub fn spiffe_store(name: &str) -> String {
+    let d = cert_dir();
+    format!(
+        "grpc://localhost:50054?ca-cert={d}/ca.pem&client-cert={d}/{name}.pem&client-key={d}/{name}.key"
+    )
+}
+
 pub fn anon_store() -> String {
     format!("grpc://localhost:50052?ca-cert={}/ca.pem", cert_dir())
 }

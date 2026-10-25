@@ -1,4 +1,4 @@
-// x-forwarded-client-cert parsing: any bytes in, a sane CN or nullopt out.
+// x-forwarded-client-cert parsing: any bytes in, a sane identity or none out.
 
 #include <cstddef>
 #include <cstdint>
@@ -9,8 +9,11 @@
 
 extern "C" auto LLVMFuzzerTestOneInput(const uint8_t * raw, size_t size) -> int
 {
-    auto name = nixgrpc::xfcc::subjectCommonName(nixgrpc::fuzz::view(raw, size));
-    if (name && !nixgrpc::xfcc::detail::saneCommonName(*name)) {
+    auto peer = nixgrpc::xfcc::elementPeer(nixgrpc::fuzz::view(raw, size));
+    if (peer.commonName && !peer.commonName->empty() && !nixgrpc::xfcc::detail::saneCommonName(*peer.commonName)) {
+        std::abort();
+    }
+    if (peer.spiffeId && !(peer.present() && nixgrpc::saneSpiffeId(*peer.spiffeId))) {
         std::abort();
     }
     return 0;

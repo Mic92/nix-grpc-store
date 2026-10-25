@@ -1,5 +1,5 @@
-// ACL rule parsing + CN matching, and the logfmt escaper the CN is logged
-// through: a CN must never be able to break out of its log line.
+// ACL rule parsing + CN and SPIFFE ID matching, and the logfmt escaper the
+// name is logged through: it must never be able to break out of its log line.
 
 #include <cstddef>
 #include <cstdint>
@@ -39,7 +39,8 @@ extern "C" auto LLVMFuzzerTestOneInput(const uint8_t * raw, size_t size) -> int
         }
         rules.remove_prefix(eol + 1);
     }
-    auto role = acl.roleFor(commonName);
+    // The same bytes as both fields: a rule of either kind gets to read them.
+    auto role = acl.roleFor(nixgrpc::Peer{.commonName = commonName, .spiffeId = commonName});
     if (acl.active() && commonName && commonName->contains('\0') && role) {
         std::abort();
     }
