@@ -2,6 +2,7 @@
 
 #include "store.hh"
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -101,7 +102,14 @@ GrpcStore::GrpcStore(const ref<const Config> &config)
     : Store{*config}, RemoteStore{*config}, config{config},
       narFetcher{
           [this] -> std::shared_ptr<grpc::Channel> { return makeChannel(true); },
-          config->authority.to_string(), config->narConnections} {
+          config->authority.to_string(), config->narConnections,
+          // Only paths with nothing received are fetched again, so a broken
+          // stream is as safe to retry as a failed connect.
+          nixgrpc::RetryPolicy{
+              .retryable = [](const grpc::Status & status) -> bool {
+                return nixgrpc::goneAway(status) || nixgrpc::streamBroken(status);
+              },
+              .budget = [this] -> std::chrono::milliseconds { return retryBudget(); }}} {
   if (config->debug) {
     nixgrpc::enableGrpcTracing();
   }

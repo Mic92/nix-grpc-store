@@ -6,6 +6,7 @@
 // the download.
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -19,16 +20,19 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <ranges>
 #include <nix/store/path.hh>
 #include <nix/util/error.hh>
 #include <nix/util/file-descriptor.hh>
 #include <nix/util/file-system.hh>
+#include <nix/util/logging.hh>
 #include <nix/util/serialise.hh>
 #include <nix/util/signals.hh>
 #include <nix/util/util.hh>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <stop_token>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -38,6 +42,7 @@
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
 #include "pump.hh"
+#include "retry.hh"
 
 namespace nixgrpc {
 
@@ -104,6 +109,13 @@ public:
             failure = cause;
         }
         grown.notify_all();
+    }
+
+    // Nothing delivered yet, so a fresh stream can start this path over.
+    [[nodiscard]] auto untouched() -> bool
+    {
+        std::scoped_lock const lock(mutex);
+        return written == 0 && !eof && !failure;
     }
 
     void readInto(nix::Sink & sink)
@@ -174,10 +186,12 @@ public:
     NarFetcher(
         std::function<std::shared_ptr<grpc::Channel>()> channelFactory,
         std::string authority,
-        unsigned connections)
+        unsigned connections,
+        RetryPolicy retry = {})
         : channelFactory(std::move(channelFactory))
         , authority(std::move(authority))
         , connections(std::max(1U, connections))
+        , retry(std::move(retry))
     {
     }
 
@@ -234,7 +248,7 @@ public:
     ~NarFetcher()
     {
         for (const auto & session : sessions) {
-            session->call.ctx().TryCancel();
+            session->cancel();
             session->thread = {};
         }
     }
@@ -244,29 +258,112 @@ private:
     {
         friend class NarFetcher;
 
-        std::unique_ptr<nix::remote::NixRemote::Stub> stub;
-        nixgrpc::Call call;
-        std::unique_ptr<grpc::ClientReader<nix::remote::NarFrame>> reader;
-        std::vector<std::shared_ptr<NarSpool>> targets;
+        std::function<std::shared_ptr<grpc::Channel>()> channelFactory;
+        std::string authority;
+        RetryPolicy retry;
+        struct Pending
+        {
+            nix::StorePath path;
+            std::shared_ptr<NarSpool> spool;
+        };
+        std::vector<Pending> pending;
+        std::mutex callMutex;
+        // Only while an attempt runs: a Call stays registered for SIGINT.
+        std::unique_ptr<nixgrpc::Call> live;
         std::jthread thread;
 
-        void run()
+    public:
+        Session(const NarFetcher & fetcher, std::vector<Pending> pending)
+            : channelFactory(fetcher.channelFactory)
+            , authority(fetcher.authority)
+            , retry(fetcher.retry)
+            , pending(std::move(pending))
         {
-            try {
-                demuxNarFrames(*reader, targets);
-                auto const status = reader->Finish();
-                if (!status.ok()) {
-                    nix::checkInterrupt(); // our own cancel; the handler below passes it on
+        }
+
+    private:
+        void cancel()
+        {
+            thread.request_stop();
+            std::scoped_lock const lock(callMutex);
+            if (live) {
+                live->ctx().TryCancel();
+            }
+        }
+
+        auto fetchOnce(const std::stop_token & stop) -> grpc::Status
+        {
+            auto const stub = nix::remote::NixRemote::NewStub(channelFactory());
+            nix::remote::FetchNarsRequest request;
+            for (const auto & item : pending) {
+                request.add_paths(std::string(item.path.to_string()));
+            }
+            {
+                std::scoped_lock const lock(callMutex);
+                if (stop.stop_requested()) {
+                    return {grpc::StatusCode::CANCELLED, "NAR fetcher shut down"};
                 }
-                auto cause = std::make_exception_ptr(
-                    status.ok() ? nix::Error("gRPC FetchNars stream ended early")
-                                : nix::Error("gRPC FetchNars failed: %s", status.error_message()));
-                for (const auto & target : targets) {
-                    target->fail(cause);
+                live = std::make_unique<nixgrpc::Call>();
+            }
+            auto const reader = stub->FetchNars(&live->ctx(), request);
+            if (!reader) {
+                throw nix::Error("failed to open gRPC FetchNars stream to '%s'", authority);
+            }
+            demuxNarFrames(*reader, pending | std::views::transform(&Pending::spool) | std::ranges::to<std::vector>());
+            return reader->Finish();
+        }
+
+        // After the attempt's reader is gone, which streams on the call's context.
+        void releaseCall()
+        {
+            std::scoped_lock const lock(callMutex);
+            live.reset();
+        }
+
+        void run(const std::stop_token & stop)
+        {
+            Backoff backoff(retry.budget());
+            try {
+                for (;;) {
+                    auto const status = fetchOnce(stop);
+                    releaseCall();
+                    if (!status.ok()) {
+                        nix::checkInterrupt(); // our own cancel; the handler below passes it on
+                    }
+                    auto cause = std::make_exception_ptr(
+                        status.ok() ? nix::Error("gRPC FetchNars stream ended early")
+                                    : nix::Error("gRPC FetchNars failed: %s", status.error_message()));
+                    // A path cut off mid-NAR cannot resume, but the ones not
+                    // started yet can go on a fresh stream.
+                    auto const cutOff = std::ranges::stable_partition(pending, &NarSpool::untouched, &Pending::spool);
+                    for (const auto & item : cutOff) {
+                        item.spool->fail(cause);
+                    }
+                    pending.erase(cutOff.begin(), cutOff.end());
+                    bool retrying = !pending.empty() && retry.shouldRetry(status, backoff);
+                    if (retrying) {
+                        nix::logger->log(
+                            nix::lvlError,
+                            nix::fmt("%s: FetchNars: %s, retrying %d paths", authority, status.error_message(),
+                                     pending.size()));
+                        std::condition_variable_any wake;
+                        std::mutex sleepMutex;
+                        std::unique_lock sleepLock(sleepMutex);
+                        // Returns early only when the fetcher shuts down.
+                        wake.wait_for(sleepLock, stop, backoff.next(), [] -> bool { return false; });
+                        retrying = !stop.stop_requested();
+                    }
+                    if (!retrying) {
+                        for (const auto & item : pending) {
+                            item.spool->fail(cause);
+                        }
+                        return;
+                    }
                 }
             } catch (...) {
-                for (const auto & target : targets) {
-                    target->fail(std::current_exception());
+                releaseCall();
+                for (const auto & item : pending) {
+                    item.spool->fail(std::current_exception());
                 }
             }
         }
@@ -275,6 +372,7 @@ private:
     std::function<std::shared_ptr<grpc::Channel>()> channelFactory;
     std::string authority;
     unsigned connections;
+    RetryPolicy retry;
 
     std::mutex narMutex;
     std::vector<std::unique_ptr<Session>> sessions;
@@ -316,20 +414,14 @@ private:
     // Caller holds narMutex.
     void startSession(const std::vector<nix::StorePath> & paths)
     {
-        auto session = std::make_unique<Session>();
-        session->stub = nix::remote::NixRemote::NewStub(channelFactory());
-        nix::remote::FetchNarsRequest request;
+        std::vector<Session::Pending> pending;
         for (const auto & path : paths) {
-            request.add_paths(std::string(path.to_string()));
-            auto buffer = std::make_shared<NarSpool>();
-            session->targets.push_back(buffer);
-            buffers.emplace(path, std::move(buffer));
+            auto const spool = std::make_shared<NarSpool>();
+            buffers.emplace(path, spool);
+            pending.push_back({.path = path, .spool = spool});
         }
-        session->reader = session->stub->FetchNars(&session->call.ctx(), request);
-        if (!session->reader) {
-            throw nix::Error("failed to open gRPC FetchNars stream to '%s'", authority);
-        }
-        session->thread = std::jthread([raw = session.get()] -> void { raw->run(); });
+        auto session = std::make_unique<Session>(*this, std::move(pending));
+        session->thread = std::jthread([raw = session.get()](const std::stop_token & stop) -> void { raw->run(stop); });
         sessions.push_back(std::move(session));
     }
 };
