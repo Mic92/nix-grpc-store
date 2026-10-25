@@ -178,6 +178,31 @@ pkgs.testers.runNixOSTest {
             -keyout expired.key -out expired.csr -subj /CN=localhost
           openssl x509 -req -in expired.csr -not_before 20200101000000Z -not_after 20200102000000Z \
             -CA ca.pem -CAkey ca.key -set_serial 0x$RANDOM -out expired.pem
+
+          # Two SPIFFE trust domains for the bundle-map subtest: ca.pem is
+          # nt.example, other-ca.pem is other.example.
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout other-ca.key -out other-ca.pem -subj /CN=other-ca
+          svid() {
+            openssl req -newkey rsa:2048 -nodes \
+              -keyout $1.key -out $1.csr -subj /O=SPIRE
+            openssl x509 -req -in $1.csr -days 1 \
+              -CA $2.pem -CAkey $2.key -set_serial 0x$RANDOM \
+              -extfile <(printf 'subjectAltName=URI:%s' "$3") \
+              -out $1.pem
+          }
+          svid svid-client ca spiffe://nt.example/farm/client/one
+          svid svid-stranger ca spiffe://nt.example/stranger
+          svid svid-other other-ca spiffe://other.example/mirror
+          # other.example's CA signs an nt.example ID.
+          svid svid-forged other-ca spiffe://nt.example/farm/client/one
+          x5c() { openssl x509 -in $1 -outform der | base64 -w0; }
+          cat > spiffe-bundles.json <<EOF
+          {"trust_domains": {
+            "nt.example": {"keys": [{"kty": "RSA", "use": "x509-svid", "x5c": ["$(x5c ca.pem)"]}]},
+            "other.example": {"keys": [{"kty": "RSA", "use": "x509-svid", "x5c": ["$(x5c other-ca.pem)"]}]}
+          }}
+          EOF
           chmod a+r ${certDir}/*
         '';
       };
@@ -222,6 +247,24 @@ pkgs.testers.runNixOSTest {
             --proxy-socket /nix/var/nix/daemon-socket/socket \
             --tls-cert ${certDir}/server.pem --tls-key ${certDir}/server.key \
             --client-ca ${certDir}/ca.pem \
+            --allow localhost=trusted
+        '';
+      };
+
+      systemd.services.nix-grpc-daemon-spiffe = {
+        wantedBy = [ "multi-user.target" ];
+        after = [
+          "nix-daemon.socket"
+          "nix-grpc-certs.service"
+        ];
+        requires = [ "nix-grpc-certs.service" ];
+        serviceConfig.ExecStart = ''
+          ${lib.getExe config.services.nix-grpc-daemon.package} --sandbox --listen 127.0.0.1:50054 \
+            --proxy-socket /nix/var/nix/daemon-socket/socket \
+            --tls-cert ${certDir}/server.pem --tls-key ${certDir}/server.key \
+            --client-spiffe-bundles ${certDir}/spiffe-bundles.json \
+            --allow 'spiffe://nt.example/farm/client/*=trusted' \
+            --allow spiffe://other.example/mirror=read-only \
             --allow localhost=trusted
         '';
       };

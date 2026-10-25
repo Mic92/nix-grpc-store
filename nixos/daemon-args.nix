@@ -27,6 +27,10 @@
   "--client-ca"
   cfg.tls.clientCaFile
 ]
+++ lib.optionals (cfg.tls.clientSpiffeBundlesFile != null) [
+  "--client-spiffe-bundles"
+  cfg.tls.clientSpiffeBundlesFile
+]
 ++ lib.concatMap (rule: [
   "--allow"
   "${rule.cn}=${rule.role}"

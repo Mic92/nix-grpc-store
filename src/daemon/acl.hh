@@ -1,9 +1,7 @@
 #pragma once
-// Maps TLS client certificate CNs to roles via ordered glob rules (first
-// match wins, no match denies). Without rules every client keeps full
-// access, preserving the pre-ACL behavior.
-
-#include <fnmatch.h>
+// Maps TLS client certificates to roles via ordered glob rules on the CN or
+// the SPIFFE ID (first match wins, no match denies). Without rules every
+// client keeps full access, preserving the pre-ACL behavior.
 
 #include <array>
 #include <cstdint>
@@ -14,6 +12,8 @@
 #include <vector>
 
 #include <nix/util/error.hh>
+
+#include "peer.hh"
 
 namespace nixgrpc {
 
@@ -71,7 +71,7 @@ public:
     {
         auto const sep = spec.rfind('=');
         if (sep == std::string_view::npos || sep == 0) {
-            throw nix::Error("--allow must be 'cn-pattern=role', got '%s'", std::string(spec));
+            throw nix::Error("--allow must be 'pattern=role', got '%s'", std::string(spec));
         }
         rules.push_back({.pattern = std::string(spec.substr(0, sep)), .role = parseRole(spec.substr(sep + 1))});
     }
@@ -91,29 +91,40 @@ public:
         certRequired = true;
     }
 
-    // nullopt means access denied.
-    [[nodiscard]] auto roleFor(const std::optional<std::string> & commonName) const -> std::optional<Role>
+    struct Access
     {
-        if (!commonName) {
+        // nullopt means access denied.
+        std::optional<Role> role;
+        // The name the matching rule read, so a log line names what was
+        // authorized and not another field of the same certificate.
+        std::string name;
+    };
+
+    [[nodiscard]] auto accessFor(const Peer & peer) const -> Access
+    {
+        if (!peer.present()) {
             if (anonRole) {
-                return anonRole;
+                return {.role = anonRole, .name = peer.label()};
             }
-            return (certRequired || !rules.empty()) ? std::nullopt : std::optional(Role::trusted);
+            return {
+                .role = (certRequired || !rules.empty()) ? std::nullopt : std::optional(Role::trusted),
+                .name = peer.label()};
         }
         if (rules.empty()) {
-            return Role::trusted;
-        }
-        // fnmatch truncates at NUL; a CN like "ci-1\0evil" must not match
-        // "ci-*".
-        if (commonName->contains('\0')) {
-            return std::nullopt;
+            return {.role = Role::trusted, .name = peer.label()};
         }
         for (const auto & rule : rules) {
-            if (fnmatch(rule.pattern.c_str(), commonName->c_str(), 0) == 0) {
-                return rule.role;
+            auto const & name = patternField(rule.pattern, peer);
+            if (name && matchesName(rule.pattern, *name)) {
+                return {.role = rule.role, .name = *name};
             }
         }
-        return std::nullopt;
+        return {.role = std::nullopt, .name = peer.label()};
+    }
+
+    [[nodiscard]] auto roleFor(const Peer & peer) const -> std::optional<Role>
+    {
+        return accessFor(peer).role;
     }
 };
 

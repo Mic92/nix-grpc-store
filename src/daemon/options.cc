@@ -140,6 +140,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.tlsKey = next();
         } else if (arg == "--client-ca") {
             options.clientCA = next();
+        } else if (arg == "--client-spiffe-bundles") {
+            options.clientSpiffeBundles = next();
         } else if (arg == "--allow") {
             options.acl.addRule(next());
         } else if (arg == "--trusted-proxy") {
@@ -231,17 +233,21 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
     if (options.storeDir.empty()) {
         options.storeDir = nix::getEnv("NIX_STORE_DIR").value_or("/nix/store");
     }
-    if ((options.acl.active() || options.acl.anonymousRole()) && options.clientCA.empty() && options.oidcConfig.empty()) {
-        throw nix::Error("--allow/--allow-anonymous requires --client-ca or --oidc-config");
+    if (!options.clientCA.empty() && !options.clientSpiffeBundles.empty()) {
+        // gRPC would verify every client against the bundle map alone.
+        throw nix::Error("--client-ca and --client-spiffe-bundles cannot be combined");
+    }
+    if ((options.acl.active() || options.acl.anonymousRole()) && !options.verifiesClients() && options.oidcConfig.empty()) {
+        throw nix::Error("--allow/--allow-anonymous requires --client-ca, --client-spiffe-bundles or --oidc-config");
     }
     if (!options.oidcConfig.empty() && options.tlsCert.empty()) {
         // Bearer tokens in clear text are replayable by anyone on the path.
         logLine(LogLevel::info, {{"event", "warning"}, {"msg", "--oidc-config without --tls-cert sends bearer tokens in clear"}});
     }
-    if (!options.proxies.empty() && options.clientCA.empty()) {
-        throw nix::Error("--trusted-proxy requires --client-ca");
+    if (!options.proxies.empty() && !options.verifiesClients()) {
+        throw nix::Error("--trusted-proxy requires --client-ca or --client-spiffe-bundles");
     }
-    if (!options.clientCA.empty() && !options.acl.anonymousRole()) {
+    if (options.verifiesClients() && !options.acl.anonymousRole()) {
         options.acl.requireCertificate();
     }
     return options;
@@ -250,15 +256,17 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
 auto makeServerCredentials(const Options & options) -> std::shared_ptr<grpc::ServerCredentials>
 {
     if (options.tlsCert.empty()) {
-        if (!options.clientCA.empty()) {
-            throw nix::Error("--client-ca requires --tls-cert/--tls-key");
+        if (options.verifiesClients()) {
+            throw nix::Error("--client-ca/--client-spiffe-bundles requires --tls-cert/--tls-key");
         }
         return grpc::InsecureServerCredentials();
     }
     (void) nix::readFile(options.tlsKey);
     (void) nix::readFile(options.tlsCert);
-    if (!options.clientCA.empty()) {
-        (void) nix::readFile(options.clientCA);
+    for (const auto & file : {options.clientCA, options.clientSpiffeBundles}) {
+        if (!file.empty()) {
+            (void) nix::readFile(file);
+        }
     }
     // Re-read periodically: cert-manager/ACME renew the files in place.
     using grpc::experimental::FileWatcherCertificateProvider;
@@ -269,11 +277,17 @@ auto makeServerCredentials(const Options & options) -> std::shared_ptr<grpc::Ser
         tls.set_root_certificate_provider(
             std::make_shared<FileWatcherCertificateProvider>(options.clientCA, certRefreshSeconds));
     }
+    if (!options.clientSpiffeBundles.empty()) {
+        // A client chain must lead to the roots of the trust domain its
+        // SPIFFE ID names: with one flat CA file a federated domain's CA
+        // could sign an ID of ours.
+        tls.set_root_certificate_provider(std::make_shared<FileWatcherCertificateProvider>(
+            "", "", "", options.clientSpiffeBundles, certRefreshSeconds));
+    }
     // Cert-less clients pass the handshake and are denied by the ACL with a
     // readable UNAUTHENTICATED instead of an opaque "Socket closed".
     tls.set_cert_request_type(
-        options.clientCA.empty() ? GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE
-                                 : GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY);
+        options.verifiesClients() ? GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY : GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE);
     return grpc::experimental::TlsServerCredentials(tls);
 }
 

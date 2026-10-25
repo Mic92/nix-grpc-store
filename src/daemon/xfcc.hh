@@ -1,9 +1,9 @@
 #pragma once
 // Client identity forwarded by a TLS-terminating proxy (envoy's
 // x-forwarded-client-cert). Only believed from a peer whose own certificate
-// matches --trusted-proxy, so the proxy must use SANITIZE_SET semantics.
-
-#include <fnmatch.h>
+// matches --trusted-proxy, so the proxy must use SANITIZE_SET semantics. The
+// proxy verified the client's chain: a forwarded SPIFFE ID is only as good
+// as the proxy's check that the chain belongs to that ID's trust domain.
 
 #include <algorithm>
 #include <cstddef>
@@ -15,6 +15,8 @@
 #include <vector>
 
 #include <grpcpp/server_context.h>
+
+#include "peer.hh"
 
 namespace nixgrpc::xfcc {
 
@@ -143,50 +145,71 @@ inline auto saneCommonName(const std::string & name) -> bool
 
 } // namespace detail
 
-// CN of the first (client-adjacent) element's Subject, e.g.
-//   Hash=..;Subject="CN=ci-1,O=nt";URI=..,By=..   ->  "ci-1"
-// nullopt when malformed, oversized, without Subject/CN, or when the CN is
-// empty or holds control characters.
-inline auto subjectCommonName(std::string_view value) -> std::optional<std::string>
+// Identity in the first (client-adjacent) element, e.g.
+//   Hash=..;Subject="CN=ci-1,O=nt";URI=spiffe://nt/ci,By=..
+//     ->  CN "ci-1", SPIFFE ID "spiffe://nt/ci"
+// Envoy sends URI only with set_current_client_cert_details.uri, and one
+// pair per URI SAN: as for a direct peer, the SPIFFE ID counts only when it
+// is the single URI. By is the proxy's own URI and never the client's.
+// No certificate (an empty Peer) when the element is malformed, oversized,
+// has neither a CN nor a SPIFFE ID, or its CN holds control characters.
+inline auto elementPeer(std::string_view value) -> Peer
 {
     if (value.empty() || value.size() > maxHeaderBytes) {
-        return std::nullopt;
+        return {};
     }
+    std::optional<std::string> subject;
+    std::vector<std::string> uris;
     detail::Cursor cur(value);
     while (!cur.done()) {
         auto key = cur.until("=");
         if (!key) {
-            return std::nullopt;
+            return {};
         }
         cur.take();
         auto val = detail::readPairValue(cur);
         if (!val) {
-            return std::nullopt;
+            return {};
         }
         if (*key == "Subject") {
-            auto name = detail::commonNameOfDn(*val);
-            if (!name || !detail::saneCommonName(*name)) {
-                return std::nullopt;
+            if (subject) {
+                return {};
             }
-            return name;
+            subject = std::move(*val);
+        } else if (*key == "URI") {
+            uris.push_back(std::move(*val));
         }
-        if (cur.peek() != ';') {
-            return std::nullopt; // ',' starts the next hop's element, or junk
+        if (cur.peek() == ',') {
+            break; // the next hop's element
         }
-        cur.take();
+        if (!cur.done() && cur.take() != ';') {
+            return {};
+        }
     }
-    return std::nullopt;
+    Peer peer;
+    if (uris.size() == 1 && saneSpiffeId(uris.front())) {
+        peer.spiffeId = std::move(uris.front());
+    }
+    auto name = subject ? detail::commonNameOfDn(*subject) : std::nullopt;
+    if (name && !detail::saneCommonName(*name)) {
+        return {};
+    }
+    if (!name && !peer.spiffeId) {
+        return {};
+    }
+    peer.commonName = name.value_or("");
+    return peer;
 }
 
-// nullopt unless exactly one header is present and parses.
-inline auto forwardedCommonName(const grpc::ServerContextBase & context) -> std::optional<std::string>
+// No certificate unless exactly one header is present and parses.
+inline auto forwardedPeer(const grpc::ServerContextBase & context) -> Peer
 {
     auto const & metadata = context.client_metadata();
     auto [first, last] = metadata.equal_range(std::string(header));
     if (first == last || std::next(first) != last) {
-        return std::nullopt;
+        return {};
     }
-    return subjectCommonName({first->second.data(), first->second.size()});
+    return elementPeer({first->second.data(), first->second.size()});
 }
 
 class TrustedProxies
@@ -207,13 +230,13 @@ public:
         return patterns.empty();
     }
 
-    [[nodiscard]] auto matches(const std::optional<std::string> & peerCommonName) const -> bool
+    [[nodiscard]] auto matches(const Peer & peer) const -> bool
     {
-        if (!peerCommonName || !detail::saneCommonName(*peerCommonName)) {
-            return false;
-        }
         return std::ranges::any_of(patterns, [&](const std::string & pattern) -> bool {
-            return fnmatch(pattern.c_str(), peerCommonName->c_str(), 0) == 0;
+            if (!isSpiffePattern(pattern) && !(peer.commonName && detail::saneCommonName(*peer.commonName))) {
+                return false;
+            }
+            return matchesPeer(pattern, peer);
         });
     }
 };
