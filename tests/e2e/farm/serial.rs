@@ -122,7 +122,7 @@ fn dag_build_is_scheduled_across_workers_and_lands_in_the_cache() {
 }
 
 #[test]
-fn repeat_is_answered_cached_by_the_scheduler_without_building() {
+fn repeat_is_answered_from_the_cache_without_building() {
     farm_ready();
     let top = build(&envoy(), "cached1", &[]);
     for w in WORKERS {
@@ -134,10 +134,10 @@ fn repeat_is_answered_cached_by_the_scheduler_without_building() {
         );
         succeed(w, &["sh", "-c", &script]);
     }
-    let before = events(leader(), "cached");
+    let (_, builds) = input_counts();
     build(&envoy(), "cached1", &[]);
     assert!(holders(&top).is_empty(), "{:?}", holders(&top));
-    assert!(events(leader(), "cached") > before);
+    assert_eq!(input_counts().1, builds);
 }
 
 #[test]
