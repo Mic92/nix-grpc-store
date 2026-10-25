@@ -193,7 +193,7 @@ certs (`tls.clientCaFile`).
 
 ## Access control
 
-With mTLS, `--allow 'cn-pattern=role'` maps client certificate CNs to
+With mTLS, `--allow 'pattern=role'` maps client certificate CNs to
 roles via glob patterns. The first match wins and unmatched clients are
 denied. Without any rules every authenticated client keeps full access.
 
@@ -225,6 +225,38 @@ a proxy: the daemon takes the client's identity from the
 if neither is present. From any other peer the header is ignored. The
 proxy must overwrite the header (envoy `forward_client_cert_details:
 SANITIZE_SET`) and authenticate to the daemon with its own client cert.
+
+### SPIFFE IDs
+
+A pattern that starts with `spiffe://` is matched against the client
+certificate's SPIFFE ID (its single URI SAN) and never against the CN.
+Its `*` stays inside one path segment, so it reaches neither a deeper path
+nor another trust domain:
+
+    nix-grpc-daemon ... --client-spiffe-bundles bundles.json \
+        --allow 'spiffe://example.org/farm/client/*=trusted' \
+        --allow 'spiffe://partner.example/mirror=read-only'
+
+`--client-spiffe-bundles FILE` replaces `--client-ca` when the daemon
+trusts more than one trust domain. The file is a SPIFFE bundle map
+([gRFC A87](https://github.com/grpc/proposal/blob/master/A87-mtls-spiffe-support.md)):
+
+    {"trust_domains": {
+      "example.org":     {"keys": [{"kty": "EC", "use": "x509-svid", "x5c": ["<base64 DER>"]}]},
+      "partner.example": {"keys": [{"kty": "EC", "use": "x509-svid", "x5c": ["<base64 DER>"]}]}
+    }}
+
+A client must then present an X.509-SVID whose chain leads to the bundle
+of the trust domain its SPIFFE ID names. With `--client-ca` and one file
+that holds both CAs, `partner.example`'s CA could sign
+`spiffe://example.org/farm/client/x` and the daemon would accept it. A
+certificate without a SPIFFE ID fails the handshake. The file is re-read
+when it changes, so a federated bundle can rotate.
+
+`--trusted-proxy` takes `spiffe://` patterns too. Behind such a proxy the
+SPIFFE ID comes from the header's `URI` (envoy
+`set_current_client_cert_details: {subject: true, uri: true}`), and the
+proxy is the one that verifies the chain against the right trust domain.
 
 NixOS:
 
@@ -358,7 +390,8 @@ which also requires `trustClients` (see above).
   * `--listen ADDR` — default `0.0.0.0:50051`
   * `--proxy-socket PATH` — nix-daemon socket, default `/nix/var/nix/daemon-socket/socket`
   * `--tls-cert`, `--tls-key`, `--client-ca` — see above
-  * `--allow 'cn-pattern=role'`, `--allow-anonymous ROLE`, `--trusted-proxy CN-PATTERN` — see access control
+  * `--client-spiffe-bundles FILE` — verify clients per SPIFFE trust domain, see access control
+  * `--allow 'pattern=role'`, `--allow-anonymous ROLE`, `--trusted-proxy PATTERN` — see access control
   * `--oidc-config FILE` — accept OIDC bearer tokens, see access control
   * `--metrics-listen ADDR` — serve Prometheus metrics, disabled if unset
   * `--worker-name NAME` — name in build-log prefixes and `nix_grpc_build_info`, default hostname

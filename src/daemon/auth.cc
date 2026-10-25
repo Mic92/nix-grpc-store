@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include <grpcpp/server_context.h>
 #include <grpcpp/support/status.h>
@@ -15,26 +16,46 @@
 #include "acl.hh"
 #include "logfmt.hh"
 #include "oidc.hh"
+#include "peer.hh"
 #include "xfcc.hh"
 
 namespace nixgrpc {
+
+namespace {
+
+auto directPeer(const grpc::ServerContextBase & context) -> Peer
+{
+    Peer peer{.commonName = clientCommonName(context), .spiffeId = clientSpiffeId(context)};
+    if (!peer.present() || (peer.spiffeId && !saneSpiffeId(*peer.spiffeId))) {
+        peer.spiffeId.reset();
+    }
+    return peer;
+}
+
+auto certCaller(const Acl & acl, const Peer & peer) -> Caller
+{
+    auto access = acl.accessFor(peer);
+    return {
+        .name = std::move(access.name),
+        .role = access.role,
+        .kind = peer.present() ? Caller::Kind::named : Caller::Kind::anonymous};
+}
+
+} // namespace
 
 // A client certificate with an access rule first, then bearer token, then
 // the certificate anyway (for the error), then anonymous. A trusted proxy's
 // own certificate stands in for whatever client it forwards.
 auto Auth::identify(const grpc::ServerContextBase & context) const -> Caller
 {
-    auto cert = clientCommonName(context);
-    if (proxies.matches(cert)) {
-        cert = xfcc::forwardedCommonName(context);
+    auto peer = directPeer(context);
+    if (proxies.matches(peer)) {
+        peer = xfcc::forwardedPeer(context);
     }
-    auto const certKnown = cert && acl.roleFor(cert);
+    auto const certKnown = peer.present() && acl.roleFor(peer);
     auto token = certKnown || !*oidc ? std::nullopt : oidc::bearerToken(context);
     if (!token) {
-        return {
-            .name = cert.value_or("-"),
-            .role = acl.roleFor(cert),
-            .kind = cert ? Caller::Kind::named : Caller::Kind::anonymous};
+        return certCaller(acl, peer);
     }
     auto res = (*oidc)->verify(*token);
     if (!res.identity) {
@@ -49,11 +70,7 @@ auto Auth::identify(const grpc::ServerContextBase & context) const -> Caller
 
 auto Auth::identifyDirect(const grpc::ServerContextBase & context) const -> Caller
 {
-    auto const cert = clientCommonName(context);
-    return {
-        .name = cert.value_or("-"),
-        .role = acl.roleFor(cert),
-        .kind = cert ? Caller::Kind::named : Caller::Kind::anonymous};
+    return certCaller(acl, directPeer(context));
 }
 
 auto Auth::authorize(const Caller & caller, std::string_view method, Role minRole) -> grpc::Status

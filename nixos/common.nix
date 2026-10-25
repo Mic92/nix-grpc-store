@@ -8,6 +8,7 @@
 
 let
   cfg = config.services.nix-grpc-daemon;
+  verifiesClients = cfg.tls.clientCaFile != null || cfg.tls.clientSpiffeBundlesFile != null;
   builder = lib.elem "builder" cfg.roles;
 in
 {
@@ -106,6 +107,19 @@ in
           must present a certificate signed by this CA (mTLS).
         '';
       };
+      clientSpiffeBundlesFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = ''
+          SPIFFE bundle map (gRFC A87): a JSON object `trust_domains` that
+          maps each trust domain to its SPIFFE bundle. Replaces
+          {option}`clientCaFile`: clients must present an X.509-SVID whose
+          chain leads to the bundle of the trust domain in its SPIFFE ID.
+          Use it when the daemon trusts more than one trust domain: with one
+          flat CA file, each domain's CA could sign any other domain's IDs.
+          The file is re-read when it changes.
+        '';
+      };
     };
 
     accessRules = lib.mkOption {
@@ -115,7 +129,12 @@ in
             cn = lib.mkOption {
               type = lib.types.str;
               example = "ci-*";
-              description = "Glob pattern matched against the client certificate CN.";
+              description = ''
+                Glob pattern matched against the client certificate CN. A
+                pattern that starts with `spiffe://` is matched against the
+                certificate's SPIFFE ID instead, and its `*` stays inside
+                one path segment.
+              '';
             };
             role = lib.mkOption {
               type = lib.types.enum [
@@ -139,6 +158,7 @@ in
       example = lib.literalExpression ''
         [
           { cn = "ci-*"; role = "trusted"; }
+          { cn = "spiffe://example.org/farm/client/*"; role = "trusted"; }
           { cn = "cache-mirror"; role = "read-only"; }
           { cn = "*"; role = "write"; }
         ]
@@ -346,8 +366,12 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion = cfg.tls.clientCaFile == null || cfg.tls.certFile != null;
-        message = "services.nix-grpc-daemon.tls.clientCaFile requires tls.certFile/keyFile";
+        assertion = !verifiesClients || cfg.tls.certFile != null;
+        message = "services.nix-grpc-daemon.tls.clientCaFile/clientSpiffeBundlesFile requires tls.certFile/keyFile";
+      }
+      {
+        assertion = cfg.tls.clientCaFile == null || cfg.tls.clientSpiffeBundlesFile == null;
+        message = "services.nix-grpc-daemon.tls.clientCaFile and clientSpiffeBundlesFile cannot be combined";
       }
       {
         assertion = (cfg.tls.certFile == null) == (cfg.tls.keyFile == null);
@@ -355,12 +379,12 @@ in
       }
       {
         assertion =
-          (cfg.accessRules == [ ] && cfg.anonymousRole == null) || cfg.tls.clientCaFile != null || cfg.oidc != null;
-        message = "services.nix-grpc-daemon.accessRules/anonymousRole requires tls.clientCaFile or oidc";
+          (cfg.accessRules == [ ] && cfg.anonymousRole == null) || verifiesClients || cfg.oidc != null;
+        message = "services.nix-grpc-daemon.accessRules/anonymousRole requires tls.clientCaFile, tls.clientSpiffeBundlesFile or oidc";
       }
       {
-        assertion = cfg.trustedProxies == [ ] || cfg.tls.clientCaFile != null;
-        message = "services.nix-grpc-daemon.trustedProxies requires tls.clientCaFile";
+        assertion = cfg.trustedProxies == [ ] || verifiesClients;
+        message = "services.nix-grpc-daemon.trustedProxies requires tls.clientCaFile or tls.clientSpiffeBundlesFile";
       }
       {
         assertion = cfg.oidc == null || cfg.tls.certFile != null || (cfg.oidc.allow_insecure or false);

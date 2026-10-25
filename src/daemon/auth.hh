@@ -19,7 +19,7 @@ namespace nixgrpc {
 struct Caller
 {
     enum class Kind : std::uint8_t { anonymous, named, badToken };
-    std::string name = "-"; // cert CN or oidc:<provider>:<sub>, for logs and metrics
+    std::string name = "-"; // cert CN, SPIFFE ID or oidc:<provider>:<sub>, for logs and metrics
     std::optional<Role> role;
     Kind kind = Kind::anonymous;
 };

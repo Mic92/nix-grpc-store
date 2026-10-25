@@ -227,6 +227,42 @@ fn acl_unmatched_cn_is_denied() {
     assert_journal(MTLS, "event=denied method=.* cn=stranger role=none");
 }
 
+#[test]
+fn spiffe_ids_are_bound_to_their_trust_domain() {
+    const SPIFFE: &str = "nix-grpc-daemon-spiffe.service";
+    wait_for_unit(SPIFFE);
+    wait_for_open_port(50054);
+    let p = hello_path();
+
+    let client = spiffe_store("svid-client");
+    succeed(&["nix", "store", "info", "--json", "--store", &client]);
+    let deny = deny_file(&workdir("spiffe"));
+    succeed(&["nix", "store", "add", "--store", &client, &deny]);
+
+    // A file of its own: adding one the store already has needs no write.
+    let other = spiffe_store("svid-other");
+    succeed(&["nix", "path-info", "--store", &other, p]);
+    let denied = deny_file(&workdir("spiffe-ro"));
+    fail(&["nix", "store", "add", "--store", &other, &denied]);
+    assert_journal(
+        SPIFFE,
+        "event=denied method=Connect cn=spiffe://other.example/mirror role=read-only",
+    );
+
+    fail(&["nix", "store", "info", "--store", &spiffe_store("svid-stranger")]);
+    assert_journal(
+        SPIFFE,
+        "event=denied method=.* cn=spiffe://nt.example/stranger role=none",
+    );
+
+    // other.example's CA signed this nt.example ID: the handshake fails, so
+    // the rule for the ID is never consulted.
+    fail(&["nix", "path-info", "--store", &spiffe_store("svid-forged"), p]);
+    // A certificate without a SPIFFE ID has no trust domain to verify against.
+    fail(&["nix", "path-info", "--store", &spiffe_store("client"), p]);
+    assert_no_journal(SPIFFE, "cn=localhost");
+}
+
 /// Asks the mock issuer for a token with the given claims and returns a store
 /// URI that presents it.
 fn token_store(dir: &str, name: &str, claims: &[&str]) -> String {
