@@ -2,8 +2,6 @@
 
 #include "store.hh"
 
-#include <algorithm>
-#include <array>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -40,6 +38,7 @@
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
 #include "pump.hh"
+#include "retry.hh"
 
 namespace nix {
 
@@ -129,18 +128,11 @@ GrpcStore::GrpcStore(const ref<const Config> &config)
   sched = remote::Scheduler::NewStub(channel);
 }
 
-auto GrpcStore::transportError(std::string_view msg) -> bool {
-  return std::ranges::any_of(
-      std::array{"Connection refused", "Connection reset", "No route", "unreachable", "timed out",
-                 "tcp handshaker shutdown", "DNS", "GOAWAY"},
-      [&](const char * needle) -> bool { return msg.contains(needle); });
-}
-
 auto GrpcStore::connectHint(const std::string & msg) const -> std::string
 {
   auto const has = [&](std::string_view needle) -> bool { return msg.contains(needle); };
   std::string const more = config->debug ? "" : " Set NIX_GRPC_DEBUG=1 for a handshake trace.";
-  if (transportError(msg)) {
+  if (nixgrpc::transportError(msg)) {
     return "\nhint: could not reach the server (TCP/DNS), not a certificate problem." + more;
   }
   if (has("Handshake") || has("SSL") || has("TLS") ||
@@ -171,19 +163,6 @@ auto GrpcStore::statusError(const grpc::Status & status, const char * opName) co
   // NOLINTNEXTLINE(modernize-return-braced-init-list): Error ctor is explicit
   return Error("gRPC %s on '%s' failed: %s%s", opName, config->authority.to_string(),
                status.error_message(), hint);
-}
-
-auto GrpcStore::goneAway(const grpc::Status & status) -> bool {
-  switch (status.error_code()) {
-  case grpc::StatusCode::UNAVAILABLE:
-    return transportError(status.error_message()) || status.error_message().contains("upstream")
-           || status.error_message().contains("shutting down")
-           || status.error_message().contains("local nix-daemon connection lost");
-  case grpc::StatusCode::CANCELLED:
-    return status.error_message().contains("Cancelling all calls");
-  default:
-    return false;
-  }
 }
 
 auto GrpcStore::isTrustedClient() -> std::optional<TrustedFlag> {

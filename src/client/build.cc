@@ -50,6 +50,7 @@
 #include "nix-compat.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
+#include "retry.hh"
 #include "top-down.hh"
 
 namespace nix {
@@ -466,8 +467,7 @@ auto schedulerGone(const grpc::Status & status) -> bool {
   case grpc::StatusCode::UNAVAILABLE:
   case grpc::StatusCode::UNKNOWN:
   case grpc::StatusCode::INTERNAL:
-    // "tcp handshaker shutdown" is a plain connect timeout, not TLS.
-    return GrpcStore::transportError(status.error_message())
+    return nixgrpc::transportError(status.error_message())
            || (!status.error_message().contains("andshake") && !status.error_message().contains("certificate"));
   default:
     return false;
@@ -510,8 +510,7 @@ void logReconnect(const std::string & where, const grpc::Status & status, bool r
 // re-Want everything not yet placed. Jobs already Assigned carry on.
 auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::Status {
   grpc::Status status;
-  auto giveUp = std::chrono::steady_clock::time_point::max();
-  auto pause = reconnectPause;
+  std::optional<nixgrpc::Backoff> backoff;
   bool handover = false;
   for (;;) {
     nixgrpc::Call call;
@@ -524,20 +523,17 @@ auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::
     if (run.detach() == 0 || isInterrupted() || !(restarting || schedulerGone(status))) {
       return status;
     }
-    auto const now = std::chrono::steady_clock::now();
-    if (answered || giveUp == std::chrono::steady_clock::time_point::max()) {
-      giveUp = now + restartGrace();
-      pause = reconnectPause;
+    if (!backoff || answered) {
+      backoff.emplace(restartGrace());
     }
-    if (now + pause > giveUp) {
+    if (backoff->exhausted()) {
       return status;
     }
     // The balancer has no healthy upstream until the new leader is up, so
     // retries after an announced restart belong to the same handover.
     handover = answered ? restarting : handover || restarting;
     logReconnect(config->authority.to_string(), status, handover);
-    std::this_thread::sleep_for(pause);
-    pause = std::min(pause * 2, maxReconnectPause);
+    std::this_thread::sleep_for(backoff->next());
   }
 }
 

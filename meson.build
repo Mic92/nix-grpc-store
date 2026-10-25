@@ -304,6 +304,13 @@ if build_server
     dependencies : common_deps + [nix_store_dep, nix_util_dep],
   ), timeout : 30)
 
+  test('retry', executable('retry-test',
+    sources : ['tests/retry-test.cc'],
+    include_directories : [src_inc, include_directories('src/client')],
+    cpp_args : ['-UNDEBUG'],
+    dependencies : [grpc_dep],
+  ))
+
   test('call', executable('call-test',
     sources : ['tests/call-test.cc', gen],
     include_directories : [gen_inc, src_inc, include_directories('src/client')],

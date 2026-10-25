@@ -82,6 +82,7 @@
 #include "channel.hh"
 #include "nix-compat.hh"
 #include "nar-fetcher.hh"
+#include "retry.hh"
 #include "path-info-wire.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
@@ -255,9 +256,6 @@ public:
                   config->authority.to_string());
     }
 
-    // gRPC folds TCP and TLS failures into UNAVAILABLE, only the text differs.
-    static auto transportError(std::string_view msg) -> bool;
-
 private:
 
     auto connectHint(const std::string & msg) const -> std::string
@@ -314,36 +312,30 @@ public:
     // restart does not fail the build; TLS rejections fail at once.
     void connect() override { isTrustedClient(); }
 
-    // A worker or the balancer restarting under us. TLS/auth failures are
-    // also UNAVAILABLE but retrying those only delays the error.
-    static auto goneAway(const grpc::Status & status) -> bool;
-
-    // connect-timeout until the service first answers, restart-grace after: a
-    // worker restart behind the balancer is expected, being offline is not.
     [[nodiscard]] auto restartGrace() const -> std::chrono::seconds {
       return std::chrono::seconds(config->restartGrace.get());
     }
-    static constexpr std::chrono::milliseconds reconnectPause{500};
+    // connect-timeout until the service first answers, restart-grace after: a
+    // worker restart behind the balancer is expected, being offline is not.
+    [[nodiscard]] auto retryBudget() const -> std::chrono::milliseconds {
+      return everConnected ? restartGrace() : std::chrono::seconds(config->connectTimeout.get());
+    }
     static constexpr int minReconnectBackoffMs = 2000;
-    static constexpr std::chrono::milliseconds maxReconnectPause{4000};
     template<typename F>
     void retrying(const char * what, const F & attempt) {
-      auto const giveUp = std::chrono::steady_clock::now()
-                    + (everConnected ? restartGrace() : std::chrono::seconds(config->connectTimeout.get()));
-      auto pause = std::chrono::milliseconds(500); // NOLINT(*-magic-numbers)
+      nixgrpc::Backoff backoff(retryBudget());
       for (;;) {
         auto const status = attempt();
         checkInterrupt();
         if (status.ok()) {
           everConnected = true;
         }
-        if (!goneAway(status) || std::chrono::steady_clock::now() + pause > giveUp) {
+        if (!nixgrpc::goneAway(status) || backoff.exhausted()) {
           checkStatus(status, what);
           return;
         }
         printError("%s: %s, retrying", config->authority.to_string(), firstLine(status.error_message()));
-        std::this_thread::sleep_for(pause);
-        pause = std::min(pause * 2, std::chrono::milliseconds(4000)); // NOLINT(*-magic-numbers)
+        std::this_thread::sleep_for(backoff.next());
       }
     }
 
