@@ -28,6 +28,14 @@ struct Options
     std::string tlsCert;
     std::string tlsKey;
     std::string clientCA;
+    // SPIFFE bundle map (gRFC A87): one CA set per trust domain, in place
+    // of clientCA.
+    std::string clientSpiffeBundles;
+
+    [[nodiscard]] auto verifiesClients() const -> bool
+    {
+        return !clientCA.empty() || !clientSpiffeBundles.empty();
+    }
     std::string metricsListen;
     std::string workerName;
     LogLevel logLevel = LogLevel::info;
