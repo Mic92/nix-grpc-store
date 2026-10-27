@@ -215,29 +215,43 @@ struct GrpcStore::Run {
     debug("grpc: want %s", job.drvPath.to_string());
   }
 
-  // Under `mutex`. Everything wantable goes out as one stream message. With
-  // no stream it stays wantable until reconnect or give-up.
+  // Under `mutex`. Wantable jobs go out in messages well below the server's
+  // receive limit. With no stream they stay wantable until reconnect or
+  // give-up.
   void flushWants() {
+    static constexpr size_t maxBatchBytes = 4UL << 20U;
     remote::ClientMsgs batch;
+    size_t bytes = 0;
     std::deque<Job *> keep;
+    std::deque<Job *> sent;
+    auto const write = [&] -> void {
+      if (stream != nullptr && batch.msgs_size() > 0 && !stream->Write(batch)) {
+        stream = nullptr;
+      }
+      if (stream == nullptr) {
+        keep.insert(keep.end(), sent.begin(), sent.end());
+      }
+      batch.Clear();
+      bytes = 0;
+      sent.clear();
+    };
     for (auto * job : wantable) {
       if (job->failedInput) {
         ready.push_back(job);
       } else if (stream == nullptr) {
         keep.push_back(job);
       } else {
-        fillWant(batch.add_msgs()->mutable_want(), *job);
-        keep.push_back(job); // dropped below once the Write succeeded
+        auto * msg = batch.add_msgs();
+        fillWant(msg->mutable_want(), *job);
+        bytes += msg->ByteSizeLong();
+        sent.push_back(job);
+        if (bytes >= maxBatchBytes) {
+          write();
+        }
       }
     }
+    write();
     wantable.swap(keep);
-    if (batch.msgs_size() > 0) {
-      if (stream->Write(batch)) {
-        wantable.clear();
-      } else {
-        stream = nullptr;
-      }
-    }
     if (remaining == 0 && stream != nullptr && !closed) {
       closed = true;
       stream->WritesDone();

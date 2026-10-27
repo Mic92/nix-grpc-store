@@ -99,7 +99,8 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
   # empty input. Real campaigns run locally via scripts/fuzz.sh.
   fuzz = pkgs.runCommand "nix-grpc-store-fuzz-smoke" { } ''
     for f in ${packages.fuzzers}/bin/fuzz-*; do
-      "$f" -runs=200 2>&1 | tail -n2
+      [ "$f" = ${packages.fuzzers}/bin/fuzz-gen-seeds ] && continue
+      "$f" -runs=200 -malloc_limit_mb=256 2>&1 | tail -n2
     done
     touch $out
   '';
