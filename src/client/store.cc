@@ -115,9 +115,6 @@ GrpcStore::GrpcStore(const ref<const Config> &config)
                 return nixgrpc::goneAway(status) || nixgrpc::streamBroken(status);
               },
               .budget = [this] -> std::chrono::milliseconds { return retryBudget(); }}} {
-  if (config->debug) {
-    nixgrpc::enableGrpcTracing();
-  }
   if (config->insecure) {
     if (!config->tokenFile.get().empty()) {
       throw Error("gRPC store '%s': token-file needs TLS", config->authority.to_string());
@@ -242,6 +239,10 @@ auto GrpcStore::openConnection() -> ref<RemoteStore::Connection> {
 }
 
 auto GrpcStoreConfig::openStore() const -> ref<Store> {
+  // gRPC reads its trace settings in grpc_init().
+  if (debug) {
+    nixgrpc::enableGrpcTracing();
+  }
   nixgrpc::retainGrpcRuntime();
   return make_ref<GrpcStore>(ref{shared_from_this()});
 }
