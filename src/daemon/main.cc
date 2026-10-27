@@ -28,6 +28,7 @@
 #include <ranges>
 #include <span>
 #include <string>
+#include <iterator>
 #include <set>
 #include <string_view>
 #include <thread>
@@ -88,6 +89,7 @@
 #include "nix_remote.pb.h"
 #include "pump.hh"
 #include "socket-activation.hh"
+#include "session-roots.hh"
 #include "upload-claims.hh"
 #include "parse-int.hh"
 #include "sandbox.hh"
@@ -121,6 +123,7 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     std::mutex storeMutex;
     std::shared_ptr<nix::Store> store;
     nixgrpc::UploadClaims uploads;
+    nixgrpc::SessionRoots sessions{[this] -> nix::ref<nix::Store> { return openScopedStore(); }};
 
     // Without the path info cache a path deleted behind our back (gc) is
     // invalid here too, instead of failing later when its NAR is read.
@@ -278,7 +281,24 @@ private:
         return Rpc{.context = &context, .method = method, .caller = std::move(caller)};
     }
 
+    // Writers only: a session pins disk until it expires.
+    void holdForSession(const Rpc & rpc, const std::vector<nix::StorePath> & paths)
+    {
+        if (rpc.caller.role < nixgrpc::Role::write) {
+            return;
+        }
+        auto const & meta = rpc.context->client_metadata();
+        if (auto const found = meta.find("x-nix-session"); found != meta.end()) {
+            sessions.hold(std::string_view(found->second.data(), found->second.size()), paths);
+        }
+    }
+
 public:
+    void tick()
+    {
+        sessions.expire();
+    }
+
     NixRemoteService(
         std::string socketPath,
         std::string storeUri,
@@ -360,7 +380,9 @@ public:
             auto const substitute = request->substitute() && rpc.caller.role >= nixgrpc::Role::write;
             std::vector<std::string> valid;
             nixgrpc::Metrics::Phase phase(metrics, "QueryValidPaths", "query");
-            for (const auto & path : localStore->queryValidPaths(paths, substitute ? nix::Substitute : nix::NoSubstitute)) {
+            auto const here = localStore->queryValidPaths(paths, substitute ? nix::Substitute : nix::NoSubstitute);
+                holdForSession(rpc, {here.begin(), here.end()});
+            for (const auto & path : here) {
                 reply->add_paths(std::string(path.to_string()));
                 valid.push_back(localStore->printStorePath(path));
                 paths.erase(path);
@@ -483,6 +505,11 @@ public:
             std::vector<std::string> imported;
             auto const cancelled = [&] -> bool { return context->IsCancelled() || stopSignal != 0; };
             auto const stats = importUploads(*localStore, source, repair, checkSigs, cancelled, imported);
+            holdForSession(
+                rpc,
+                imported | std::views::transform([&](const auto & path) -> nix::StorePath {
+                    return localStore->parseStorePath(path);
+                }) | std::ranges::to<std::vector>());
             phase.next("publish");
             publish(*localStore, imported, cancelled);
             phase.done();
@@ -884,6 +911,13 @@ public:
             nixgrpc::Backends::Limits const limits{
                 .buildTimeout = request->build_timeout(), .maxSilentTime = request->max_silent_time()};
 
+            std::vector<nix::StorePath> held{drvPath};
+            std::ranges::copy(nixcompat::drvInputs(drv), std::back_inserter(held));
+            for (auto & [name, path] : staticOutputs(*localStore, drv)) {
+                held.push_back(std::move(path));
+            }
+            holdForSession(rpc, held);
+
             nix::remote::BuildDerivationChunk chunk;
             nixgrpc::Metrics::Inputs inputs;
             if (auto const status =
@@ -981,6 +1015,7 @@ auto drained(nixgrpc::Coordinator & coord, nixgrpc::Metrics & metrics) -> bool
 // supervisor's stop timeout or a second signal bounds that.
 void serve(
     grpc::Server const & server,
+    NixRemoteService & service,
     const nixgrpc::Options & options,
     nixgrpc::IdleTracker const & idle,
     nixgrpc::Coordinator & coord,
@@ -997,6 +1032,7 @@ void serve(
                 return;
             }
             coord.tick();
+            service.tick();
         } else {
             if (!draining) {
                 draining = true;
@@ -1171,7 +1207,7 @@ try {
     coord.start(*server);
     nixgrpc::sdNotify("READY=1");
 
-    serve(*server, options, idle, coord, metrics);
+    serve(*server, service, options, idle, coord, metrics);
     nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", stopSignal != 0 ? "signal_exit" : "idle_exit"}});
     stopSignal = nixgrpc::kCancelBuilds;
     nixgrpc::sdNotify("STOPPING=1");

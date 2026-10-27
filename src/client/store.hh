@@ -54,6 +54,7 @@
 #include <openssl/types.h>
 #include <openssl/x509.h>
 #include <optional>
+#include <random>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -532,6 +533,12 @@ public:
     void throwOnFailedBuilds(std::vector<KeyedBuildResult> & results);
 
 private:
+    // Workers keep this session's paths until it goes quiet.
+    const std::string session = [] -> std::string {
+      std::random_device rnd;
+      return fmt("%08x%08x%08x%08x", rnd(), rnd(), rnd(), rnd());
+    }();
+
     using PathInfoMap = std::map<StorePath, std::shared_ptr<const ValidPathInfo>>;
 
     std::atomic<bool> everConnected = false;

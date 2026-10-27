@@ -126,7 +126,13 @@ fn repeat_is_answered_cached_by_the_scheduler_without_building() {
     farm_ready();
     let top = build(&envoy(), "cached1", &[]);
     for w in WORKERS {
-        succeed(w, &["nix-store", "--delete", &top]);
+        // The client's session still roots it on the builder: end that
+        // nix-daemon connection, as its expiry would.
+        let script = format!(
+            "nix-store -q --roots {top} | grep -o 'temp:[0-9]*' | cut -d: -f2 | xargs -r kill -9; \
+             for _ in $(seq 50); do nix-store --delete {top} && exit; sleep 0.2; done; exit 1"
+        );
+        succeed(w, &["sh", "-c", &script]);
     }
     let before = events(leader(), "cached");
     build(&envoy(), "cached1", &[]);

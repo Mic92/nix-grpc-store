@@ -65,6 +65,7 @@ auto GrpcStore::routingFor(const BasicDerivation & drv, const std::string & work
   if (!workerAddr.empty()) {
     meta.emplace_back("x-nix-worker", workerAddr);
   }
+    meta.emplace_back("x-nix-session", session);
   return meta;
 }
 
