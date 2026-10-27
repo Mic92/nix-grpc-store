@@ -163,7 +163,14 @@ inline auto loadConfig(const std::string & path) -> Config
         Config cfg;
         cfg.allowInsecure = json.value("allow_insecure", false);
         for (const auto & [name, prov] : json.at("providers").items()) {
-            cfg.providers.push_back(providerFrom(name, prov, cfg.allowInsecure));
+            auto provider = providerFrom(name, prov, cfg.allowInsecure);
+            // A token names one issuer, so it can only be checked against one provider.
+            for (const auto & other : cfg.providers) {
+                if (other.issuer == provider.issuer) {
+                    throw nix::Error("providers '%s' and '%s' share issuer %s", other.name, name, provider.issuer);
+                }
+            }
+            cfg.providers.push_back(std::move(provider));
         }
         if (cfg.providers.empty()) {
             throw nix::Error("no providers");
@@ -380,6 +387,7 @@ private:
         std::vector<Jwk> keys;
         // steady_clock starts at boot on Linux, so its epoch is not "long ago".
         std::optional<std::chrono::steady_clock::time_point> fetched;
+        std::optional<std::chrono::steady_clock::time_point> attempted;
     };
 
     static constexpr std::chrono::minutes refetchAfter{60};
@@ -438,56 +446,61 @@ private:
     }
 
 public:
+    // Any attempt, failed ones included, holds off the next for refetchOnMiss.
     static auto fetchDue(
         std::optional<std::chrono::steady_clock::time_point> fetched,
+        std::optional<std::chrono::steady_clock::time_point> attempted,
         std::chrono::steady_clock::time_point now,
         bool haveKey,
         std::chrono::seconds refetchOnMiss) -> bool
     {
-        if (!fetched) {
-            return true;
+        if (attempted && now - *attempted <= refetchOnMiss) {
+            return false;
         }
-        auto const age = now - *fetched;
-        return age > refetchAfter || (!haveKey && age > refetchOnMiss);
+        return !fetched || !haveKey || now - *fetched > refetchAfter;
     }
 
 private:
-    // Keys of `provider` that the token's alg can use, narrowed to its kid if given.
+    // One verifier per key of `provider` that the token's alg can use, narrowed
+    // to its kid if given. jwt-cpp keeps one key per alg, hence not one verifier.
     auto candidates(const Provider & provider, KeySet & set, const Decoded & token,
-                    std::chrono::system_clock::time_point now) -> VerifierBuilder
+                    std::chrono::system_clock::time_point now) -> std::vector<VerifierBuilder>
     {
         auto alg = token.has_algorithm() ? token.get_algorithm() : "";
         auto kid = token.has_key_id() ? token.get_key_id() : "";
         std::scoped_lock const guard(set.lock);
-        auto const pick = [&] -> std::optional<VerifierBuilder> {
-            auto verifier = jwt::verify<FixedClock, jwt::traits::nlohmann_json>(FixedClock{now})
-                                .with_issuer(provider.issuer)
-                                .with_audience(provider.audience)
-                                .leeway(clockSkewSecs);
-            bool any = false;
+        auto const pick = [&] -> std::vector<VerifierBuilder> {
+            std::vector<VerifierBuilder> verifiers;
             for (const auto & key : set.keys) {
-                if (kid.empty() || key.kid == kid) {
-                    any = allowKey(verifier, alg, key) || any;
+                if (!kid.empty() && key.kid != kid) {
+                    continue;
+                }
+                auto verifier = jwt::verify<FixedClock, jwt::traits::nlohmann_json>(FixedClock{now})
+                                    .with_issuer(provider.issuer)
+                                    .with_audience(provider.audience)
+                                    .leeway(clockSkewSecs);
+                if (allowKey(verifier, alg, key)) {
+                    verifiers.push_back(std::move(verifier));
                 }
             }
-            return any ? std::optional(std::move(verifier)) : std::nullopt;
+            return verifiers;
         };
         auto res = pick();
         auto const mono = std::chrono::steady_clock::now();
-        if (fetchDue(set.fetched, mono, res.has_value(), refetchOnMiss)) {
-            set.fetched = mono;
+        if (fetchDue(set.fetched, set.attempted, mono, !res.empty(), refetchOnMiss)) {
+            set.attempted = mono;
             try {
                 set.keys = fetchKeys(provider);
+                set.fetched = mono;
             } catch (std::exception & err) {
                 logLine(LogLevel::info, {{"event", "oidc_jwks_failed"}, {"provider", provider.name}, {"error", err.what()}});
-                *set.fetched -= refetchAfter - refetchOnMiss; // retry soon, keep old keys
             }
             res = pick();
         }
-        if (!res) {
+        if (res.empty()) {
             throw nix::Error("no signing keys for provider %s and alg %s (issuer unreachable?)", provider.name, alg);
         }
-        return std::move(*res);
+        return res;
     }
 
     auto doVerify(const std::string & token, std::chrono::system_clock::time_point now) -> Result
@@ -506,7 +519,13 @@ private:
                 return fail("token has no exp");
             }
             std::error_code err;
-            candidates(provider, keys.at(idx), *parsed, now).verify(*parsed, err);
+            for (auto & verifier : candidates(provider, keys.at(idx), *parsed, now)) {
+                err.clear();
+                verifier.verify(*parsed, err);
+                if (!err) {
+                    break;
+                }
+            }
             if (err) {
                 return fail(provider.name + ": " + err.message());
             }

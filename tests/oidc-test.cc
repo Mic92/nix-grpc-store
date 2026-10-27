@@ -25,6 +25,7 @@
 #include <nlohmann/json_fwd.hpp>
 
 #include <nix/util/base-n.hh>
+#include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
 
 #include "acl.hh"
@@ -159,7 +160,16 @@ struct Key
 
     [[nodiscard]] auto sign(const Json & claims, const std::string & headerAlg = "") const -> std::string
     {
-        Json const header{{"alg", headerAlg.empty() ? alg : headerAlg}, {"typ", "JWT"}, {"kid", kid}};
+        return signWith(claims, Json{{"alg", headerAlg.empty() ? alg : headerAlg}, {"typ", "JWT"}, {"kid", kid}});
+    }
+
+    [[nodiscard]] auto signWithoutKid(const Json & claims) const -> std::string
+    {
+        return signWith(claims, Json{{"alg", alg}, {"typ", "JWT"}});
+    }
+
+    [[nodiscard]] auto signWith(const Json & claims, const Json & header) const -> std::string
+    {
         auto input = b64url(header.dump()) + "." + b64url(claims.dump());
         std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> const ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
         EVP_PKEY_CTX * pctx = nullptr;
@@ -238,6 +248,7 @@ auto run(const std::string & dir, const std::string & base) -> int
     auto const pssKey = Key::generate(Kind::pss, "pss-1");
     auto const edKey = Key::generate(Kind::ed, "ed-1");
     auto const stranger = Key::generate(Kind::ec, "ec-1"); // same kid, different key
+    auto const ecKey2 = Key::generate(Kind::ec, "ec-2");
 
     // k8s style: issuer taken from the SA token, JWKS behind explicit URL.
     nix::writeFile(dir + "/sa-token", ecKey.sign({{"iss", "https://kubernetes.default.svc"}, {"sub", "x"}}));
@@ -246,6 +257,19 @@ auto run(const std::string & dir, const std::string & base) -> int
     // Issuer serves nothing yet: config loads, verifier constructs, tokens are refused.
     auto const cfg = loadConfig(dir + "/oidc.json");
     check(cfg.providers.size() == 2, "two providers");
+    {
+        auto twice = Json::parse(nix::readFile(dir + "/oidc.json"));
+        auto & providers = twice.at("providers");
+        providers.emplace("ci2", providers.at("ci"));
+        nix::writeFile(dir + "/twice.json", twice.dump());
+        bool refused = false;
+        try {
+            loadConfig(dir + "/twice.json");
+        } catch (nix::Error &) {
+            refused = true;
+        }
+        check(refused, "two providers with one issuer are refused");
+    }
     Verifier verifier(cfg, std::chrono::seconds(0));
 
     auto const claims = [&](const Json & extra) -> Json {
@@ -260,10 +284,13 @@ auto run(const std::string & dir, const std::string & base) -> int
         using std::chrono::seconds;
         seconds const onMiss{30};
         auto const justBooted = Clock::time_point{} + seconds{5};
-        check(Verifier::fetchDue({}, justBooted, false, onMiss), "first token right after boot fetches JWKS");
-        check(!Verifier::fetchDue(justBooted, justBooted + seconds{1}, false, onMiss), "no refetch storm on unknown kid");
-        check(Verifier::fetchDue(justBooted, justBooted + onMiss + seconds{1}, false, onMiss), "unknown kid refetches later");
-        check(!Verifier::fetchDue(justBooted, justBooted + onMiss * 2, true, onMiss), "known kid uses cached keys");
+        auto const later = justBooted + onMiss + seconds{1};
+        check(Verifier::fetchDue({}, {}, justBooted, false, onMiss), "first token right after boot fetches JWKS");
+        check(!Verifier::fetchDue(justBooted, justBooted, justBooted + seconds{1}, false, onMiss), "no refetch storm on unknown kid");
+        check(Verifier::fetchDue(justBooted, justBooted, later, false, onMiss), "unknown kid refetches later");
+        check(!Verifier::fetchDue(justBooted, justBooted, justBooted + onMiss * 2, true, onMiss), "known kid uses cached keys");
+        check(!Verifier::fetchDue({}, justBooted, justBooted + seconds{1}, false, onMiss), "failed fetch holds off the next");
+        check(Verifier::fetchDue({}, justBooted, later, false, onMiss), "failed fetch is retried later");
     }
     {
         auto const res = verifier.verify(ecKey.sign(good));
@@ -275,7 +302,7 @@ auto run(const std::string & dir, const std::string & base) -> int
     nix::writeFile(
         dir + "/jwks.json",
         Json{{"keys",
-              {"junk", Json{{"kty", "RSA"}, {"n", "!!"}}, ecKey.jwk(), rsaKey.jwk(), pssKey.jwk(), edKey.jwk()}}}
+              {"junk", Json{{"kty", "RSA"}, {"n", "!!"}}, ecKey.jwk(), ecKey2.jwk(), rsaKey.jwk(), pssKey.jwk(), edKey.jwk()}}}
             .dump());
 
     {
@@ -297,6 +324,7 @@ auto run(const std::string & dir, const std::string & base) -> int
         auto res = verifier.verify(edKey.sign(good));
         check(res.identity && res.identity->role == Role::write, "EdDSA");
     }
+    check(verifier.verify(ecKey.signWithoutKid(good)).identity.has_value(), "no kid: every ES256 key is tried");
     {
         auto res = verifier.verify(ecKey.sign(claims({{"sub", "repo:other/x:y"}})));
         check(res.identity && !res.identity->role, "verified but no rule -> no role");
