@@ -250,8 +250,7 @@ public:
 
     void schedClients(int delta) const
     {
-        auto & gauge = sched->Add({{"kind", "clients"}});
-        gauge.Set(gauge.Value() + delta);
+        sched->Add({{"kind", "clients"}}).Increment(delta);
     }
 
     // `listen` empty: keep counting but do not serve /metrics.

@@ -26,6 +26,7 @@ namespace {
 constexpr std::chrono::seconds retryEvery{1};
 // niks3 sends a line every 5 s.
 constexpr long silentSecs = 15;
+constexpr long connectSecs = 5;
 
 struct Reader
 {
@@ -98,6 +99,8 @@ void Elector::run(const std::stop_token & stop)
                 },
                 .buf = {}};
             call->opt(CURLOPT_TIMEOUT, 0L);
+            // Dropped SYNs would block for minutes, past the grace checked below.
+            call->opt(CURLOPT_CONNECTTIMEOUT, connectSecs);
             call->opt(CURLOPT_LOW_SPEED_LIMIT, 1L);
             call->opt(CURLOPT_LOW_SPEED_TIME, silentSecs);
             call->opt(CURLOPT_WRITEDATA, &reader);
