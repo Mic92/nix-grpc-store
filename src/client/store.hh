@@ -652,51 +652,107 @@ public:
     }
 
 private:
+    // A descriptor per NAR ran out on big closures. Past the cap, NARs are
+    // not retried.
+    struct UploadSpool
+    {
+      static constexpr unsigned capGiB = 4;
+      static constexpr uint64_t cap = uint64_t{capGiB} << 30U;
+      AutoCloseFD fd;
+      uint64_t tail = 0;
+
+      auto reserve(uint64_t size) -> std::optional<uint64_t>
+      {
+        if (tail + size > cap) {
+          return std::nullopt;
+        }
+        if (!fd) {
+          auto [tmpFd, tmpPath] = createTempFile("nix-grpc-upload");
+          ::unlink(tmpPath.c_str());
+          fd = std::move(tmpFd);
+        }
+        auto const offset = tail;
+        tail += size;
+        return offset;
+      }
+    };
+
     // Caller sources are single-use and may sit on a pooled daemon connection,
-    // so read each to the end exactly once, teeing to a temp file for retries.
+    // so read each to the end exactly once, teeing to the spool for retries.
     struct ReplayableNar
     {
-        std::unique_ptr<Source> upstream;
-        AutoCloseFD fd;
-        bool complete = false;
+      std::unique_ptr<Source> upstream;
+      std::shared_ptr<UploadSpool> spool;
+      uint64_t size;
+      std::optional<uint64_t> offset; // in the spool, once read
+      bool complete = false;
 
-        explicit ReplayableNar(std::unique_ptr<Source> src)
-            : upstream(std::move(src))
-        {
-            auto [tmpFd, tmpPath] = createTempFile("nix-grpc-upload");
-            ::unlink(tmpPath.c_str());
-            fd = std::move(tmpFd);
-        }
+      ReplayableNar(std::unique_ptr<Source> src, std::shared_ptr<UploadSpool> spool, uint64_t size)
+          : upstream(std::move(src)), spool(std::move(spool)), size(size)
+      {
+      }
 
-        void drainInto(Sink & sink)
-        {
-            if (!complete) {
-                std::exception_ptr sinkError;
-                LambdaSink tee([&](std::string_view data) -> void {
-                    writeFull(fd.get(), data);
-                    if (sinkError) {
-                      return;
-                    }
-                    try {
-                      sink(data);
-                    } catch (...) {
-                      sinkError = std::current_exception();
-                    }
-                });
-                upstream->drainInto(tee);
-                complete = true;
-                upstream.reset();
-                if (sinkError) {
-                  std::rethrow_exception(sinkError);
-                }
-                return;
+      void drainInto(Sink & sink)
+      {
+        if (!complete) {
+          offset = spool->reserve(size);
+          uint64_t pos = offset.value_or(0);
+          std::exception_ptr sinkError;
+          LambdaSink tee([&](std::string_view data) -> void {
+            // narSize is the client's claim: no replay if the NAR overruns it.
+            if (offset && pos + data.size() > *offset + size) {
+              offset.reset();
             }
-            if (::lseek(fd.get(), 0, SEEK_SET) != 0) {
-              throw SysError("rewinding upload spool");
+            if (offset) {
+              writeAt(data, pos);
             }
-            FdSource replay(fd.get());
-            replay.drainInto(sink);
+            if (sinkError) {
+              return;
+            }
+            try {
+              sink(data);
+            } catch (...) {
+              sinkError = std::current_exception();
+            }
+          });
+          upstream->drainInto(tee);
+          complete = true;
+          upstream.reset();
+          if (offset && pos != *offset + size) {
+            offset.reset();
+          }
+          if (sinkError) {
+            std::rethrow_exception(sinkError);
+          }
+          return;
         }
+        if (!offset) {
+          throw Error("cannot retry an upload of more than %d GiB", UploadSpool::capGiB);
+        }
+        std::vector<char> buf(nixgrpc::kChunkSize);
+        for (uint64_t pos = *offset, end = *offset + size; pos < end;) {
+          auto const count = ::pread(spool->fd.get(), buf.data(), std::min<uint64_t>(buf.size(), end - pos),
+                                     static_cast<off_t>(pos));
+          if (count <= 0) {
+            throw SysError("reading upload spool");
+          }
+          sink({buf.data(), static_cast<size_t>(count)});
+          pos += static_cast<uint64_t>(count);
+        }
+      }
+
+    private:
+      void writeAt(std::string_view data, uint64_t & pos) const
+      {
+        while (!data.empty()) {
+          auto const count = ::pwrite(spool->fd.get(), data.data(), data.size(), static_cast<off_t>(pos));
+          if (count < 0) {
+            throw SysError("writing upload spool");
+          }
+          data.remove_prefix(static_cast<size_t>(count));
+          pos += static_cast<uint64_t>(count);
+        }
+      }
     };
 
     void addMultipleToStoreRouted(

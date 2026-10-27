@@ -214,10 +214,11 @@ void GrpcStore::queryPathInfoUncached(const StorePath & path, InfoCallback callb
 void GrpcStore::addMultipleToStoreRouted(
     PathsSource pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs, const Metadata & headers)
 {
+    auto const spool = std::make_shared<UploadSpool>();
     std::vector<std::pair<ValidPathInfo, ReplayableNar>> paths;
     paths.reserve(pathsToCopy.size());
     for (auto & [pathInfo, pathSource] : pathsToCopy) {
-      paths.emplace_back(pathInfo, ReplayableNar(std::move(pathSource)));
+      paths.emplace_back(pathInfo, ReplayableNar(std::move(pathSource), spool, pathInfo.narSize));
     }
     retrying("AddMultipleToStore", [&] -> grpc::Status {
       return addMultipleToStoreOnce(paths, act, repair, checkSigs, headers);
