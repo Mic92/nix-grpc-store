@@ -16,6 +16,9 @@ try {
     assert(subjectCommonName("Subject=/CN=legacy/O=x") == "legacy");
     assert(subjectCommonName(R"(Subject="CN=a\,b,O=x")") == "a,b");
     assert(subjectCommonName(R"(Subject="CN=q\"x")") == "q\"x");
+    // '/' separates only in the legacy form
+    assert(subjectCommonName(R"(Subject="O=a/CN=admin,CN=real")") == "real");
+    assert(subjectCommonName(R"(Subject="CN=ci-1/x")") == "ci-1/x");
 
     // only the first element (the hop that saw the client) counts
     assert(subjectCommonName(R"(Hash=1;URI=u,Hash=2;Subject="CN=evil")") == std::nullopt);

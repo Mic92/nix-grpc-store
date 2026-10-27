@@ -109,12 +109,13 @@ inline auto readPairValue(Cursor & cur) -> std::optional<std::string>
 inline auto commonNameOfDn(std::string_view name) -> std::optional<std::string>
 {
     Cursor cur(name);
-    if (cur.peek() == '/') {
+    char const sep = cur.peek() == '/' ? '/' : ',';
+    if (sep == '/') {
         cur.take();
     }
     while (!cur.done()) {
         std::string attr;
-        while (!cur.done() && cur.peek() != ',' && cur.peek() != '/') {
+        while (!cur.done() && cur.peek() != sep) {
             char const chr = cur.take();
             if (chr == '\\' && !cur.done()) {
                 attr += cur.take();
