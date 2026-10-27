@@ -94,7 +94,16 @@ void Dispatcher::lookupLoop()
             job = std::move(lookupQueue.front());
             lookupQueue.pop_front();
         }
-        applyClientMsgs(*job.client, job.msgs, lookup(job.msgs));
+        // Inline, the reactor closes the stream on a throw. Here only this client fails.
+        try {
+            applyClientMsgs(*job.client, job.msgs, lookup(job.msgs));
+        } catch (std::exception & err) {
+            logLine(LogLevel::info, {{"event", "client_failed"}, {"client", std::to_string(job.client->id)}, {"error", err.what()}});
+                    const Lock lock(*this);
+            if (!job.client->gone) {
+                job.client->abort();
+            }
+        }
     }
 }
 
@@ -339,12 +348,13 @@ void Dispatcher::revokeOn(sched::WorkerId wid, const std::string & drvPath)
 
 // ------------------------------------------------------------------ clients
 
-auto Dispatcher::connectClient(ClientSend send) -> ClientPtr
+auto Dispatcher::connectClient(ClientSend send, std::function<void()> abort) -> ClientPtr
 {
     metrics.schedClients(1);
     auto client = std::make_shared<Client>();
     client->id = nextClient++;
     client->send = std::move(send);
+    client->abort = std::move(abort);
     return client;
 }
 
@@ -390,16 +400,20 @@ void Dispatcher::clientMsgs(const ClientPtr & client, const nix::remote::ClientM
 void Dispatcher::applyClientMsgs(
     Client & client, const nix::remote::ClientMsgs & msgs, const std::vector<bool> & cached)
 {
-    const Lock lock(*this);
-    if (client.gone) {
-        return;
-    }
-    for (int i = 0; i < msgs.msgs_size(); i++) {
-        const auto & msg = msgs.msgs(i);
-        if (msg.has_want()) {
-            onWant(client, msg.want(), cached.at(static_cast<size_t>(i)));
-        } else if (msg.has_cancel()) {
-            onCancel(client, msg.cancel());
+    // The lock is released between chunks so a large batch does not stall everyone else.
+    static constexpr int chunk = 256;
+    for (int start = 0; start < msgs.msgs_size(); start += chunk) {
+        const Lock lock(*this);
+        if (client.gone) {
+            return;
+        }
+        for (int i = start; i < std::min(start + chunk, msgs.msgs_size()); i++) {
+            const auto & msg = msgs.msgs(i);
+            if (msg.has_want()) {
+                onWant(client, msg.want(), cached.at(static_cast<size_t>(i)));
+            } else if (msg.has_cancel()) {
+                onCancel(client, msg.cancel());
+            }
         }
     }
 }
@@ -433,6 +447,12 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
         clients[client.id] = client.send;
     }
     auto const system = systemFor(want.system());
+    if (!core.admitsSystem(std::string(system))) {
+        reply.mutable_unplaceable()->set_drv_path(want.drv_path());
+        reply.mutable_unplaceable()->set_reason("too many systems no worker offers, not keeping '" + std::string(system) + "'");
+        client.send(reply);
+        return;
+    }
     auto res = core.want(
         client.id,
         {.drvPath = want.drv_path(),
@@ -459,7 +479,7 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
             "no connected, non-draining worker for system '" + std::string(system) + "' offers features {"
             + join(want.required_features()) + "}, the workers offer {" + join(core.offeredFeatures(std::string(system))) + "}");
         client.send(reply);
-        exportStats(true); // rare, and nothing else may happen for a while
+        exportStats(false);
     }
 }
 
@@ -486,7 +506,7 @@ void Dispatcher::clientGone(const ClientPtr & clientPtr)
         }
     }
     metrics.schedClients(-1);
-    exportStats(true);
+    exportStats(false);
 }
 
 // ------------------------------------------------------------------ workers
@@ -505,7 +525,7 @@ void Dispatcher::workerMsgs(Worker & worker, const nix::remote::WorkerMsgs & msg
     }
     dispatchLocked();
     metrics.schedWorkers(core.workersUp());
-    exportStats(true);
+    exportStats(false);
 }
 
 void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg)
@@ -577,7 +597,7 @@ void Dispatcher::workerGone(Worker & worker)
     membershipChangedLocked();
     dispatchLocked();
     metrics.schedWorkers(core.workersUp());
-    exportStats(true);
+    exportStats(false);
     worker.id.reset();
 }
 

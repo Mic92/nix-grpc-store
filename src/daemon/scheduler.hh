@@ -693,7 +693,19 @@ public:
         return out;
     }
 
+    // Right after a restart no worker has said Hello yet, so a Want for a
+    // system nobody offers is kept, but only for a few such systems.
+    [[nodiscard]] auto admitsSystem(const std::string & system) const -> bool
+    {
+        if (systems.contains(system)) {
+            return true;
+        }
+        return std::ranges::count_if(systems, [&](const auto & named) -> bool { return !offered(named.first); })
+            < static_cast<std::ptrdiff_t>(maxUnofferedSystems);
+    }
+
     // Bounds on soft state; inputs come from the network.
+    static constexpr size_t maxUnofferedSystems = 16;
     static constexpr size_t maxEntries = 1U << 22U;
     static constexpr size_t maxLastBuilder = 1U << 18U;
     static constexpr size_t initialEntries = 1U << 16U;
@@ -725,10 +737,22 @@ private:
         if (!slot) {
             return;
         }
-        sys(slot->system).queue.erase(drv);
+        auto const iter = systems.find(slot->system);
+        if (iter != systems.end()) {
+            iter->second.queue.erase(drv);
+            if (iter->second.queue.size() == 0 && !offered(iter->first)) {
+                systems.erase(iter);
+            }
+        }
         drvIds.erase(PathKey(slot->drvPath));
         slot.reset();
         freeIds.push_back(drv);
+    }
+
+    [[nodiscard]] auto offered(const std::string & system) const -> bool
+    {
+        return std::ranges::any_of(
+            workers, [&](const Worker & wkr) -> bool { return std::ranges::find(wkr.systems, system) != wkr.systems.end(); });
     }
 
     void rememberBuilder(std::string_view path, WorkerId wid, uint64_t size)
