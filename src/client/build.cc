@@ -47,6 +47,7 @@
 #include <nix/util/strings.hh>
 
 #include "channel.hh"
+#include "executor.hh"
 #include "nix-compat.hh"
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
@@ -102,7 +103,7 @@ void GrpcStore::uploadDrvClosure(Store & evalStore, std::vector<StorePath> drvPa
 }
 
 auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & request, const Metadata & headers,
-                        std::optional<BuildResult> & res) -> grpc::Status {
+                        std::optional<BuildResult> & res, std::string & missingInput) -> grpc::Status {
   // ^C cancels the stream so the worker stops the build at once.
   nixgrpc::Call call;
   addHeaders(call.ctx(), headers);
@@ -112,19 +113,25 @@ auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & reques
   auto const drv = printStorePath(StorePath(request.drv_path()));
   BuildLogActivity act(fmt("building '%s' on %s", drv, config->authority.to_string()),
                        {drv, config->authority.to_string(), 1, 1});
-  return readBuildStream(*reader, act, [&](const remote::BuildDerivationDone & done) -> void {
+  auto status = readBuildStream(*reader, act, [&](const remote::BuildDerivationDone & done) -> void {
     StringSource source(done.result());
     res = WorkerProto::Serialise<BuildResult>::read(
         *this, WorkerProto::ReadConn{.from = source, .version = nixcompat::buildProtocolVersion()});
   });
+  const auto & trailers = call.ctx().GetServerTrailingMetadata();
+  if (auto const found = trailers.find("x-nix-missing-input"); found != trailers.end()) {
+    missingInput.assign(found->second.data(), found->second.size());
+  }
+  return status;
 }
 
-auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore) -> std::optional<BuildResult> {
+auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & where, BuildMode buildMode,
+                              Store & evalStore) -> Attempt {
   remote::BuildDerivationRequest request;
   request.set_drv_path(std::string(job.drvPath.to_string()));
   request.set_build_mode(static_cast<uint32_t>(buildMode));
   request.set_protocol(nixcompat::kBuildProtocolWire);
-  request.set_assign_id(job.assignId);
+  request.set_assign_id(where.assignId);
   request.set_build_timeout(static_cast<uint64_t>(nixcompat::buildTimeout()));
   request.set_max_silent_time(static_cast<uint64_t>(nixcompat::maxSilentTime()));
   {
@@ -132,34 +139,40 @@ auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore)
     nixcompat::writeDrv(sink, *this, job.drv);
     *request.mutable_drv() = std::move(sink.s);
   }
-  auto const headers = routingFor(job.drv, job.workerAddr, job.workerSystem);
+  auto const headers = routingFor(job.drv, where.addr, where.system);
   std::optional<BuildResult> res;
-  auto status = tryBuildDerivation(request, headers, res);
+  std::string missing;
+  auto status = tryBuildDerivation(request, headers, res, missing);
   if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
     uploadDrvClosure(evalStore, {job.drvPath}, headers);
-    status = tryBuildDerivation(request, headers, res);
+    status = tryBuildDerivation(request, headers, res, missing);
   }
   // Our own cancel ends the stream CANCELLED, and a dead worker looks the same.
   if (!status.ok()) {
     checkInterrupt();
   }
   switch (status.error_code()) {
-  case grpc::StatusCode::ABORTED: // superseded: the scheduler already sent where to go
-    return std::nullopt;
   case grpc::StatusCode::FAILED_PRECONDITION: // not expected there (any more), or an input missing
+    if (!missing.empty()) {
+      return MissingInput{.path = parseStorePath(missing)};
+    }
+    [[fallthrough]];
+  case grpc::StatusCode::ABORTED:             // superseded: the scheduler already sent where to go
   case grpc::StatusCode::UNAVAILABLE:         // worker gone or failing for a while
   case grpc::StatusCode::CANCELLED:           // worker shut down (ours was checked above)
   case grpc::StatusCode::UNKNOWN:             // worker died mid-stream ("Stream removed"),
   case grpc::StatusCode::INTERNAL:            //   or RST_STREAM via the balancer
-    printError("%s: %s, asking the scheduler again", job.drvPath.to_string(), firstLine(status.error_message()));
-    return std::nullopt;
+    if (status.error_code() != grpc::StatusCode::ABORTED) {
+      printError("%s: %s, asking the scheduler again", job.drvPath.to_string(), firstLine(status.error_message()));
+    }
+    return Bounced{};
   default:
     checkStatus(status, "BuildDerivation");
   }
   if (!res) {
     throw Error("gRPC BuildDerivation stream ended without a result");
   }
-  return res;
+  return std::move(*res);
 }
 
 auto GrpcStore::localEvalStore(const StorePathSet & drvPaths) -> std::shared_ptr<Store> {
@@ -173,8 +186,10 @@ auto GrpcStore::localEvalStore(const StorePathSet & drvPaths) -> std::shared_ptr
   return local;
 }
 
-// Shared between the Schedule reader and the build threads.
+// Wires the executor to the Schedule stream and the build threads.
 struct GrpcStore::Run {
+  using JobId = nixgrpc::exec::JobId;
+
   GrpcStore & store;
   BuildMode mode;
   Store & evalStore;
@@ -182,22 +197,59 @@ struct GrpcStore::Run {
 
   std::mutex mutex;
   std::condition_variable cv;
-  std::deque<Job *> ready;    // assigned, cached, lost or dep-failed: a thread can finish it
-  std::deque<Job *> wantable; // inputs done, Want not yet sent
-  size_t remaining;
-  bool closed = false; // WritesDone sent
+  nixgrpc::exec::Executor exe;
+  std::deque<Job *> byId; // deque: build threads keep references while jobs are added
+  std::map<std::string, JobId, std::less<>> byName;
+  std::set<StorePath> recovered; // missing inputs, each handled once
+  bool closed = false;           // WritesDone sent
   grpc::ClientReaderWriter<remote::ClientMsgs, remote::SchedMsgs> * stream = nullptr;
-  std::map<std::string, Job *, std::less<>> byName;
 
-  auto next() -> Job * {
-    std::unique_lock lock(mutex);
-    cv.wait(lock, [&] -> bool { return !ready.empty() || remaining == 0; });
-    if (ready.empty()) {
-      return nullptr;
+  Run(GrpcStore & store, BuildMode mode, Store & evalStore, std::map<StorePath, Job> & jobs, size_t threads)
+      : store(store), mode(mode), evalStore(evalStore), jobs(jobs),
+        exe({.threads = threads,
+             .rescheduleRetries = store.config->rescheduleRetries,
+             .keepGoing = nixcompat::keepGoing()}) {
+        std::function<JobId(Job &)> add = [&](Job & job) -> JobId {
+      auto const name = std::string(job.drvPath.to_string());
+      if (auto const found = byName.find(name); found != byName.end()) {
+        return found->second;
+      }
+      std::vector<JobId> inputs;
+      inputs.reserve(job.inputs.size());
+      for (auto * input : job.inputs) {
+        inputs.push_back(add(*input));
+      }
+      return addLocked(job, inputs);
+    };
+    for (auto & [drvPath, job] : jobs) {
+      add(job);
     }
-    auto * job = ready.front();
-    ready.pop_front();
-    return job;
+  }
+
+  auto addLocked(Job & job, const std::vector<JobId> & inputs) -> JobId {
+    auto const jid = exe.add(static_cast<double>(job.cpHintMs), inputs);
+    byId.push_back(&job);
+    byName.emplace(std::string(job.drvPath.to_string()), jid);
+    return jid;
+  }
+
+  struct Work {
+    JobId jid;
+    Job * job;
+    nixgrpc::exec::Placement where;
+  };
+
+  auto next() -> std::optional<Work> {
+    std::unique_lock lock(mutex);
+    for (;;) {
+      cv.wait(lock, [&] -> bool { return exe.hasReady() || exe.remainingJobs() == 0; });
+      if (auto job = exe.next()) {
+        return Work{.jid = job->first, .job = byId.at(job->first), .where = std::move(job->second)};
+      }
+      if (exe.remainingJobs() == 0) {
+        return std::nullopt;
+      }
+    }
   }
 
   void fillWant(remote::Want * want, const Job & job) const {
@@ -219,128 +271,107 @@ struct GrpcStore::Run {
     debug("grpc: want %s", job.drvPath.to_string());
   }
 
-  // Under `mutex`. Wantable jobs go out in messages well below the server's
-  // receive limit. With no stream they stay wantable until reconnect or
-  // give-up.
-  void flushWants() {
+  // Under `mutex`. Batches stay below the server's receive limit.
+  void flushLocked() {
     static constexpr size_t maxBatchBytes = 4UL << 20U;
+    auto const cancels = exe.takeCancels();
+    auto const wants = exe.takeWants();
     remote::ClientMsgs batch;
     size_t bytes = 0;
-    std::deque<Job *> keep;
-    std::deque<Job *> sent;
+    std::vector<JobId> sent;
     auto const write = [&] -> void {
       if (stream != nullptr && batch.msgs_size() > 0 && !stream->Write(batch)) {
         stream = nullptr;
+        exe.disconnected();
       }
       if (stream == nullptr) {
-        keep.insert(keep.end(), sent.begin(), sent.end());
+        exe.unsent(sent);
       }
       batch.Clear();
       bytes = 0;
       sent.clear();
     };
-    for (auto * job : wantable) {
-      if (job->failedInput) {
-        ready.push_back(job);
-      } else if (stream == nullptr) {
-        keep.push_back(job);
-      } else {
-        auto * msg = batch.add_msgs();
-        fillWant(msg->mutable_want(), *job);
-        bytes += msg->ByteSizeLong();
-        sent.push_back(job);
-        if (bytes >= maxBatchBytes) {
-          write();
-        }
+    for (auto const jid : cancels) {
+      batch.add_msgs()->mutable_cancel()->set_drv_path(std::string(byId.at(jid)->drvPath.to_string()));
+    }
+    for (auto const jid : wants) {
+      auto * msg = batch.add_msgs();
+      fillWant(msg->mutable_want(), *byId.at(jid));
+      bytes += msg->ByteSizeLong();
+      sent.push_back(jid);
+      if (bytes >= maxBatchBytes) {
+        write();
       }
     }
     write();
-    wantable.swap(keep);
-    if (remaining == 0 && stream != nullptr && !closed) {
+    if (exe.remainingJobs() == 0 && stream != nullptr && !closed) {
       closed = true;
       stream->WritesDone();
     }
     cv.notify_all();
   }
 
-  // Under `mutex`. Releases dependants: they become wantable (or dep-failed => ready).
-  void finishLocked(Job & job, BuildResult res) {
-    bool const succeeded = nixcompat::succeeded(res);
-    job.result = std::move(res);
-    // NOLINTNEXTLINE(cert-dcl03-c,misc-static-assert): glibc 2.44's assert() expands to constant ternaries
-    assert(remaining > 0);
-    remaining--;
-    for (auto * dep : job.dependants) {
-      if (!succeeded && !dep->failedInput) {
-        dep->failedInput = job.drvPath;
-      }
-      // NOLINTNEXTLINE(cert-dcl03-c,misc-static-assert): glibc 2.44's assert() expands to constant ternaries
-      assert(dep->waiting > 0);
-      if (--dep->waiting == 0) {
-        wantable.push_back(dep);
-      }
-    }
-    flushWants();
-  }
-
-  // Under `mutex`. Bounced by the worker: hand back to the scheduler, or
-  // follow a redirect it already sent.
-  void requeueLocked(Job & job) {
-    job.workerAddr = std::exchange(job.redirectAddr, {});
-    job.assignId = std::exchange(job.redirectId, 0);
-    job.workerSystem = std::exchange(job.redirectSystem, {});
-    if (!job.workerAddr.empty()) {
-      ready.push_back(&job);
-      cv.notify_all();
-      return;
-    }
-    if (++job.bounced > store.config->rescheduleRetries) {
-      finishLocked(job, nixcompat::failed(nixcompat::FailureStatus::MiscFailure,
-                                          fmt("gave up after %d reschedules", job.bounced)));
-    } else {
-      wantable.push_back(&job);
-      flushWants();
-    }
-  }
-
-  auto resultFor(Job & job) -> std::optional<BuildResult> {
-    using nixcompat::FailureStatus;
-    if (job.failedInput) {
-      return nixcompat::failed(FailureStatus::DependencyFailed,
-                               fmt("dependency '%s' failed", job.failedInput->to_string()));
-    }
-    if (isInterrupted()) {
-      return nixcompat::failed(FailureStatus::MiscFailure, "interrupted");
-    }
-    if (job.lost) {
-      return nixcompat::failed(FailureStatus::MiscFailure, "scheduler connection lost");
-    }
-    if (job.result) { // Cached / Unplaceable
-      return std::exchange(job.result, std::nullopt);
-    }
-    return store.buildAssigned(job, mode, evalStore);
-  }
-
   // Build thread body.
   void work() {
-    while (auto * job = next()) {
-      std::optional<BuildResult> res;
+    while (auto work = next()) {
+      Attempt res;
       try {
-        res = resultFor(*job);
+        if (isInterrupted()) {
+          throw Interrupted("interrupted");
+        }
+        res = store.buildAssigned(*work->job, work->where, mode, evalStore);
       } catch (Interrupted &) {
         res = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, "interrupted");
       } catch (std::exception & err) {
         // nix reports only the top-level result, so a failed leaf would just read "dependency failed".
-        printError("%s: %s", job->drvPath.to_string(), err.what());
+        printError("%s: %s", work->job->drvPath.to_string(), err.what());
         res = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, err.what());
       }
+      if (auto * missing = std::get_if<MissingInput>(&res)) {
+        res = recover(*work, missing->path);
+      }
       std::scoped_lock const lock(mutex);
-      if (res) {
-        finishLocked(*job, std::move(*res));
-      } else {
-        requeueLocked(*job);
+      if (auto * result = std::get_if<BuildResult>(&res)) {
+        bool const succeeded = nixcompat::succeeded(*result);
+        work->job->result = std::move(*result);
+        exe.finished(work->jid, succeeded);
+      } else if (std::holds_alternative<Bounced>(res)) {
+        exe.bounced(work->jid);
+      }
+            flushLocked();
+    }
+  }
+
+  // A drv output becomes a job in this run, a source or .drv is uploaded again.
+  auto recover(const Work & work, const StorePath & path) -> Attempt {
+    auto const pathS = store.printStorePath(path);
+    {
+      std::scoped_lock const lock(mutex);
+      if (!recovered.insert(path).second) {
+        return nixcompat::failed(nixcompat::FailureStatus::MiscFailure,
+                                 fmt("input '%s' is missing on the farm", pathS));
       }
     }
+    auto const producer = work.job->farmInputs.find(path);
+    if (producer == work.job->farmInputs.end()) {
+      warn("%s: worker lacks '%s', uploading it again", work.job->drvPath.to_string(), pathS);
+      store.uploadDrvClosure(evalStore, {work.job->drvPath}, store.routingFor(work.job->drv, work.where.addr, work.where.system));
+      return Bounced{};
+    }
+    warn("%s: farm lacks '%s', building '%s' too", work.job->drvPath.to_string(), pathS,
+         producer->second.to_string());
+    auto const drvPath = producer->second;
+    auto const full = evalStore.readDerivation(drvPath);
+    std::scoped_lock const lock(mutex);
+    auto const name = std::string(drvPath.to_string());
+    if (!byName.contains(name)) {
+      auto noJobs = [](const StorePath &) -> bool { return false; };
+      auto & job = jobs.emplace(drvPath, store.farmJob(evalStore, drvPath, full, noJobs)).first->second;
+      job.cpHintMs = work.job->cpHintMs + 1; // ahead of the build waiting for it
+      addLocked(job, {});
+    }
+    exe.blockOn(work.jid, byName.at(name));
+    return MissingInput{.path = path};
   }
 
   static auto drvOf(const remote::SchedMsg & msg) -> std::string {
@@ -375,114 +406,104 @@ struct GrpcStore::Run {
     for (const auto & msg : msgs.msgs()) {
       onMsgLocked(msg);
     }
-    cv.notify_all();
+    flushLocked();
   }
 
   void onMsgLocked(const remote::SchedMsg & msg) {
     auto const name = drvOf(msg);
     auto const found = byName.find(name);
-    Job * job = found == byName.end() ? nullptr : found->second;
-    if (job == nullptr || job->result) {
+    if (found == byName.end()) {
       return;
     }
-    if (!job->workerAddr.empty()) {
-      if (msg.has_assigned() && msg.assigned().worker_addr() != job->workerAddr) {
-        job->redirectAddr = msg.assigned().worker_addr();
-        job->redirectId = msg.assigned().assign_id();
-        job->redirectSystem = msg.assigned().worker_system();
-      }
-      return;
-    }
-    if (msg.has_placeable()) {
-      job->unplaceableSince.reset();
-      return;
-    }
-    if (msg.has_assigned()) {
+    auto const jid = found->second;
+    switch (msg.msg_case()) {
+    case remote::SchedMsg::kAssigned:
       debug("grpc: assigned %s -> %s", name, msg.assigned().worker_addr());
-      if (msg.assigned().worker_addr().empty()) {
-        return;
+      exe.onAssigned(jid, {.addr = msg.assigned().worker_addr(),
+                          .assignId = msg.assigned().assign_id(),
+                          .system = msg.assigned().worker_system()});
+      break;
+    case remote::SchedMsg::kCached:
+      exe.onCached(jid);
+      break;
+    case remote::SchedMsg::kUnplaceable:
+      if (exe.onUnplaceable(jid, msg.unplaceable().reason(), std::chrono::steady_clock::now())) {
+        warn("%s: %s, waiting up to %ds for a worker", name, msg.unplaceable().reason(), store.restartGrace().count());
       }
-      job->workerAddr = msg.assigned().worker_addr();
-      job->assignId = msg.assigned().assign_id();
-      job->workerSystem = msg.assigned().worker_system();
-    } else if (msg.has_cached()) {
-      job->result = cachedResult(*job);
-    } else {
-      if (!job->unplaceableSince) {
-        warn("%s: %s, waiting up to %ds for a worker", job->drvPath.to_string(), msg.unplaceable().reason(),
-             store.restartGrace().count());
-        job->unplaceableSince = std::chrono::steady_clock::now();
-      }
-      job->unplaceableReason = msg.unplaceable().reason();
-      cv.notify_all();
-      return;
+      break;
+    case remote::SchedMsg::kPlaceable:
+      exe.onPlaceable(jid);
+      break;
+    default:
+      break;
     }
-    job->unplaceableSince.reset();
-    ready.push_back(job);
   }
 
   // Thread body: fail jobs whose Unplaceable outlived the grace.
   void reapUnplaceable(const std::stop_token & stop) {
     std::unique_lock lock(mutex);
-    while (!stop.stop_requested() && remaining > 0) {
-      auto const now = std::chrono::steady_clock::now();
-      auto wake = now + store.restartGrace();
-      for (auto & [drvPath, job] : jobs) {
-        if (!job.unplaceableSince || job.result || !job.workerAddr.empty()) {
-          continue;
-        }
-        auto const due = *job.unplaceableSince + store.restartGrace();
-        if (due <= now) {
-          // nix reports only the top-level result. Say why a leaf failed.
-          printError("%s: %s", job.drvPath.to_string(), job.unplaceableReason);
-          job.unplaceableSince.reset();
-          job.result = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, job.unplaceableReason);
-          ready.push_back(&job);
-          cv.notify_all();
-        } else {
-          wake = std::min(wake, due);
-        }
-      }
+    while (!stop.stop_requested() && exe.remainingJobs() > 0) {
+      auto const wake = exe.reap(std::chrono::steady_clock::now(), store.restartGrace());
+      flushLocked();
       cv.wait_until(lock, wake);
     }
   }
 
-  // A fresh stream: everything not finished is Wanted again. Assigned jobs
-  // too, so the scheduler keeps their builds instead of revoking them.
   void attach(grpc::ClientReaderWriter<remote::ClientMsgs, remote::SchedMsgs> * fresh) {
     std::scoped_lock const lock(mutex);
     stream = fresh;
     closed = false;
-    for (auto & [drvPath, job] : jobs) {
-      bool const pending = !job.result && !job.failedInput && !job.lost && job.waiting == 0;
-      if (pending && std::ranges::find(wantable, &job) == wantable.end()
-          && std::ranges::find(ready, &job) == ready.end()) {
-        wantable.push_back(&job);
-      }
-    }
-    flushWants();
+    exe.connected();
+    flushLocked();
   }
 
   auto detach() -> size_t {
     std::scoped_lock const lock(mutex);
     stream = nullptr;
-    return remaining;
+    exe.disconnected();
+    return exe.remainingJobs();
   }
 
-  // No scheduler any more: jobs a thread already holds finish, the rest fail.
-  void abandon() {
+  auto progress() -> uint64_t {
     std::scoped_lock const lock(mutex);
-    for (auto & [drvPath, job] : jobs) {
-      if (job.result || job.failedInput || job.lost || !job.workerAddr.empty() || job.waiting > 0) {
+    return exe.progress();
+  }
+
+    void abandon() {
+    std::scoped_lock const lock(mutex);
+    exe.abandon();
+    flushLocked();
+  }
+
+    void collectResults() {
+    using nixcompat::FailureStatus;
+    using nixgrpc::exec::Outcome;
+    for (JobId jid = 0; jid < byId.size(); jid++) {
+      auto & job = *byId.at(jid);
+      const auto * done = std::get_if<nixgrpc::exec::state::Done>(&exe.at(jid));
+      if (job.result || done == nullptr) {
         continue;
       }
-      job.lost = true;
-      std::erase(wantable, &job);
-      if (std::ranges::find(ready, &job) == ready.end()) {
-        ready.push_back(&job);
+      switch (done->outcome) {
+      case Outcome::cached:
+        job.result = cachedResult(job);
+        break;
+      case Outcome::dependencyFailed: {
+        auto const input = exe.failedInput(jid);
+        job.result = nixcompat::failed(
+            FailureStatus::DependencyFailed,
+            fmt("dependency '%s' failed", input ? byId.at(*input)->drvPath.to_string() : "?"));
+        break;
+      }
+      case Outcome::unplaceable:
+        // nix reports only the top-level result. Say why a leaf failed.
+        printError("%s: %s", job.drvPath.to_string(), done->message);
+        [[fallthrough]];
+      default:
+        job.result = nixcompat::failed(FailureStatus::MiscFailure,
+                                       isInterrupted() ? std::string("interrupted") : done->message);
       }
     }
-    flushWants();
   }
 };
 
@@ -528,14 +549,18 @@ void logReconnect(const std::string & where, const grpc::Status & status, bool r
 } // namespace
 
 // The scheduler holds soft state only: on a broken stream reconnect and
-// re-Want everything not yet placed. Jobs already Assigned carry on.
+// re-Want everything not done. Placed jobs carry on.
 auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::Status {
+  // One long build may be all there is, so a long-lived stream counts as progress.
+  static constexpr std::chrono::seconds healthyStream{30};
   grpc::Status status;
   std::optional<nixgrpc::Backoff> backoff;
   bool handover = false;
   for (;;) {
     nixgrpc::Call call;
     addHeaders(call.ctx(), headers);
+    auto const before = run.progress();
+    auto const opened = std::chrono::steady_clock::now();
     auto stream = sched->Schedule(&call.ctx());
     run.attach(stream.get());
     debug("grpc: Schedule stream open, %d jobs", run.jobs.size());
@@ -547,7 +572,9 @@ auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::
     if (isInterrupted() || !(restarting || schedulerGone(status))) {
       return status;
     }
-    if (!backoff || answered) {
+    bool const recovered =
+        run.progress() != before || (answered && std::chrono::steady_clock::now() - opened >= healthyStream);
+    if (!backoff || recovered) {
       backoff.emplace(restartGrace());
     }
     if (backoff->exhausted()) {
@@ -555,7 +582,7 @@ auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::
     }
     // The balancer has no healthy upstream until the new leader is up, so
     // retries after an announced restart belong to the same handover.
-    handover = answered ? restarting : handover || restarting;
+    handover = recovered ? restarting : handover || restarting;
     logReconnect(config->authority.to_string(), status, handover);
     std::this_thread::sleep_for(backoff->next());
   }
@@ -565,13 +592,8 @@ void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, BuildMode buildMode, St
   if (jobs.empty()) {
     return;
   }
-  Run run{.store = *this, .mode = buildMode, .evalStore = evalStore, .jobs = jobs, .remaining = jobs.size()};
-  for (auto & [drvPath, job] : jobs) {
-    run.byName.emplace(std::string(drvPath.to_string()), &job);
-    if (job.waiting == 0) {
-      run.wantable.push_back(&job);
-    }
-  }
+  auto const threadCount = std::min<size_t>(config->maxBuilds, jobs.size());
+  Run run(*this, buildMode, evalStore, jobs, threadCount);
   auto const headers = routingFor(jobs.begin()->second.drv);
   // Uploading here keeps a build from waiting on the upload of its inputs' derivations.
   std::vector<StorePath> drvPaths;
@@ -580,7 +602,7 @@ void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, BuildMode buildMode, St
     drvPaths.push_back(drvPath);
   }
   uploadDrvClosure(evalStore, std::move(drvPaths), headers);
-  std::vector<std::jthread> threads(std::min<size_t>(config->maxBuilds, jobs.size()));
+  std::vector<std::jthread> threads(threadCount);
   for (auto & thread : threads) {
     thread = std::jthread([&run] -> void { run.work(); });
   }
@@ -598,6 +620,7 @@ void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, BuildMode buildMode, St
   run.abandon();
   reaper.request_stop();
   threads.clear(); // join
+  run.collectResults();
 }
 
 auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode buildMode,
@@ -736,6 +759,22 @@ auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, Store & 
       [&](const StorePathSet & paths) -> StorePathSet { return queryValidPaths(paths, NoSubstitute); });
 }
 
+auto GrpcStore::farmJob(Store & evalStore, const StorePath & drvPath, const Derivation & full,
+                        const std::function<bool(const StorePath &)> & isJob) -> Job {
+  Job job{.drvPath = drvPath, .drv = basicForFarm(evalStore, drvPath, full)};
+  nixcompat::forInputDrvs(full, [&](const StorePath & input) -> void {
+    if (isJob(input)) {
+      return;
+    }
+    for (auto & [name, path] : evalStore.queryStaticPartialDerivationOutputMap(input)) {
+      if (path) {
+        job.farmInputs.emplace(*path, input);
+      }
+    }
+  });
+  return job;
+}
+
 void GrpcStore::loadJobs(const std::vector<DerivedPath> & reqs, Store & evalStore,
                   std::map<StorePath, Job> & jobs) {
   auto const missing = missingInputDrvs(reqs, evalStore);
@@ -744,17 +783,15 @@ void GrpcStore::loadJobs(const std::vector<DerivedPath> & reqs, Store & evalStor
       return found->second;
     }
     auto const full = evalStore.readDerivation(drvPath);
-    auto & job = jobs.emplace(drvPath, Job{.drvPath = drvPath,
-                                           .drv = basicForFarm(evalStore, drvPath, full)})
-                     .first->second;
+    auto const isJob = [&](const StorePath & input) -> bool { return missing.contains(input); };
+    auto & job = jobs.emplace(drvPath, farmJob(evalStore, drvPath, full, isJob)).first->second;
     nixcompat::forInputDrvs(full, [&](const StorePath & input) -> void {
-      if (!missing.contains(input)) {
+      if (!isJob(input)) {
         return;
       }
       auto & dep = load(input);
       dep.dependants.push_back(&job);
       job.inputs.push_back(&dep);
-      job.waiting++;
     });
     return job;
   };

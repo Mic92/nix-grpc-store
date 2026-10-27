@@ -462,6 +462,17 @@ inline auto buildCores() -> unsigned {
   return get(nix::settings);
 }
 
+inline auto keepGoing() -> bool {
+  constexpr auto get = []<typename S>(S &settings) -> bool {
+    if constexpr (requires { settings.getWorkerSettings(); }) {
+      return settings.getWorkerSettings().keepGoing;
+    } else {
+      return settings.keepGoing;
+    }
+  };
+  return get(nix::settings);
+}
+
 inline auto buildTimeout() -> time_t {
   constexpr auto get = []<typename S>(S &settings) -> time_t {
     if constexpr (requires { settings.getWorkerSettings(); }) {

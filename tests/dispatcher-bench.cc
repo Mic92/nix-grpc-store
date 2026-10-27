@@ -42,6 +42,7 @@
 #include <vector>
 
 #include "dispatcher.hh"
+#include "executor.hh"
 #include "metrics.hh"
 #include "nix_remote.pb.h"
 
@@ -289,15 +290,16 @@ struct Sim
     std::unordered_set<std::string> built; // outputs some worker has
 
     // ---- clients
+    // The real client's executor; the sim stands in for its threads and stream.
     struct ClientSim
     {
         size_t idx;
         const Dag * dag;
         Dispatcher::ClientPtr conn;
-        std::vector<uint32_t> waiting; // unfinished deps per node
-        std::vector<bool> done;
+        nixgrpc::exec::Executor exe{{.threads = SIZE_MAX, .rescheduleRetries = nixgrpc::exec::Executor::defaultRescheduleRetries, .keepGoing = true}};
+        std::vector<nixgrpc::exec::JobId> ids; // node -> job
+        std::vector<uint32_t> nodes;           // job -> node
         std::unordered_map<std::string_view, uint32_t> local; // drvPath -> node
-        size_t remaining = 0;
         double finishedAt = 0;
     };
 
@@ -398,19 +400,38 @@ struct Sim
             return true;
         }, [] { std::abort(); });
         auto n = cs->dag->ids.size();
-        cs->waiting.resize(n);
-        cs->done.assign(n, false);
-        cs->remaining = n;
         cs->local.reserve(n);
+        cs->ids.assign(n, UINT32_MAX);
+        std::function<nixgrpc::exec::JobId(uint32_t)> add = [&](uint32_t k) -> nixgrpc::exec::JobId {
+            if (cp->ids[k] != UINT32_MAX) {
+                return cp->ids[k];
+            }
+            std::vector<nixgrpc::exec::JobId> inputs;
+            for (auto d : cp->dag->deps[k]) {
+                inputs.push_back(add(d));
+            }
+            cp->ids[k] = cp->exe.add(cp->dag->cp[k], inputs);
+            cp->nodes.push_back(k);
+            return cp->ids[k];
+        };
         for (size_t k = 0; k < n; k++) {
-            cs->waiting[k] = static_cast<uint32_t>(cs->dag->deps[k].size());
+            add(static_cast<uint32_t>(k));
             cs->local.emplace(world.specs[cs->dag->ids[k]].drvPath, static_cast<uint32_t>(k));
         }
         clients.push_back(std::move(cs));
-        for (size_t k = 0; k < n; k++) {
-            if (cp->waiting[k] == 0) {
-                sendWant(*cp, static_cast<uint32_t>(k));
-            }
+        cp->exe.connected();
+        flush(*cp);
+    }
+
+    void flush(ClientSim & cs)
+    {
+        for (auto id : cs.exe.takeWants()) {
+            sendWant(cs, cs.nodes[id]);
+        }
+        if (cs.exe.remainingJobs() == 0 && cs.finishedAt == 0) {
+            cs.finishedAt = now;
+            clientsDone++;
+            timed("client_gone", [&] { disp.clientGone(cs.conn); });
         }
     }
 
@@ -447,33 +468,22 @@ struct Sim
             return;
         }
         auto k = it->second;
-        if (cs.done[k]) {
+        auto const id = cs.ids[k];
+        if (msg.has_cached()) {
+            cs.exe.onCached(id);
+            flush(cs);
             return;
         }
-        if (msg.has_cached()) {
-            nodeDone(cs, k);
-        } else {
+        cs.exe.onAssigned(id, {.addr = msg.assigned().worker_addr(), .assignId = msg.assigned().assign_id(), .system = {}});
+        if (cs.exe.next()) {
             followers.emplace(*drv, std::pair(&cs, k));
         }
     }
 
     void nodeDone(ClientSim & cs, uint32_t k)
     {
-        if (cs.done[k]) {
-            return;
-        }
-        cs.done[k] = true;
-        cs.remaining--;
-        for (auto d : cs.dag->dnts[k]) {
-            if (--cs.waiting[d] == 0) {
-                sendWant(cs, d);
-            }
-        }
-        if (cs.remaining == 0) {
-            cs.finishedAt = now;
-            clientsDone++;
-            timed("client_gone", [&] { disp.clientGone(cs.conn); });
-        }
+        cs.exe.finished(cs.ids[k], true);
+        flush(cs);
     }
 
     void run()

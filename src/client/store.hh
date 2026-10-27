@@ -80,6 +80,7 @@
 #include <utility>
 
 #include "channel.hh"
+#include "executor.hh"
 #include "nix-compat.hh"
 #include "nar-fetcher.hh"
 #include "retry.hh"
@@ -331,19 +332,28 @@ public:
     static constexpr int minReconnectBackoffMs = 2000;
     template<typename F>
     void retrying(const char * what, const F & attempt) {
-      nixgrpc::Backoff backoff(retryBudget());
+      // From the first failure, not the call's start: a long upload cut
+      // off late still gets the whole budget.
+      std::optional<nixgrpc::Backoff> backoff;
       for (;;) {
         auto const status = attempt();
         checkInterrupt();
         if (status.ok()) {
           everConnected = true;
         }
-        if (!nixgrpc::goneAway(status) || backoff.exhausted()) {
+        if (!nixgrpc::goneAway(status)) {
+          checkStatus(status, what);
+          return;
+        }
+        if (!backoff) {
+          backoff.emplace(retryBudget());
+        }
+        if (backoff->exhausted()) {
           checkStatus(status, what);
           return;
         }
         printError("%s: %s, retrying", config->authority.to_string(), firstLine(status.error_message()));
-        std::this_thread::sleep_for(backoff.next());
+        std::this_thread::sleep_for(backoff->next());
       }
     }
 
@@ -473,39 +483,31 @@ public:
     }
 
     // Log lines stream, the result carries the output path infos.
-    auto tryBuildDerivation(const remote::BuildDerivationRequest & request, const Metadata & headers,
-                            std::optional<BuildResult> & res) -> grpc::Status;
+        auto tryBuildDerivation(const remote::BuildDerivationRequest & request, const Metadata & headers,
+                            std::optional<BuildResult> & res, std::string & missingInput) -> grpc::Status;
 
     struct Job {
       StorePath drvPath;
       BasicDerivation drv;
-      std::vector<Job *> dependants;
+      std::vector<Job *> dependants; // for the critical-path hint
       std::vector<Job *> inputs;
-      size_t waiting = 0;
       uint64_t cpHintMs = 0;
-      unsigned bounced = 0;
-      std::optional<StorePath> failedInput;
+      // Outputs of input drvs left to the farm, and their drv: a missing one becomes a job.
+      std::map<StorePath, StorePath> farmInputs;
       std::optional<BuildResult> result;
-      // Set by the reader thread, consumed by a build thread.
-      std::string workerAddr;
-      uint64_t assignId = 0;
-      std::string workerSystem; // empty from older schedulers
-      // A second Assigned while building: the scheduler moved the drv to a
-      // worker that was already at it. Followed when the current one bounces.
-      std::string redirectAddr;
-      uint64_t redirectId = 0;
-      std::string redirectSystem;
-      bool lost = false; // scheduler stream gone before assignment
-      // Set on Unplaceable, cleared on Assigned. reapUnplaceable fails the
-      // job once it is older than restart-grace.
-      std::optional<std::chrono::steady_clock::time_point> unplaceableSince;
-      std::string unplaceableReason;
     };
     struct Run;
 
+        struct Bounced {};
+        struct MissingInput {
+      StorePath path;
+    };
+    using Attempt = std::variant<BuildResult, Bounced, MissingInput>;
+
     // One BuildDerivation against the assigned worker. NOT_FOUND: upload the
-    // drv closure there and ask again. Returns nullopt if the worker bounced us.
-    auto buildAssigned(Job & job, BuildMode buildMode, Store & evalStore) -> std::optional<BuildResult>;
+    // drv closure there and ask again.
+    auto buildAssigned(const Job & job, const nixgrpc::exec::Placement & where, BuildMode buildMode, Store & evalStore)
+        -> Attempt;
 
     // The build hook and plain `--store grpc://` pass no eval store but
     // usually have the derivations in the local store.
@@ -520,6 +522,8 @@ public:
 
     auto basicForFarm(Store & evalStore, const StorePath & drvPath, const Derivation & full)
         -> BasicDerivation;
+        auto farmJob(Store & evalStore, const StorePath & drvPath, const Derivation & full,
+                 const std::function<bool(const StorePath &)> & isJob) -> Job;
 
     auto missingInputDrvs(const std::vector<nix::DerivedPath> & reqs, nix::Store & evalStore) -> nix::StorePathSet;
     void loadJobs(const std::vector<DerivedPath> & reqs, Store & evalStore,

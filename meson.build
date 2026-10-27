@@ -216,6 +216,7 @@ if build_server
 
   dispatcher_bench = executable('dispatcher-bench',
     sources : ['tests/dispatcher-bench.cc'],
+    include_directories : [include_directories('src/client')],
     dependencies : [dispatcher_dep, jemalloc_dep],
   )
   benchmark('dispatcher', dispatcher_bench, args : ['large'], timeout : 300)
@@ -317,6 +318,12 @@ if build_server
     cpp_args : nix_compat_args + ['-UNDEBUG'],
     dependencies : common_deps + [nix_store_dep, nix_util_dep],
   ), timeout : 30)
+
+  test('executor', executable('executor-test',
+    sources : ['tests/executor-test.cc'],
+    include_directories : [src_inc, include_directories('src/client')],
+    cpp_args : ['-UNDEBUG'],
+  ))
 
   test('retry', executable('retry-test',
     sources : ['tests/retry-test.cc'],
