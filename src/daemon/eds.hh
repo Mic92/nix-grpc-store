@@ -14,6 +14,7 @@
 
 #include "auth.hh"
 #include "dispatcher.hh"
+#include "idle.hh"
 #include "eds.grpc.pb.h"
 
 namespace nixgrpc {
@@ -23,7 +24,7 @@ class EdsService final : public envoy::service::endpoint::v3::EndpointDiscoveryS
 public:
     static constexpr unsigned maxStreams = 64;
 
-    EdsService(Dispatcher & dispatcher, Auth & auth);
+    EdsService(Dispatcher & dispatcher, Auth & auth, IdleTracker & idle);
 
     auto StreamEndpoints(grpc::CallbackServerContext * context)
         -> grpc::ServerBidiReactor<envoy::service::endpoint::v3::DiscoveryRequest, envoy::service::endpoint::v3::DiscoveryResponse> *
@@ -48,6 +49,7 @@ public:
 private:
     Dispatcher * dispatcher;
     Auth * auth;
+    IdleTracker * idle;
     std::atomic<bool> active_{true};
     std::atomic<unsigned> open_{0};
     absl::Mutex renderMutex;

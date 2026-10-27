@@ -46,9 +46,11 @@ in
 
     idleTimeout = lib.mkOption {
       type = lib.types.nullOr lib.types.ints.positive;
-      default = 600;
+      default = if cfg.scheduler == null then 600 else null;
+      defaultText = lib.literalExpression "if scheduler == null then 600 else null";
       description = ''
-        Exit after this many seconds without in-flight RPCs. systemd keeps
+        Exit after this many seconds without in-flight RPCs or open farm
+        streams. Must be `null` with {option}`scheduler`. systemd keeps
         the socket and restarts the daemon on the next connection. `null`
         runs the daemon as a plain service that binds {option}`listen` itself.
       '';

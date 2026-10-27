@@ -16,6 +16,13 @@ in
   imports = [ ./common.nix ];
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = cfg.scheduler == null || cfg.idleTimeout == null;
+        message = "services.nix-grpc-daemon.idleTimeout must be null with scheduler: an idle builder would stop taking work";
+      }
+    ];
+
     # gRPC clients inherit the store privileges of this uid via the proxied
     # nix-daemon connection, so default to a dedicated unprivileged user.
     users.users.nix-grpc-daemon = {
@@ -59,6 +66,11 @@ in
         ExecStart = lib.escapeShellArgs (import ./daemon-args.nix { inherit cfg lib pkgs; });
         # Builds run in nix-daemon. This only bounds the proxy.
         MemoryMax = lib.mkDefault "2G";
+      }
+      // lib.optionalAttrs (!socketActivated) {
+        # Binds listen itself, which may be a port below 1024.
+        AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
+        CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
       }
       // lib.optionalAttrs builder {
         ExecReload = "${pkgs.coreutils}/bin/kill -TERM $MAINPID";

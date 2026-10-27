@@ -34,6 +34,7 @@
 #include "dispatcher.hh"
 #include "eds.hh"
 #include "elector.hh"
+#include "idle.hh"
 #include "log-spill.hh"
 #include "metrics.hh"
 #include "nix_remote.grpc.pb.h"
@@ -159,7 +160,7 @@ private:
 class SchedulerService final : public nix::remote::Scheduler::CallbackService
 {
 public:
-    SchedulerService(Dispatcher & dispatcher, Auth & auth);
+    SchedulerService(Dispatcher & dispatcher, Auth & auth, IdleTracker & idle);
 
     auto Schedule(grpc::CallbackServerContext * context)
         -> grpc::ServerBidiReactor<nix::remote::ClientMsgs, nix::remote::SchedMsgs> * override;
@@ -178,6 +179,7 @@ public:
 private:
     Dispatcher * dispatcher;
     Auth * auth;
+    IdleTracker * idle;
     std::atomic<bool> active_{true};
 };
 
@@ -185,7 +187,7 @@ private:
 class Coordinator
 {
 public:
-    Coordinator(const Options & options, Auth & auth, Metrics & metrics);
+    Coordinator(const Options & options, Auth & auth, Metrics & metrics, IdleTracker & idle);
     ~Coordinator();
     Coordinator(const Coordinator &) = delete;
     Coordinator(Coordinator &&) = delete;

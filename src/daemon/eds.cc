@@ -27,6 +27,7 @@
 #include "acl.hh"
 #include "auth.hh"
 #include "dispatcher.hh"
+#include "idle.hh"
 #include "eds.pb.h"
 #include "logfmt.hh"
 #include "sched-reactor.hh"
@@ -153,8 +154,9 @@ enum class Phase : uint8_t { Open, Closed, ReadsDone, Finished };
 class EdsReactor final : public grpc::ServerBidiReactor<pb::DiscoveryRequest, pb::DiscoveryResponse>
 {
 public:
-    EdsReactor(grpc::CallbackServerContext * ctx, Dispatcher & disp, EdsService & svc)
-        : ctx(ctx)
+    EdsReactor(grpc::CallbackServerContext * ctx, Dispatcher & disp, EdsService & svc, IdleTracker & idle)
+        : active(idle)
+        , ctx(ctx)
         , disp(disp)
         , svc(svc)
         , stream(std::make_shared<Stream>())
@@ -350,6 +352,7 @@ private:
         }
     }
 
+    IdleTracker::Guard active;
     grpc::CallbackServerContext * ctx;
     Dispatcher & disp;
     EdsService & svc;
@@ -367,9 +370,10 @@ private:
     Phase phase ABSL_GUARDED_BY(mutex) = Phase::Open;
 };
 
-EdsService::EdsService(Dispatcher & dispatcher, Auth & auth)
+EdsService::EdsService(Dispatcher & dispatcher, Auth & auth, IdleTracker & idle)
     : dispatcher(&dispatcher)
     , auth(&auth)
+    , idle(&idle)
 {
 }
 
@@ -424,7 +428,7 @@ auto EdsService::StreamEndpoints(grpc::CallbackServerContext * context)
         return new Reject({grpc::StatusCode::RESOURCE_EXHAUSTED, "too many endpoint streams"}); // NOLINT(cppcoreguidelines-owning-memory)
     }
     logLine(LogLevel::info, {{"event", "eds_stream_open"}, {"cn", caller.name}, {"peer", context->peer()}});
-    return new EdsReactor(context, *dispatcher, *this); // NOLINT(cppcoreguidelines-owning-memory)
+    return new EdsReactor(context, *dispatcher, *this, *idle); // NOLINT(cppcoreguidelines-owning-memory)
 }
 
 } // namespace nixgrpc

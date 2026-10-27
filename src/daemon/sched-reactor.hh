@@ -18,6 +18,7 @@
 #include <grpcpp/support/status.h>
 
 #include "dispatcher.hh"
+#include "idle.hh"
 #include "logfmt.hh"
 #include "nix_remote.pb.h"
 
@@ -203,8 +204,9 @@ class ScheduleReactor final
     : public SchedReactorBase<nix::remote::ClientMsgs, nix::remote::SchedMsg, nix::remote::SchedMsgs>
 {
 public:
-    ScheduleReactor(grpc::CallbackServerContext * ctx, Dispatcher & disp)
+    ScheduleReactor(grpc::CallbackServerContext * ctx, Dispatcher & disp, IdleTracker & idle)
         : SchedReactorBase(ctx)
+        , active(idle)
         , disp(disp)
         , client(disp.connectClient(sender(disp), [ctx] -> void { ctx->TryCancel(); }))
     {
@@ -223,6 +225,7 @@ protected:
     }
 
 private:
+    IdleTracker::Guard active;
     Dispatcher & disp;
     Dispatcher::ClientPtr client;
 };
@@ -231,8 +234,9 @@ class WorkerSessionReactor final
     : public SchedReactorBase<nix::remote::WorkerMsgs, nix::remote::SchedCmd, nix::remote::SchedCmds>
 {
 public:
-    WorkerSessionReactor(grpc::CallbackServerContext * ctx, Dispatcher & disp)
+    WorkerSessionReactor(grpc::CallbackServerContext * ctx, Dispatcher & disp, IdleTracker & idle)
         : SchedReactorBase(ctx)
+        , active(idle)
         , disp(disp)
         , worker{.send = sender(disp), .abort = [ctx] -> void { ctx->TryCancel(); }}
     {
@@ -252,6 +256,7 @@ protected:
     }
 
 private:
+    IdleTracker::Guard active;
     Dispatcher & disp;
     Dispatcher::Worker worker;
 };

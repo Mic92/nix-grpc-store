@@ -123,6 +123,7 @@ auto makeTls() -> Creds
 class Service final : public nix::remote::Scheduler::CallbackService
 {
     Dispatcher & disp;
+    IdleTracker idle;
 
 public:
     explicit Service(Dispatcher & disp)
@@ -132,12 +133,12 @@ public:
 
     auto Schedule(grpc::CallbackServerContext * ctx) -> grpc::ServerBidiReactor<ClientMsgs, SchedMsgs> * override
     {
-        return new ScheduleReactor(ctx, disp);
+        return new ScheduleReactor(ctx, disp, idle);
     }
 
     auto WorkerSession(grpc::CallbackServerContext * ctx) -> grpc::ServerBidiReactor<WorkerMsgs, SchedCmds> * override
     {
-        return new WorkerSessionReactor(ctx, disp);
+        return new WorkerSessionReactor(ctx, disp, idle);
     }
 };
 

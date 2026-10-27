@@ -1,5 +1,6 @@
 #include "coordinator.hh"
 #include "dispatcher.hh"
+#include "idle.hh"
 
 #include <algorithm>
 #include <atomic>
@@ -287,9 +288,10 @@ void Builder::tick()
 
 // ---------------------------------------------------------- SchedulerService
 
-SchedulerService::SchedulerService(Dispatcher & dispatcher, Auth & auth)
+SchedulerService::SchedulerService(Dispatcher & dispatcher, Auth & auth, IdleTracker & idle)
     : dispatcher(&dispatcher)
     , auth(&auth)
+    , idle(&idle)
 {
 }
 
@@ -304,7 +306,7 @@ auto SchedulerService::Schedule(grpc::CallbackServerContext * context)
     if (auto const status = Auth::authorize(caller, "Schedule", Role::write); !status.ok()) {
         return new RejectReactor<ClientMsgs, SchedMsgs>(status); // NOLINT(cppcoreguidelines-owning-memory)
     }
-    return new ScheduleReactor(context, *dispatcher); // NOLINT(cppcoreguidelines-owning-memory)
+    return new ScheduleReactor(context, *dispatcher, *idle); // NOLINT(cppcoreguidelines-owning-memory)
 }
 
 auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
@@ -318,7 +320,7 @@ auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
         return new RejectReactor<WorkerMsgs, SchedCmds>(status); // NOLINT(cppcoreguidelines-owning-memory)
     }
     logLine(LogLevel::info, {{"event", "worker_session_open"}, {"cn", caller.name}, {"peer", context->peer()}});
-    return new WorkerSessionReactor(context, *dispatcher); // NOLINT(cppcoreguidelines-owning-memory)
+    return new WorkerSessionReactor(context, *dispatcher, *idle); // NOLINT(cppcoreguidelines-owning-memory)
 }
 
 // -------------------------------------------------------------- Coordinator
@@ -389,7 +391,7 @@ void Coordinator::restarting()
     // finish, and a peer that misses the message just reconnects the old way.
 }
 
-Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics)
+Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics, IdleTracker & idle)
     : cache(options.niks3)
     , options(options)
 {
@@ -410,8 +412,8 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
                 .present = std::move(present),
                 .logLevel = options.logLevel},
             metrics);
-        scheduler = std::make_unique<SchedulerService>(*dispatcher, auth);
-        eds = std::make_unique<EdsService>(*dispatcher, auth);
+        scheduler = std::make_unique<SchedulerService>(*dispatcher, auth, idle);
+        eds = std::make_unique<EdsService>(*dispatcher, auth, idle);
     }
     if (builder && dispatcher && options.schedulerAddr.empty()) {
         // In-process worker: the Dispatcher calls straight into the Builder.

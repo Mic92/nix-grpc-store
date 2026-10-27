@@ -227,6 +227,10 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
     if (options.schedulerAddr.empty() && !options.scheduler) {
         throw nix::Error("--role builder without --scheduler has nobody to take work from");
     }
+    if (options.idleTimeout && !options.schedulerAddr.empty()) {
+        // Nothing would bring it back to take work.
+        throw nix::Error("--idle-timeout with --scheduler: the builder must stay connected");
+    }
     if (options.advertise.empty()) {
         options.advertise = options.listen;
     }

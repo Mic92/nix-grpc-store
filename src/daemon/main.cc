@@ -1185,7 +1185,7 @@ try {
         oidc.emplace(std::move(cfg));
     }
     nixgrpc::Auth auth{.acl = options.acl, .proxies = options.proxies, .oidc = &oidc};
-    nixgrpc::Coordinator coord(options, auth, metrics);
+    nixgrpc::Coordinator coord(options, auth, metrics, idle);
     nixgrpc::logLine(
         nixgrpc::LogLevel::info,
         {{"event", "roles"},
