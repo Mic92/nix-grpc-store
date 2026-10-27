@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <iostream>
@@ -276,6 +277,23 @@ void checkStats(Core & shard)
     shard.cancel(1, "e.drv");
 }
 
+// Wants for systems no worker offers are kept, but only for a few systems,
+// and a system is forgotten once nothing wants it.
+void testUnofferedSystems()
+{
+    Core shard;
+    for (size_t idx = 0; idx < Core::maxUnofferedSystems; idx++) {
+        auto const name = "sys" + std::to_string(idx);
+        assert(shard.admitsSystem(name));
+        shard.want(1, {.drvPath = name + ".drv", .inputs = {}, .system = name, .features = {}, .cpHintMs = 0}, 0);
+    }
+    assert(!shard.admitsSystem("one-too-many"));
+    assert(shard.admitsSystem("sys0"));
+    shard.cancel(1, "sys0.drv");
+    assert(shard.admitsSystem("one-too-many"));
+    assert(!shard.stats().contains({.system = "sys0", .features = ""}));
+}
+
 void testSystems()
 {
     Core shard;
@@ -348,6 +366,7 @@ try {
     testDraining();
     testFeatures();
     testSystems();
+    testUnofferedSystems();
     testStaleDoneAndUnknown();
     return 0;
 } catch (std::exception & err) {

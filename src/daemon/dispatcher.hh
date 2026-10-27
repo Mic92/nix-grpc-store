@@ -67,13 +67,14 @@ public:
     {
         sched::ClientId id = 0;
         ClientSend send;
+        std::function<void()> abort; // ends the stream; for errors off its thread
         bool known = false; // under Dispatcher::mutex: in `clients`
         bool gone = false;  // under Dispatcher::mutex
     };
 
     using ClientPtr = std::shared_ptr<Client>;
 
-    auto connectClient(ClientSend send) -> ClientPtr;
+    auto connectClient(ClientSend send, std::function<void()> abort) -> ClientPtr;
     // May hand the batch to the lookup pool; `client` is kept alive until applied.
     void clientMsgs(const ClientPtr & client, const nix::remote::ClientMsgs & msgs);
     void clientGone(const ClientPtr & client);

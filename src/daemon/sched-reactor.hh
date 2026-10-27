@@ -206,7 +206,7 @@ public:
     ScheduleReactor(grpc::CallbackServerContext * ctx, Dispatcher & disp)
         : SchedReactorBase(ctx)
         , disp(disp)
-        , client(disp.connectClient(sender(disp)))
+        , client(disp.connectClient(sender(disp), [ctx] -> void { ctx->TryCancel(); }))
     {
         start();
     }

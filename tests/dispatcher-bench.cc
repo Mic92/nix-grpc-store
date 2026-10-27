@@ -396,7 +396,7 @@ struct Sim
             // Under the dispatcher mutex: defer like a real stream would.
             at(now, [this, cp, msg] { onSched(*cp, msg); });
             return true;
-        });
+        }, [] { std::abort(); });
         auto n = cs->dag->ids.size();
         cs->waiting.resize(n);
         cs->done.assign(n, false);
