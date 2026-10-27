@@ -166,8 +166,10 @@ let
     def ren: . as $n | (names[$n] // $n);
     # SDS resource files: a ConfigMap path in the chart, a store path in NixOS.
     def sds: walk(if type == "object" and has("path_config_source") then .path_config_source.path = "X" else . end);
+    # The chart's admin stays on loopback behind a stats listener.
     .static_resources | sds
-    | .clusters |= (map(.name |= ren
+    | .listeners |= map(select(.name != "stats"))
+    | .clusters |= (map(select(.name != "admin")) | map(.name |= ren
                         | if has("load_assignment") then
                             .load_assignment.cluster_name |= ren
                             | .load_assignment.endpoints[0].lb_endpoints |= map(.endpoint.address.socket_address.address = "X" | .endpoint.address.socket_address |= del(.ipv4_compat))
@@ -235,7 +237,7 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
 
     # A public certificate faces clients, the farm-CA one still faces the nodes.
     envoyCerts() { yq -r 'select(.kind == "ConfigMap" and .metadata.name == "t-nix-grpc-farm-lb") | .data."envoy.json"' "$1" \
-      | jq -c '[.static_resources.listeners[0].filter_chains[0].transport_socket.typed_config.common_tls_context.tls_certificate_sds_secret_configs[0].name, ([.static_resources.clusters[].transport_socket.typed_config.common_tls_context.tls_certificate_sds_secret_configs[0].name] | unique)]'; }
+      | jq -c '[.static_resources.listeners[0].filter_chains[-1].transport_socket.typed_config.common_tls_context.tls_certificate_sds_secret_configs[0].name, ([.static_resources.clusters[] | select(.name != "admin") | .transport_socket.typed_config.common_tls_context.tls_certificate_sds_secret_configs[0].name] | unique)]'; }
     test "$(envoyCerts out.yaml)" = '["lb",["lb"]]'
     ! grep -q "name: t-nix-grpc-farm-public" cm.yaml
     helm template t chart -f ${json.generate "values.json" valuesPublicCertManager} > public-cm.yaml
@@ -273,6 +275,35 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
     # Without a map the node's InternalIP is the address.
     daemon arm '.args[]' | grep -qx -- '--advertise=$(HOST_IP):50052'
     test "$(daemon arm '.command[0]')" = /bin/nix-grpc-daemon
+
+    # The CA secret also holds the CA key under cert-manager: mount only ca.crt.
+    for f in out.yaml cm.yaml; do
+      for d in t-nix-grpc-farm-worker-x86 t-nix-grpc-farm-scheduler-0 t-nix-grpc-farm-lb; do
+        test "$(pick Deployment $d '.spec.template.spec.volumes[] | select(.secret.secretName == "ca" or .secret.secretName == "t-nix-grpc-farm-ca") | .secret.items | to_json(0)' "$f")" = '[{"key":"ca.crt","path":"ca.crt"}]'
+      done
+    done
+
+    # Admin on loopback, only /ready and /stats/prometheus reachable.
+    envoy() { yq -r 'select(.kind == "ConfigMap" and .metadata.name == "t-nix-grpc-farm-lb") | .data."envoy.json"' "$1"; }
+    envoy out.yaml | jq -e '.admin.address.socket_address.address == "127.0.0.1"'
+    envoy out.yaml | jq -e '[.static_resources.listeners[] | select(.name == "stats") | .. | .path? // empty] == ["/ready", "/stats/prometheus"]'
+
+    # Upstream names are verified, and long streams are not capped at 1024.
+    envoy out.yaml | jq -e '[.static_resources.clusters[] | select(.name != "admin") | .transport_socket.typed_config.common_tls_context.combined_validation_context.default_validation_context.match_typed_subject_alt_names[0].matcher.exact] | unique == ["worker"]'
+    envoy out.yaml | jq -e '[.static_resources.clusters[] | select(.name != "admin") | .circuit_breakers.thresholds[0].max_requests] | unique == [1000000]'
+
+    # A rollout's surge pod gets Ready while the old one leads, and may share its node.
+    test "$(pick Deployment t-nix-grpc-farm-scheduler-0 '.spec.template.spec.containers[0].readinessProbe.grpc.service' in-cluster.yaml)" = null
+    test "$(pick Deployment t-nix-grpc-farm-scheduler-1 '.spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].labelSelector.matchExpressions[0].values[0]' out.yaml)" = 1
+
+    # Builders dial the .svc name, which the public certificate lacks.
+    envoy public-cm.yaml | jq -e '.static_resources.listeners[0].filter_chains[0] | (.filter_chain_match.server_names | index("t-nix-grpc-farm.default.svc")) and .transport_socket.typed_config.common_tls_context.tls_certificate_sds_secret_configs[0].name == "lb"'
+
+    # Worker settings that must reach nix-daemon, and a changed cache must roll workers.
+    pick ConfigMap t-nix-grpc-farm-worker-x86 '.data."farm.conf"' out.yaml | grep -qx 'build-dir = /build'
+    helm template t chart -f ${valuesFile} --set 'upstreamCaches.urls={https://other}' --api-versions monitoring.coreos.com/v1/PodMonitor > caches.yaml
+    sum() { pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.metadata.annotations."checksum/config"' "$1"; }
+    test "$(sum out.yaml)" != "$(sum caches.yaml)"
 
     touch $out
   ''

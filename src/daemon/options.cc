@@ -105,6 +105,16 @@ void finishNiks3(Niks3Config & niks3, const std::string & tlsCert, const std::st
         argv.insert(argv.end(), {"--client-cert", niks3.clientCert, "--client-key", niks3.clientKey});
     }
 }
+
+// `$(POD_IP):50051` is an unbracketed address on IPv6 pod networks.
+auto bracketHost(std::string_view addr) -> std::string
+{
+    auto const colon = addr.rfind(':');
+    if (colon == std::string_view::npos || addr.starts_with('[') || addr.starts_with("unix:") || !addr.substr(0, colon).contains(':')) {
+        return std::string(addr);
+    }
+    return "[" + std::string(addr.substr(0, colon)) + "]" + std::string(addr.substr(colon));
+}
 } // namespace
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity): flat flag list.
@@ -231,6 +241,7 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
         // Nothing would bring it back to take work.
         throw nix::Error("--idle-timeout with --scheduler: the builder must stay connected");
     }
+    options.advertise = bracketHost(options.advertise);
     if (options.advertise.empty()) {
         options.advertise = options.listen;
     }

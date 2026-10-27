@@ -372,7 +372,12 @@ pkgs.testers.runNixOSTest {
         machine.wait_for_unit("niks3.service")
         # envoy has health-checked both workers and the scheduler
         lb_ip = pod_ip("-l app.kubernetes.io/component=lb")
-        machine.wait_until_succeeds(f"test $(curl -sf {lb_ip}:9901/clusters | grep -c 'health_flags::healthy') -ge 3", timeout=sec(120))
+        machine.wait_until_succeeds(
+            f"test $(curl -sf {lb_ip}:9901/stats/prometheus | grep -v '^#' | grep '^envoy_cluster_membership_healthy' | grep -v 'envoy_cluster_name=\"admin\"' | awk '{{s+=$2}} END {{print s+0}}') -ge 3",
+            timeout=sec(120),
+        )
+        # The admin API is not reachable from the pod network.
+        machine.fail(f"curl -sf {lb_ip}:9901/clusters")
         sched_ip = pod_ip("-l app.kubernetes.io/component=scheduler")
         machine.wait_until_succeeds(f"curl -sf http://{sched_ip}:9464/metrics | grep -qx 'nix_grpc_sched{{kind=\"workers\"}} 2'", timeout=sec(120))
 

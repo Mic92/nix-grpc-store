@@ -29,6 +29,9 @@ type: STRICT_DNS
 dns_lookup_family: ALL
 {{- end }}
 connect_timeout: 5s
+# Streams last hours; the default 1024 would 503 the next one.
+circuit_breakers:
+  thresholds: [{max_connections: 1000000, max_pending_requests: 1000000, max_requests: 1000000}]
 typed_extension_protocol_options:
   envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
     "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
@@ -94,7 +97,14 @@ transport_socket:
       tls_certificate_sds_secret_configs: [{{ include "farm.envoy.sds" "lb" }}]
       {{- end }}
       {{- if (include "farm.tlsSecret" (list $root "clientCA")) }}
+      {{- with $root.Values.tls.worker.serverName }}
+      combined_validation_context:
+        default_validation_context:
+          match_typed_subject_alt_names: [{san_type: DNS, matcher: {exact: {{ . }}}}]
+        validation_context_sds_secret_config: {{ include "farm.envoy.sds" "ca" }}
+      {{- else }}
       validation_context_sds_secret_config: {{ include "farm.envoy.sds" "ca" }}
+      {{- end }}
       {{- end }}
 {{- end }}
 {{- end }}
@@ -154,8 +164,26 @@ access_log:
         text_format_source:
           inline_string: "conn peer=%DOWNSTREAM_REMOTE_ADDRESS% tls=%DOWNSTREAM_TLS_VERSION% subject=\"%DOWNSTREAM_PEER_SUBJECT%\" sni=%REQUESTED_SERVER_NAME% flags=%RESPONSE_FLAGS% tls_fail=\"%DOWNSTREAM_TRANSPORT_FAILURE_REASON%\" rx=%BYTES_RECEIVED% tx=%BYTES_SENT% ms=%DURATION%\n"
 {{- end }}
+{{- $root := . }}
+{{- $public := include "farm.tlsSecret" (list . "public") }}
+{{- /* Clients get the public certificate if there is one, else the farm-CA
+     one. The nodes always get tls.lb, picked by the in-cluster name they dial. */}}
+{{- $chains := list (dict "cert" ($public | empty | ternary "lb" "public") "names" list) }}
+{{- if $public }}
+{{- $name := include "farm.fullname" . }}
+{{- $chains = prepend $chains (dict "cert" "lb" "names" (list $name (printf "%s.%s" $name .Release.Namespace) (printf "%s.%s.svc" $name .Release.Namespace))) }}
+listener_filters:
+  - name: envoy.filters.listener.tls_inspector
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+{{- end }}
 filter_chains:
-  - filters:
+{{- range $chain := $chains }}
+  -
+    {{- with $chain.names }}
+    filter_chain_match: {server_names: {{ toJson . }}}
+    {{- end }}
+    filters:
       - name: envoy.filters.network.http_connection_manager
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
@@ -163,7 +191,7 @@ filter_chains:
           codec_type: HTTP2
           stream_idle_timeout: 0s
           http2_protocol_options:
-            max_concurrent_streams: {{ .Values.lb.maxStreams }}
+            max_concurrent_streams: {{ $root.Values.lb.maxStreams }}
             connection_keepalive: {interval: 10s, timeout: 5s}
           forward_client_cert_details: SANITIZE_SET
           set_current_client_cert_details: {subject: true}
@@ -171,29 +199,62 @@ filter_chains:
             virtual_hosts:
               - name: farm
                 domains: ["*"]
-                routes: {{ toJson .routes }}
+                routes: {{ toJson $root.routes }}
           http_filters:
             - name: envoy.filters.http.router
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
-    {{- $public := include "farm.tlsSecret" (list . "public") }}
-    {{- if or $public (include "farm.tlsSecret" (list . "lb")) }}
+    {{- if or $public (include "farm.tlsSecret" (list $root "lb")) }}
     transport_socket:
       name: envoy.transport_sockets.tls
       typed_config:
         "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
-        {{- if (include "farm.tlsSecret" (list . "clientCA")) }}
+        {{- if (include "farm.tlsSecret" (list $root "clientCA")) }}
         require_client_certificate: false # tokens keep working
         {{- end }}
         common_tls_context:
           alpn_protocols: [h2]
-          # Clients get the public certificate if there is one, else the
-          # farm-CA one. The nodes always get tls.lb.
-          tls_certificate_sds_secret_configs: [{{ include "farm.envoy.sds" ($public | empty | ternary "lb" "public") }}]
-          {{- if (include "farm.tlsSecret" (list . "clientCA")) }}
+          tls_certificate_sds_secret_configs: [{{ include "farm.envoy.sds" $chain.cert }}]
+          {{- if (include "farm.tlsSecret" (list $root "clientCA")) }}
           validation_context_sds_secret_config: {{ include "farm.envoy.sds" "ca" }}
           {{- end }}
     {{- end }}
+{{- end }}
+{{- end }}
+
+{{/* The admin API can stop envoy, so it stays on loopback. Probes and
+     scrapes reach just these two paths through a listener of their own. */}}
+{{- define "farm.envoy.statsListener" -}}
+name: stats
+address:
+  socket_address: {address: "::", port_value: 9901, ipv4_compat: true}
+filter_chains:
+  - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: stats
+          route_config:
+            virtual_hosts:
+              - name: stats
+                domains: ["*"]
+                routes:
+                  - {match: {path: /ready}, route: {cluster: admin}}
+                  - {match: {path: /stats/prometheus}, route: {cluster: admin}}
+          http_filters:
+            - name: envoy.filters.http.router
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+{{- end }}
+
+{{- define "farm.envoy.adminCluster" -}}
+name: admin
+type: STATIC
+load_assignment:
+  cluster_name: admin
+  endpoints:
+    - lb_endpoints:
+        - endpoint: {address: {socket_address: {address: 127.0.0.1, port_value: 9902}}}
 {{- end }}
 
 {{- define "farm.envoy.config" -}}
@@ -216,7 +277,7 @@ filter_chains:
 {{- $listener := include "farm.envoy.listener" (dict "Values" .Values "Chart" .Chart "Release" .Release "routes" $routes) | fromYaml }}
 {{- toJson (dict
   "node" (dict "id" "nix-grpc-farm-lb" "cluster" "nix-grpc-farm")
-  "admin" (dict "address" (dict "socket_address" (dict "address" "::" "port_value" 9901 "ipv4_compat" true)))
-  "static_resources" (dict "listeners" (list $listener) "clusters" $clusters)
+  "admin" (dict "address" (dict "socket_address" (dict "address" "127.0.0.1" "port_value" 9902)))
+  "static_resources" (dict "listeners" (list $listener (include "farm.envoy.statsListener" . | fromYaml)) "clusters" (append $clusters (include "farm.envoy.adminCluster" . | fromYaml)))
 ) }}
 {{- end }}

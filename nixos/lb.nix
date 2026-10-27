@@ -59,8 +59,23 @@ let
           tls_certificate_sds_secret_configs = [
             (certSds "lb" cfg.tls.upstream.certFile cfg.tls.upstream.keyFile)
           ];
-          validation_context_sds_secret_config = caSds "ca" cfg.tls.upstream.caFile;
-        };
+        }
+        // (
+          if cfg.tls.upstream.sni == null then
+            { validation_context_sds_secret_config = caSds "ca" cfg.tls.upstream.caFile; }
+          else
+            {
+              combined_validation_context = {
+                default_validation_context.match_typed_subject_alt_names = [
+                  {
+                    san_type = "DNS";
+                    matcher.exact = cfg.tls.upstream.sni;
+                  }
+                ];
+                validation_context_sds_secret_config = caSds "ca" cfg.tls.upstream.caFile;
+              };
+            }
+        );
       }
       // lib.optionalAttrs (cfg.tls.upstream.sni != null) { inherit (cfg.tls.upstream) sni; };
     };
@@ -106,6 +121,14 @@ let
   };
 
   http2 = {
+    # Streams last hours; the default 1024 would 503 the next one.
+    circuit_breakers.thresholds = [
+      {
+        max_connections = 1000000;
+        max_pending_requests = 1000000;
+        max_requests = 1000000;
+      }
+    ];
     typed_extension_protocol_options."envoy.extensions.upstreams.http.v3.HttpProtocolOptions" = {
       "@type" = "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions";
       explicit_http_config.http2_protocol_options = {

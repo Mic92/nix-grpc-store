@@ -122,7 +122,7 @@ spec:
         {{- end }}
         {{- with (include "farm.tlsSecret" (list . "clientCA")) }}
         - name: tls-ca
-          secret: {secretName: {{ . }}}
+          secret: {secretName: {{ . }}, items: [{key: ca.crt, path: ca.crt}]}
         {{- end }}
         {{- with (include "farm.tlsSecret" (list . "public")) }}
         - name: tls-public

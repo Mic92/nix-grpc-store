@@ -73,6 +73,9 @@ spec:
     {{- range splitList "," (include "farm.schedulerNames" $root) }}
     - {{ . }}.{{ $ns }}.svc
     {{- end }}
+    {{- with $root.Values.tls.worker.serverName }}
+    - {{ . }}
+    {{- end }}
   usages: [server auth, client auth]
   duration: {{ .duration }}
   privateKey: {algorithm: ECDSA, size: 256, rotationPolicy: Always}

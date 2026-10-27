@@ -40,6 +40,7 @@ data:
     substituters = {{ $root.Values.niks3.cacheURL }} {{ join " " $root.Values.upstreamCaches.urls }}
     trusted-public-keys = {{ join " " (concat $root.Values.niks3.publicKeys $root.Values.upstreamCaches.publicKeys) }}
     narinfo-cache-negative-ttl = 0
+    build-dir = /build
     keep-build-log = true
     max-jobs = {{ $w.maxJobs }}
     cores = {{ $w.cores }}
@@ -76,7 +77,7 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/config: {{ print $w $root.Values.niks3 $root.Values.sandbox $oidc | sha256sum }}
+        checksum/config: {{ print $w $root.Values.niks3 $root.Values.upstreamCaches $root.Values.sandbox $oidc | sha256sum }}
         {{- with $w.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -122,6 +123,8 @@ spec:
           command: [/bin/sh, -ec]
           args:
             - |
+              # emptyDir is world-writable, which nix refuses for build-dir.
+              chmod 0755 /build
               # A restart can pull a newer image whose /bin points at store paths the volume lacks.
               if [ -e /vol/nix/var/nix/db/db.sqlite ] &&
                  [ "$(readlink /vol/nix/var/nix/gcroots/image)" = "$(readlink /nix/var/nix/gcroots/image)" ]; then exit 0; fi
@@ -131,6 +134,7 @@ spec:
               mkdir -p /vol/nix/var/nix/daemon-socket /vol/nix/var/nix/gcroots /vol/nix/var/nix/profiles
           volumeMounts:
             - {name: nix, mountPath: /vol}
+            - {name: build, mountPath: /build}
       containers:
         - name: nix-daemon
           image: {{ include "farm.image" $root }}
@@ -337,7 +341,7 @@ spec:
         {{- end }}
         {{- with (include "farm.tlsSecret" (list $root "clientCA")) }}
         - name: ca
-          secret: {secretName: {{ . }}}
+          secret: {secretName: {{ . }}, items: [{key: ca.crt, path: ca.crt}]}
         {{- end }}
         {{- if $oidc }}
         - name: oidc

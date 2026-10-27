@@ -35,7 +35,8 @@
 }:
 let
   client = variant == "client";
-  nixbld = lib.genList (i: "nixbld${toString (i + 1)}") 32;
+  # One per slot (at most 63).
+  nixbld = lib.genList (i: "nixbld${toString (i + 1)}") 64;
   passwd = writeTextDir "etc/passwd" (
     ''
       root:x:0:0:root:/root:/bin/sh

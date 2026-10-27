@@ -66,6 +66,8 @@ spec:
             - topologyKey: kubernetes.io/hostname
               labelSelector:
                 matchLabels: {{- include "farm.schedulerSelectorLabels" $root | nindent 18 }}
+                matchExpressions:
+                  - {key: app.kubernetes.io/instance-rank, operator: NotIn, values: [{{ $i | quote }}]}
       {{- end }}
       containers:
         - name: nix-grpc-daemon
@@ -120,9 +122,10 @@ spec:
           ports:
             - {name: grpc, containerPort: 50051}
             - {name: metrics, containerPort: 9464}
-          {{- /* Ready = serving scheduler streams. Live = process answers. A draining or passive scheduler is live but not ready. */}}
+          {{- /* Ready = serving. Not tied to leadership: the surge pod of a
+               rollout must become Ready while the old one still leads. */}}
           {{- $tcp := not (empty (include "farm.tlsSecret" (list . "worker"))) }}
-          readinessProbe: {{- toYaml (merge (dict "periodSeconds" 5) (ternary (dict "tcpSocket" (dict "port" 50051)) (dict "grpc" (dict "port" 50051 "service" "nix.scheduler")) $tcp)) | nindent 12 }}
+          readinessProbe: {{- toYaml (merge (dict "periodSeconds" 5) (ternary (dict "tcpSocket" (dict "port" 50051)) (dict "grpc" (dict "port" 50051)) $tcp)) | nindent 12 }}
           livenessProbe: {{- toYaml (merge (dict "periodSeconds" 30 "timeoutSeconds" 10) (ternary (dict "tcpSocket" (dict "port" 50051)) (dict "grpc" (dict "port" 50051)) $tcp)) | nindent 12 }}
           volumeMounts:
             - {name: niks3-token, mountPath: /secrets/niks3, readOnly: true}
@@ -158,7 +161,7 @@ spec:
         {{- end }}
         {{- with (include "farm.tlsSecret" (list . "clientCA")) }}
         - name: ca
-          secret: {secretName: {{ . }}}
+          secret: {secretName: {{ . }}, items: [{key: ca.crt, path: ca.crt}]}
         {{- end }}
         {{- if $oidc }}
         - name: oidc
