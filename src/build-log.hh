@@ -2,6 +2,7 @@
 // Parser for the worker-protocol stderr stream the backend nix-daemon sends
 // around each operation. Shared between the daemon's build RPCs and the fuzzer.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -38,10 +39,20 @@ public:
 };
 #endif
 
-// nix::readString() preallocates the announced length.
 constexpr size_t kMaxLogString = size_t{1} << 20U;
 
 namespace detail {
+
+// nix::readString() preallocates the announced length, so read the head and skip the rest.
+inline auto readLogString(nix::Source & source) -> std::string
+{
+    auto const len = nix::readNum<uint64_t>(source);
+    std::string head(std::min<uint64_t>(len, kMaxLogString), '\0');
+    source(head.data(), head.size());
+    source.skip(len - head.size());
+    nix::readPadding(len, source);
+    return head;
+}
 
 inline auto readLogFields(nix::Source & source) -> std::vector<std::string>
 {
@@ -53,7 +64,7 @@ inline auto readLogFields(nix::Source & source) -> std::vector<std::string>
             nix::readNum<uint64_t>(source);
             fields.emplace_back();
         } else if (type == 1) {
-            fields.push_back(nix::readString(source, kMaxLogString));
+            fields.push_back(readLogString(source));
         } else {
             throw nix::Error("unknown logger field type %d from backend", type);
         }
@@ -78,12 +89,12 @@ inline void relayBuildLog(nix::Source & source, const BuildEventSink & send)
     while (true) {
         auto msg = nix::readNum<uint64_t>(source);
         if (msg == STDERR_NEXT) {
-            send({.text = nix::chomp(nix::readString(source, kMaxLogString))});
+            send({.text = nix::chomp(detail::readLogString(source))});
         } else if (msg == STDERR_START_ACTIVITY) {
             nix::readNum<uint64_t>(source); // id
             nix::readNum<uint64_t>(source); // level
             nix::readNum<uint64_t>(source); // type
-            nix::readString(source, kMaxLogString); // text
+            detail::readLogString(source); // text
             detail::readLogFields(source);
             nix::readNum<uint64_t>(source); // parent
         } else if (msg == STDERR_STOP_ACTIVITY) {
