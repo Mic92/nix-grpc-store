@@ -309,7 +309,8 @@ Scale-down is a drain, see below. [kubernetes.md](kubernetes.md#autoscale-a-work
 has a KEDA example.
 
 **Drain a builder.** `systemctl stop nix-grpc-daemon` stops new builds
-arriving and returns once running builds have published. After
+arriving, hands assignments no client has claimed yet back to the
+scheduler, and returns once the claimed ones have published. After
 `TimeoutStopSec` (1h) the rest is killed and the clients are sent to
 another worker. A second SIGTERM cancels right away. `nixos-rebuild
 switch` only signals the worker and the next connection starts the new

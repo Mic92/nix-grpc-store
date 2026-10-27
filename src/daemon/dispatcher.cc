@@ -648,6 +648,24 @@ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
          {"running", std::to_string(hel.running_size())}});
 }
 
+void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
+{
+    metrics.event("done_" + nix::remote::Done::Outcome_Name(done.outcome()));
+    if (done.outcome() == nix::remote::Done::GIVEN_BACK || done.outcome() == nix::remote::Done::NO_SHOW) {
+        core.giveBack(wid, done.drv_path());
+        metrics.event("given_back_" + nix::remote::Done::Reason_Name(done.reason()));
+        placeabilityChangedLocked(); // its followers may have no worker left
+        return;
+    }
+    std::vector<std::pair<std::string_view, uint64_t>> outputs;
+    if (done.outcome() == nix::remote::Done::BUILT) {
+        for (const auto & out : done.outputs()) {
+            outputs.emplace_back(out.path(), out.nar_size());
+        }
+    }
+    core.done(wid, done.drv_path(), outputs);
+}
+
 void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg)
 {
     if (msg.has_hello()) {
@@ -655,15 +673,7 @@ void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg &
     } else if (!worker.id) {
         throw nix::Error("WorkerSession: first message must be Hello");
     } else if (msg.has_done()) {
-        const auto & done = msg.done();
-        std::vector<std::pair<std::string_view, uint64_t>> outputs;
-        if (done.outcome() == nix::remote::Done::BUILT) {
-            for (const auto & out : done.outputs()) {
-                outputs.emplace_back(out.path(), out.nar_size());
-            }
-        }
-        core.done(*worker.id, done.drv_path(), outputs);
-        metrics.event("done_" + nix::remote::Done::Outcome_Name(done.outcome()));
+        onDone(*worker.id, msg.done());
     } else if (msg.has_load()) {
         core.setDraining(*worker.id, msg.load().draining());
         membershipChangedLocked();

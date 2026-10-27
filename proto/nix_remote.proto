@@ -235,13 +235,25 @@ message Done {
     BUILT = 0;
     FAILED = 1;
     CANCELLED = 2;
-    // Expect expired without a BuildDerivation arriving.
+    // Expect expired without a BuildDerivation arriving. Older builders;
+    // newer ones give it back as UNREACHABLE.
     NO_SHOW = 3;
+    // The worker can't run it: place it elsewhere, here only as a last resort.
+    GIVEN_BACK = 4;
+  }
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    DRAINING = 1;
+    PUBLISH_UNAVAILABLE = 2;
+    INPUT_UNAVAILABLE = 3;
+    UNREACHABLE = 4; // no client came for it
+    TRANSIENT_FAILURE = 5; // e.g. ENOSPC
   }
   string drv_path = 1;
   uint64 assign_id = 2;
   Outcome outcome = 3;
   repeated PathSize outputs = 4;
+  Reason reason = 5; // with GIVEN_BACK
 }
 
 message Load {

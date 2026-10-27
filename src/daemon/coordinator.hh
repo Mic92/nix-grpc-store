@@ -49,6 +49,9 @@ struct Expected
 {
     uint64_t assignId = 0;
     Clock::time_point since;
+    // A client reached us for it. The worker then holds the lease until Done,
+    // a give-back or a Revoke: the scheduler revokes it if its client leaves.
+    bool claimed = false;
     bool running = false;
 
     // Second BuildDerivation for the same drv attaches here.
@@ -99,12 +102,16 @@ public:
         bool attach = false;
     };
 
+    // Any BuildDerivation for the drv, also one answered NOT_FOUND.
+    void claim(const std::string & drvPath);
     auto admit(const std::string & drvPath) -> std::optional<Admission>;
     void finished(
         const std::string & drvPath,
         nix::remote::Done::Outcome outcome,
         const std::vector<std::pair<std::string, uint64_t>> & outputs,
-        std::string resultWire);
+        std::string resultWire,
+        nix::remote::Done::Reason reason = nix::remote::Done::REASON_UNSPECIFIED);
+    [[nodiscard]] auto holding() const -> size_t;
 
     // Hello reflecting current state. Sent on every (re)connect.
     auto hello() const -> nix::remote::WorkerMsg;
@@ -117,7 +124,7 @@ public:
         return draining_;
     }
 
-    // Expire unclaimed Expects. Called from the serve loop.
+    // Give back unclaimed Expects nobody came for. Called from the serve loop.
     void tick();
 
     // Swapped by the session thread on every (re)connect.
@@ -142,7 +149,10 @@ private:
         const std::string & drvPath,
         uint64_t assignId,
         nix::remote::Done::Outcome outcome,
-        const std::vector<std::pair<std::string, uint64_t>> & outputs);
+        const std::vector<std::pair<std::string, uint64_t>> & outputs,
+        nix::remote::Done::Reason reason = nix::remote::Done::REASON_UNSPECIFIED);
+    void giveBack(const std::vector<std::pair<std::string, uint64_t>> & drvs, nix::remote::Done::Reason reason);
+    auto takeUnclaimed(const std::function<bool(const Expected &)> & pred) -> std::vector<std::pair<std::string, uint64_t>>;
 };
 
 // gRPC front for the Dispatcher: auth, then pump the stream into it.

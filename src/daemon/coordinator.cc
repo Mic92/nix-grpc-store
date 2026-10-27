@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
@@ -78,14 +79,39 @@ void Builder::onExpect(const nix::remote::Expect & exp)
     if (exp.drv_path().empty()) {
         return;
     }
+    if (draining_) {
+        giveBack({{exp.drv_path(), exp.assign_id()}}, nix::remote::Done::DRAINING);
+        return;
+    }
     auto lck = state.lock();
     auto & ent = lck->expected[exp.drv_path()];
-    if (ent.running) {
+    if (ent.claimed) {
         return; // re-announced across a scheduler restart, keep the live one
     }
     ent.assignId = exp.assign_id();
     ent.since = Clock::now();
     metrics.event("expect");
+}
+
+void Builder::claim(const std::string & drvPath)
+{
+    auto lck = state.lock();
+    if (auto const found = lck->expected.find(drvPath); found != lck->expected.end()) {
+        found->second.claimed = true;
+    }
+}
+
+auto Builder::holding() const -> size_t
+{
+    return state.lock()->expected.size();
+}
+
+void Builder::giveBack(const std::vector<std::pair<std::string, uint64_t>> & drvs, nix::remote::Done::Reason reason)
+{
+    for (const auto & [drv, assignId] : drvs) {
+        metrics.event("give_back");
+        sendDone(drv, assignId, nix::remote::Done::GIVEN_BACK, {}, reason);
+    }
 }
 
 void Builder::onRevoke(const nix::remote::Revoke & rev)
@@ -118,6 +144,7 @@ auto Builder::admit(const std::string & drvPath) -> std::optional<Admission>
     }
     auto & ent = found->second;
     Admission adm{.shared = ent.shared, .assignId = ent.assignId, .attach = ent.running};
+    ent.claimed = true;
     ent.running = true;
     return adm;
 }
@@ -126,7 +153,8 @@ void Builder::finished(
     const std::string & drvPath,
     nix::remote::Done::Outcome outcome,
     const std::vector<std::pair<std::string, uint64_t>> & outputs,
-    std::string resultWire)
+    std::string resultWire,
+    nix::remote::Done::Reason reason)
 {
     uint64_t assignId = 0;
     std::shared_ptr<Expected::Shared> shared;
@@ -145,20 +173,22 @@ void Builder::finished(
         shared->resultWire = std::move(resultWire);
         shared->cv.notify_all();
     }
-    sendDone(drvPath, assignId, outcome, outputs);
+    sendDone(drvPath, assignId, outcome, outputs, reason);
 }
 
 void Builder::sendDone(
     const std::string & drvPath,
     uint64_t assignId,
     nix::remote::Done::Outcome outcome,
-    const std::vector<std::pair<std::string, uint64_t>> & outputs)
+    const std::vector<std::pair<std::string, uint64_t>> & outputs,
+    nix::remote::Done::Reason reason)
 {
     WorkerMsg msg;
     auto * done = msg.mutable_done();
     done->set_drv_path(drvPath);
     done->set_assign_id(assignId);
     done->set_outcome(outcome);
+    done->set_reason(reason);
     for (const auto & [path, size] : outputs) {
         auto * out = done->add_outputs();
         out->set_path(path);
@@ -213,6 +243,25 @@ void Builder::setDraining(bool draining)
     WorkerMsg msg;
     msg.mutable_load()->set_draining(draining);
     send(msg);
+    if (draining) {
+        giveBack(takeUnclaimed([](const Expected &) -> bool { return true; }), nix::remote::Done::DRAINING);
+    }
+}
+
+auto Builder::takeUnclaimed(const std::function<bool(const Expected &)> & pred)
+    -> std::vector<std::pair<std::string, uint64_t>>
+{
+    std::vector<std::pair<std::string, uint64_t>> taken;
+    auto lck = state.lock();
+    for (auto iter = lck->expected.begin(); iter != lck->expected.end();) {
+        if (!iter->second.claimed && pred(iter->second)) {
+            taken.emplace_back(iter->first, iter->second.assignId);
+            iter = lck->expected.erase(iter);
+        } else {
+            ++iter;
+        }
+    }
+    return taken;
 }
 
 void Builder::setSend(SendFn send)
@@ -228,23 +277,12 @@ auto Builder::send(const WorkerMsg & msg) const -> bool
 
 void Builder::tick()
 {
-    std::vector<std::pair<std::string, uint64_t>> expired;
-    {
-        auto lck = state.lock();
-        const auto now = Clock::now();
-        for (auto iter = lck->expected.begin(); iter != lck->expected.end();) {
-            if (!iter->second.running && now - iter->second.since > expectTimeout) {
-                expired.emplace_back(iter->first, iter->second.assignId);
-                iter = lck->expected.erase(iter);
-            } else {
-                ++iter;
-            }
-        }
-    }
-    for (const auto & [drv, assignId] : expired) {
-        metrics.event("expect_no_show");
-        sendDone(drv, assignId, nix::remote::Done::NO_SHOW, {});
-    }
+    const auto now = Clock::now();
+    // While draining, also what an Expect racing setDraining() left behind.
+    bool const draining = draining_;
+    giveBack(
+        takeUnclaimed([&](const Expected & ent) -> bool { return draining || now - ent.since > expectTimeout; }),
+        draining ? nix::remote::Done::DRAINING : nix::remote::Done::UNREACHABLE);
 }
 
 // ---------------------------------------------------------- SchedulerService

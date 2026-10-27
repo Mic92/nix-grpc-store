@@ -618,6 +618,34 @@ public:
         return shared.resultWire;
     }
 
+    auto attached(
+        grpc::ServerContext & context,
+        nixgrpc::Expected::Shared & shared,
+        const nixgrpc::BuildEventSink & log,
+        const std::array<uint64_t, 3> & settings,
+        nix::remote::BuildDerivationDone & done) -> grpc::Status
+    {
+        metrics.event("attached");
+        auto wire = attach(context, shared, log);
+        if (shared.revoked) {
+            return {grpc::StatusCode::ABORTED, "superseded, another worker was already building this"};
+        }
+        if (!wire) {
+            throw nixgrpc::CancelledWait("gave up waiting for the running build");
+        }
+        if (wire->empty()) {
+            return {grpc::StatusCode::UNAVAILABLE, "the build this call attached to did not finish, retry"};
+        }
+        // Its result (a timeout, or no check) is not ours. Retrying after it finished builds anew.
+        if (shared.settings != settings) {
+            return {grpc::StatusCode::UNAVAILABLE, "the build this call attached to ran with other mode or limits, retry"};
+        }
+        if (!done.ParseFromString(*wire)) {
+            return {grpc::StatusCode::INTERNAL, "corrupt shared result"};
+        }
+        return grpc::Status::OK;
+    }
+
     // gRPC errors mean "ask the scheduler again", build outcomes travel as BuildResult.
     auto build(
         grpc::ServerContext & context,
@@ -641,7 +669,10 @@ public:
         if (auto feature = missingFeature(localStore, drv)) {
             return {grpc::StatusCode::FAILED_PRECONDITION, "lacks system feature '" + *feature + "'"};
         }
-        // Before admit: NOT_FOUND makes the client upload the closure and retry, which must not consume the Expect.
+        auto const drvName = std::string(drvPath.to_string());
+        // The client is here: the lease holds through its upload. NOT_FOUND
+        // makes it upload the closure and retry, so admit comes after.
+        builder.claim(drvName);
         if (!localStore.isValidPath(drvPath)) {
             try {
                 nixcompat::ensurePath(localStore, drvPath);
@@ -649,7 +680,6 @@ public:
                 return {grpc::StatusCode::NOT_FOUND, "missing: " + localStore.printStorePath(drvPath)};
             }
         }
-        auto const drvName = std::string(drvPath.to_string());
         auto adm = builder.admit(drvName);
         if (!adm) {
             metrics.event("unexpected_build");
@@ -657,33 +687,16 @@ public:
         }
         std::array<uint64_t, 3> const settings{static_cast<uint64_t>(mode), limits.buildTimeout, limits.maxSilentTime};
         if (adm->attach) {
-            metrics.event("attached");
-            auto wire = attach(context, *adm->shared, log);
-            if (adm->shared->revoked) {
-                return {grpc::StatusCode::ABORTED, "superseded, another worker was already building this"};
-            }
-            if (!wire) {
-                throw nixgrpc::CancelledWait("gave up waiting for the running build");
-            }
-            if (wire->empty()) {
-                return {grpc::StatusCode::UNAVAILABLE, "the build this call attached to did not finish, retry"};
-            }
-            // Its result (a timeout, or no check) is not ours. Retrying after it finished builds anew.
-            if (adm->shared->settings != settings) {
-                return {grpc::StatusCode::UNAVAILABLE, "the build this call attached to ran with other mode or limits, retry"};
-            }
-            if (!done.ParseFromString(*wire)) {
-                return {grpc::StatusCode::INTERNAL, "corrupt shared result"};
-            }
-            return grpc::Status::OK;
+            return attached(context, *adm->shared, log, settings, done);
         }
 
         // From here on we own the Expect and must report Done exactly once.
         adm->shared->settings = settings;
         auto outcome = nix::remote::Done::FAILED;
+        auto reason = nix::remote::Done::REASON_UNSPECIFIED;
         std::vector<std::pair<std::string, uint64_t>> outputs;
         std::string wire;
-        auto const report = [&] -> void { builder.finished(drvName, outcome, outputs, wire); };
+        auto const report = [&] -> void { builder.finished(drvName, outcome, outputs, wire, reason); };
         auto const tee = [&](nixgrpc::BuildEvent event) -> void {
             adm->shared->logged(static_cast<nixgrpc::SpillKind>(event.kind), event.text);
             log(std::move(event));
@@ -697,6 +710,9 @@ public:
             // failed owner must retry, not return an empty Done as success.
             if (status.ok()) {
                 wire = done.SerializeAsString();
+            } else if (auto const why = giveBackReason(status)) {
+                outcome = nix::remote::Done::GIVEN_BACK;
+                reason = *why;
             } else {
                 outcome = nix::remote::Done::FAILED;
             }
@@ -710,9 +726,27 @@ public:
                 return {grpc::StatusCode::ABORTED, "superseded, another worker was already building this"};
             }
             throw;
+        } catch (Unavailable &) {
+            outcome = nix::remote::Done::GIVEN_BACK;
+            reason = nix::remote::Done::PUBLISH_UNAVAILABLE;
+            report();
+            throw;
         } catch (...) {
             report();
             throw;
+        }
+    }
+
+    // A failure of this worker, not of the build: another one may do better.
+    static auto giveBackReason(const grpc::Status & status) -> std::optional<nix::remote::Done::Reason>
+    {
+        switch (status.error_code()) {
+        case grpc::StatusCode::FAILED_PRECONDITION:
+            return nix::remote::Done::INPUT_UNAVAILABLE;
+        case grpc::StatusCode::UNAVAILABLE:
+            return nix::remote::Done::TRANSIENT_FAILURE;
+        default:
+            return std::nullopt;
         }
     }
 
@@ -897,6 +931,13 @@ public:
 } // namespace
 
 namespace {
+// Claimed leases count too: their clients may still be uploading.
+auto drained(nixgrpc::Coordinator & coord, nixgrpc::Metrics & metrics) -> bool
+{
+    return (!coord.builder || coord.builder->holding() == 0)
+           && metrics.inflightNow("BuildDerivation") + metrics.inflightNow("FetchNars") == 0;
+}
+
 // Returns on idle timeout or SIGTERM. A builder's first SIGTERM only stops
 // taking builds and this returns once those in flight have reported. The
 // supervisor's stop timeout or a second signal bounds that.
@@ -927,8 +968,8 @@ void serve(
                 }
                 server.GetHealthCheckService()->SetServingStatus("", false);
             }
-            if (stopSignal >= nixgrpc::kCancelBuilds
-                || metrics.inflightNow("BuildDerivation") + metrics.inflightNow("FetchNars") == 0) {
+            coord.tick(); // gives back unclaimed leases
+            if (stopSignal >= nixgrpc::kCancelBuilds || drained(coord, metrics)) {
                 return;
             }
         }

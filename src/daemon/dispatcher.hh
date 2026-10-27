@@ -200,6 +200,7 @@ private:
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto assignedMsg(sched::DrvId drv) const -> nix::remote::SchedMsg;
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto unplaceableMsg(const sched::Entry & ent) const -> nix::remote::SchedMsg;
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void supersede(sched::DrvId drv, sched::WorkerId loser);
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onDone(sched::WorkerId wid, const nix::remote::Done & done);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onHello(Worker & worker, const nix::remote::Hello & hel);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onWant(Client & client, const nix::remote::Want & want, bool cached);
