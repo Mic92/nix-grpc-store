@@ -26,10 +26,10 @@ in
       type = lib.types.bool;
       default = false;
       description = ''
-        Add the proxy user to `nix.settings.trusted-users`. Needed to use
-        this daemon as a remote builder (clients import unsigned store
-        paths); gives every authenticated gRPC client trusted-user
-        privileges.
+        Give clients that no {option}`accessRules` entry matches the
+        `trusted` role instead of `write`, and add the proxy user to
+        `nix.settings.trusted-users`. Needed to use this daemon as a remote
+        builder without access rules (clients import unsigned store paths).
       '';
     };
 

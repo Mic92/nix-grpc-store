@@ -71,6 +71,8 @@ auth:
   # Client certificate CN patterns to roles: read-only | write | trusted.
   # CI that builds through the farm needs `trusted`.
   accessRules: [] # [{cn: "ci-*", role: trusted}]
+  # Without accessRules, clients get `write`; this raises them to `trusted`.
+  trustClients: false
   anonymousRole: null
   # CNs whose x-forwarded-client-cert header workers believe.
   trustedProxies: [lb]

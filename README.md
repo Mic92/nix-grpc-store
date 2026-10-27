@@ -195,7 +195,11 @@ certs (`tls.clientCaFile`).
 
 With mTLS, `--allow 'cn-pattern=role'` maps client certificate CNs to
 roles via glob patterns. The first match wins and unmatched clients are
-denied. Without any rules every authenticated client keeps full access.
+denied. Without any rules every authenticated client gets `write`, or
+`trusted` with `--trust-clients` (`trustClients` in the NixOS module).
+Once `--client-ca` or `--oidc-config` is set, callers that present
+neither a certificate nor a token are denied unless `--allow-anonymous`
+is given.
 
     nix-grpc-daemon ... --client-ca ca.pem \
         --allow 'ci-*=trusted' \
@@ -358,7 +362,7 @@ which also requires `trustClients` (see above).
   * `--listen ADDR` — default `0.0.0.0:50051`
   * `--proxy-socket PATH` — nix-daemon socket, default `/nix/var/nix/daemon-socket/socket`
   * `--tls-cert`, `--tls-key`, `--client-ca` — see above
-  * `--allow 'cn-pattern=role'`, `--allow-anonymous ROLE`, `--trusted-proxy CN-PATTERN` — see access control
+  * `--allow 'cn-pattern=role'`, `--allow-anonymous ROLE`, `--trust-clients`, `--trusted-proxy CN-PATTERN` — see access control
   * `--oidc-config FILE` — accept OIDC bearer tokens, see access control
   * `--metrics-listen ADDR` — serve Prometheus metrics, disabled if unset
   * `--worker-name NAME` — name in build-log prefixes and `nix_grpc_build_info`, default hostname

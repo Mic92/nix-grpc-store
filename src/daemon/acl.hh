@@ -1,10 +1,11 @@
 #pragma once
 // Maps TLS client certificate CNs to roles via ordered glob rules (first
-// match wins, no match denies). Without rules every client keeps full
-// access, preserving the pre-ACL behavior.
+// match wins, no match denies). Without rules, clients get `write`, or
+// `trusted` with --trust-clients.
 
 #include <fnmatch.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -59,7 +60,14 @@ class Acl
     std::vector<Rule> rules;
     // Separate from the glob rules so '*' cannot grant anonymous access.
     std::optional<Role> anonRole;
-    bool certRequired = false;
+    bool identityRequired = false;
+    bool clientsTrusted = false;
+
+    // Only an explicit rule grants more than write without --trust-clients.
+    [[nodiscard]] auto capped(Role role) const -> Role
+    {
+        return clientsTrusted ? role : std::min(role, Role::write);
+    }
 
 public:
     [[nodiscard]] auto active() const -> bool
@@ -86,9 +94,14 @@ public:
         return anonRole;
     }
 
-    void requireCertificate()
+    void requireIdentity()
     {
-        certRequired = true;
+        identityRequired = true;
+    }
+
+    void trustClients()
+    {
+        clientsTrusted = true;
     }
 
     // nullopt means access denied.
@@ -98,10 +111,13 @@ public:
             if (anonRole) {
                 return anonRole;
             }
-            return (certRequired || !rules.empty()) ? std::nullopt : std::optional(Role::trusted);
+            if (identityRequired || !rules.empty()) {
+                return std::nullopt;
+            }
+            return capped(Role::trusted);
         }
         if (rules.empty()) {
-            return Role::trusted;
+            return capped(Role::trusted);
         }
         // fnmatch truncates at NUL; a CN like "ci-1\0evil" must not match
         // "ci-*".

@@ -219,6 +219,9 @@ spec:
             {{- with $root.Values.auth.anonymousRole }}
             - --allow-anonymous={{ . }}
             {{- end }}
+            {{- if $root.Values.auth.trustClients }}
+            - --trust-clients
+            {{- end }}
             {{- if $oidc }}
             - --oidc-config=/secrets/oidc/oidc.json
             {{- end }}

@@ -276,6 +276,13 @@ if build_server
     ))
   endif
 
+  test('acl', executable('acl-test',
+    sources : ['tests/acl-test.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    dependencies : [nix_util_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
+
   test('xfcc', executable('xfcc-test',
     sources : ['tests/xfcc-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],

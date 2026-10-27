@@ -31,6 +31,7 @@
   "--allow"
   "${rule.cn}=${rule.role}"
 ]) cfg.accessRules
+++ lib.optionals cfg.trustClients [ "--trust-clients" ]
 ++ lib.optionals (cfg.anonymousRole != null) [
   "--allow-anonymous"
   cfg.anonymousRole

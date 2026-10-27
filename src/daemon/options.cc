@@ -144,6 +144,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.acl.addRule(next());
         } else if (arg == "--trusted-proxy") {
             options.proxies.add(next());
+        } else if (arg == "--trust-clients") {
+            options.acl.trustClients();
         } else if (arg == "--allow-anonymous") {
             options.acl.allowAnonymous(parseRole(next()));
         } else if (arg == "--worker-name") {
@@ -241,8 +243,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
     if (!options.proxies.empty() && options.clientCA.empty()) {
         throw nix::Error("--trusted-proxy requires --client-ca");
     }
-    if (!options.clientCA.empty() && !options.acl.anonymousRole()) {
-        options.acl.requireCertificate();
+    if (!options.clientCA.empty() || !options.oidcConfig.empty()) {
+        options.acl.requireIdentity();
     }
     return options;
 }
