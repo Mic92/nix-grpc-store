@@ -192,7 +192,10 @@ in
             audience = "grpc://cache.example.com";
             rules = [
               { bound_claims.repository_owner = [ "myorg" ]; scopes = [ "write" ]; }
-              { bound_claims.ref = [ "refs/heads/main" ]; scopes = [ "admin" ]; }
+              {
+                bound_claims = { repository_owner = [ "myorg" ]; ref = [ "refs/heads/main" ]; };
+                scopes = [ "admin" ];
+              }
             ];
           };
           providers.k8s = {

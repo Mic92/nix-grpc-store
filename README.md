@@ -278,7 +278,7 @@ can serve the cache and the daemon. Scopes map to roles: `read` →
           "audience": "grpc://cache.example.com",
           "rules": [
             { "bound_subject": ["repo:myorg/*"], "scopes": ["write"] },
-            { "bound_claims": { "ref": ["refs/heads/main"] }, "scopes": ["admin"] }
+            { "bound_claims": { "repository_owner": ["myorg"], "ref": ["refs/heads/main"] }, "scopes": ["admin"] }
           ]
         },
         "k8s": {
@@ -294,7 +294,10 @@ Without `issuer`, it is taken from `bearer_token_file` (Kubernetes
 workload identity). `jwks_url` skips discovery. Signing keys are
 fetched on first use and cached for an hour, so the daemon starts while
 the issuer is down and refuses tokens until it comes back. A presented
-client certificate takes precedence over a token. A verified token that
+client certificate takes precedence over a token.
+Rules are alternatives: a token gets the highest role of all rules it
+matches, so each rule must bind the repository or owner on its own. Two
+providers may not share an issuer. A verified token that
 matches no rule is denied, it does not fall back to `--allow-anonymous`.
 In logs and metrics the caller shows as `oidc:<provider>:<sub>`.
 
