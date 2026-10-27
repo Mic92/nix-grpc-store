@@ -312,10 +312,11 @@ public:
             for (const auto & path : request->paths()) {
                 paths.insert(nix::StorePath(path));
             }
+            // Substituting fills this node's disk, so read-only callers only query.
+            auto const substitute = request->substitute() && rpc.caller.role >= nixgrpc::Role::write;
             std::vector<std::string> valid;
             nixgrpc::Metrics::Phase phase(metrics, "QueryValidPaths", "query");
-            for (const auto & path :
-                 localStore->queryValidPaths(paths, request->substitute() ? nix::Substitute : nix::NoSubstitute)) {
+            for (const auto & path : localStore->queryValidPaths(paths, substitute ? nix::Substitute : nix::NoSubstitute)) {
                 reply->add_paths(std::string(path.to_string()));
                 valid.push_back(localStore->printStorePath(path));
                 paths.erase(path);
