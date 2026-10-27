@@ -283,6 +283,13 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
+  test('build-log', executable('build-log-test',
+    sources : ['tests/build-log-test.cc'],
+    include_directories : [src_inc],
+    cpp_args : nix_compat_args + ['-UNDEBUG'],
+    dependencies : [nix_util_dep, nix_store_dep],
+  ))
+
   test('xfcc', executable('xfcc-test',
     sources : ['tests/xfcc-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
