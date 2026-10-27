@@ -439,7 +439,8 @@ public:
     };
 
     // What the balancer routes on: shard for Schedule, shard + worker for the build.
-    auto routingFor(const BasicDerivation & drv, const std::string & workerAddr = "") -> Metadata;
+    auto routingFor(const BasicDerivation & drv, const std::string & workerAddr = "", const std::string & workerSystem = "")
+        -> Metadata;
 
     static void addHeaders(grpc::ClientContext & ctx, const Metadata & headers) {
       for (const auto & [key, value] : headers) {
@@ -488,10 +489,12 @@ public:
       // Set by the reader thread, consumed by a build thread.
       std::string workerAddr;
       uint64_t assignId = 0;
+      std::string workerSystem; // empty from older schedulers
       // A second Assigned while building: the scheduler moved the drv to a
       // worker that was already at it. Followed when the current one bounces.
       std::string redirectAddr;
       uint64_t redirectId = 0;
+      std::string redirectSystem;
       bool lost = false; // scheduler stream gone before assignment
       // Set on Unplaceable, cleared on Assigned. reapUnplaceable fails the
       // job once it is older than restart-grace.

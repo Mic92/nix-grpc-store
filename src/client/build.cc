@@ -55,8 +55,11 @@
 
 namespace nix {
 
-auto GrpcStore::routingFor(const BasicDerivation & drv, const std::string & workerAddr) -> Metadata {
-  Metadata meta{{"x-nix-system", drv.platform},
+// The balancer routes on the system. The worker's own beats the drv's, which
+// may be `builtin` or an extra platform only some workers offer.
+auto GrpcStore::routingFor(const BasicDerivation & drv, const std::string & workerAddr, const std::string & workerSystem)
+    -> Metadata {
+  Metadata meta{{"x-nix-system", workerSystem.empty() ? drv.platform : workerSystem},
                 {"x-nix-features", concatStringsSep(",", nixcompat::requiredSystemFeatures(*this, drv))}};
   if (!workerAddr.empty()) {
     meta.emplace_back("x-nix-worker", workerAddr);
@@ -129,7 +132,7 @@ auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore)
     nixcompat::writeDrv(sink, *this, job.drv);
     *request.mutable_drv() = std::move(sink.s);
   }
-  auto const headers = routingFor(job.drv, job.workerAddr);
+  auto const headers = routingFor(job.drv, job.workerAddr, job.workerSystem);
   std::optional<BuildResult> res;
   auto status = tryBuildDerivation(request, headers, res);
   if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
@@ -285,6 +288,7 @@ struct GrpcStore::Run {
   void requeueLocked(Job & job) {
     job.workerAddr = std::exchange(job.redirectAddr, {});
     job.assignId = std::exchange(job.redirectId, 0);
+    job.workerSystem = std::exchange(job.redirectSystem, {});
     if (!job.workerAddr.empty()) {
       ready.push_back(&job);
       cv.notify_all();
@@ -347,6 +351,8 @@ struct GrpcStore::Run {
       return msg.cached().drv_path();
     case remote::SchedMsg::kUnplaceable:
       return msg.unplaceable().drv_path();
+    case remote::SchedMsg::kPlaceable:
+      return msg.placeable().drv_path();
     default:
       return {};
     }
@@ -383,7 +389,12 @@ struct GrpcStore::Run {
       if (msg.has_assigned() && msg.assigned().worker_addr() != job->workerAddr) {
         job->redirectAddr = msg.assigned().worker_addr();
         job->redirectId = msg.assigned().assign_id();
+        job->redirectSystem = msg.assigned().worker_system();
       }
+      return;
+    }
+    if (msg.has_placeable()) {
+      job->unplaceableSince.reset();
       return;
     }
     if (msg.has_assigned()) {
@@ -393,6 +404,7 @@ struct GrpcStore::Run {
       }
       job->workerAddr = msg.assigned().worker_addr();
       job->assignId = msg.assigned().assign_id();
+      job->workerSystem = msg.assigned().worker_system();
     } else if (msg.has_cached()) {
       job->result = cachedResult(*job);
     } else {
@@ -435,13 +447,14 @@ struct GrpcStore::Run {
     }
   }
 
-  // A fresh stream: everything not yet placed is Wanted again.
+  // A fresh stream: everything not finished is Wanted again. Assigned jobs
+  // too, so the scheduler keeps their builds instead of revoking them.
   void attach(grpc::ClientReaderWriter<remote::ClientMsgs, remote::SchedMsgs> * fresh) {
     std::scoped_lock const lock(mutex);
     stream = fresh;
     closed = false;
     for (auto & [drvPath, job] : jobs) {
-      bool const pending = !job.result && !job.failedInput && !job.lost && job.workerAddr.empty() && job.waiting == 0;
+      bool const pending = !job.result && !job.failedInput && !job.lost && job.waiting == 0;
       if (pending && std::ranges::find(wantable, &job) == wantable.end()
           && std::ranges::find(ready, &job) == ready.end()) {
         wantable.push_back(&job);

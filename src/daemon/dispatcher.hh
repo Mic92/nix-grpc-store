@@ -68,7 +68,6 @@ public:
         sched::ClientId id = 0;
         ClientSend send;
         std::function<void()> abort; // ends the stream; for errors off its thread
-        bool known = false; // under Dispatcher::mutex: in `clients`
         bool gone = false;  // under Dispatcher::mutex
     };
 
@@ -83,7 +82,8 @@ public:
     struct Worker
     {
         WorkerSend send;
-        std::optional<sched::WorkerId> id;
+        std::function<void()> abort; // ends the stream when a newer session replaces it
+        std::optional<sched::WorkerId> id; // under Dispatcher::mutex; reset when replaced
     };
 
     // Throws on protocol violations; the caller closes the stream.
@@ -141,8 +141,17 @@ private:
     std::vector<std::function<void()>> deferred ABSL_GUARDED_BY(mutex);
     sched::Core core ABSL_GUARDED_BY(mutex);
     std::unordered_map<sched::ClientId, ClientSend> clients ABSL_GUARDED_BY(mutex);
-    std::unordered_map<sched::WorkerId, WorkerSend> workers ABSL_GUARDED_BY(mutex);
+    // The live session of each worker. A stale one, replaced by a re-Hello, is not here.
+    std::unordered_map<sched::WorkerId, Worker *> workers ABSL_GUARDED_BY(mutex);
     bool lettingGo ABSL_GUARDED_BY(mutex) = false;
+    // Assigned drvs whose last follower left. Revoked unless one is back in time.
+    struct Orphan
+    {
+        sched::DrvId drv;
+        uint64_t assignId;
+        double dueMs;
+    };
+    std::vector<Orphan> orphans ABSL_GUARDED_BY(mutex);
     std::optional<double> statsAtMs ABSL_GUARDED_BY(mutex);
     std::map<sched::Core::StatsKey, std::vector<prometheus::Gauge *>> statGauges ABSL_GUARDED_BY(mutex);
     std::atomic<sched::ClientId> nextClient{1};
@@ -185,7 +194,13 @@ private:
     // Per-system gauges. O(entries), so at most once a second unless forced.
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void exportStats(bool force);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOn(sched::WorkerId wid, const std::string & drvPath);
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOrphans();
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void placeabilityChangedLocked();
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void sendToFollowers(sched::DrvId drv, const nix::remote::SchedMsg & msg);
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto assignedMsg(sched::DrvId drv) const -> nix::remote::SchedMsg;
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto unplaceableMsg(const sched::Entry & ent) const -> nix::remote::SchedMsg;
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void supersede(sched::DrvId drv, sched::WorkerId loser);
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onHello(Worker & worker, const nix::remote::Hello & hel);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onWant(Client & client, const nix::remote::Want & want, bool cached);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onCancel(Client & client, const nix::remote::Cancel & cancel);

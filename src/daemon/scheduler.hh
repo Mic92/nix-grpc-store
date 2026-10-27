@@ -289,6 +289,7 @@ struct Entry
     uint64_t assignId = 0;
     double enqMs = 0;
     double cpHint = 0;
+    bool unplaceable = false; // as last told to the followers
 };
 
 struct Worker
@@ -490,13 +491,13 @@ public:
         std::vector<std::pair<std::string_view, uint64_t>> running; // running + expecting, with assignId
     };
 
-    // A reported drv that this scheduler had meanwhile placed on `loser`:
-    // the reporter keeps it, the caller revokes `loser` and re-points the
-    // followers with a fresh Assigned.
+    // A reported drv that followers wait for: the caller sends them a fresh
+    // Assigned. If this scheduler had meanwhile placed it on `loser`, the
+    // reporter keeps it and the caller revokes `loser`.
     struct Superseded
     {
         DrvId drv;
-        WorkerId loser;
+        WorkerId loser = noWorker;
     };
 
     auto hello(const HelloInfo & info, std::vector<Superseded> & superseded) -> WorkerId
@@ -529,6 +530,8 @@ public:
                 superseded.push_back({.drv = drv, .loser = slot->worker});
                 std::erase(workers.at(slot->worker).running, drv);
                 refreshFree(slot->worker);
+            } else if (slot->worker == noWorker && !slot->followers.empty()) {
+                superseded.push_back({.drv = drv});
             }
             slot->worker = wid;
             slot->assignId = assignId;
@@ -623,6 +626,36 @@ public:
     {
         const auto & slot = entries.at(drv);
         return slot && placeable(*slot);
+    }
+
+    // What a follower was last told about a queued entry.
+    void markUnplaceable(DrvId drv, bool unplaceable)
+    {
+        if (auto & slot = entries.at(drv)) {
+            slot->unplaceable = unplaceable;
+        }
+    }
+
+    // Queued entries whose placeability flipped since the followers were
+    // last told. After Hello, workerGone and Load: O(entries), memoised per
+    // (system, features).
+    void placeabilityChanges(std::vector<DrvId> & out)
+    {
+        std::map<std::pair<std::string, std::vector<std::string>>, bool> byKey;
+        for (size_t idx = 0; idx < entries.size(); idx++) {
+            auto & slot = entries.at(idx);
+            if (!slot || slot->worker != noWorker || slot->followers.empty()) {
+                continue;
+            }
+            auto [iter, fresh] = byKey.try_emplace({slot->system, slot->features}, false);
+            if (fresh) {
+                iter->second = placeable(*slot);
+            }
+            if (slot->unplaceable == iter->second) {
+                slot->unplaceable = !iter->second;
+                out.push_back(static_cast<DrvId>(idx));
+            }
+        }
     }
 
     struct StatsKey

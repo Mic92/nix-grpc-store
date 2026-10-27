@@ -234,7 +234,7 @@ public:
     WorkerSessionReactor(grpc::CallbackServerContext * ctx, Dispatcher & disp)
         : SchedReactorBase(ctx)
         , disp(disp)
-        , worker{.send = sender(disp)}
+        , worker{.send = sender(disp), .abort = [ctx] -> void { ctx->TryCancel(); }}
     {
         start();
     }

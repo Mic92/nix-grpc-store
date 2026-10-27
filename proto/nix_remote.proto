@@ -175,6 +175,8 @@ message Assigned {
   // IP:port the balancer knows the worker by; goes into x-nix-worker.
   string worker_addr = 2;
   uint64 assign_id = 3;
+  // The worker's native system, for the balancer's x-nix-system routing.
+  string worker_system = 4;
 }
 
 message Cached {
@@ -193,12 +195,18 @@ message Unplaceable {
 // want or are running. Not an error.
 message Restarting {}
 
+// A worker that can run the drv is back after Unplaceable. Assigned follows.
+message Placeable {
+  string drv_path = 1;
+}
+
 message SchedMsg {
   oneof msg {
     Assigned assigned = 1;
     Cached cached = 2;
     Unplaceable unplaceable = 3;
     Restarting restarting = 4;
+    Placeable placeable = 5;
   }
 }
 

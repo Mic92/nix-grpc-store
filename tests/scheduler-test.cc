@@ -294,6 +294,39 @@ void testUnofferedSystems()
     assert(!shard.stats().contains({.system = "sys0", .features = ""}));
 }
 
+// A worker reporting a drv that was still queued takes it, and its
+// followers must be told.
+void testHelloAdoptsQueued()
+{
+    Core shard;
+    std::vector<Core::Superseded> sup;
+    shard.want(1, {.drvPath = "q.drv", .inputs = {}, .system = "x86_64", .features = {}, .cpHintMs = 0}, 0);
+    auto const wkr = shard.hello(
+        {.addr = "w", .systems = {"x86_64"}, .features = {}, .maxJobs = 1, .running = {{"q.drv", 7}}}, sup);
+    assert(sup.size() == 1 && sup.at(0).loser == noWorker);
+    assert(shard.entry(sup.at(0).drv)->worker == wkr && shard.entry(sup.at(0).drv)->assignId == 7);
+}
+
+// Followers of a queued entry hear when a capable worker comes or goes.
+void testPlaceabilityFlips()
+{
+    Core shard;
+    std::vector<Core::Superseded> sup;
+    std::vector<DrvId> changed;
+    auto const res = shard.want(1, {.drvPath = "k.drv", .inputs = {}, .system = "x86_64", .features = {"kvm"}, .cpHintMs = 0}, 0);
+    shard.markUnplaceable(res.drv, true);
+    shard.hello({.addr = "plain", .systems = {"x86_64"}, .features = {}, .maxJobs = 1, .running = {}}, sup);
+    shard.placeabilityChanges(changed);
+    assert(changed.empty());
+    auto const kvm = shard.hello({.addr = "kvm", .systems = {"x86_64"}, .features = {"kvm"}, .maxJobs = 1, .running = {}}, sup);
+    shard.placeabilityChanges(changed);
+    assert(changed.size() == 1 && !shard.entry(res.drv)->unplaceable);
+    changed.clear();
+    shard.workerGone(kvm);
+    shard.placeabilityChanges(changed);
+    assert(changed.size() == 1 && shard.entry(res.drv)->unplaceable);
+}
+
 void testSystems()
 {
     Core shard;
@@ -367,6 +400,8 @@ try {
     testFeatures();
     testSystems();
     testUnofferedSystems();
+    testHelloAdoptsQueued();
+    testPlaceabilityFlips();
     testStaleDoneAndUnknown();
     return 0;
 } catch (std::exception & err) {

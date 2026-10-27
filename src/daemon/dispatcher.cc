@@ -36,6 +36,9 @@ namespace {
 constexpr size_t maxSystemLen = 64;
 constexpr double statsEveryMs = 1000;
 constexpr double msPerSecond = 1000;
+// A client whose stream broke reconnects within its backoff and Wants its
+// assigned drvs again. Until then their builds keep running.
+constexpr double orphanGraceMs = 10'000;
 } // namespace
 
 Dispatcher::Dispatcher(Config config_, Metrics & metrics)
@@ -69,9 +72,14 @@ Dispatcher::~Dispatcher()
 
 void Dispatcher::statsLoop()
 {
-    const Lock lock(*this);
-    while (!statsStop) {
+    for (;;) {
+        // A Lock per round, so what it defers runs.
+        const Lock lock(*this);
         mutex.AwaitWithTimeout(absl::Condition(&statsStop), absl::Milliseconds(statsEveryMs));
+        if (statsStop) {
+            return;
+        }
+        revokeOrphans();
         if (statsPending) {
             exportStats(true);
         }
@@ -248,23 +256,16 @@ void Dispatcher::dispatchLocked()
         cmd.mutable_expect()->set_drv_path(ent->drvPath);
         cmd.mutable_expect()->set_assign_id(asg.assignId);
         auto const wit = workers.find(asg.worker);
-        if (wit == workers.end() || !wit->second(cmd)) {
+        if (wit == workers.end() || !wit->second->send(cmd)) {
             // Worker stream died under us; requeue and let the next event retry.
             core.workerGone(asg.worker);
             membershipChangedLocked();
             workers.erase(asg.worker);
             metrics.event("expect_undeliverable");
+            placeabilityChangedLocked();
             continue;
         }
-        SchedMsg msg;
-        msg.mutable_assigned()->set_drv_path(ent->drvPath);
-        msg.mutable_assigned()->set_worker_addr(wkr.addr);
-        msg.mutable_assigned()->set_assign_id(asg.assignId);
-        for (auto const cid : asg.clients) {
-            if (auto const cit = clients.find(cid); cit != clients.end()) {
-                cit->second(msg);
-            }
-        }
+        sendToFollowers(asg.drv, assignedMsg(asg.drv));
         assignedCtr.Increment();
         metrics.queueWait(ent->system, (nowMs() - ent->enqMs) / msPerSecond);
         debugLog(
@@ -318,16 +319,11 @@ void Dispatcher::supersede(sched::DrvId drv, sched::WorkerId loser)
     if (!ent) {
         return;
     }
-    revokeOn(loser, ent->drvPath);
-    SchedMsg msg;
-    msg.mutable_assigned()->set_drv_path(ent->drvPath);
-    msg.mutable_assigned()->set_worker_addr(core.worker(ent->worker).addr);
-    msg.mutable_assigned()->set_assign_id(ent->assignId);
-    for (auto const cid : ent->followers) {
-        if (auto const cit = clients.find(cid); cit != clients.end()) {
-            cit->second(msg);
-        }
+    sendToFollowers(drv, assignedMsg(drv));
+    if (loser == sched::noWorker) {
+        return; // was queued: only the followers need telling
     }
+    revokeOn(loser, ent->drvPath);
     metrics.event("superseded");
     logLine(
         LogLevel::info,
@@ -342,7 +338,86 @@ void Dispatcher::revokeOn(sched::WorkerId wid, const std::string & drvPath)
     if (auto const wit = workers.find(wid); wit != workers.end()) {
         SchedCmd cmd;
         cmd.mutable_revoke()->set_drv_path(drvPath);
-        wit->second(cmd);
+        wit->second->send(cmd);
+    }
+}
+
+void Dispatcher::revokeOrphans()
+{
+    auto const now = nowMs();
+    std::erase_if(orphans, [&](const Orphan & orphan) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) -> bool {
+        if (orphan.dueMs > now) {
+            return false;
+        }
+        const auto & ent = core.entry(orphan.drv);
+        if (ent && ent->assignId == orphan.assignId && ent->worker != sched::noWorker && ent->followers.empty()) {
+            revokeOn(ent->worker, ent->drvPath);
+        }
+        return true;
+    });
+}
+
+auto Dispatcher::assignedMsg(sched::DrvId drv) const -> SchedMsg
+{
+    SchedMsg msg;
+    const auto & ent = core.entry(drv);
+    if (!ent || ent->worker == sched::noWorker) {
+        return msg;
+    }
+    const auto & wkr = core.worker(ent->worker);
+    auto * asg = msg.mutable_assigned();
+    asg->set_drv_path(ent->drvPath);
+    asg->set_worker_addr(wkr.addr);
+    asg->set_assign_id(ent->assignId);
+    // The balancer routes on it: the drv's own system may be one only some of the worker's peers offer.
+    asg->set_worker_system(wkr.systems.empty() ? std::string() : wkr.systems.front());
+    return msg;
+}
+
+auto Dispatcher::unplaceableMsg(const sched::Entry & ent) const -> SchedMsg
+{
+    auto const join = [](const auto & feats) -> std::string {
+        return nix::concatStringsSep(",", nix::Strings(feats.begin(), feats.end()));
+    };
+    SchedMsg msg;
+    msg.mutable_unplaceable()->set_drv_path(ent.drvPath);
+    msg.mutable_unplaceable()->set_reason(
+        "no connected, non-draining worker for system '" + ent.system + "' offers features {" + join(ent.features)
+        + "}, the workers offer {" + join(core.offeredFeatures(ent.system)) + "}");
+    return msg;
+}
+
+void Dispatcher::sendToFollowers(sched::DrvId drv, const SchedMsg & msg)
+{
+    const auto & ent = core.entry(drv);
+    if (!ent) {
+        return;
+    }
+    for (auto const cid : ent->followers) {
+        if (auto const cit = clients.find(cid); cit != clients.end()) {
+            cit->second(msg);
+        }
+    }
+}
+
+// After an event that changes which workers are usable: tell the followers
+// of queued entries whose answer flipped.
+void Dispatcher::placeabilityChangedLocked()
+{
+    std::vector<sched::DrvId> changed;
+    core.placeabilityChanges(changed);
+    for (auto const drv : changed) {
+        const auto & ent = core.entry(drv);
+        if (!ent) {
+            continue;
+        }
+        SchedMsg msg;
+        if (ent->unplaceable) {
+            msg = unplaceableMsg(*ent);
+        } else {
+            msg.mutable_placeable()->set_drv_path(ent->drvPath);
+        }
+        sendToFollowers(drv, msg);
     }
 }
 
@@ -355,6 +430,9 @@ auto Dispatcher::connectClient(ClientSend send, std::function<void()> abort) -> 
     client->id = nextClient++;
     client->send = std::move(send);
     client->abort = std::move(abort);
+    // Known from the start, so restarting() reaches clients that only got Cached so far.
+    const Lock lock(*this);
+    clients.emplace(client->id, client->send);
     return client;
 }
 
@@ -378,8 +456,8 @@ void Dispatcher::restarting()
     for (auto & [cid, send] : clients) {
         send(msg);
     }
-    for (auto & [wid, send] : workers) {
-        send(cmd);
+    for (auto & [wid, wkr] : workers) {
+        wkr->send(cmd);
     }
 }
 
@@ -430,6 +508,12 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
          {"drv", want.drv_path()},
          {"cached", cached ? "1" : "0"}});
     SchedMsg reply;
+    if (lettingGo) {
+        // Yielded while this batch waited for its lookup: go to the new leader.
+        reply.mutable_restarting();
+        client.send(reply);
+        return;
+    }
     if (cached) {
         reply.mutable_cached()->set_drv_path(want.drv_path());
         client.send(reply);
@@ -441,10 +525,6 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
         reply.mutable_unplaceable()->set_reason("bad system '" + want.system() + "'");
         client.send(reply);
         return;
-    }
-    if (!client.known) {
-        client.known = true;
-        clients[client.id] = client.send;
     }
     auto const system = systemFor(want.system());
     if (!core.admitsSystem(std::string(system))) {
@@ -462,23 +542,16 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
          .cpHintMs = static_cast<double>(want.cp_hint_ms())},
         nowMs());
     if (res.assigned) {
-        reply.mutable_assigned()->set_drv_path(want.drv_path());
-        reply.mutable_assigned()->set_worker_addr(core.worker(res.assigned->first).addr);
-        reply.mutable_assigned()->set_assign_id(res.assigned->second);
-        client.send(reply);
+        client.send(assignedMsg(res.drv));
         return;
     }
     dispatchLocked();
-    if (!core.placeable(res.drv)) {
+    const auto & ent = core.entry(res.drv);
+    if (ent && ent->worker == sched::noWorker && !core.placeable(res.drv)) {
         // Keep the Want: right after a (re)start no worker has said Hello yet.
-        reply.mutable_unplaceable()->set_drv_path(want.drv_path());
-        auto const join = [](const auto & feats) -> std::string {
-            return nix::concatStringsSep(",", nix::Strings(feats.begin(), feats.end()));
-        };
-        reply.mutable_unplaceable()->set_reason(
-            "no connected, non-draining worker for system '" + std::string(system) + "' offers features {"
-            + join(want.required_features()) + "}, the workers offer {" + join(core.offeredFeatures(std::string(system))) + "}");
-        client.send(reply);
+        // placeabilityChangedLocked() tells the followers once one has.
+        core.markUnplaceable(res.drv, true);
+        client.send(unplaceableMsg(*ent));
         exportStats(false);
     }
 }
@@ -500,9 +573,8 @@ void Dispatcher::clientGone(const ClientPtr & clientPtr)
     std::vector<std::pair<sched::DrvId, sched::WorkerId>> revokes;
     core.clientGone(client.id, revokes);
     for (auto [drv, wid] : revokes) {
-        // A client we sent away comes back for the same build. Keep it running.
-        if (const auto  & ent = core.entry(drv); ent && !lettingGo) {
-            revokeOn(wid, ent->drvPath);
+        if (const auto & ent = core.entry(drv)) {
+            orphans.push_back({.drv = drv, .assignId = ent->assignId, .dueMs = nowMs() + orphanGraceMs});
         }
     }
     metrics.schedClients(-1);
@@ -528,45 +600,58 @@ void Dispatcher::workerMsgs(Worker & worker, const nix::remote::WorkerMsgs & msg
     exportStats(false);
 }
 
-void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg)
+void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
 {
-    if (msg.has_hello()) {
-        const auto & hel = msg.hello();
-        std::vector<std::pair<std::string_view, uint64_t>> running;
-        running.reserve(static_cast<size_t>(hel.running_size()));
-        for (const auto & run : hel.running()) {
-            running.emplace_back(run.drv_path(), run.assign_id());
+    std::vector<std::pair<std::string_view, uint64_t>> running;
+    running.reserve(static_cast<size_t>(hel.running_size()));
+    for (const auto & run : hel.running()) {
+        running.emplace_back(run.drv_path(), run.assign_id());
+    }
+    if (hel.systems().empty()) {
+        throw nix::Error("worker %s offers no system", hel.addr());
+    }
+    std::vector<std::string> systems;
+    for (const auto & name : hel.systems()) {
+        if (name.size() > maxSystemLen) {
+            throw nix::Error("WorkerSession: bad system '%s'", name);
         }
-        if (hel.systems().empty()) {
-            throw nix::Error("worker %s offers no system", hel.addr());
+        systems.emplace_back(systemFor(name));
+    }
+    auto const wid = core.workerId(hel.addr());
+    if (auto const old = workers.find(wid); old != workers.end() && old->second != &worker) {
+        // A half-open older session must not take the new one down when it finally closes.
+        old->second->id.reset();
+        if (old->second->abort) {
+            afterUnlock(old->second->abort);
         }
-        std::vector<std::string> systems;
-        for (const auto & name : hel.systems()) {
-            if (name.size() > maxSystemLen) {
-                throw nix::Error("WorkerSession: bad system '%s'", name);
-            }
-            systems.emplace_back(systemFor(name));
-        }
-        std::vector<sched::Core::Superseded> superseded;
-        worker.id = core.hello(
+    }
+    std::vector<sched::Core::Superseded> superseded;
+    worker.id = core.hello(
         {.addr = hel.addr(),
          .systems = std::move(systems),
          .features = {hel.features().begin(), hel.features().end()},
          .maxJobs = hel.max_jobs(),
          .running = std::move(running)},
         superseded);
-        workers[*worker.id] = worker.send;
-        membershipChangedLocked();
-        for (auto const sup : superseded) {
-            supersede(sup.drv, sup.loser);
-        }
-        logLine(
-            LogLevel::info,
-            {{"event", "worker_hello"},
-             {"addr", hel.addr()},
-             {"systems", nix::concatStringsSep(",", core.worker(*worker.id).systems)},
-             {"max_jobs", std::to_string(hel.max_jobs())},
-             {"running", std::to_string(hel.running_size())}});
+    workers[*worker.id] = &worker;
+    membershipChangedLocked();
+    for (auto const sup : superseded) {
+        supersede(sup.drv, sup.loser);
+    }
+    placeabilityChangedLocked();
+    logLine(
+        LogLevel::info,
+        {{"event", "worker_hello"},
+         {"addr", hel.addr()},
+         {"systems", nix::concatStringsSep(",", core.worker(*worker.id).systems)},
+         {"max_jobs", std::to_string(hel.max_jobs())},
+         {"running", std::to_string(hel.running_size())}});
+}
+
+void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg)
+{
+    if (msg.has_hello()) {
+        onHello(worker, msg.hello());
     } else if (!worker.id) {
         throw nix::Error("WorkerSession: first message must be Hello");
     } else if (msg.has_done()) {
@@ -582,6 +667,7 @@ void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg &
     } else if (msg.has_load()) {
         core.setDraining(*worker.id, msg.load().draining());
         membershipChangedLocked();
+        placeabilityChangedLocked();
     }
 }
 
@@ -596,6 +682,7 @@ void Dispatcher::workerGone(Worker & worker)
     workers.erase(*worker.id);
     membershipChangedLocked();
     dispatchLocked();
+    placeabilityChangedLocked();
     metrics.schedWorkers(core.workersUp());
     exportStats(false);
     worker.id.reset();
