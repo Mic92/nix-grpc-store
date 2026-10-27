@@ -707,6 +707,45 @@ public:
         return grpc::Status::OK;
     }
 
+    // Sends the owner's log from its own thread, so a slow client can't
+    // block the relay.
+    class OwnerRelay
+    {
+    public:
+        OwnerRelay(grpc::ServerContext & context, nixgrpc::Expected::Shared & shared, const nixgrpc::BuildEventSink & log)
+            : shared_(shared)
+            , thread_([&context, &shared, &log] -> void {
+                (void) nixgrpc::followSpill(
+                    shared.spill, shared.mutex, shared.cv, shared.finished, nixgrpc::cancelPoll,
+                    [&] -> bool { return context.IsCancelled() || stopSignal >= nixgrpc::kCancelBuilds; },
+                    [&](nixgrpc::SpillKind kind, std::string_view text) -> void {
+                        log({.kind = static_cast<nixgrpc::BuildEvent::Kind>(kind), .text = std::string(text)});
+                    });
+            })
+        {
+        }
+
+        OwnerRelay(const OwnerRelay &) = delete;
+        OwnerRelay(OwnerRelay &&) = delete;
+        auto operator=(const OwnerRelay &) -> OwnerRelay & = delete;
+        auto operator=(OwnerRelay &&) -> OwnerRelay & = delete;
+
+        // Builder::finished already did this unless the Expect was gone.
+        ~OwnerRelay()
+        {
+            {
+                const std::scoped_lock lock(shared_.mutex);
+                shared_.finished = true;
+                shared_.cv.notify_all();
+            }
+            thread_.join();
+        }
+
+    private:
+        nixgrpc::Expected::Shared & shared_;
+        std::jthread thread_;
+    };
+
     // gRPC errors mean "ask the scheduler again", build outcomes travel as BuildResult.
     auto build(
         grpc::ServerContext & context,
@@ -758,10 +797,10 @@ public:
         std::vector<std::pair<std::string, uint64_t>> outputs;
         std::string wire;
         auto const report = [&] -> void { builder.finished(drvName, outcome, outputs, wire, reason); };
-        auto const tee = [&](nixgrpc::BuildEvent event) -> void {
+        auto const tee = [&](const nixgrpc::BuildEvent & event) -> void {
             adm->shared->logged(static_cast<nixgrpc::SpillKind>(event.kind), event.text);
-            log(std::move(event));
         };
+        OwnerRelay const relay(context, *adm->shared, log);
         try {
             auto status =
                 buildExpected(
