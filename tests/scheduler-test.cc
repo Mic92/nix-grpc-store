@@ -327,6 +327,54 @@ void testPlaceabilityFlips()
     assert(changed.size() == 1 && shard.entry(res.drv)->unplaceable);
 }
 
+// A given-back drv goes to another worker, or back to the same one if
+// nobody else can run it.
+void testGiveBack()
+{
+    Core shard;
+    std::vector<Core::Superseded> sup;
+    std::vector<Assign> out;
+    auto const first = shard.hello({.addr = "a", .systems = {"x86_64"}, .features = {}, .maxJobs = 1, .running = {}}, sup);
+    auto const res = shard.want(1, {.drvPath = "g.drv", .inputs = {}, .system = "x86_64", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 1 && out.at(0).worker == first);
+    out.clear();
+    shard.giveBack(first, "g.drv");
+    shard.dispatch(out);
+    assert(out.size() == 1 && out.at(0).worker == first); // sole worker
+    out.clear();
+    auto const second = shard.hello({.addr = "b", .systems = {"x86_64"}, .features = {}, .maxJobs = 1, .running = {}}, sup);
+    shard.giveBack(first, "g.drv");
+    shard.dispatch(out);
+    assert(out.size() == 1 && out.at(0).worker == second);
+    out.clear();
+    shard.want(2, {.drvPath = "h.drv", .inputs = {}, .system = "x86_64", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 1 && out.at(0).worker == first);
+    out.clear();
+    // Another worker can run it, just not now: it waits rather than going back.
+    shard.giveBack(second, "g.drv");
+    shard.dispatch(out);
+    assert(out.empty() && shard.entry(res.drv)->worker == noWorker);
+}
+
+// A worker serving two systems gives its slot to the more urgent drv.
+void testCrossSystemPriority()
+{
+    for (auto const * urgent : {"x86_64", "i686"}) {
+        Core shard;
+        std::vector<Core::Superseded> sup;
+        std::vector<Assign> out;
+        shard.hello({.addr = "w", .systems = {"x86_64", "i686"}, .features = {}, .maxJobs = 1, .running = {}}, sup);
+        for (auto const * system : {"x86_64", "i686"}) {
+            auto const hint = std::string_view(system) == urgent ? 1000.0 : 0.0;
+            shard.want(1, {.drvPath = std::string(system) + ".drv", .inputs = {}, .system = system, .features = {}, .cpHintMs = hint}, 0);
+        }
+        shard.dispatch(out);
+        assert(out.size() == 1 && shard.entry(out.at(0).drv)->system == urgent);
+    }
+}
+
 void testSystems()
 {
     Core shard;
@@ -401,6 +449,8 @@ try {
     testSystems();
     testUnofferedSystems();
     testHelloAdoptsQueued();
+    testGiveBack();
+    testCrossSystemPriority();
     testPlaceabilityFlips();
     testStaleDoneAndUnknown();
     return 0;

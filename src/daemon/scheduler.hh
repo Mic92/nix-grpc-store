@@ -129,6 +129,11 @@ public:
         return heap.empty() ? std::nullopt : std::optional(heap.front().second);
     }
 
+    [[nodiscard]] auto topKey() const -> std::optional<double>
+    {
+        return heap.empty() ? std::nullopt : std::optional(heap.front().first);
+    }
+
     void set(DrvId drv, double key)
     {
         if (drv == npos) {
@@ -290,6 +295,7 @@ struct Entry
     double enqMs = 0;
     double cpHint = 0;
     bool unplaceable = false; // as last told to the followers
+    WorkerId avoid = noWorker; // gave it back; used only if no other worker can run it
 };
 
 struct Worker
@@ -563,6 +569,28 @@ public:
         }
     }
 
+    // The worker can't run it after all: place it elsewhere.
+    void giveBack(WorkerId wid, std::string_view drvPath)
+    {
+        auto found = findDrv(drvPath);
+        if (!found) {
+            return;
+        }
+        std::erase(workers.at(wid).running, *found);
+        refreshFree(wid);
+        auto & slot = entries.at(*found);
+        if (!slot || slot->worker != wid) {
+            return;
+        }
+        slot->worker = noWorker;
+        slot->avoid = wid;
+        if (slot->followers.empty()) {
+            retire(*found);
+        } else {
+            sys(slot->system).queue.set(*found, prio(*slot));
+        }
+    }
+
     void setDraining(WorkerId wid, bool draining)
     {
         workers.at(wid).draining = draining;
@@ -596,10 +624,27 @@ public:
         }
     }
 
+    // Across systems, so the most urgent drv wins.
     void dispatch(std::vector<Assign> & out)
     {
-        for (auto & [name, state] : systems) {
-            dispatch(state, out);
+        std::vector<Skipped> skipped;
+        for (;;) {
+            std::string const * best = nullptr;
+            double bestKey = 0;
+            for (const auto & [name, state] : systems) {
+                auto const key = state.queue.topKey();
+                if (key && state.free.maxFree() > 0 && (best == nullptr || *key < bestKey)) {
+                    best = &name;
+                    bestKey = *key;
+                }
+            }
+            if (best == nullptr) {
+                break;
+            }
+            dispatchHead(std::string(*best), out, skipped);
+        }
+        for (const auto & skip : skipped) {
+            sys(skip.system).queue.set(skip.drv, skip.key);
         }
     }
 
@@ -806,44 +851,35 @@ private:
         return systems.try_emplace(name).first->second;
     }
 
-    void dispatch(SystemState & state, std::vector<Assign> & out)
+    struct Skipped
     {
-        auto & queue = state.queue;
-        std::vector<std::pair<DrvId, double>> skipped; // need a feature no free worker has
-        while (auto head = queue.top()) {
-            if (state.free.maxFree() <= 0) {
-                break;
+        std::string system;
+        DrvId drv;
+        double key;
+    };
+
+    void dispatchHead(const std::string & system, std::vector<Assign> & out, std::vector<Skipped> & skipped)
+    {
+        auto & queue = sys(system).queue;
+        auto const drv = queue.top().value_or(0);
+        queue.erase(drv);
+        auto & slot = entries.at(drv);
+        if (!slot || slot->followers.empty() || slot->worker != noWorker) {
+            if (slot && slot->followers.empty() && slot->worker == noWorker) {
+                retire(drv); // stale
             }
-            auto & slot = entries.at(*head);
-            auto const drv = *head;
-            if (!slot || slot->followers.empty() || slot->worker != noWorker) {
-                queue.erase(drv); // stale
-                if (slot && slot->followers.empty() && slot->worker == noWorker) {
-                    retire(drv);
-                }
-                continue;
-            }
-            auto wid = pick(*slot);
-            queue.erase(*head);
-            if (!wid) {
-                skipped.emplace_back(*head, prio(*slot));
-                continue;
-            }
-            slot->worker = *wid;
-            slot->assignId = ++lastAssignId;
-            workers.at(*wid).running.push_back(*head);
-            refreshFree(*wid);
-            out.push_back(
-                Assign{
-                    .drv = *head,
-                    .worker = *wid,
-                    .assignId = slot->assignId,
-                    .clients = slot->followers,
-                });
+            return;
         }
-        for (auto [drv, key] : skipped) {
-            queue.set(drv, key);
+        auto wid = pick(*slot);
+        if (!wid) {
+            skipped.push_back({.system = system, .drv = drv, .key = prio(*slot)});
+            return;
         }
+        slot->worker = *wid;
+        slot->assignId = ++lastAssignId;
+        workers.at(*wid).running.push_back(drv);
+        refreshFree(*wid);
+        out.push_back(Assign{.drv = drv, .worker = *wid, .assignId = slot->assignId, .clients = slot->followers});
     }
 
     [[nodiscard]] auto freeOf(WorkerId wid) const -> int32_t
@@ -902,9 +938,33 @@ private:
         return best;
     }
 
+    // The worker it was given back by, if nobody else can run it.
+    [[nodiscard]] auto avoiding(const Entry & ent) const -> std::optional<WorkerId>
+    {
+        std::optional<WorkerId> best;
+        bool others = false;
+        for (WorkerId wid = 0; wid < workers.size(); wid++) {
+            const auto & wkr = workers.at(wid);
+            if (wid == ent.avoid || !wkr.up || wkr.draining || !offers(wkr, ent)) {
+                continue;
+            }
+            others = true;
+            if (freeOf(wid) > 0 && (!best || freeOf(wid) > freeOf(*best))) {
+                best = wid;
+            }
+        }
+        if (best || others) {
+            return best;
+        }
+        return ent.avoid;
+    }
+
     [[nodiscard]] auto pick(const Entry & ent) const -> std::optional<WorkerId>
     {
         auto best = emptiestFor(ent);
+        if (best && *best == ent.avoid) {
+            best = avoiding(ent);
+        }
         if (!best) {
             return std::nullopt;
         }
@@ -919,7 +979,8 @@ private:
                 continue;
             }
             auto [wid, size] = iter->second;
-            if (wid >= workers.size() || !workers.at(wid).up || freeOf(wid) <= 0 || !offers(workers.at(wid), ent)) {
+            if (wid >= workers.size() || wid == ent.avoid || !workers.at(wid).up || freeOf(wid) <= 0
+                || !offers(workers.at(wid), ent)) {
                 continue;
             }
             auto const cand = std::ranges::find_if(cands, [&](auto & cnd) -> bool { return cnd.first == wid; });
