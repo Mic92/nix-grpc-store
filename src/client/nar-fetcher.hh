@@ -6,6 +6,7 @@
 // the download.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -46,11 +47,29 @@
 
 namespace nixgrpc {
 
-// Unlinked temp file one reader thread appends to while fetchInto() streams
-// it out, so a large NAR never has to fit in memory.
-class NarSpool
+// A descriptor per path ran out on big copies.
+struct SpoolFile
 {
     nix::AutoCloseFD fd;
+    uint64_t tail = 0; // only the session's reader thread appends
+
+    auto get() -> int
+    {
+        if (!fd) {
+            auto [tmpFd, tmpPath] = nix::createTempFile("nix-grpc-nar");
+            ::unlink(tmpPath.c_str());
+            fd = std::move(tmpFd);
+        }
+        return fd.get();
+    }
+};
+
+// One path's range of the session file. The reader thread appends while
+// fetchInto() streams it out, so a large NAR never has to fit in memory.
+class NarSpool
+{
+    std::shared_ptr<SpoolFile> file;
+    uint64_t base = 0;
     std::mutex mutex;
     std::condition_variable grown;
     uint64_t written = 0;
@@ -58,28 +77,33 @@ class NarSpool
     std::exception_ptr failure;
 
 public:
-    NarSpool()
+    explicit NarSpool(std::shared_ptr<SpoolFile> file)
+        : file(std::move(file))
     {
-        auto [tmpFd, tmpPath] = nix::createTempFile("nix-grpc-nar");
-        ::unlink(tmpPath.c_str());
-        fd = std::move(tmpFd);
     }
 
     void append(std::string_view data)
     {
         auto const size = data.size();
-        uint64_t off = written;
         if (eof) {
             throw nix::Error("gRPC FetchNars sent data after EOF for a path");
         }
+        if (written == 0) {
+            base = file->tail;
+        } else if (base + written != file->tail) {
+            throw nix::Error("gRPC FetchNars interleaved paths");
+        }
+        uint64_t off = file->tail;
+        auto const descriptor = file->get();
         while (!data.empty()) {
-            auto const count = ::pwrite(fd.get(), data.data(), data.size(), static_cast<off_t>(off));
+            auto const count = ::pwrite(descriptor, data.data(), data.size(), static_cast<off_t>(off));
             if (count < 0) {
                 throw nix::SysError("writing NAR spool file");
             }
             data.remove_prefix(static_cast<size_t>(count));
             off += static_cast<uint64_t>(count);
         }
+        file->tail = off;
         {
             std::scoped_lock const lock(mutex);
             written += size;
@@ -111,6 +135,12 @@ public:
         grown.notify_all();
     }
 
+    [[nodiscard]] auto failed() -> bool
+    {
+        std::scoped_lock const lock(mutex);
+        return failure != nullptr;
+    }
+
     // Nothing delivered yet, so a fresh stream can start this path over.
     [[nodiscard]] auto untouched() -> bool
     {
@@ -132,13 +162,13 @@ public:
                 }
                 avail = written;
                 if (avail == pos && eof) {
-                    fd.close();
                     return;
                 }
             }
             while (pos < avail) {
                 auto const want = std::min<uint64_t>(buf.size(), avail - pos);
-                auto const count = ::pread(fd.get(), buf.data(), want, static_cast<off_t>(pos));
+                // fd and base are set before `written` grows, under the mutex.
+                auto const count = ::pread(file->fd.get(), buf.data(), want, static_cast<off_t>(base + pos));
                 if (count <= 0) {
                     throw nix::SysError("reading NAR spool file");
                 }
@@ -204,7 +234,7 @@ public:
     {
         std::scoped_lock const lock(narMutex);
         for (auto & path : order) {
-            if (!buffers.contains(path)) {
+            if (!live(path)) {
                 pending.push_back(std::move(path));
             }
         }
@@ -216,11 +246,10 @@ public:
         std::shared_ptr<NarSpool> buffer;
         {
             std::scoped_lock const lock(narMutex);
-            auto found = buffers.find(path);
-            if (found == buffers.end()) {
+            if (!live(path)) {
                 startPending();
-                found = buffers.find(path);
             }
+            auto found = buffers.find(path);
             if (found == buffers.end()) {
                 startSession({path});
                 found = buffers.find(path);
@@ -243,6 +272,13 @@ public:
             throw;
         }
         forget();
+    }
+
+    [[nodiscard]] auto sessionCount() -> size_t
+    {
+        std::scoped_lock const lock(narMutex);
+        reap();
+        return sessions.size();
     }
 
     ~NarFetcher()
@@ -270,6 +306,7 @@ private:
         std::mutex callMutex;
         // Only while an attempt runs: a Call stays registered for SIGINT.
         std::unique_ptr<nixgrpc::Call> live;
+        std::atomic<bool> finished = false; // run() is about to return
         std::jthread thread;
 
     public:
@@ -321,6 +358,13 @@ private:
         }
 
         void run(const std::stop_token & stop)
+        {
+            attempts(stop);
+            pending.clear();
+            finished = true;
+        }
+
+        void attempts(const std::stop_token & stop)
         {
             Backoff backoff(retry.budget());
             try {
@@ -411,18 +455,44 @@ private:
         }
     }
 
+    // Caller holds narMutex. A failed spool is dropped, so asking again
+    // starts over, also for the paths of a failed session nobody read yet.
+    auto live(const nix::StorePath & path) -> bool
+    {
+        auto const found = buffers.find(path);
+        if (found == buffers.end()) {
+            return false;
+        }
+        if (found->second->failed()) {
+            buffers.erase(found);
+            return false;
+        }
+        return true;
+    }
+
     // Caller holds narMutex.
+    void reap()
+    {
+        std::erase_if(sessions, [](const auto & session) -> bool { return session->finished; });
+    }
+
+    // Caller holds narMutex. Spools become visible only once their writer runs.
     void startSession(const std::vector<nix::StorePath> & paths)
     {
+        reap();
+        auto const file = std::make_shared<SpoolFile>();
         std::vector<Session::Pending> pending;
+        pending.reserve(paths.size());
         for (const auto & path : paths) {
-            auto const spool = std::make_shared<NarSpool>();
-            buffers.emplace(path, spool);
-            pending.push_back({.path = path, .spool = spool});
+            pending.push_back({.path = path, .spool = std::make_shared<NarSpool>(file)});
         }
+        auto spools = pending;
         auto session = std::make_unique<Session>(*this, std::move(pending));
         session->thread = std::jthread([raw = session.get()](const std::stop_token & stop) -> void { raw->run(stop); });
         sessions.push_back(std::move(session));
+        for (auto & item : spools) {
+            buffers.insert_or_assign(std::move(item.path), std::move(item.spool));
+        }
     }
 };
 

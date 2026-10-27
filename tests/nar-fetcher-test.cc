@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -207,6 +208,40 @@ void nonRetryableFailsAtOnce()
     assert(fix.service.calls() == 1);
 }
 
+// The paths a failed session never delivered must be asked for again too.
+void siblingFailureIsRetried()
+{
+    Fixture fix([](int, const auto &, auto &) -> grpc::Status {
+        return {grpc::StatusCode::PERMISSION_DENIED, "no"};
+    });
+    auto fetcher = fix.fetcher();
+    fetcher->recordOrder({pathA(), pathB()}, {});
+
+    assert(fetchFails(*fetcher, pathA()));
+    assert(fetchFails(*fetcher, pathB()));
+    assert(fix.service.calls() == 2);
+}
+
+// Each unannounced path gets a session; finished ones must not pile up.
+void finishedSessionsGo()
+{
+    Fixture fix([](int, const auto & request, auto & writer) -> grpc::Status {
+        sendNar(writer, 0, narOf(request.paths(0)));
+        return grpc::Status::OK;
+    });
+    auto fetcher = fix.fetcher();
+    for (int i = 0; i < 3; ++i) {
+        assert(fetch(*fetcher, pathA()) == narOf(std::string(pathA().to_string())));
+    }
+    // The last thread may still be on its way out.
+    constexpr int polls = 100;
+    constexpr std::chrono::milliseconds poll{10};
+    for (int i = 0; i < polls && fetcher->sessionCount() > 0; ++i) {
+        std::this_thread::sleep_for(poll);
+    }
+    assert(fetcher->sessionCount() == 0);
+}
+
 } // namespace
 
 auto main() -> int
@@ -215,6 +250,8 @@ try {
     connectFailureIsRetried();
     midStreamBreakRefetchesUntouchedPaths();
     nonRetryableFailsAtOnce();
+    siblingFailureIsRetried();
+    finishedSessionsGo();
     return 0;
 } catch (...) {
     return 1;

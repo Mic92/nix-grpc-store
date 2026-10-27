@@ -68,9 +68,10 @@ extern "C" auto LLVMFuzzerTestOneInput(const uint8_t * raw, size_t size) -> int
         reader.frames.push_back(std::move(frame));
     }
 
+    auto const file = std::make_shared<nixgrpc::SpoolFile>();
     std::vector<std::shared_ptr<nixgrpc::NarSpool>> targets;
     for (unsigned idx = 0; idx < kTargets; ++idx) {
-        targets.push_back(std::make_shared<nixgrpc::NarSpool>());
+        targets.push_back(std::make_shared<nixgrpc::NarSpool>(file));
     }
     try {
         nixgrpc::demuxNarFrames(reader, targets);
