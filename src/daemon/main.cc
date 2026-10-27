@@ -549,8 +549,12 @@ public:
     }
 
     // Inputs may have been uploaded to, or built on, another worker.
-    auto gatherInputs(nix::Store & localStore, const nix::BasicDerivation & drv, nix::Store & roots, nixgrpc::Metrics::Inputs & counted)
-        -> grpc::Status
+    auto gatherInputs(
+        nix::Store & localStore,
+        const nix::BasicDerivation & drv,
+        nix::Store & roots,
+        nixgrpc::Metrics::Inputs & counted,
+        std::string & missing) -> grpc::Status
     {
         try {
             const auto & inputs = nixcompat::drvInputs(drv);
@@ -563,7 +567,9 @@ public:
                 if (local.contains(input)) {
                     continue;
                 }
+                missing = localStore.printStorePath(input);
                 nixcompat::ensurePath(localStore, input);
+                missing.clear();
                 counted.bytes += localStore.queryPathInfo(input)->narSize;
             }
             counted.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - before).count();
@@ -771,7 +777,11 @@ public:
         nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "substitute");
         // Roots inputs and outputs until publish is done.
         auto const roots = openScopedStore();
-        if (auto status = gatherInputs(localStore, drv, *roots, inputs); !status.ok()) {
+        std::string missing;
+        if (auto status = gatherInputs(localStore, drv, *roots, inputs, missing); !status.ok()) {
+            if (!missing.empty()) {
+                context.AddTrailingMetadata("x-nix-missing-input", missing);
+            }
             return status;
         }
         for (const auto & [name, path] : outPaths) {
