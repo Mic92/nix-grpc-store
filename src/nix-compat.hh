@@ -450,6 +450,18 @@ inline auto maxBuildJobs() -> unsigned {
   return has(nix::settings);
 }
 
+// The worker's own `cores`. 2.36 moved it into LocalSettings.
+inline auto buildCores() -> unsigned {
+  constexpr auto get = []<typename S>(S &settings) -> unsigned {
+    if constexpr (requires { settings.getLocalSettings(); }) {
+      return settings.getLocalSettings().buildCores;
+    } else {
+      return settings.buildCores;
+    }
+  };
+  return get(nix::settings);
+}
+
 inline auto buildTimeout() -> time_t {
   constexpr auto get = []<typename S>(S &settings) -> time_t {
     if constexpr (requires { settings.getWorkerSettings(); }) {

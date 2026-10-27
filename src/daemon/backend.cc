@@ -47,8 +47,8 @@ void buildLocally(Backend::Conn & conn, Backends::Limits limits)
     constexpr uint64_t yes = 1;
     conn.to << nix::WorkerProto::Op::SetOptions << off /* keepFailed */ << off /* keepGoing */
             << off /* tryFallback */ << off /* verbosity */ << yes /* maxBuildJobs */
-            << limits.maxSilentTime << yes << off /* verbosity */ << off << off << off /* buildCores */
-            << yes /* useSubstitutes */;
+            << limits.maxSilentTime << yes << off /* verbosity */ << off << off
+            << uint64_t{nixcompat::buildCores()} << yes /* useSubstitutes */;
     std::map<std::string, std::string> const overrides{
         {"builders", ""}, {"timeout", std::to_string(limits.buildTimeout)}};
     conn.to << overrides.size();
