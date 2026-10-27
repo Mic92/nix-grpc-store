@@ -33,7 +33,7 @@ Why gRPC instead of `ssh-ng://`?
     without a database. See [docs/farm.md](docs/farm.md).
 
 Everything that works over `ssh-ng://` works here: remote builds,
-`nix copy`, path queries, GC. The gRPC layer is a thin tunnel to the
+`nix copy`, path queries. The gRPC layer is a thin tunnel to the
 `nix-daemon` on the other side, with dedicated RPCs for the `nix copy` hot
 path (path info queries, bulk import, NAR download).
 [docs/latency.md](docs/latency.md) shows the round trips each
@@ -50,7 +50,7 @@ wired link with ~47 ms RTT, 10 interleaved runs each.
 
 A static HTTP binary cache stays ahead for pure downloads, but it is
 download-only. The gRPC store keeps close while also handling uploads,
-remote builds, GC and mTLS through the same endpoint.
+remote builds and mTLS through the same endpoint.
 
 Reproduce with `./scripts/bench-transports.py`.
 
@@ -169,7 +169,7 @@ presenting a certificate signed by that CA are accepted.
 
 gRPC clients act as the `nix-grpc-daemon` user, which is not trusted by
 default. That is enough for `nix build --store 'grpc://…'`, `nix copy`,
-path queries and GC: sources and derivations are content-addressed, signed
+path queries: sources and derivations are content-addressed, signed
 cache paths are accepted, and the server builds everything itself.
 
 This makes an untrusting server usable as a builder without any special
@@ -212,7 +212,7 @@ is given.
     regardless of `--no-check-sigs`) and server-side builds
     (`nix build --store 'grpc://…'`)
   * `trusted` — everything, including the raw worker-protocol tunnel
-    (GC, `nix store add`, repair) and unsigned imports (still subject to
+    (`nix store add`, repair) and unsigned imports (still subject to
     the nix-daemon's trust in the proxy user, see above)
 
 `--allow-anonymous ROLE` relaxes the client-certificate requirement:
@@ -246,7 +246,7 @@ Role needed per use case:
 | `nix copy --to` (signed paths)                   | `write`     |
 | `nix build --store 'grpc://…' --eval-store auto` | `write`     |
 | Remote builder (`nix.buildMachines`)             | `trusted`   |
-| GC, `--repair`, `nix store add`                  | `trusted`   |
+| `--repair`, `nix store add`                      | `trusted`   |
 
 Builds are submitted through a dedicated RPC and run entirely
 server-side, so the `write` role suffices. Only operations that tunnel

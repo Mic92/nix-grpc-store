@@ -116,6 +116,7 @@ services.nix-grpc-daemon = {
     { cn = "lb-*"; role = "trusted"; }   # the balancer, to read the builder list
   ];
   niks3 = {
+    package = pkgs.niks3;
     url = "https://niks3.example.com";
     tokenFile = "/run/keys/niks3-token";
     cacheUrl = "https://cache.example.com";
@@ -290,9 +291,9 @@ one-liner for the team, e.g. `nix run .#nix-farm`.
 
 ## Managing the farm
 
-**Add a builder.** Deploy it with the Step 1 config, add its address
-under `workers.<system>`, redeploy the balancer. It takes queued builds
-as soon as it has connected to the scheduler.
+**Add a builder.** Deploy it with the Step 1 config. The balancer learns
+of it from the scheduler, and it takes queued builds as soon as it has
+connected.
 
 **Autoscale builders.** `nix_grpc_sched_system` has one series per
 system and feature set. `queued`, `unplaceable` and `running` are
@@ -344,7 +345,7 @@ and feature set,
 `nix_grpc_sched_system{system,features,kind="queued|unplaceable|running|slots|free"}`.
 Only the node holding the lock has `leader` 1 and non-zero values, so
 aggregate with `max by (system, kind)` over the scheduler nodes. A
-Grafana dashboard for all of it ships as `nixos/grafana/farm.json`
+Grafana dashboard for all of it ships as `deploy/helm/nix-grpc-farm/files/farm.json`
 (flake: `nix-grpc-store.dashboards.farm`):
 
 ```nix
