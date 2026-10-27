@@ -35,6 +35,7 @@
 #include <sys/socket.h>
 
 #include <grpc/impl/channel_arg_names.h>
+#include <grpcpp/resource_quota.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
 #include <grpcpp/security/server_credentials.h>
@@ -1001,7 +1002,14 @@ try {
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
-    builder.SetMaxReceiveMessageSize(-1);
+    // Clients stream NARs in 256 KiB chunks and Wants in 4 MiB batches. The
+    // quota bounds what peers, authenticated or not, can make us buffer.
+    constexpr int maxReceiveBytes = 64 << 20;
+    constexpr size_t memoryQuotaBytes = size_t{1} << 30U;
+    grpc::ResourceQuota quota("nix-grpc-daemon");
+    quota.Resize(memoryQuotaBytes);
+    builder.SetResourceQuota(quota);
+    builder.SetMaxReceiveMessageSize(maxReceiveBytes);
     builder.SetMaxSendMessageSize(-1);
     // A balancer keeps idle upstream connections alive with pings.
     builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
