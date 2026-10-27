@@ -75,6 +75,7 @@
 #include "idle.hh"
 #include "import-paths.hh"
 #include "log-spill.hh"
+#include "keepalive.hh"
 #include "logfmt.hh"
 #include "oidc.hh"
 #include "path-info-wire.hh"
@@ -140,13 +141,19 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     // only fail on the next write. Drop them all so the retry gets fresh ones.
     // A failed reconnect while the daemon is down is latched by the store and
     // reported as "previously failed", so that drops the store too.
-    auto localDaemonGone(const std::exception & err) -> bool
+    static auto backendGone(const std::exception & err) -> bool
     {
         const auto * sys = dynamic_cast<const nix::SysError *>(&err);
-        bool const gone = dynamic_cast<const nix::EndOfFile *>(&err) != nullptr
-                          || (sys != nullptr && (sys->errNo == EPIPE || sys->errNo == ECONNRESET
-                                                 || sys->errNo == ECONNREFUSED || sys->errNo == ENOENT))
-                          || std::string_view(err.what()).contains("previously failed");
+        return dynamic_cast<const nix::EndOfFile *>(&err) != nullptr
+               || (sys != nullptr
+                   && (sys->errNo == EPIPE || sys->errNo == ECONNRESET || sys->errNo == ECONNREFUSED
+                       || sys->errNo == ENOENT))
+               || std::string_view(err.what()).contains("previously failed");
+    }
+
+    auto localDaemonGone(const std::exception & err) -> bool
+    {
+        bool const gone = backendGone(err);
         if (gone) {
             std::scoped_lock const lock(storeMutex);
             store.reset();
@@ -158,6 +165,24 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     auto openScopedStore() -> nix::ref<nix::Store>
     {
         return openLocalStore();
+    }
+
+    // Retryable on another worker or later: guarded() maps it to UNAVAILABLE.
+    struct Unavailable : nix::Error
+    {
+        using nix::Error::Error;
+    };
+
+    // Publishing makes our paths everyone's. Without it the client may not rely on them.
+    void publish(nix::Store & localStore, const std::vector<std::string> & paths, const nixgrpc::Cancelled & cancelled)
+    {
+        try {
+            coord.cache.publish(localStore, paths, cancelled);
+        } catch (nixgrpc::CancelledWait &) {
+            throw;
+        } catch (nix::Error & err) {
+            throw Unavailable("publish failed: %s", err.what());
+        }
     }
 
 public:
@@ -183,6 +208,8 @@ private:
         } catch (Denied & denied) {
             return denied.status;
         } catch (nixgrpc::CancelledWait & err) {
+            return {grpc::StatusCode::UNAVAILABLE, err.what()};
+        } catch (Unavailable & err) {
             return {grpc::StatusCode::UNAVAILABLE, err.what()};
         } catch (std::exception & err) {
             if (stopSignal != 0) {
@@ -277,12 +304,14 @@ public:
             }
 
             std::atomic<uint64_t> bytesIn{0};
+            std::atomic<bool> received{false};
             std::jthread receiver([&] -> void {
                 try {
                     bytesIn = nixgrpc::pumpStreamToFd(*stream, sock.get());
                 } catch (...) {
                     nix::ignoreExceptionInDestructor();
                 }
+                received = true;
                 ::shutdown(sock.get(), SHUT_WR);
             });
 
@@ -293,6 +322,10 @@ public:
                 nix::ignoreExceptionInDestructor();
             }
 
+            // nix-daemon hung up first: the client still waits for a reply, so end the call.
+            if (!received) {
+                context->TryCancel();
+            }
             receiver.join();
             rpc.done({{"bytes_in", std::to_string(bytesIn.load())}, {"bytes_out", std::to_string(bytesOut)}});
             metrics.countTunnelBytes(rpc.caller.name, bytesIn, bytesOut);
@@ -329,7 +362,7 @@ public:
                 }
                 // and what only we have must become so before the client relies on it.
                 phase.next("publish");
-                coord.cache.publish(*localStore, valid, [&] -> bool { return context->IsCancelled(); });
+                publish(*localStore, valid, [&] -> bool { return context->IsCancelled(); });
             }
             return grpc::Status::OK;
         });
@@ -422,7 +455,7 @@ public:
             std::vector<std::string> imported;
             auto const stats = importUploads(*localStore, source, repair, checkSigs, imported);
             phase.next("publish");
-            coord.cache.publish(*localStore, imported, [&] -> bool { return context->IsCancelled(); });
+            publish(*localStore, imported, [&] -> bool { return context->IsCancelled(); });
             phase.done();
             rpc.done({{"paths", std::to_string(stats.paths)}, {"nar_bytes_in", std::to_string(stats.narBytes)}});
             metrics.countNarBytes("in", rpc.caller.name, stats.narBytes);
@@ -445,6 +478,9 @@ public:
                     substituteIfRemote(*localStore, path);
                     info = localStore->queryPathInfo(path).get_ptr();
                 } catch (nix::Error & err) {
+                    if (backendGone(err)) {
+                        throw;
+                    }
                     // invalid here and not substitutable: omitted from the reply
                     logDebug({{"event", "path_info_miss"}, {"path", name}, {"error", err.what()}});
                     continue;
@@ -534,7 +570,7 @@ public:
         } catch (nix::Error & err) {
             // Another worker may still hold it locally. UNAVAILABLE makes the client retry elsewhere.
             metrics.event("input_not_substitutable");
-            return {grpc::StatusCode::UNAVAILABLE, workerName + ": input not substitutable: " + err.what()};
+            return {grpc::StatusCode::FAILED_PRECONDITION, workerName + ": input not substitutable: " + err.what()};
         }
         return grpc::Status::OK;
     }
@@ -691,7 +727,6 @@ public:
         auto const cancelled = [&] -> bool {
             return (context.IsCancelled() && shared.attached == 0) || shared.revoked || stopSignal >= nixgrpc::kCancelBuilds;
         };
-        nixgrpc::Metrics::Held const held(metrics, "BuildDerivation");
         nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "substitute");
         // Roots inputs and outputs until publish is done.
         auto const roots = openScopedStore();
@@ -730,18 +765,13 @@ public:
                 built.push_back(localStore.printStorePath(path));
                 outputs.emplace_back(built.back(), localStore.queryPathInfo(path)->narSize);
             }
-            try {
-                phase.next("publish");
-                coord.cache.publish(localStore, built, cancelled);
-                phase.done();
-            } catch (nixgrpc::CancelledWait &) {
-                throw;
-            } catch (nix::Error & err) {
-                return {grpc::StatusCode::UNAVAILABLE, std::string("publish failed: ") + err.what()};
-            }
+            phase.next("publish");
+            publish(localStore, built, cancelled);
+            phase.done();
             outcome = nix::remote::Done::BUILT;
-        } else if (nixcompat::failureStatus(res) == nixcompat::FailureStatus::TransientFailure) {
+        } else if (nixcompat::failureStatus(res) == nixcompat::FailureStatus::TransientFailure && nixcompat::isSandboxed(drv)) {
             // ENOSPC and the like: not the build's fault, let the scheduler place it again.
+            // Nix reports every failed fixed-output build as transient too, which is the build's result.
             return {grpc::StatusCode::UNAVAILABLE, nixcompat::buildFailureMsg(res).value_or("transient failure")};
         }
         nixgrpc::encodeResult(localStore, res, &done);
@@ -755,13 +785,13 @@ public:
     {
         return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "BuildDerivation", nixgrpc::Role::write, request->build_mode());
+            // The whole call, attachers too: the drain waits for it.
+            nixgrpc::Metrics::Held const inflight(metrics, "BuildDerivation");
             if (request->protocol() != nixcompat::kBuildProtocolWire
                 || request->build_mode() > static_cast<uint32_t>(nix::bmCheck)) {
                 return {grpc::StatusCode::INVALID_ARGUMENT, "unsupported build protocol or mode"};
             }
-            if (stopSignal != 0) {
-                return {grpc::StatusCode::UNAVAILABLE, "worker draining"};
-            }
+            // No drain check: the scheduler stops sending new work, and what it already sent runs.
             auto const localStore = getStore();
             auto const sendLogLine = [&](nixgrpc::BuildEvent event) -> void {
                 writer->Write(nixgrpc::toChunk<nix::remote::BuildDerivationChunk>(std::move(event)));
@@ -802,6 +832,7 @@ public:
     {
         return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "FetchNars", nixgrpc::Role::readOnly);
+            nixgrpc::Metrics::Held const held(metrics, "FetchNars"); // the drain waits for it
             auto const localStore = getStore();
 
             class TaggingWriter
@@ -880,13 +911,19 @@ void serve(
                 return;
             }
             coord.tick();
-        } else if (stopSignal >= nixgrpc::kCancelBuilds || !coord.builder || metrics.inflightNow("BuildDerivation") == 0) {
-            return;
-        } else if (!draining) {
-            draining = true;
-            nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "draining"}});
-            coord.builder->setDraining(true);
-            server.GetHealthCheckService()->SetServingStatus("", false);
+        } else {
+            if (!draining) {
+                draining = true;
+                nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "draining"}});
+                if (coord.builder) {
+                    coord.builder->setDraining(true);
+                }
+                server.GetHealthCheckService()->SetServingStatus("", false);
+            }
+            if (stopSignal >= nixgrpc::kCancelBuilds
+                || metrics.inflightNow("BuildDerivation") + metrics.inflightNow("FetchNars") == 0) {
+                return;
+            }
         }
         if (watchdog.count() != 0) {
             nixgrpc::sdNotify("WATCHDOG=1");
@@ -1013,6 +1050,10 @@ try {
     builder.SetMaxSendMessageSize(-1);
     // A balancer keeps idle upstream connections alive with pings.
     builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+    // Builds keep streams silent for hours: drop clients that vanished without a FIN.
+    builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS, nixgrpc::kKeepaliveTimeMs);
+    builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, nixgrpc::kKeepaliveTimeoutMs);
+    builder.AddChannelArgument(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
     constexpr int minPingIntervalMs = 10'000;
     builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, minPingIntervalMs);
     auto const creds = nixgrpc::makeServerCredentials(options);

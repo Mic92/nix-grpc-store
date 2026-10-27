@@ -189,6 +189,17 @@ inline void readDrv(nix::Source &source, const nix::StoreDirConfig &store,
 }
 #endif
 
+// Late 2.36 made the derivation type a free function, found by ADL.
+template<typename D>
+auto isSandboxed(const D & drv) -> bool
+{
+    if constexpr (requires { drv.type(); }) {
+        return drv.type().isSandboxed();
+    } else {
+        return type(drv).isSandboxed();
+    }
+}
+
 // BuildResult: flat struct with `status` before 2.32, variant of
 // Success/Failure(BuildError) since.
 // Non-const because BuildResult::success() is non-const before Nix 2.32.
