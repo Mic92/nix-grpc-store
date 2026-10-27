@@ -143,8 +143,9 @@ auto GrpcStore::buildAssigned(Job & job, BuildMode buildMode, Store & evalStore)
   switch (status.error_code()) {
   case grpc::StatusCode::ABORTED: // superseded: the scheduler already sent where to go
     return std::nullopt;
-  case grpc::StatusCode::FAILED_PRECONDITION: // not expected there (any more)
-  case grpc::StatusCode::UNAVAILABLE:         // worker draining or gone
+  case grpc::StatusCode::FAILED_PRECONDITION: // not expected there (any more), or an input missing
+  case grpc::StatusCode::UNAVAILABLE:         // worker gone or failing for a while
+  case grpc::StatusCode::CANCELLED:           // worker shut down (ours was checked above)
   case grpc::StatusCode::UNKNOWN:             // worker died mid-stream ("Stream removed"),
   case grpc::StatusCode::INTERNAL:            //   or RST_STREAM via the balancer
     printError("%s: %s, asking the scheduler again", job.drvPath.to_string(), firstLine(status.error_message()));
@@ -472,20 +473,13 @@ struct GrpcStore::Run {
   }
 };
 
-// A dead scheduler (or the balancer in front losing it) shows as UNAVAILABLE,
-// or as UNKNOWN/INTERNAL "Stream removed" when it dies mid-stream. Config
-// errors (auth, TLS, bad request) are not worth reconnecting for.
+// A scheduler dying mid-stream shows as UNKNOWN/INTERNAL "Stream removed"
+// or an RST_STREAM. It holds soft state only, so any of these is worth a
+// reconnect. Config errors (auth, TLS, bad request) are not.
 namespace {
 auto schedulerGone(const grpc::Status & status) -> bool {
-  switch (status.error_code()) {
-  case grpc::StatusCode::UNAVAILABLE:
-  case grpc::StatusCode::UNKNOWN:
-  case grpc::StatusCode::INTERNAL:
-    return nixgrpc::transportError(status.error_message())
-           || (!status.error_message().contains("andshake") && !status.error_message().contains("certificate"));
-  default:
-    return false;
-  }
+  return nixgrpc::goneAway(status) || status.error_code() == grpc::StatusCode::UNKNOWN
+         || status.error_code() == grpc::StatusCode::INTERNAL;
 }
 
 struct StreamEnd {
@@ -534,7 +528,10 @@ auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::
     debug("grpc: Schedule stream open, %d jobs", run.jobs.size());
     auto const [answered, restarting] = readSchedule(*stream, run, call.ctx());
     status = stream->Finish();
-    if (run.detach() == 0 || isInterrupted() || !(restarting || schedulerGone(status))) {
+    if (run.detach() == 0) {
+      return grpc::Status::OK;
+    }
+    if (isInterrupted() || !(restarting || schedulerGone(status))) {
       return status;
     }
     if (!backoff || answered) {
@@ -580,13 +577,14 @@ void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, BuildMode buildMode, St
   Finally const abandon([&run] -> void { run.abandon(); });
 
   auto const status = scheduleUntilDone(run, headers);
+  checkInterrupt();
+  // Before the join: the abandoned jobs would only report a lost connection.
+  if (!status.ok() && status.error_code() != grpc::StatusCode::CANCELLED) {
+    throw statusError(status, "Schedule");
+  }
   run.abandon();
   reaper.request_stop();
   threads.clear(); // join
-  checkInterrupt();
-  if (!status.ok() && status.error_code() != grpc::StatusCode::CANCELLED && run.remaining > 0) {
-    throw statusError(status, "Schedule");
-  }
 }
 
 auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode buildMode,

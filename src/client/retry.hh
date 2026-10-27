@@ -30,13 +30,13 @@ inline auto transportError(std::string_view msg) -> bool
 }
 
 // A worker or the balancer restarting under us, or not reachable right now.
+// The daemon sends UNAVAILABLE only for that; TLS setup failures are config errors.
 inline auto goneAway(const grpc::Status & status) -> bool
 {
     auto const & msg = status.error_message();
     switch (status.error_code()) {
     case grpc::StatusCode::UNAVAILABLE:
-        return transportError(msg) || msg.contains("upstream") || msg.contains("shutting down")
-               || msg.contains("local nix-daemon connection lost");
+        return transportError(msg) || (!msg.contains("andshake") && !msg.contains("certificate"));
     case grpc::StatusCode::CANCELLED:
         // Empty: the daemon shut down before a handler took the call.
         return msg.empty() || msg.contains("Cancelling all calls");

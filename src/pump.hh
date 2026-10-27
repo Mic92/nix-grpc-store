@@ -205,6 +205,13 @@ inline auto pumpStreamToFd(Stream & stream, int sinkFd) -> uint64_t
     return total;
 }
 
+// The peer ended the call: its status says why.
+class StreamClosed : public nix::Error
+{
+public:
+    using nix::Error::Error;
+};
+
 // Sink that zstd-compresses written data into gRPC messages of type `Msg`
 // (must have a `data` bytes field) sent through the writer. Unlike the tunnel
 // pump above there is no per-batch flush: the Sink's lifetime is one zstd
@@ -223,7 +230,7 @@ class ZstdWriterSink : public nix::Sink
             return;
         }
         if (!writer->Write(msg)) {
-            throw nix::Error("gRPC stream closed by peer during bulk import");
+            throw StreamClosed("gRPC stream closed by peer during bulk import");
         }
         msg.mutable_data()->clear();
     }

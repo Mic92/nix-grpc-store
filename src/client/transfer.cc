@@ -25,7 +25,6 @@
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
 #include <nix/store/worker-protocol.hh>
-#include <nix/util/error.hh>
 #include <nix/util/logging.hh>
 #include <nix/util/repair-flag.hh>
 #include <nix/util/serialise.hh>
@@ -247,7 +246,7 @@ auto GrpcStore::addMultipleToStoreOnce(
         flags.set_repair(repair == Repair);
         flags.set_check_sigs(checkSigs == CheckSigs);
         if (!writer->Write(flags)) {
-          throw Error("gRPC stream closed by peer");
+          throw nixgrpc::StreamClosed("gRPC stream closed by peer");
         }
 
         nixgrpc::ZstdWriterSink<grpc::ClientWriter<remote::AddMultipleChunk>, remote::AddMultipleChunk> sink(
@@ -263,11 +262,19 @@ auto GrpcStore::addMultipleToStoreOnce(
         }
         sink.finish();
         writer->WritesDone();
-    } catch (...) {
-        // The server-side status usually explains a broken stream better
-        // than the local write failure.
+    } catch (nixgrpc::StreamClosed &) {
+        // No cancel: it could replace the server's status with CANCELLED.
         auto status = writer->Finish();
         if (status.ok()) {
+          throw;
+        }
+        return status;
+    } catch (...) {
+        // The server may still be reading. A status other than our cancel
+        // explains the failure better.
+        call.ctx().TryCancel();
+        auto status = writer->Finish();
+        if (status.ok() || status.error_code() == grpc::StatusCode::CANCELLED) {
           throw;
         }
         return status;
