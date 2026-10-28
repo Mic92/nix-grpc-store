@@ -105,6 +105,8 @@ public:
 
     // Hello reflecting current state. Sent on every (re)connect.
     auto hello() const -> nix::remote::WorkerMsg;
+    // False if the session is gone.
+    auto greet() const -> bool;
     void setDraining(bool draining);
 
     [[nodiscard]] auto draining() const -> bool

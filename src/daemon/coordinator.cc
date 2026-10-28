@@ -182,7 +182,7 @@ auto Builder::hello() const -> WorkerMsg
     for (const auto & feat : nix::settings.systemFeatures.get()) {
         hel->add_features(feat);
     }
-    hel->set_max_jobs(draining_ ? 0 : options.maxJobs);
+    hel->set_max_jobs(options.maxJobs);
     auto lck = state.lock();
     for (const auto & [drv, ent] : lck->expected) {
         auto * run = hel->add_running();
@@ -190,6 +190,19 @@ auto Builder::hello() const -> WorkerMsg
         run->set_assign_id(ent.assignId);
     }
     return msg;
+}
+
+auto Builder::greet() const -> bool
+{
+    if (!send(hello())) {
+        return false;
+    }
+    if (draining_) {
+        WorkerMsg msg;
+        msg.mutable_load()->set_draining(true);
+        return send(msg);
+    }
+    return true;
 }
 
 void Builder::setDraining(bool draining)
@@ -416,7 +429,7 @@ void Coordinator::start(grpc::Server & server)
         return;
     }
     if (options.schedulerAddr.empty()) {
-        builder->send(builder->hello());
+        builder->greet();
     } else {
         sessionThread = std::jthread(
             [this, &bld = *builder](const std::stop_token & stop) -> void { runRemoteSession(bld, stop); });
@@ -450,7 +463,7 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
             const std::scoped_lock lock(*writeMutex);
             return *live && raw->Write(one);
         });
-        const bool helloed = bld.send(bld.hello());
+        const bool helloed = bld.greet();
         if (helloed) {
             logLine(LogLevel::info, {{"event", "scheduler_connected"}, {"addr", options.schedulerAddr}});
             backoff = minBackoff;
