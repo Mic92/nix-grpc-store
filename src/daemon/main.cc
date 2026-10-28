@@ -28,6 +28,7 @@
 #include <ranges>
 #include <span>
 #include <string>
+#include <set>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -381,8 +382,12 @@ public:
     // the unread bytes can fill an HTTP/2 window that other uploads share.
     template<class Source>
     auto importUploads(
-        nix::Store & localStore, Source & source, nix::RepairFlag repair, nix::CheckSigsFlag checkSigs, std::vector<std::string> & imported)
-        -> nixgrpc::ImportStats
+        nix::Store & localStore,
+        Source & source,
+        nix::RepairFlag repair,
+        nix::CheckSigsFlag checkSigs,
+        const nixgrpc::Cancelled & cancelled,
+        std::vector<std::string> & imported) -> nixgrpc::ImportStats
     {
         struct Owned
         {
@@ -393,9 +398,15 @@ public:
         nixgrpc::NarSpool spool;
         std::vector<Owned> owned;
         std::map<std::string, std::shared_future<void>> theirs;
+        std::set<std::string> seen;
         auto stats = nixgrpc::importPaths(
             localStore, source, [&](const nix::ValidPathInfo & info, nix::Source & nar) -> void {
                 auto const name = localStore.printStorePath(info.path);
+                // A repeat would wait on its own claim.
+                if (!seen.insert(name).second) {
+                    nixgrpc::NarSpool::discard(nar, info.narSize);
+                    return;
+                }
                 auto entry = uploads.enter(name);
                 if (entry.owner) {
                     owned.push_back({.info = std::make_shared<const nix::ValidPathInfo>(info),
@@ -406,11 +417,17 @@ public:
                     theirs.emplace(name, std::move(entry.result));
                 }
             });
+        // The owner's failure is not ours: a replay can succeed.
         auto const await = [&](const std::string & name, const std::shared_future<void> & result) -> void {
+            while (result.wait_for(nixgrpc::cancelPoll) != std::future_status::ready) {
+                if (cancelled()) {
+                    throw nixgrpc::CancelledWait("gave up waiting for a concurrent upload");
+                }
+            }
             try {
                 result.get();
             } catch (const std::future_error &) {
-                throw nix::Error("a concurrent upload of '%s' failed", name);
+                throw Unavailable("a concurrent upload of '%s' failed", name);
             }
         };
         // Only references are awaited, so two uploads cannot wait on each other.
@@ -426,8 +443,10 @@ public:
             imported.push_back(localStore.printStorePath(item.info->path));
             item.promise.set_value();
         }
+        // Ours to publish as well: the owner may have answered before publishing.
         for (const auto & [name, result] : theirs) {
             await(name, result);
+            imported.push_back(name);
         }
         return stats;
     }
@@ -462,9 +481,10 @@ public:
             nixgrpc::Metrics::Held const held(metrics, "AddMultipleToStore");
             nixgrpc::Metrics::Phase phase(metrics, "AddMultipleToStore", "recv");
             std::vector<std::string> imported;
-            auto const stats = importUploads(*localStore, source, repair, checkSigs, imported);
+            auto const cancelled = [&] -> bool { return context->IsCancelled() || stopSignal != 0; };
+            auto const stats = importUploads(*localStore, source, repair, checkSigs, cancelled, imported);
             phase.next("publish");
-            publish(*localStore, imported, [&] -> bool { return context->IsCancelled(); });
+            publish(*localStore, imported, cancelled);
             phase.done();
             rpc.done({{"paths", std::to_string(stats.paths)}, {"nar_bytes_in", std::to_string(stats.narBytes)}});
             metrics.countNarBytes("in", rpc.caller.name, stats.narBytes);
