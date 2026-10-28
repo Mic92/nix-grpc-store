@@ -109,7 +109,7 @@ transport_socket:
 {{- end }}
 {{- end }}
 
-{{/* BuildDerivation goes to the worker the scheduler named in x-nix-worker. */}}
+{{/* Direct BuildDerivation uses x-nix-worker; reverse builds and pinned uploads go to the scheduler. */}}
 {{- define "farm.envoy.workerCluster" -}}
 {{ include "farm.envoy.clusterCommon" . }}
 load_balancing_policy:
@@ -129,12 +129,22 @@ load_balancing_policy:
 
 {{- define "farm.envoy.route" -}}
 match:
+  {{- if .path }}
+  path: {{ .path | quote }}
+  {{- else }}
   prefix: {{ .prefix }}
+  {{- end }}
   grpc: {}
-  {{- if and .system (not .isDefault) }}
+  {{- if or .reverse (and .system (not .isDefault)) }}
   headers:
+    {{- if .reverse }}
+    - name: x-nix-reverse
+      string_match: {exact: "1"}
+    {{- end }}
+    {{- if and .system (not .isDefault) }}
     - name: x-nix-system
       string_match: {exact: {{ .system }}}
+    {{- end }}
   {{- end }}
 route:
   cluster: {{ .cluster | quote }}
@@ -264,14 +274,17 @@ load_assignment:
 {{- /* default group last so its catch-all route does not shadow the others */}}
 {{- $clusters := list }}
 {{- /* Envoy reads the builder list from the scheduler over its own connection. A route for it here would let any client read the list. */}}
-{{- $routes := list (dict "match" (dict "prefix" "/envoy.service.endpoint.v3.EndpointDiscoveryService/" "grpc" (dict)) "direct_response" (dict "status" 404)) (include "farm.envoy.route" (dict "prefix" "/nix.remote.Scheduler/" "cluster" "sched" "system" "" "isDefault" true) | fromYaml) }}
+{{- $routes := list (dict "match" (dict "prefix" "/envoy.service.endpoint.v3.EndpointDiscoveryService/" "grpc" (dict)) "direct_response" (dict "status" 404)) (include "farm.envoy.route" (dict "prefix" "/nix.remote.Scheduler/" "cluster" "sched" "system" "" "isDefault" true) | fromYaml) (include "farm.envoy.route" (dict "prefix" "/nix.remote.ReverseSession/" "cluster" "sched" "system" "" "isDefault" true) | fromYaml) (include "farm.envoy.route" (dict "path" "/nix.remote.NixRemote/UploadBuildInputs" "cluster" "sched") | fromYaml) (include "farm.envoy.route" (dict "path" "/nix.remote.NixRemote/BuildDerivation" "reverse" true "cluster" "sched") | fromYaml) }}
 {{- range $g := concat (without $groups $defaultGroup) (list $defaultGroup) }}
 {{- $w := mustMergeOverwrite (deepCopy $root.Values.workerDefaults) ((index $root.Values.workers $g) | default dict) }}
 {{- $svc := include "farm.workerService" (dict "root" $root "group" $g) }}
 {{- $isDefault := eq $g $defaultGroup }}
+{{- /* Reverse workers are reached only through their session, never by EDS. */}}
+{{- if not $w.reverse.enabled }}
 {{- if not $w.system }}{{ fail (printf "workers.%s.system is required, the scheduler names the endpoints of a group by system" $g) }}{{ end }}
 {{- $clusters = append $clusters (include "farm.envoy.workerCluster" (dict "root" $root "name" $g "edsSystem" $w.system) | fromYaml) }}
 {{- $routes = append $routes (include "farm.envoy.route" (dict "prefix" "/" "cluster" $g "system" $w.system "isDefault" $isDefault) | fromYaml) }}
+{{- end }}
 {{- end }}
 {{- $clusters = append $clusters (include "farm.envoy.clusterCommon" (dict "root" $root "name" "sched" "service" (include "farm.schedulerNames" $root) "healthService" "nix.scheduler") | fromYaml) }}
 {{- $listener := include "farm.envoy.listener" (dict "Values" .Values "Chart" .Chart "Release" .Release "routes" $routes) | fromYaml }}

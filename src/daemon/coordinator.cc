@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -16,8 +17,10 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <sys/statvfs.h>
@@ -50,6 +53,9 @@
 #include "nix_remote.grpc.pb.h"
 #include "nix_remote.pb.h"
 #include "options.hh"
+#include "reverse-capability.hh"
+#include "reverse-protocol.hh"
+#include "reverse-worker.hh"
 #include "sched-reactor.hh"
 
 namespace nixgrpc {
@@ -65,6 +71,8 @@ namespace {
 constexpr int minReconnectBackoffMs = 2'000;
 constexpr std::chrono::milliseconds minBackoff{200};
 constexpr std::chrono::milliseconds maxBackoff{5000};
+// A scheduler session that lasted this long was real, not a balancer refusal.
+constexpr std::chrono::seconds stableSession{10};
 } // namespace
 
 // ---------------------------------------------------------------- Builder
@@ -121,7 +129,7 @@ void Builder::onRevoke(const nix::remote::Revoke & rev)
     {
         auto lck = state.lock();
         auto const found = lck->expected.find(rev.drv_path());
-        if (found == lck->expected.end()) {
+        if (found == lck->expected.end() || found->second.assignId != rev.assign_id()) {
             return;
         }
         if (found->second.running) {
@@ -136,11 +144,11 @@ void Builder::onRevoke(const nix::remote::Revoke & rev)
     sendDone(rev.drv_path(), assignId, nix::remote::Done::CANCELLED, {});
 }
 
-auto Builder::admit(const std::string & drvPath) -> std::optional<Admission>
+auto Builder::admit(const std::string & drvPath, uint64_t assignId) -> std::optional<Admission>
 {
     auto lck = state.lock();
     auto const found = lck->expected.find(drvPath);
-    if (found == lck->expected.end()) {
+    if (found == lck->expected.end() || found->second.assignId != assignId) {
         return std::nullopt;
     }
     auto & ent = found->second;
@@ -150,20 +158,28 @@ auto Builder::admit(const std::string & drvPath) -> std::optional<Admission>
     return adm;
 }
 
+auto Builder::expects(const std::string & drvPath, uint64_t assignId) const -> bool
+{
+    auto lck = state.lock();
+    auto const it = lck->expected.find(drvPath);
+    return assignId != 0 && it != lck->expected.end() && it->second.assignId == assignId
+        && !it->second.shared->revoked;
+}
+
 void Builder::finished(
     const std::string & drvPath,
+    uint64_t assignId,
     nix::remote::Done::Outcome outcome,
     const std::vector<std::pair<std::string, uint64_t>> & outputs,
     std::string resultWire,
-    nix::remote::Done::Reason reason)
+    nix::remote::Done::Reason reason,
+    std::function<void()> * deferredDone)
 {
-    uint64_t assignId = 0;
     std::shared_ptr<Expected::Shared> shared;
     {
         auto lck = state.lock();
         auto const found = lck->expected.find(drvPath);
-        if (found != lck->expected.end()) {
-            assignId = found->second.assignId;
+        if (found != lck->expected.end() && found->second.assignId == assignId) {
             shared = found->second.shared;
             lck->expected.erase(found);
         }
@@ -174,7 +190,18 @@ void Builder::finished(
         shared->resultWire = std::move(resultWire);
         shared->cv.notify_all();
     }
-    sendDone(drvPath, assignId, outcome, outputs, reason);
+    if (shared) {
+        if (deferredDone) {
+            // A reverse build must put its terminal response on the data
+            // session before retiring the scheduler assignment: the relay
+            // fences responses against that live assignment.
+            *deferredDone = [this, drvPath, assignId, outcome, outputs, reason] {
+                sendDone(drvPath, assignId, outcome, outputs, reason);
+            };
+        } else {
+            sendDone(drvPath, assignId, outcome, outputs, reason);
+        }
+    }
 }
 
 void Builder::sendDone(
@@ -206,6 +233,10 @@ auto Builder::hello() const -> WorkerMsg
     WorkerMsg msg;
     auto * hel = msg.mutable_hello();
     hel->set_addr(options.advertise);
+    if (!options.reverseWorkerId.empty()) {
+        hel->set_reverse_worker_id(options.reverseWorkerId);
+        hel->set_reverse_protocol(reverseProtocolVersion);
+    }
     hel->add_systems(nix::settings.thisSystem.get());
     for (const auto & extra : nix::settings.extraPlatforms.get()) {
         hel->add_systems(extra);
@@ -286,43 +317,6 @@ void Builder::tick()
         draining ? nix::remote::Done::DRAINING : nix::remote::Done::UNREACHABLE);
 }
 
-// ---------------------------------------------------------- SchedulerService
-
-SchedulerService::SchedulerService(Dispatcher & dispatcher, Auth & auth, IdleTracker & idle)
-    : dispatcher(&dispatcher)
-    , auth(&auth)
-    , idle(&idle)
-{
-}
-
-
-auto SchedulerService::Schedule(grpc::CallbackServerContext * context)
-    -> grpc::ServerBidiReactor<ClientMsgs, SchedMsgs> *
-{
-    if (!active_) {
-        return new RejectReactor<ClientMsgs, SchedMsgs>(passive()); // NOLINT(cppcoreguidelines-owning-memory): deletes itself in OnDone
-    }
-    auto const caller = auth->identify(*context);
-    if (auto const status = Auth::authorize(caller, "Schedule", Role::write); !status.ok()) {
-        return new RejectReactor<ClientMsgs, SchedMsgs>(status); // NOLINT(cppcoreguidelines-owning-memory)
-    }
-    return new ScheduleReactor(context, *dispatcher, *idle); // NOLINT(cppcoreguidelines-owning-memory)
-}
-
-auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
-    -> grpc::ServerBidiReactor<WorkerMsgs, SchedCmds> *
-{
-    if (!active_) {
-        return new RejectReactor<WorkerMsgs, SchedCmds>(passive()); // NOLINT(cppcoreguidelines-owning-memory)
-    }
-    auto caller = auth->identify(*context);
-    if (auto const status = Auth::authorize(caller, "WorkerSession", Role::trusted); !status.ok()) {
-        return new RejectReactor<WorkerMsgs, SchedCmds>(status); // NOLINT(cppcoreguidelines-owning-memory)
-    }
-    logLine(LogLevel::info, {{"event", "worker_session_open"}, {"cn", caller.name}, {"peer", context->peer()}});
-    return new WorkerSessionReactor(context, *dispatcher, *idle); // NOLINT(cppcoreguidelines-owning-memory)
-}
-
 // -------------------------------------------------------------- Coordinator
 
 namespace {
@@ -330,7 +324,7 @@ namespace {
 // --scheduler-token-file adds a bearer: either, both or neither. The address
 // is often the balancer with a public certificate, so trust the system
 // bundle as well as the farm CA.
-auto schedulerCreds(const Options & options) -> std::shared_ptr<grpc::ChannelCredentials>
+auto schedulerCreds(const Options & options, const std::string & tokenFile) -> std::shared_ptr<grpc::ChannelCredentials>
 {
     if (options.schedulerAddr.starts_with(plaintextScheme)) {
         return grpc::InsecureChannelCredentials();
@@ -355,18 +349,53 @@ auto schedulerCreds(const Options & options) -> std::shared_ptr<grpc::ChannelCre
             options.tlsKey, options.tlsCert, certRefreshSeconds));
     }
     std::shared_ptr<grpc::ChannelCredentials> creds = grpc::experimental::TlsCredentials(tls);
-    if (!options.schedulerTokenFile.empty()) {
+    if (!tokenFile.empty()) {
         creds = grpc::CompositeChannelCredentials(
             creds,
-            grpc::MetadataCredentialsFromPlugin(std::make_unique<TokenFileCredentials>(options.schedulerTokenFile)));
+            grpc::MetadataCredentialsFromPlugin(std::make_unique<TokenFileCredentials>(tokenFile)));
     }
     return creds;
+}
+
+auto readToken(const std::string & path) -> std::string
+{
+    try {
+        auto token = nix::chomp(nix::readFile(path));
+        return token.find_first_of("\r\n") == std::string::npos ? token : std::string{};
+    } catch (std::exception &) {
+        return {};
+    }
+}
+
+// Kubelet rewrites a projected token at 80% of its lifetime: two minutes
+// before a 10-minute token expires. Forward each new token on the open
+// stream so it outlives the token it was opened with.
+constexpr std::chrono::seconds tokenPollInterval{5};
+
+void forwardRotatedTokens(const std::string & path, std::string last, const std::stop_token & stop,
+                          const std::function<bool(std::string)> & send)
+{
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::unique_lock lock(mutex);
+    while (!stop.stop_requested()) {
+        cv.wait_for(lock, stop, tokenPollInterval, [] { return false; });
+        auto token = readToken(path);
+        if (stop.stop_requested() || token.empty() || token == last) {
+            continue;
+        }
+        if (!send(token)) {
+            return;
+        }
+        last = std::move(token);
+    }
 }
 } // namespace
 
 
 void Coordinator::setSchedulerActive(bool active)
 {
+    reverseRegistry.setActive(active);
     if (health != nullptr) {
         health->SetServingStatus("nix.scheduler", active);
     }
@@ -442,6 +471,11 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
 Coordinator::~Coordinator()
 {
     elector.reset();
+    reverseRegistry.setActive(false);
+    if (reverseThread.joinable()) {
+        reverseThread.request_stop();
+        reverseThread.join();
+    }
     if (sessionThread.joinable()) {
         sessionThread.request_stop();
         sessionThread.join();
@@ -473,12 +507,241 @@ void Coordinator::start(grpc::Server & server)
     } else {
         sessionThread = std::jthread(
             [this, &bld = *builder](const std::stop_token & stop) -> void { runRemoteSession(bld, stop); });
+        if (!options.reverseTokenFile.empty()) {
+            reverseThread = std::jthread([this](const std::stop_token & stop) { runReverseSession(stop); });
+        }
+    }
+}
+
+void Coordinator::runReverseSession(const std::stop_token & stop)
+{
+    auto const creds = schedulerCreds(options, options.reverseTokenFile);
+    grpc::ChannelArguments args;
+    args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, kKeepaliveTimeMs);
+    args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, kKeepaliveTimeoutMs);
+    args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, minReconnectBackoffMs);
+    auto const channel = grpc::CreateCustomChannel(options.schedulerAddr, creds, args);
+    auto stub = nix::remote::ReverseSession::NewStub(channel);
+    auto backoff = minBackoff;
+    while (!stop.stop_requested()) {
+        grpc::ClientContext ctx;
+        const std::stop_callback onStop(stop, [&ctx] { ctx.TryCancel(); });
+        auto openedWith = readToken(options.reverseTokenFile);
+        auto stream = stub->Register(&ctx);
+        nix::remote::ReverseWorkerMsg registration;
+        registration.set_worker_id(options.reverseWorkerId);
+        registration.set_protocol(reverseProtocolVersion);
+        nix::remote::ReverseFarmMsg ack;
+        bool const acked = stream->Write(registration) && stream->Read(&ack);
+        if (acked && ack.protocol() != reverseProtocolVersion) {
+            // An older scheduler omits the field; it cannot acknowledge
+            // results. Never run reverse builds against it.
+            logLine(LogLevel::info, {{"event", "reverse_protocol_mismatch"}, {"addr", options.schedulerAddr},
+                                     {"error", reverseProtocolMismatch(ack.protocol())}});
+            ctx.TryCancel();
+        } else if (acked && ack.stream_id() == 0
+            && ack.frame_case() == nix::remote::ReverseFarmMsg::FRAME_NOT_SET && ack.generation() != 0
+            && ack.session_key().size() == ReverseCapability::keyBytes) {
+            logLine(LogLevel::info, {{"event", "reverse_registered"}, {"addr", options.schedulerAddr}});
+            backoff = minBackoff;
+            ReverseRequest requests(options.reverseWorkerId, ack.generation(), ack.session_key(),
+                [this](std::string_view drv, uint64_t id) {
+                    return builder && builder->expects(std::string(drv), id);
+                });
+            if (!reverseBuild || !reverseUpload) {
+                ctx.TryCancel();
+                (void) stream->Finish();
+                continue;
+            }
+            const std::stop_callback cancelUploads(stop, [&requests] { requests.cancelUploads(); });
+            ReverseWorkerOutbound outgoing;
+            std::mutex mutex;
+            std::condition_variable_any cv;
+            std::deque<std::variant<ReverseRequest::Ready, ReverseRequest::Upload>> jobs;
+            std::unordered_map<uint64_t, std::shared_ptr<std::atomic<bool>>> cancellations;
+            std::unordered_set<uint64_t> queuedJobs;
+            bool closed = false;
+            std::jthread writer([&](std::stop_token writeStop) {
+                nix::remote::ReverseWorkerMsg reply;
+                while (outgoing.take(reply, writeStop)) {
+                    if (!stream->Write(reply)) { requests.cancelUploads(); ctx.TryCancel(); break; }
+                }
+            });
+            std::jthread rotation([&](std::stop_token rotationStop) {
+                forwardRotatedTokens(options.reverseTokenFile, openedWith, rotationStop,
+                    [&](std::string token) { return outgoing.credential(std::move(token)); });
+            });
+            // A bounded pool per registration leaves the reader and control
+            // session free while several builds run. The inbound 64-stream
+            // cap also bounds the number of queued, decoded requests.
+            auto execute = [&](std::stop_token workStop) {
+                while (!workStop.stop_requested()) {
+                    std::variant<ReverseRequest::Ready, ReverseRequest::Upload> job;
+                    std::shared_ptr<std::atomic<bool>> cancelled;
+                    {
+                        std::unique_lock lock(mutex);
+                        cv.wait(lock, workStop, [&] { return closed || !jobs.empty(); });
+                        if (closed || workStop.stop_requested()) break;
+                        job = std::move(jobs.front());
+                        jobs.pop_front();
+                        cancelled = cancellations.at(std::visit([](auto const & value) { return value.id; }, job));
+                    }
+                    auto const id = std::visit([](auto const & value) { return value.id; }, job);
+                    grpc::Status status{grpc::StatusCode::UNIMPLEMENTED, "reverse method not dispatched"};
+                    std::function<void()> afterFinish;
+                    if (std::holds_alternative<ReverseRequest::Ready>(job) && reverseBuild && !*cancelled) {
+                        try {
+                            status = reverseBuild(std::get<ReverseRequest::Ready>(job),
+                                [&](const nix::remote::BuildDerivationChunk & chunk) {
+                                    return !*cancelled && !workStop.stop_requested()
+                                        && outgoing.message(id, chunk, workStop, [&] { return cancelled->load(); });
+                                 }, [&] { return *cancelled || workStop.stop_requested() || stop.stop_requested(); },
+                                 afterFinish);
+                        } catch (std::exception & error) {
+                            status = {grpc::StatusCode::INTERNAL, error.what()};
+                        }
+                    } else if (std::holds_alternative<ReverseRequest::Upload>(job) && reverseUpload && !*cancelled) {
+                        try {
+                            status = reverseUpload(std::get<ReverseRequest::Upload>(job),
+                                [&] { return *cancelled || workStop.stop_requested() || stop.stop_requested(); });
+                        } catch (std::exception & error) {
+                            status = {grpc::StatusCode::INTERNAL, error.what()};
+                        }
+                    } else if (*cancelled) {
+                        status = {grpc::StatusCode::CANCELLED, "reverse call cancelled"};
+                    }
+                    if (auto * upload = std::get_if<ReverseRequest::Upload>(&job)) upload->pipe->cancel();
+                    // A lost data session may close the response queue before
+                    // Finish can register the deferred control-plane Done.
+                    // Retire that assignment here instead of leaving a stale
+                    // slot which the worker no longer expects. If Finish was
+                    // queued, acknowledgement or session teardown owns Done.
+                    auto const finished = outgoing.finish(id, status, workStop, true, afterFinish);
+                    if (!finished) {
+                        if (afterFinish) afterFinish();
+                        ctx.TryCancel();
+                        break;
+                    }
+                    if (!requests.finished(id)) { ctx.TryCancel(); break; }
+                    std::scoped_lock lock(mutex);
+                    cancellations.erase(id);
+                    queuedJobs.erase(id);
+                }
+            };
+            std::vector<std::jthread> executors;
+            constexpr size_t maxExecutors = 4;
+            for (size_t i = 0; i < std::min<size_t>(maxExecutors, std::max(1u, options.maxJobs)); ++i)
+                executors.emplace_back(execute);
+            nix::remote::ReverseFarmMsg frame;
+            // Every fatal path below ends the data session; say which one.
+            auto const drop = [&](std::string_view why) {
+                logLine(LogLevel::info, {{"event", "reverse_frame_rejected"}, {"why", std::string(why)},
+                                         {"stream", std::to_string(frame.stream_id())},
+                                         {"frame", std::to_string(static_cast<int>(frame.frame_case()))},
+                                         {"method", frame.has_open() ? frame.open().method() : ""}});
+                ctx.TryCancel();
+            };
+            while (!stop.stop_requested() && stream->Read(&frame)) {
+                if (frame.frame_case() == nix::remote::ReverseFarmMsg::kAcknowledged) {
+                    if (!frame.acknowledged() || frame.stream_id() == 0 || frame.generation() != 0
+                        || !frame.session_key().empty() || !outgoing.acknowledged(frame.stream_id())) {
+                        drop("unexpected acknowledgement");
+                        break;
+                    }
+                    continue;
+                }
+                if (frame.has_open() && frame.open().method() != "BuildDerivation"
+                    && frame.open().method() != "UploadBuildInputs") {
+                    drop("method not served");
+                    break;
+                }
+                if (!requests.accept(frame)) { drop(requests.lastRejection()); break; }
+                if (frame.has_open()) {
+                    std::scoped_lock lock(mutex);
+                    if (!cancellations.emplace(frame.stream_id(), std::make_shared<std::atomic<bool>>(false)).second) {
+                        drop("stream reopened");
+                        break;
+                    }
+                }
+                if (frame.cancel()) {
+                    outgoing.cancel(frame.stream_id());
+                    if (!outgoing.healthy()) { drop("too many cancelled streams"); break; }
+                    bool beforeRequest = false;
+                    {
+                        std::scoped_lock lock(mutex);
+                        if (auto it = cancellations.find(frame.stream_id()); it != cancellations.end()) {
+                            *it->second = true;
+                            beforeRequest = !queuedJobs.contains(frame.stream_id());
+                            if (beforeRequest) cancellations.erase(it);
+                        }
+                    }
+                    if (beforeRequest && !outgoing.finish(frame.stream_id(),
+                            {grpc::StatusCode::CANCELLED, "reverse request cancelled"}, stop, false)) {
+                        drop("cannot answer cancel");
+                        break;
+                    }
+                    if (beforeRequest && !requests.finished(frame.stream_id())) { drop("cancel of unknown stream"); break; }
+                }
+                if (auto upload = requests.takeUploadReady()) {
+                    std::scoped_lock lock(mutex);
+                    queuedJobs.insert(upload->id);
+                    jobs.emplace_back(std::move(*upload));
+                    cv.notify_one();
+                }
+                if (auto ready = requests.takeReady()) {
+                    std::scoped_lock lock(mutex);
+                    queuedJobs.insert(ready->id);
+                    jobs.push_back(std::move(*ready));
+                    cv.notify_one();
+                }
+            }
+            ctx.TryCancel(); // wake a writer blocked in gRPC Write on disconnect
+            {
+                std::scoped_lock lock(mutex);
+                closed = true;
+                for (auto & [id, flag] : cancellations) *flag = true;
+            }
+            cv.notify_all();
+            requests.close(); // unblock upload sources before joining executors
+            // A build thread may be blocked in response backpressure while
+            // the writer is stuck in (or has left) gRPC Write. Wake those
+            // producers before joining executors, not after.
+            outgoing.close();
+            rotation.request_stop();
+            rotation.join();
+            for (auto & executor : executors) executor.request_stop();
+            for (auto & executor : executors) executor.join();
+            writer.request_stop();
+            writer.join();
+            // On disconnect the scheduler must not retain completed builds
+            // whose terminal response never received a gateway acknowledgement.
+            outgoing.abandonUnacknowledged();
+            stream->WritesDone();
+        } else {
+            // A malformed or unexpected first frame must not leave Finish()
+            // waiting indefinitely for a server that expects more input.
+            ctx.TryCancel();
+        }
+        auto const status = stream->Finish();
+        if (stop.stop_requested()) {
+            return;
+        }
+        logLine(LogLevel::info, {{"event", "reverse_disconnected"}, {"addr", options.schedulerAddr},
+                                 {"error", status.error_message()}});
+        // Cancellation must also interrupt reconnect backoff during daemon
+        // shutdown, not only an in-flight gRPC Read.
+        std::mutex waitMutex;
+        std::condition_variable_any waitCv;
+        std::unique_lock lock(waitMutex);
+        waitCv.wait_for(lock, stop, backoff, [] { return false; });
+        backoff = std::min(backoff * 2, maxBackoff);
     }
 }
 
 void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
 {
-    auto const creds = schedulerCreds(options);
+    auto const creds = schedulerCreds(options, options.reverseTokenFile.empty() ? options.schedulerTokenFile
+                                                                                 : options.reverseTokenFile);
     grpc::ChannelArguments args;
     args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, kKeepaliveTimeMs);
     args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, kKeepaliveTimeoutMs);
@@ -492,6 +755,7 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
     auto backoff = minBackoff;
     while (!stop.stop_requested()) {
         grpc::ClientContext ctx;
+        auto openedWith = options.reverseTokenFile.empty() ? std::string{} : readToken(options.reverseTokenFile);
         auto stream = stub->WorkerSession(&ctx);
         auto const writeMutex = std::make_shared<std::mutex>();
         auto const live = std::make_shared<std::atomic<bool>>(true);
@@ -503,12 +767,24 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
             const std::scoped_lock lock(*writeMutex);
             return *live && raw->Write(one);
         });
+        // A buffered Hello succeeds even when the balancer then answers "no
+        // healthy upstream", so only a session that stayed up resets backoff.
         const bool helloed = bld.greet();
+        auto const connectedAt = std::chrono::steady_clock::now();
         if (helloed) {
             logLine(LogLevel::info, {{"event", "scheduler_connected"}, {"addr", options.schedulerAddr}});
-            backoff = minBackoff;
         }
         const std::stop_callback onStop(stop, [&ctx] -> void { ctx.TryCancel(); });
+        std::jthread rotation;
+        if (helloed && !options.reverseTokenFile.empty()) {
+            rotation = std::jthread([&](std::stop_token rotationStop) {
+                forwardRotatedTokens(options.reverseTokenFile, openedWith, rotationStop, [&](std::string token) {
+                    WorkerMsg msg;
+                    msg.mutable_reauth()->set_token(std::move(token));
+                    return bld.send(msg);
+                });
+            });
+        }
         SchedCmds cmds;
         bool restarting = false;
         while (helloed && stream->Read(&cmds)) {
@@ -527,6 +803,10 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
             }
         }
         *live = false;
+        if (rotation.joinable()) {
+            rotation.request_stop();
+            rotation.join();
+        }
         auto const status = stream->Finish();
         if (stop.stop_requested()) {
             return;
@@ -539,6 +819,9 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
             logLine(
                 LogLevel::info,
                 {{"event", "scheduler_disconnected"}, {"addr", options.schedulerAddr}, {"error", status.error_message()}});
+            if (helloed && std::chrono::steady_clock::now() - connectedAt >= stableSession) {
+                backoff = minBackoff;
+            }
         }
         std::this_thread::sleep_for(backoff);
         backoff = std::min(backoff * 2, maxBackoff);
@@ -547,6 +830,9 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
 
 void Coordinator::tick()
 {
+    if (dispatcher) {
+        dispatcher->expireCredentials();
+    }
     if (!builder) {
         return;
     }

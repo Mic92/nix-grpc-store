@@ -155,6 +155,9 @@ private:
     static constexpr unsigned defaultMaxBuilds = 64;
 
     static constexpr unsigned defaultRescheduleRetries = 8;
+    Setting<bool> reverseUploads{this, false, "reverse-uploads",
+                                 "Upload a missing input closure to a reverse (worker-initiated) builder and "
+                                 "retry the pinned build. Off: such a build fails instead."};
     Setting<unsigned> rescheduleRetries{this, defaultRescheduleRetries, "reschedule-retries",
         "How often a derivation bounced by its assigned worker is handed back to the scheduler."};
     Setting<unsigned> maxBuilds{
@@ -459,8 +462,11 @@ public:
       }
     }
 
-    // Same headers on every RPC so the balancer keeps us on that worker.
-    void uploadDrvClosure(Store & evalStore, std::vector<StorePath> drvPaths, const Metadata & headers);
+    // Direct uploads retain worker routing; reverse uploads use an assignment
+    // in the request body, validated against the scheduler's live placement.
+    auto uploadDrvClosure(Store & evalStore, std::vector<StorePath> drvPaths, const Metadata & headers,
+                          std::optional<std::pair<StorePath, uint64_t>> reverseAssignment = std::nullopt)
+        -> grpc::Status;
 
     // Relays log/phase chunks, hands `done` to onDone, keeps the output infos for queryPathInfo.
     template<typename Chunk, typename F>
@@ -761,7 +767,8 @@ private:
 
     auto addMultipleToStoreOnce(
         std::vector<std::pair<ValidPathInfo, ReplayableNar>> & paths, Activity & act, RepairFlag repair,
-        CheckSigsFlag checkSigs, const Metadata & headers) -> grpc::Status
+        CheckSigsFlag checkSigs, const Metadata & headers,
+        const std::optional<std::pair<std::string, uint64_t>> & reverseAssignment = std::nullopt) -> grpc::Status
 ;
 
 public:

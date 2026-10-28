@@ -272,6 +272,63 @@ in
         client certificate. Re-read when the file changes.
       '';
     };
+    reverse = {
+      worker = lib.mkOption {
+        default = null;
+        description = ''
+          Opt-in reverse worker: dial {option}`scheduler` and carry builds
+          and build-input uploads over the outbound connection, for builders
+          the balancer cannot reach. Needs {option}`tls`, a remote TLS
+          {option}`scheduler`, and no {option}`schedulerTokenFile`.
+        '';
+        type = lib.types.nullOr (
+          lib.types.submodule {
+            options = {
+              id = lib.mkOption {
+                type = lib.types.strMatching "pod:.+";
+                example = "pod:staging:12345678-1234-1234-1234-123456789abc";
+                description = "`pod:<namespace>:<pod-uid>`; must match the uid in the token.";
+              };
+              tokenFile = lib.mkOption {
+                type = lib.types.path;
+                description = ''
+                  Pod-bound service-account token with the tunnel audience.
+                  Sent again whenever the file changes.
+                '';
+              };
+            };
+          }
+        );
+      };
+      registration = lib.mkOption {
+        default = null;
+        description = ''
+          Accept reverse workers on this scheduler. Their pod-bound token is
+          checked against a dedicated provider, and their certificate (or
+          the one a {option}`trustedProxies` balancer forwards) must have
+          the `trusted` role.
+        '';
+        type = lib.types.nullOr (
+          lib.types.submodule {
+            options = {
+              oidc = lib.mkOption {
+                type = (pkgs.formats.json { }).type;
+                description = "OIDC config with exactly one provider, used for nothing else.";
+              };
+              provider = lib.mkOption { type = lib.types.str; };
+              namespace = lib.mkOption { type = lib.types.str; };
+              serviceAccount = lib.mkOption { type = lib.types.str; };
+              audience = lib.mkOption { type = lib.types.str; };
+              maxTokenLifetime = lib.mkOption {
+                type = lib.types.ints.between 600 3600;
+                default = 600;
+                description = "Longest accepted token lifetime in seconds; also the revocation window.";
+              };
+            };
+          }
+        );
+      };
+    };
     advertise = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;

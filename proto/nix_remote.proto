@@ -33,6 +33,17 @@ message AddMultipleChunk {
 
 message AddMultipleReply {}
 
+// Opt-in build-input upload. Unlike unpinned AddMultipleToStore, the first
+// frame identifies a live scheduler assignment. Neither this path nor a worker
+// address from client metadata grants authority: the gateway resolves the
+// assigned pod and delegates the authenticated caller over its data session.
+// Subsequent frames must leave drv_path and assign_id empty/zero.
+message UploadBuildInputsChunk {
+  string drv_path = 1;
+  uint64 assign_id = 2;
+  AddMultipleChunk chunk = 3;
+}
+
 message QueryPathInfosRequest {
   repeated string paths = 1;
 }
@@ -56,7 +67,8 @@ message BuildDerivationRequest {
   bytes drv = 2;
   uint32 build_mode = 3;
   uint32 protocol = 4;
-  // From Assigned, for log correlation only.
+  // From Assigned. The worker checks this against its current Expect so an
+  // old or misrouted request cannot start/attach to a different assignment.
   uint64 assign_id = 5;
   // The client's build-timeout / max-silent-time settings, 0 = none.
   uint64 build_timeout = 6;
@@ -128,6 +140,7 @@ service NixRemote {
   rpc Connect(stream Chunk) returns (stream Chunk);
   rpc QueryValidPaths(QueryValidPathsRequest) returns (QueryValidPathsReply);
   rpc AddMultipleToStore(stream AddMultipleChunk) returns (AddMultipleReply);
+  rpc UploadBuildInputs(stream UploadBuildInputsChunk) returns (AddMultipleReply);
   rpc QueryPathInfos(QueryPathInfosRequest) returns (QueryPathInfosReply);
   rpc FetchNars(FetchNarsRequest) returns (stream NarFrame);
   rpc BuildDerivation(BuildDerivationRequest) returns (stream BuildDerivationChunk);
@@ -177,6 +190,10 @@ message Assigned {
   uint64 assign_id = 3;
   // The worker's native system, for the balancer's x-nix-system routing.
   string worker_system = 4;
+  // The scheduler selected an authenticated pod-bound reverse data session.
+  // Clients send BuildDerivation to the scheduler frontend instead of the
+  // direct worker route. This bit is a routing hint only, not authorization.
+  bool reverse = 5;
 }
 
 message Cached {
@@ -228,6 +245,12 @@ message Hello {
   // Builds in progress and Expects not yet claimed, so a restarted scheduler
   // neither double-assigns them nor counts their slots as free.
   repeated RunningBuild running = 5;
+  // Only accepted on a WorkerSession whose transport-audience token was
+  // independently verified to this exact pod UID. Never trust this field on
+  // a certificate-only control stream.
+  string reverse_worker_id = 6;
+  // Required with reverse_worker_id; must equal the scheduler's version.
+  uint32 reverse_protocol = 7;
 }
 
 message Done {
@@ -260,21 +283,31 @@ message Load {
   bool draining = 1;
 }
 
+// A rotated pod-bound tunnel token for an already verified reverse control
+// session. It must verify to the same pod; it never establishes identity.
+message Reauth {
+  string token = 1;
+}
+
 message WorkerMsg {
   oneof msg {
     Hello hello = 1;
     Done done = 2;
     Load load = 3;
+    Reauth reauth = 4;
   }
 }
 
 message Expect {
   string drv_path = 1;
+  // Unique to the scheduler incarnation (including after failover).
   uint64 assign_id = 2;
 }
 
 message Revoke {
   string drv_path = 1;
+  // Do not revoke a replacement assignment for the same drv.
+  uint64 assign_id = 2;
 }
 
 message SchedCmd {
@@ -295,4 +328,86 @@ message SchedCmds { repeated SchedCmd msgs = 1; }
 service Scheduler {
   rpc Schedule(stream ClientMsgs) returns (stream SchedMsgs);
   rpc WorkerSession(stream WorkerMsgs) returns (stream SchedCmds);
+}
+
+// Opt-in reverse data-session registration. Separate from WorkerSession so
+// slow data streams cannot delay scheduling messages. Each logical RPC gets
+// its own stream_id and can be cancelled independently. The farm accepts
+// bounded response frames only for gateway-reserved streams; worker-side
+// build dispatch validates the caller capability and decoded request.
+message ReverseOpen {
+  // An exact NixRemote method name (not an arbitrary gRPC method path).
+  string method = 1;
+  // A worker MUST validate a gateway-issued, session/stream/method-scoped
+  // caller capability before opening a local handler. Never a client token.
+  bytes capability = 2;
+}
+
+// Authenticated by a per-registration secret delivered only on the verified
+// TLS worker stream. Never accept these fields without the capability MAC.
+message ReverseCapability {
+  string worker_id = 1;
+  uint64 generation = 2;
+  uint64 stream_id = 3;
+  string method = 4;
+  string caller_name = 5;
+  uint32 caller_role = 6;
+  int64 expires_at_ms = 7;
+  // Set for builds and build-input uploads; checked against the decoded
+  // request, current Expect and scheduler-owned assignment.
+  string drv_path = 8;
+  uint64 assign_id = 9;
+  uint32 build_mode = 10;
+  // Must be the authenticated named kind; anonymous delegation is denied.
+  uint32 caller_kind = 11;
+}
+
+message ReverseData {
+  bytes data = 1;
+}
+
+message ReverseFinish {
+  // gRPC status code plus a bounded, non-secret diagnostic.
+  uint32 code = 1;
+  string message = 2;
+}
+
+message ReverseWorkerMsg {
+  // Required on the first message. Must match the ID derived from the
+  // independently verified, pod-bound credential, not just this field.
+  string worker_id = 1;
+  uint64 stream_id = 2;
+  oneof frame {
+    ReverseData data = 3;
+    ReverseFinish finish = 4;
+  }
+  // Only on stream 0 without a frame: a rotated tunnel token that must
+  // verify to the registered pod. It extends the session's expiry.
+  string credential = 5;
+  // Required on the first message; must equal the scheduler's version.
+  uint32 protocol = 6;
+}
+
+message ReverseFarmMsg {
+  uint64 generation = 1;
+  uint64 stream_id = 2;
+  oneof frame {
+    ReverseOpen open = 3;
+    ReverseData data = 4;
+    // End of request bytes, not the response (e.g. an upload).
+    bool half_close = 5;
+    bool cancel = 6;
+    // Gateway accepted the complete response. Only after this may the worker
+    // retire the assignment on the separate control stream.
+    bool acknowledged = 8;
+  }
+  // Set only on the first, registration-ack message. Per-registration HMAC
+  // key; never log, persist, or forward to a client. Rotated on reconnect.
+  bytes session_key = 7;
+  // Set only on the registration ack: the scheduler's reverse protocol.
+  uint32 protocol = 9;
+}
+
+service ReverseSession {
+  rpc Register(stream ReverseWorkerMsg) returns (stream ReverseFarmMsg);
 }

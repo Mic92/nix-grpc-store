@@ -34,6 +34,9 @@ struct Auth
     // Identity from the peer's own certificate, for calls the balancer makes
     // for itself. Client requests go through identify().
     [[nodiscard]] auto identifyDirect(const grpc::ServerContextBase & context) const -> Caller;
+    // A certificate identity only: the peer's own, or the one a trusted
+    // proxy forwards. Never a bearer token, and never the proxy itself.
+    [[nodiscard]] auto identifyCertificate(const grpc::ServerContextBase & context) const -> Caller;
     static auto authorize(const Caller & caller, std::string_view method, Role minRole) -> grpc::Status;
     // Repair rewrites existing store paths.
     static auto authorize(const Caller & caller, std::string_view method, Role minRole, uint32_t buildMode)

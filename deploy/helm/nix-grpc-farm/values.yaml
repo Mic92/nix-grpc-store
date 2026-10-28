@@ -1,6 +1,7 @@
 image:
   repository: ghcr.io/mic92/nix-grpc-farm
   tag: "" # defaults to appVersion
+  digest: "" # optional sha256 digest; takes precedence over tag
   pullPolicy: IfNotPresent
 lbImage:
   repository: ghcr.io/mic92/nix-grpc-farm-lb
@@ -123,6 +124,18 @@ workerDefaults:
   advertise: {}
   # Node port for scrapers outside the cluster.
   metricsHostPort: null
+  # Reverse worker: dial the scheduler and carry builds over that outbound
+  # connection, for workers the balancer cannot reach (no hostPort,
+  # advertise or per-worker ingress). Needs tls.worker and scheduler.external.
+  # The scheduler's release must set scheduler.reverse for this cluster.
+  reverse:
+    enabled: false
+    # Audience of the projected token; equals the scheduler's
+    # scheduler.reverse.audience.
+    audience: nix-grpc-farm-worker-tunnel
+    # Also the revocation window: the scheduler rejects longer tokens
+    # (600 by default). Kubernetes does not issue shorter ones.
+    expirationSeconds: 600
 # One Deployment per entry, the key names the group. E.g.
 #   x86-64: {system: x86_64-linux, replicas: 4, nodeSelector: {kubernetes.io/arch: amd64}}
 #   aarch64: {system: aarch64-linux, replicas: 2, nodeSelector: {kubernetes.io/arch: arm64}}
@@ -134,6 +147,26 @@ defaultGroup: ""
 scheduler:
   # host:port of a scheduler outside this release; then only workers run here.
   external: ""
+  # Accept reverse workers (workerDefaults.reverse) from one other cluster.
+  # Their pod-bound token is checked against that cluster's service-account
+  # issuer; their tls.worker certificate (forwarded by the balancer) must
+  # match auth.workerCNs. Needs tls.worker and tls.clientCA.
+  reverse:
+    enabled: false
+    # Workers in this cluster: read the API server's JWKS with the pod's own
+    # service-account token. issuer may stay empty (taken from that token).
+    inCluster: false
+    # The workers' cluster: its service-account issuer, and JWKS URL when
+    # discovery is not public. Both https.
+    issuer: ""
+    jwksURL: ""
+    # CA for the JWKS endpoint, as a Secret with key ca.crt. Empty: system CAs.
+    caSecret: ""
+    # Namespace and service account the worker pods run as in that cluster.
+    namespace: ""
+    serviceAccount: ""
+    audience: nix-grpc-farm-worker-tunnel
+    maxTokenLifetime: 600
   # >1 adds standby schedulers on separate nodes. niks3 picks the active one
   # through a lock in its database, so this needs a `niks3` no other farm
   # elects against.

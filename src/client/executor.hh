@@ -23,6 +23,9 @@ struct Placement
     std::string addr;
     uint64_t assignId = 0;
     std::string system; // the worker's native one, empty from older schedulers
+    // A pod-bound reverse worker: reached through the scheduler, not the
+    // balancer's x-nix-worker route.
+    bool reverse = false;
 };
 
 enum class Outcome : uint8_t {
@@ -219,7 +222,10 @@ public:
             return;
         }
         if (auto * run = std::get_if<state::Running>(&job.state)) {
-            if (placement.addr != run->at.addr) {
+            // A reverse worker's new data session gets a new assignment at
+            // the same address; the old one is fenced.
+            if (placement.addr != run->at.addr || placement.reverse != run->at.reverse
+                || (placement.reverse && placement.assignId != run->at.assignId)) {
                 run->redirect = std::move(placement);
             }
             return;

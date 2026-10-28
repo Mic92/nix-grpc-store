@@ -31,6 +31,7 @@
 #include "acl.hh"
 #include "logfmt.hh"
 #include "niks3-client.hh"
+#include "oidc.hh"
 #include "parse-int.hh"
 #include "scheduler.hh"
 #include "xfcc.hh"
@@ -172,6 +173,23 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.logLevel = parseLogLevel(next());
         } else if (arg == "--oidc-config") {
             options.oidcConfig = next();
+        } else if (arg == "--reverse-oidc-config") {
+            options.reverseOidcConfig = next();
+        } else if (arg == "--reverse-provider") {
+            options.reverseProvider = next();
+        } else if (arg == "--reverse-namespace") {
+            options.reverseNamespace = next();
+        } else if (arg == "--reverse-service-account") {
+            options.reverseServiceAccount = next();
+        } else if (arg == "--reverse-audience") {
+            options.reverseAudience = next();
+        } else if (arg == "--reverse-max-token-lifetime") {
+            auto secs = parseInt<unsigned>(next());
+            // Kubernetes refuses projected tokens shorter than 10 minutes.
+            if (!secs || *secs < 600 || *secs > 3600) {
+                throw nix::Error("--reverse-max-token-lifetime expects seconds in 600..3600");
+            }
+            options.reverseMaxTokenLifetime = std::chrono::seconds(*secs);
         } else if (arg == "--niks3") {
             options.niks3.url = next();
         } else if (arg == "--niks3-token-file") {
@@ -199,6 +217,10 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.schedulerAddr = next();
         } else if (arg == "--scheduler-token-file") {
             options.schedulerTokenFile = next();
+        } else if (arg == "--reverse-worker-id") {
+            options.reverseWorkerId = next();
+        } else if (arg == "--reverse-token-file") {
+            options.reverseTokenFile = next();
         } else if (arg == "--advertise") {
             options.advertise = next();
         } else if (arg == "--max-jobs") {
@@ -225,6 +247,14 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
     }
     if (!options.schedulerTokenFile.empty() && options.schedulerAddr.starts_with(plaintextScheme)) {
         throw nix::Error("--scheduler-token-file with --scheduler http:// would send the token in clear");
+    }
+    if (!options.reverseWorkerId.empty() || !options.reverseTokenFile.empty()) {
+        if (options.reverseWorkerId.empty() || options.reverseTokenFile.empty() || options.schedulerAddr.empty()
+            || options.schedulerAddr.starts_with(plaintextScheme) || options.tlsCert.empty() || options.tlsKey.empty()
+            || options.clientCA.empty() || !options.builder || !options.schedulerTokenFile.empty()
+            || !options.reverseWorkerId.starts_with("pod:")) {
+            throw nix::Error("reverse worker requires pod worker ID, tunnel token, remote TLS scheduler, client certificate and CA; do not set --scheduler-token-file");
+        }
     }
     if (!options.builder && !options.scheduler) {
         throw nix::Error("--role: need at least one of builder, scheduler");
@@ -257,6 +287,22 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
     }
     if (!options.proxies.empty() && options.clientCA.empty()) {
         throw nix::Error("--trusted-proxy requires --client-ca");
+    }
+    if (!options.reverseOidcConfig.empty()) {
+        if (!options.scheduler || options.tlsCert.empty() || options.tlsKey.empty()
+            || options.reverseProvider.empty() || options.reverseNamespace.empty()
+            || options.reverseServiceAccount.empty() || options.reverseAudience.empty()) {
+            throw nix::Error("reverse registration requires scheduler role, TLS, provider, namespace, service account and audience");
+        }
+        auto const config = oidc::loadConfig(options.reverseOidcConfig);
+        if (config.allowInsecure || config.providers.size() != 1 || config.providers.front().name != options.reverseProvider
+            || config.providers.front().audience != options.reverseAudience
+            || config.providers.front().rules.empty()) {
+            throw nix::Error("reverse registration requires one dedicated OIDC provider with matching audience and rules");
+        }
+    } else if (!options.reverseProvider.empty() || !options.reverseNamespace.empty()
+               || !options.reverseServiceAccount.empty() || !options.reverseAudience.empty()) {
+        throw nix::Error("reverse registration flags require --reverse-oidc-config");
     }
     if (!options.clientCA.empty() || !options.oidcConfig.empty()) {
         options.acl.requireIdentity();

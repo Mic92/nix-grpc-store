@@ -43,7 +43,11 @@ app.kubernetes.io/component: lb
 {{- end }}
 
 {{- define "farm.image" -}}
+{{- if .Values.image.digest -}}
+{{ .Values.image.repository }}@{{ .Values.image.digest }}
+{{- else -}}
 {{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}
+{{- end -}}
 {{- end }}
 
 {{- define "farm.lbImage" -}}
@@ -97,6 +101,9 @@ app.kubernetes.io/component: scheduler
 {{- if and (or .Values.auth.accessRules .Values.auth.anonymousRole) (not (or (include "farm.tlsSecret" (list . "clientCA")) (include "farm.oidcProviders" .))) }}{{ fail "auth.accessRules/anonymousRole need tls.clientCA or an OIDC provider" }}{{ end }}
 {{- if and (include "farm.tlsSecret" (list . "clientCA")) (not (include "farm.tlsSecret" (list . "worker"))) }}{{ fail "tls.clientCA requires tls.worker (workers verify the balancer over TLS)" }}{{ end }}
 {{- if and (include "farm.lbEnabled" .) (include "farm.tlsSecret" (list . "clientCA")) (not (include "farm.tlsSecret" (list . "lb"))) }}{{ fail "tls.clientCA requires tls.lb (the balancer presents it to clients and workers)" }}{{ end }}
+{{- if and .Values.scheduler.reverse.enabled .Values.scheduler.external }}{{ fail "scheduler.reverse configures this release's scheduler; it has none with scheduler.external" }}{{ end }}
+{{- if and .Values.scheduler.reverse.enabled (not (and (include "farm.tlsSecret" (list . "worker")) (include "farm.tlsSecret" (list . "clientCA")))) }}{{ fail "scheduler.reverse needs tls.worker and tls.clientCA" }}{{ end }}
+{{- if include "farm.lbEnabled" . }}{{ $d := mustMergeOverwrite (deepCopy .Values.workerDefaults) ((index .Values.workers (include "farm.defaultGroup" .)) | default dict) }}{{ if $d.reverse.enabled }}{{ fail "defaultGroup must be a direct group: the balancer sends unpinned store calls there" }}{{ end }}{{ end }}
 {{- with .Values.defaultGroup }}{{ if not (hasKey $.Values.workers .) }}{{ fail (printf "defaultGroup %q is not a key of workers" .) }}{{ end }}{{ end }}
 {{- end }}
 
@@ -130,6 +137,33 @@ app.kubernetes.io/component: scheduler
 {{- end }}
 {{- end }}
 {{- if $providers }}{{ toJson (dict "providers" $providers) }}{{- end }}
+{{- end }}
+
+{{/* Reverse-worker registration provider; empty unless scheduler.reverse.enabled.
+     Kept apart from farm.oidcProviders: this token must never be a client credential. */}}
+{{- define "farm.reverseOidc" -}}
+{{- with .Values.scheduler.reverse }}
+{{- if .enabled }}
+{{- $p := dict
+  "audience" .audience
+  "rules" (list (dict
+    "bound_claims" (dict
+      "kubernetes.io.namespace" (list (required "scheduler.reverse.namespace is required" .namespace))
+      "kubernetes.io.serviceaccount.name" (list (required "scheduler.reverse.serviceAccount is required" .serviceAccount)))
+    "scopes" (list "admin"))) }}
+{{- if .inCluster }}
+{{- with .issuer }}{{ $_ := set $p "issuer" . }}{{ end }}
+{{- $_ := set $p "jwks_url" "https://kubernetes.default.svc/openid/v1/jwks" }}
+{{- $_ := set $p "ca_file" "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt" }}
+{{- $_ := set $p "bearer_token_file" "/var/run/secrets/kubernetes.io/serviceaccount/token" }}
+{{- else }}
+{{- $_ := set $p "issuer" (required "scheduler.reverse.issuer is required" .issuer) }}
+{{- with .jwksURL }}{{ $_ := set $p "jwks_url" . }}{{ end }}
+{{- with .caSecret }}{{ $_ := set $p "ca_file" "/secrets/reverse-ca/ca.crt" }}{{ end }}
+{{- end }}
+{{- toJson (dict "providers" (dict "worker-tunnel" $p)) }}
+{{- end }}
+{{- end }}
 {{- end }}
 
 {{/* Secret name for tls.<part> (lb | worker | clientCA): the cert-manager

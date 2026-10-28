@@ -74,6 +74,31 @@
   "--scheduler-token-file"
   cfg.schedulerTokenFile
 ]
+++ lib.optionals (cfg.reverse.worker != null) [
+  "--reverse-worker-id"
+  cfg.reverse.worker.id
+  "--reverse-token-file"
+  cfg.reverse.worker.tokenFile
+]
+++ lib.optionals (cfg.reverse.registration != null) (
+  let
+    r = cfg.reverse.registration;
+  in
+  [
+    "--reverse-oidc-config"
+    ((pkgs.formats.json { }).generate "nix-grpc-daemon-reverse-oidc.json" r.oidc)
+    "--reverse-provider"
+    r.provider
+    "--reverse-namespace"
+    r.namespace
+    "--reverse-service-account"
+    r.serviceAccount
+    "--reverse-audience"
+    r.audience
+    "--reverse-max-token-lifetime"
+    (toString r.maxTokenLifetime)
+  ]
+)
 ++ lib.optionals (cfg.advertise != null) [
   "--advertise"
   cfg.advertise

@@ -6,6 +6,13 @@
 {{- $svc := include "farm.workerService" (dict "root" $root "group" $g) }}
 {{- $sel := include "farm.workerSelectorLabels" (dict "root" $root "group" $g) }}
 {{- if and $w.advertise (not $w.hostPort) }}{{ fail (printf "workers.%s.advertise needs hostPort" $g) }}{{ end }}
+{{- $reverse := $w.reverse.enabled }}
+{{- if $reverse }}
+{{- if or $w.hostPort $w.advertise }}{{ fail (printf "workers.%s: reverse workers are not dialed, drop hostPort and advertise" $g) }}{{ end }}
+{{- if not (or $root.Values.scheduler.external (and $root.Values.scheduler.reverse.enabled (include "farm.lbEnabled" $root))) }}{{ fail (printf "workers.%s.reverse needs scheduler.external, or scheduler.reverse with this release's balancer" $g) }}{{ end }}
+{{- if not (and (include "farm.tlsSecret" (list $root "worker")) (include "farm.tlsSecret" (list $root "clientCA"))) }}{{ fail (printf "workers.%s.reverse needs tls.worker and tls.clientCA" $g) }}{{ end }}
+{{- if gt (int $w.reverse.expirationSeconds) 3600 }}{{ fail (printf "workers.%s.reverse.expirationSeconds above 3600" $g) }}{{ end }}
+{{- end }}
 {{- $affinity := deepCopy ($w.affinity | default dict) }}
 {{- if $w.advertise }}
 {{- if hasKey $affinity "nodeAffinity" }}{{ fail (printf "workers.%s: advertise sets the nodeAffinity, drop affinity.nodeAffinity" $g) }}{{ end }}
@@ -192,11 +199,23 @@ spec:
           args:
             - --role=builder
             - --listen=[::]:50051
-            {{- if not $w.advertise }}
+            {{- if $reverse }}
+            # Never dialed: the scheduler reaches this pod only through the
+            # reverse session, keyed by the pod UID in its projected token.
+            - --advertise=reverse/$(POD_UID)
+            - --reverse-worker-id=pod:{{ $root.Release.Namespace }}:$(POD_UID)
+            - --reverse-token-file=/secrets/reverse/token
+            {{- else if not $w.advertise }}
             # What the balancer reaches this pod at, so x-nix-worker pins here.
             - --advertise=$({{ if $w.hostPort }}HOST_IP):{{ $w.hostPort }}{{ else }}POD_IP):50051{{ end }}
             {{- end }}
+            {{- if and $reverse (not $root.Values.scheduler.external) }}
+            # Through the balancer: it forwards the worker certificate and
+            # follows the active scheduler.
+            - --scheduler={{ include "farm.fullname" $root }}.{{ $root.Release.Namespace }}.svc:{{ $root.Values.lb.service.port }}
+            {{- else }}
             - --scheduler={{ if not (include "farm.tlsSecret" (list $root "worker")) }}http://{{ end }}{{ include "farm.schedulerFor" $root }}
+            {{- end }}
             # civetweb binds [::] v6-only. Pod IPs are v4 on most clusters.
             - --metrics-listen=0.0.0.0:9464
             - --worker-name=$(NODE_NAME)/$(POD_NAME)
@@ -238,6 +257,10 @@ spec:
               valueFrom: {fieldRef: {fieldPath: status.podIP}}
             - name: HOST_IP
               valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+            {{- if $reverse }}
+            - name: POD_UID
+              valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+            {{- end }}
             - {name: TMPDIR, value: /spool}
           securityContext:
             runAsUser: 990
@@ -271,6 +294,9 @@ spec:
             - {name: spool, mountPath: /spool}
             - {name: nixconf, mountPath: /etc/nix/nix.conf.d}
             - {name: niks3-token, mountPath: /secrets/niks3, readOnly: true}
+            {{- if $reverse }}
+            - {name: reverse-token, mountPath: /secrets/reverse, readOnly: true}
+            {{- end }}
             {{- if (include "farm.tlsSecret" (list $root "worker")) }}
             - {name: tls, mountPath: /secrets/tls, readOnly: true}
             {{- end }}
@@ -335,6 +361,17 @@ spec:
             secretName: {{ $root.Values.niks3.auth.existingSecret }}
             items: [{key: token, path: token}]
           {{- end }}
+        {{- if $reverse }}
+        # Pod-bound (carries metadata.uid); kubelet rotates it at 80% of
+        # its lifetime and the worker forwards each new one.
+        - name: reverse-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: {{ $w.reverse.audience }}
+                  expirationSeconds: {{ $w.reverse.expirationSeconds }}
+        {{- end }}
         {{- with (include "farm.tlsSecret" (list $root "worker")) }}
         - name: tls
           secret: {secretName: {{ . }}}
