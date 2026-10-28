@@ -18,6 +18,9 @@ let
   signingPublicKey = "farm-test-1:RkClDwvfixdOwourBI4UD9hudE3xfU5EBQcMFUVuRV8=";
   niks3Url = "http://lb:5751";
   niks3Pkgs = niks3.packages.${system};
+  # A binary cache outside the farm that the builders substitute from but
+  # whose signatures they do not trust. The client fills it.
+  offerUrl = "file:///tmp/shared/offer";
 
   # nixos test framework: nodes get 192.168.1.<n> in attribute-name order.
   ip = {
@@ -132,6 +135,7 @@ let
           publicKeys = [ signingPublicKey ];
         };
       };
+      nix.settings.extra-substituters = [ "${offerUrl}?want-mass-query=true" ];
       programs.nix-grpc-store.enable = true;
       networking.firewall.allowedTCPPorts = [ 50051 ];
     };
@@ -318,6 +322,7 @@ pkgs.testers.runNixOSTest {
         "NGS_OIDC_AUDIENCE": "${oidcAudience}",
         "NGS_SIGNING_PUBKEY": "${signingPublicKey}",
         "NGS_NIKS3_URL": "${niks3Url}",
+        "NGS_OFFER_URL": "${offerUrl}",
         "NGS_JOB_EXPR": "${jobExpr}",
         "NGS_DEP_EXPR": "${depExpr}",
         "NGS_FAIL_EXPR": "${failExpr}",

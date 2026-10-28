@@ -151,6 +151,105 @@ fn inputs_already_in_the_cache_are_not_sent_to_the_scheduler() {
 }
 
 #[test]
+fn an_output_a_substituter_offers_unsigned_is_built() {
+    farm_ready();
+    let dep = expr("DEP");
+    let offer = env("NGS_OFFER_URL");
+    let tag = "offered1";
+    // Built on the client only, then offered unsigned and deleted there.
+    let out = succeed(
+        CLIENT,
+        &[
+            "nix-build",
+            "--no-out-link",
+            &dep,
+            "-A",
+            "input",
+            "--argstr",
+            "tag",
+            tag,
+        ],
+    );
+    let out = out.trim();
+    succeed(CLIENT, &["nix", "copy", "--to", &offer, out]);
+    succeed(CLIENT, &["nix-store", "--delete", out]);
+    for w in WORKERS {
+        fail(w, &["test", "-e", out]);
+        let dry = succeed(
+            w,
+            &[
+                "sh",
+                "-c",
+                r#"NIX_REMOTE=daemon nix-store --realise --dry-run "$1" 2>&1"#,
+                "sh",
+                out,
+            ],
+        );
+        assert!(
+            dry.contains("will be fetched"),
+            "{} is not offered {out}: {dry}",
+            w.0
+        );
+    }
+    let said = run_t(
+        CLIENT,
+        &["nix-store", "--store", &envoy(), "--check-validity", out],
+        120,
+    );
+    eprintln!(
+        "before the build, the farm answered {out} (exit {}): {}",
+        said.code,
+        said.combined()
+    );
+    let wants = || journal_count(leader(), UNIT, "event=want ");
+    let before = wants();
+    succeed(
+        CLIENT,
+        &[
+            "sh",
+            "-c",
+            r#"exec "$@" >&2"#,
+            "sh",
+            "nix",
+            "build",
+            "-L",
+            "--no-link",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "-f",
+            &dep,
+            "input",
+            "--argstr",
+            "tag",
+            tag,
+        ],
+    );
+    let wanted = wants().saturating_sub(before);
+    assert!(wanted >= 1, "no build was sent for {out}");
+    // The builders cannot fetch an unsigned path, so the build must have made it.
+    let got = run_t(CLIENT, &["nix", "path-info", "--store", &envoy(), out], 120);
+    assert_eq!(
+        got.code,
+        0,
+        "the build succeeded, but the farm cannot give {out} ({wanted} wants sent): {}",
+        got.combined()
+    );
+    assert!(
+        !holders(out).is_empty(),
+        "no builder holds {out} ({wanted} wants sent)"
+    );
+    // Checked last, so that a failure above shows whether a build was sent.
+    assert_ne!(
+        said.code,
+        0,
+        "before the build, the farm said it holds {out}: {}",
+        said.combined()
+    );
+}
+
+#[test]
 fn two_clients_wanting_the_same_drv_build_it_once() {
     farm_ready();
     let attached = || {
