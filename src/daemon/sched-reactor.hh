@@ -7,7 +7,10 @@
 #include <cstddef>
 #include <deque>
 #include <exception>
+#include <chrono>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <absl/base/thread_annotations.h>
 #include <absl/synchronization/mutex.h>
 #include <string>
@@ -234,12 +237,17 @@ class WorkerSessionReactor final
     : public SchedReactorBase<nix::remote::WorkerMsgs, nix::remote::SchedCmd, nix::remote::SchedCmds>
 {
 public:
+    // `renew` verifies a rotated token against verifiedPodId and returns its
+    // expiry; it is only set for pod-bound sessions.
+    using Renew = std::function<std::optional<std::chrono::system_clock::time_point>(const std::string &)>;
+
     WorkerSessionReactor(grpc::CallbackServerContext * ctx, Dispatcher & disp, IdleTracker & idle,
                          std::string verifiedPodId = {},
-                         std::chrono::system_clock::time_point credentialExpiresAt = {})
+                         std::chrono::system_clock::time_point credentialExpiresAt = {}, Renew renew = {})
         : SchedReactorBase(ctx)
         , active(idle)
         , disp(disp)
+        , renew(std::move(renew))
         , worker{.send = sender(disp), .abort = [ctx] -> void { ctx->TryCancel(); },
                  .verifiedPodId = std::move(verifiedPodId), .credentialExpiresAt = credentialExpiresAt}
     {
@@ -249,6 +257,19 @@ public:
 protected:
     void onMsgs(const nix::remote::WorkerMsgs & msgs) override
     {
+        // Verify outside the Dispatcher mutex: a JWKS refetch may block.
+        for (const auto & msg : msgs.msgs()) {
+            if (!msg.has_reauth()) {
+                continue;
+            }
+            auto const expiresAt = renew && !worker.verifiedPodId.empty()
+                ? renew(msg.reauth().token())
+                : std::nullopt;
+            if (!expiresAt) {
+                throw nix::Error("WorkerSession: invalid rotated tunnel credential");
+            }
+            disp.renewCredential(worker, *expiresAt);
+        }
         disp.workerMsgs(worker, msgs);
     }
 
@@ -261,6 +282,7 @@ protected:
 private:
     IdleTracker::Guard active;
     Dispatcher & disp;
+    Renew renew;
     Dispatcher::Worker worker;
 };
 

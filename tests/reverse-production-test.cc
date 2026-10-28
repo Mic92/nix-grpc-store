@@ -125,6 +125,36 @@ int main(int argc, char ** argv)
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     assert(scheduler.reverseRegistry.find(workerOptions.reverseWorkerId));
     std::cerr << "production TLS worker registration ready\n";
+    // The serve loop is not running here; enforce control-credential expiry
+    // like Coordinator::tick does for the rest of the fixture.
+    std::jthread credentialTicker([&](std::stop_token stop) {
+        std::mutex tickMutex;
+        std::condition_variable_any tickCv;
+        std::unique_lock lock(tickMutex);
+        while (!stop.stop_requested()) {
+            tickCv.wait_for(lock, stop, std::chrono::seconds(1), [] { return false; });
+            if (!stop.stop_requested()) scheduler.dispatcher->expireCredentials();
+        }
+    });
+    {
+        // Rotate the projected token the way kubelet does (atomic swap) and
+        // keep both reverse sessions alive past the first token's expiry.
+        auto const firstGeneration = scheduler.reverseRegistry.find(workerOptions.reverseWorkerId)->generation;
+        std::filesystem::copy_file(dir + "/token-next", dir + "/token.tmp");
+        std::filesystem::rename(dir + "/token.tmp", dir + "/token");
+        auto const firstExpiry = std::chrono::system_clock::time_point(
+            std::chrono::seconds(std::stoll(nix::chomp(nix::readFile(dir + "/token-expires")))));
+        std::this_thread::sleep_until(firstExpiry + std::chrono::seconds(3));
+        auto const live = scheduler.reverseRegistry.find(workerOptions.reverseWorkerId);
+        assert(live && live->generation == firstGeneration);
+        auto const members = scheduler.dispatcher->membership();
+        bool listed = false;
+        for (auto const & [system, list] : *members)
+            for (auto const & member : list) listed = listed || member.addr == workerOptions.advertise;
+        assert(listed);
+        assert(metrics.eventCounter("worker_credential_expired").Value() == 0);
+        std::cerr << "rotated tunnel token kept data and control sessions past first expiry\n";
+    }
 
     auto const source = nix::openStore("local?root=" + dir + "/source-store");
     std::string random(nixgrpc::ReverseFrames::maxQueuedBytes + 2 * 1024 * 1024, '\0');

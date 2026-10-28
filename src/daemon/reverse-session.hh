@@ -108,7 +108,8 @@ public:
         if (!stream->Read(&msg)) {
             return {grpc::StatusCode::INVALID_ARGUMENT, "missing worker ID"};
         }
-        if (msg.stream_id() != 0 || msg.frame_case() != nix::remote::ReverseWorkerMsg::FRAME_NOT_SET) {
+        if (msg.stream_id() != 0 || msg.frame_case() != nix::remote::ReverseWorkerMsg::FRAME_NOT_SET
+            || !msg.credential().empty()) {
             return {grpc::StatusCode::INVALID_ARGUMENT, "first message must be registration only"};
         }
         auto bound = identity.bind(std::string(value.substr(prefix.size())), msg.worker_id());
@@ -142,13 +143,18 @@ public:
         } cleanup{registry, *handle, cancellation};
 
 
-        // A stream must never outlive its verified projected token. stop_token
-        // wakes the timer immediately on normal close/replacement.
+        // A stream must never outlive its verified projected token. A rotated
+        // token for the same pod moves the deadline; stop_token wakes the
+        // timer immediately on normal close/replacement.
         std::mutex mutex;
         std::condition_variable_any cv;
+        auto deadline = bound->expiresAt;
         std::jthread expiry([&, cancellation](std::stop_token stop) {
             std::unique_lock lock(mutex);
-            if (!cv.wait_until(lock, stop, bound->expiresAt, [] { return false; }) && !stop.stop_requested()) {
+            while (!stop.stop_requested() && std::chrono::system_clock::now() < deadline) {
+                cv.wait_until(lock, stop, deadline, [] { return false; });
+            }
+            if (!stop.stop_requested()) {
                 cancellation->cancel();
             }
         });
@@ -172,6 +178,23 @@ public:
             }
         });
         while (stream->Read(&msg)) {
+            if (!msg.credential().empty()) {
+                auto renewed = msg.stream_id() == 0 && msg.frame_case() == nix::remote::ReverseWorkerMsg::FRAME_NOT_SET
+                        && msg.worker_id().empty() && registry.current(*handle)
+                    ? identity.renew(msg.credential(), bound->workerId)
+                    : std::nullopt;
+                if (!renewed) {
+                    transport->close();
+                    return {grpc::StatusCode::UNAUTHENTICATED, "invalid rotated tunnel credential"};
+                }
+                {
+                    const std::scoped_lock lock(mutex);
+                    deadline = std::max(deadline, *renewed);
+                }
+                cv.notify_all();
+                msg.Clear();
+                continue;
+            }
             if (!registry.current(*handle) || !transport->responses.accept(std::move(msg))) {
                 transport->close();
                 return {grpc::StatusCode::INVALID_ARGUMENT, "invalid reverse response or session displaced"};

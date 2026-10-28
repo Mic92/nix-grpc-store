@@ -83,7 +83,7 @@ public:
     struct Worker
     {
         WorkerSend send;
-        std::function<void()> abort; // ends the stream when a newer session replaces it
+        std::function<void()> abort; // ends the stream when replaced or its credential expires
         std::optional<sched::WorkerId> id; // under Dispatcher::mutex; reset when replaced
         // Set only by a verified WorkerSession credential, never by Hello.
         std::string verifiedPodId;
@@ -93,6 +93,12 @@ public:
     // Throws on protocol violations; the caller closes the stream.
     void workerMsgs(Worker & worker, const nix::remote::WorkerMsgs & msgs);
     void workerGone(Worker & worker);
+    // `expiresAt` must come from a rotated token already verified to
+    // worker.verifiedPodId. Never shortens the current deadline.
+    void renewCredential(Worker & worker, std::chrono::system_clock::time_point expiresAt);
+    // Drop pod-bound workers whose last verified token has expired. Their
+    // assignments requeue; the stream is cancelled. Called ~1 Hz.
+    void expireCredentials();
 
     // Control-plane-only build route: require the exact live Expect, a
     // follower, and the current WorkerSession owner. Never infer this from

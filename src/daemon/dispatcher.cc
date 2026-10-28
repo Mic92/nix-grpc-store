@@ -772,6 +772,52 @@ void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg &
         core.setDraining(*worker.id, msg.load().draining());
         membershipChangedLocked();
         placeabilityChangedLocked();
+    } else if (msg.has_reauth()) {
+        // Verified and applied by the session before this batch; a
+        // cert-only session cannot carry one.
+        if (worker.verifiedPodId.empty()) {
+            throw nix::Error("WorkerSession: reauthentication on a session without a pod credential");
+        }
+    }
+}
+
+void Dispatcher::renewCredential(Worker & worker, std::chrono::system_clock::time_point expiresAt)
+{
+    const Lock lock(*this);
+    // An expired session is already being torn down; it cannot be revived.
+    if (worker.verifiedPodId.empty() || expiresAt <= worker.credentialExpiresAt
+        || worker.credentialExpiresAt <= std::chrono::system_clock::now()) {
+        return;
+    }
+    worker.credentialExpiresAt = expiresAt;
+}
+
+void Dispatcher::expireCredentials()
+{
+    const Lock lock(*this);
+    auto const now = std::chrono::system_clock::now();
+    bool changed = false;
+    for (auto it = workers.begin(); it != workers.end();) {
+        if (it->second->verifiedPodId.empty() || it->second->credentialExpiresAt > now) {
+            ++it;
+            continue;
+        }
+        logLine(LogLevel::info, {{"event", "worker_credential_expired"}, {"addr", core.worker(it->first).addr}});
+        metrics.event("worker_credential_expired");
+        core.workerGone(it->first);
+        it->second->id.reset();
+        if (it->second->abort) {
+            afterUnlock(it->second->abort);
+        }
+        it = workers.erase(it);
+        changed = true;
+    }
+    if (changed) {
+        membershipChangedLocked();
+        dispatchLocked();
+        placeabilityChangedLocked();
+        metrics.schedWorkers(core.workersUp());
+        exportStats(false);
     }
 }
 

@@ -84,8 +84,14 @@ auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
         return new RejectReactor<WorkerMsgs, SchedCmds>(status); // NOLINT(cppcoreguidelines-owning-memory)
     }
     logLine(LogLevel::info, {{"event", "worker_session_open"}, {"cn", caller.name}, {"peer", context->peer()}});
+    WorkerSessionReactor::Renew renew;
+    if (!verifiedPodId.empty()) {
+        renew = [identity = reverseIdentity, podId = verifiedPodId](const std::string & token) {
+            return identity->renew(token, podId);
+        };
+    }
     return new WorkerSessionReactor( // NOLINT(cppcoreguidelines-owning-memory)
-        context, *dispatcher, *idle, std::move(verifiedPodId), credentialExpiresAt);
+        context, *dispatcher, *idle, std::move(verifiedPodId), credentialExpiresAt, std::move(renew));
 }
 
 } // namespace nixgrpc

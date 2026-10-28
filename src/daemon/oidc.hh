@@ -72,6 +72,7 @@ struct Identity
     // and tunnel audiences must not be treated as a tunnel-only credential.
     std::optional<std::string> singleAudience;
     std::optional<std::chrono::system_clock::time_point> expiresAt;
+    std::optional<std::chrono::system_clock::time_point> issuedAt;
 };
 
 constexpr size_t maxTokenBytes = 16UL * 1024;
@@ -573,6 +574,9 @@ private:
                 }
             }
             identity.expiresAt = parsed->get_expires_at();
+            if (parsed->has_issued_at()) {
+                identity.issuedAt = parsed->get_issued_at();
+            }
             return {.identity = std::move(identity), .error = role ? "" : "no rule matched"};
         }
         return fail("unknown issuer '" + iss + "'");

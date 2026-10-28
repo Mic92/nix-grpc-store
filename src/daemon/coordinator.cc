@@ -352,6 +352,40 @@ auto schedulerCreds(const Options & options, const std::string & tokenFile) -> s
     }
     return creds;
 }
+
+auto readToken(const std::string & path) -> std::string
+{
+    try {
+        auto token = nix::chomp(nix::readFile(path));
+        return token.find_first_of("\r\n") == std::string::npos ? token : std::string{};
+    } catch (std::exception &) {
+        return {};
+    }
+}
+
+// Kubelet rewrites a projected token at 80% of its lifetime: two minutes
+// before a 10-minute token expires. Forward each new token on the open
+// stream so it outlives the token it was opened with.
+constexpr std::chrono::seconds tokenPollInterval{5};
+
+void forwardRotatedTokens(const std::string & path, std::string last, const std::stop_token & stop,
+                          const std::function<bool(std::string)> & send)
+{
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::unique_lock lock(mutex);
+    while (!stop.stop_requested()) {
+        cv.wait_for(lock, stop, tokenPollInterval, [] { return false; });
+        auto token = readToken(path);
+        if (stop.stop_requested() || token.empty() || token == last) {
+            continue;
+        }
+        if (!send(token)) {
+            return;
+        }
+        last = std::move(token);
+    }
+}
 } // namespace
 
 
@@ -488,6 +522,7 @@ void Coordinator::runReverseSession(const std::stop_token & stop)
     while (!stop.stop_requested()) {
         grpc::ClientContext ctx;
         const std::stop_callback onStop(stop, [&ctx] { ctx.TryCancel(); });
+        auto openedWith = readToken(options.reverseTokenFile);
         auto stream = stub->Register(&ctx);
         nix::remote::ReverseWorkerMsg registration;
         registration.set_worker_id(options.reverseWorkerId);
@@ -519,6 +554,10 @@ void Coordinator::runReverseSession(const std::stop_token & stop)
                 while (outgoing.take(reply, writeStop)) {
                     if (!stream->Write(reply)) { requests.cancelUploads(); ctx.TryCancel(); break; }
                 }
+            });
+            std::jthread rotation([&](std::stop_token rotationStop) {
+                forwardRotatedTokens(options.reverseTokenFile, openedWith, rotationStop,
+                    [&](std::string token) { return outgoing.credential(std::move(token)); });
             });
             // A bounded pool per registration leaves the reader and control
             // session free while several builds run. The inbound 64-stream
@@ -648,6 +687,8 @@ void Coordinator::runReverseSession(const std::stop_token & stop)
             // the writer is stuck in (or has left) gRPC Write. Wake those
             // producers before joining executors, not after.
             outgoing.close();
+            rotation.request_stop();
+            rotation.join();
             for (auto & executor : executors) executor.request_stop();
             for (auto & executor : executors) executor.join();
             writer.request_stop();
@@ -694,6 +735,7 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
     auto backoff = minBackoff;
     while (!stop.stop_requested()) {
         grpc::ClientContext ctx;
+        auto openedWith = options.reverseTokenFile.empty() ? std::string{} : readToken(options.reverseTokenFile);
         auto stream = stub->WorkerSession(&ctx);
         auto const writeMutex = std::make_shared<std::mutex>();
         auto const live = std::make_shared<std::atomic<bool>>(true);
@@ -711,6 +753,16 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
             backoff = minBackoff;
         }
         const std::stop_callback onStop(stop, [&ctx] -> void { ctx.TryCancel(); });
+        std::jthread rotation;
+        if (helloed && !options.reverseTokenFile.empty()) {
+            rotation = std::jthread([&](std::stop_token rotationStop) {
+                forwardRotatedTokens(options.reverseTokenFile, openedWith, rotationStop, [&](std::string token) {
+                    WorkerMsg msg;
+                    msg.mutable_reauth()->set_token(std::move(token));
+                    return bld.send(msg);
+                });
+            });
+        }
         SchedCmds cmds;
         bool restarting = false;
         while (helloed && stream->Read(&cmds)) {
@@ -729,6 +781,10 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
             }
         }
         *live = false;
+        if (rotation.joinable()) {
+            rotation.request_stop();
+            rotation.join();
+        }
         auto const status = stream->Finish();
         if (stop.stop_requested()) {
             return;
@@ -749,6 +805,9 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
 
 void Coordinator::tick()
 {
+    if (dispatcher) {
+        dispatcher->expireCredentials();
+    }
     if (!builder) {
         return;
     }

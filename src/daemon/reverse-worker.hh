@@ -56,6 +56,14 @@ public:
         return push(std::move(frame), stop, {}, waitForSpace, std::move(afterAck));
     }
 
+    // A rotated tunnel token. Not tied to a stream; never waits for space.
+    [[nodiscard]] auto credential(std::string token) -> bool
+    {
+        nix::remote::ReverseWorkerMsg frame;
+        frame.set_credential(std::move(token));
+        return push(std::move(frame), {}, {}, false);
+    }
+
     [[nodiscard]] auto take(nix::remote::ReverseWorkerMsg & frame, std::stop_token stop) -> bool
     {
         std::unique_lock lock(mutex);

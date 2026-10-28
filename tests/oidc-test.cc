@@ -489,6 +489,7 @@ auto run(const std::string &dir, const std::string &base) -> int
                     {"sub", "system:serviceaccount:staging:worker"},
                     {"aud", "grpc://worker-tunnel"},
                     {"exp", now() + validFor},
+                    {"iat", now()},
                     {"kubernetes.io",
                      {{"namespace", "staging"},
                       {"pod", {{"name", "worker-pod-1"}, {"uid", podUid}}},
@@ -539,6 +540,32 @@ auto run(const std::string &dir, const std::string &base) -> int
         auto expired = tokenClaims(uid);
         expired["exp"] = now() - longAgo;
         check(!binding.bind(ecKey.sign(expired), workerId), "expired worker token denied");
+        auto noIat = tokenClaims(uid);
+        noIat.erase("iat");
+        check(!binding.bind(ecKey.sign(noIat), workerId), "worker token without iat denied");
+        auto longLived = tokenClaims(uid);
+        longLived["exp"] = now() + 3600;
+        check(!binding.bind(ecKey.sign(longLived), workerId), "hour-long worker token exceeds revocation window");
+        auto backdated = tokenClaims(uid);
+        backdated["iat"] = now() - 3000;
+        backdated["exp"] = now() + 3000;
+        check(!binding.bind(ecKey.sign(backdated), workerId), "back-dated iat cannot hide a long lifetime");
+        auto futureIat = tokenClaims(uid);
+        futureIat["iat"] = now() + 1200;
+        futureIat["exp"] = now() + 1500;
+        check(!binding.bind(ecKey.sign(futureIat), workerId), "future-dated iat cannot extend the window");
+        {
+            nixgrpc::WorkerIdentity hourly(tunnelVerifier, "worker-tunnel", "staging", "worker",
+                                           "grpc://worker-tunnel", std::chrono::hours(1));
+            check(hourly.bind(ecKey.sign(longLived), workerId).has_value(), "configured lifetime accepts hour token");
+        }
+        auto later = tokenClaims(uid);
+        later["exp"] = now() + validFor + 60;
+        auto renewed = binding.renew(ecKey.sign(later), workerId);
+        check(renewed && bound && *renewed > bound->expiresAt, "rotated token for same pod renews");
+        check(!binding.renew(ecKey.sign(tokenClaims("12345678-1234-1234-1234-123456789abd")), workerId),
+              "rotated token for another pod cannot renew");
+        check(!binding.renew(ecKey.sign(expired), workerId), "expired rotated token cannot renew");
         check(!binding.bind(stranger.sign(tokenClaims(uid)), workerId), "unknown signer denied");
         check(!binding.bind("", workerId), "empty token denied");
 
@@ -812,6 +839,39 @@ auto run(const std::string &dir, const std::string &base) -> int
                 check(!registry.find(workerId), "expired credential evicts worker");
                 stream->Finish();
             }
+            {
+                grpc::ClientContext ctx;
+                ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+                auto soon = tokenClaims(uid);
+                soon["exp"] = now() + 2;
+                auto [stream, gen] = open(ctx, ecKey.sign(soon), workerId);
+                nix::remote::ReverseWorkerMsg rotated;
+                rotated.set_credential(ecKey.sign(tokenClaims(uid)));
+                check(gen != 0 && stream->Write(rotated), "rotated token sent on data session");
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+                auto const live = registry.find(workerId);
+                check(live && live->generation == gen, "rotated token keeps data session past first expiry");
+                nix::remote::ReverseWorkerMsg foreign;
+                foreign.set_credential(ecKey.sign(tokenClaims("12345678-1234-1234-1234-123456789abd")));
+                stream->Write(foreign);
+                nix::remote::ReverseFarmMsg ack;
+                check(!stream->Read(&ack) && stream->Finish().error_code() == grpc::StatusCode::UNAUTHENTICATED &&
+                          !registry.find(workerId),
+                      "another pod's rotated token closes the data session");
+            }
+            {
+                grpc::ClientContext ctx;
+                ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+                auto [stream, gen] = open(ctx, token, workerId);
+                nix::remote::ReverseWorkerMsg smuggled;
+                smuggled.set_stream_id(1);
+                smuggled.set_credential(token);
+                stream->Write(smuggled);
+                nix::remote::ReverseFarmMsg ack;
+                check(gen != 0 && !stream->Read(&ack) &&
+                          stream->Finish().error_code() == grpc::StatusCode::UNAUTHENTICATED,
+                      "credential cannot ride on a stream frame");
+            }
         }
         stub.reset();
         channel.reset();
@@ -954,6 +1014,61 @@ auto run(const std::string &dir, const std::string &base) -> int
             stream->WritesDone();
             while (stream->Read(&commands)) { }
             check(stream->Finish().ok(), "direct TLS control stream ends normally");
+        }
+        auto reauth = [](std::string tokenValue) {
+            nix::remote::WorkerMsgs messages;
+            messages.add_msgs()->mutable_reauth()->set_token(std::move(tokenValue));
+            return messages;
+        };
+        auto memberCount = [&] {
+            auto const members = dispatcher.membership();
+            auto const it = members->find("x");
+            return it == members->end() ? size_t{0} : it->second.size();
+        };
+        {
+            grpc::ClientContext ctx;
+            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
+            auto stream = sendHello(ctx, {}, "127.0.0.3:50051");
+            stream->Write(reauth(token));
+            nix::remote::SchedCmds commands;
+            check(!stream->Read(&commands) && stream->Finish().error_code() == grpc::StatusCode::INVALID_ARGUMENT,
+                  "certificate-only control stream cannot send a tunnel credential");
+        }
+        {
+            grpc::ClientContext ctx;
+            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(15));
+            auto soon = tokenClaims(uid);
+            soon["exp"] = now() + 2;
+            ctx.AddMetadata("authorization", "Bearer " + ecKey.sign(soon));
+            auto stream = sendHello(ctx, workerId, "127.0.0.4:50051");
+            check(stream->Write(reauth(ecKey.sign(tokenClaims(uid)))), "rotated token sent on control session");
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            dispatcher.expireCredentials();
+            check(memberCount() == 1, "rotated token keeps pod-bound worker schedulable past first expiry");
+            stream->Write(reauth(ecKey.sign(tokenClaims("12345678-1234-1234-1234-123456789abd"))));
+            nix::remote::SchedCmds commands;
+            while (stream->Read(&commands)) { }
+            check(stream->Finish().error_code() == grpc::StatusCode::INVALID_ARGUMENT && memberCount() == 0,
+                  "another pod's rotated token closes the control session");
+        }
+        {
+            grpc::ClientContext ctx;
+            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(15));
+            auto soon = tokenClaims(uid);
+            soon["exp"] = now() + 2;
+            ctx.AddMetadata("authorization", "Bearer " + ecKey.sign(soon));
+            auto stream = sendHello(ctx, workerId, "127.0.0.5:50051");
+            auto const joined = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (memberCount() == 0 && std::chrono::steady_clock::now() < joined) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            check(memberCount() == 1, "short-lived control session joins");
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            dispatcher.expireCredentials();
+            nix::remote::SchedCmds commands;
+            while (stream->Read(&commands)) { }
+            check(memberCount() == 0 && !stream->Finish().ok(),
+                  "expired control credential removes worker and cancels its stream");
         }
         {
             grpc::ClientContext ctx;

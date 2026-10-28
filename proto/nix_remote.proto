@@ -281,11 +281,18 @@ message Load {
   bool draining = 1;
 }
 
+// A rotated pod-bound tunnel token for an already verified reverse control
+// session. It must verify to the same pod; it never establishes identity.
+message Reauth {
+  string token = 1;
+}
+
 message WorkerMsg {
   oneof msg {
     Hello hello = 1;
     Done done = 2;
     Load load = 3;
+    Reauth reauth = 4;
   }
 }
 
@@ -372,6 +379,9 @@ message ReverseWorkerMsg {
     ReverseData data = 3;
     ReverseFinish finish = 4;
   }
+  // Only on stream 0 without a frame: a rotated tunnel token that must
+  // verify to the registered pod. It extends the session's expiry.
+  string credential = 5;
 }
 
 message ReverseFarmMsg {

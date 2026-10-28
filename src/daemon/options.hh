@@ -40,6 +40,9 @@ struct Options
     std::string reverseNamespace;
     std::string reverseServiceAccount;
     std::string reverseAudience;
+    // Longest accepted tunnel token lifetime. Offline verification cannot
+    // see pod deletion, so this is also the revocation window.
+    std::chrono::seconds reverseMaxTokenLifetime{600};
     Niks3Config niks3;
 
     bool builder = true;

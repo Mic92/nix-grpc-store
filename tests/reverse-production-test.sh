@@ -209,7 +209,14 @@ claims = {'iss':issuer, 'aud':'grpc://worker-tunnel', 'exp':int(time.time())+300
                            'serviceaccount':{'name':'worker'}}}
 message = b64(json.dumps({'alg':'RS256','kid':'worker','typ':'JWT'}).encode())+'.'+b64(json.dumps(claims).encode())
 sig = subprocess.run(['openssl','dgst','-sha256','-sign',str(dir/'jwt.key')],input=message.encode(),capture_output=True,check=True).stdout
+(dir / 'token-next').write_text(message+'.'+b64(sig)+'\n')
+# The worker's first token expires early; the fixture rotates to token-next
+# and both reverse sessions must survive the original expiry.
+short = dict(claims, exp=int(time.time())+20)
+message = b64(json.dumps({'alg':'RS256','kid':'worker','typ':'JWT'}).encode())+'.'+b64(json.dumps(short).encode())
+sig = subprocess.run(['openssl','dgst','-sha256','-sign',str(dir/'jwt.key')],input=message.encode(),capture_output=True,check=True).stdout
 (dir / 'token').write_text(message+'.'+b64(sig)+'\n')
+(dir / 'token-expires').write_text(str(short['exp'])+'\n')
 claims['kubernetes.io']['pod'] = {'name':'worker-1','uid':'87654321-4321-4321-4321-cba987654321'}
 message = b64(json.dumps({'alg':'RS256','kid':'worker','typ':'JWT'}).encode())+'.'+b64(json.dumps(claims).encode())
 sig = subprocess.run(['openssl','dgst','-sha256','-sign',str(dir/'jwt.key')],input=message.encode(),capture_output=True,check=True).stdout

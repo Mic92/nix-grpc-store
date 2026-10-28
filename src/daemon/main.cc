@@ -1449,7 +1449,7 @@ try {
         reverseOidc.emplace(nixgrpc::oidc::loadConfig(options.reverseOidcConfig));
         reverseIdentity.emplace(
             *reverseOidc, options.reverseProvider, options.reverseNamespace, options.reverseServiceAccount,
-            options.reverseAudience);
+            options.reverseAudience, options.reverseMaxTokenLifetime);
     }
     nixgrpc::Auth auth{.acl = options.acl, .proxies = options.proxies, .oidc = &oidc};
     nixgrpc::Coordinator coord(options, auth, metrics, idle);

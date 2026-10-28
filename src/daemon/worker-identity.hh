@@ -22,6 +22,7 @@ class WorkerIdentity
     std::string nameSpace;
     std::string serviceAccount;
     std::string audience;
+    std::chrono::seconds maxLifetime;
 
     static auto safeName(std::string_view value, size_t limit) -> bool
     {
@@ -57,14 +58,20 @@ public:
         std::chrono::system_clock::time_point expiresAt;
     };
 
+    // Kubernetes' minimum projected-token lifetime. Offline verification
+    // cannot see pod deletion or token revocation, so this bounds how long a
+    // deleted pod's stolen token can keep (or open) a session.
+    static constexpr std::chrono::seconds defaultMaxLifetime{600};
+
     WorkerIdentity(
         oidc::Verifier & verifier, std::string provider, std::string nameSpace, std::string serviceAccount,
-        std::string audience)
+        std::string audience, std::chrono::seconds maxLifetime = defaultMaxLifetime)
         : verifier(verifier)
         , provider(std::move(provider))
         , nameSpace(std::move(nameSpace))
         , serviceAccount(std::move(serviceAccount))
         , audience(std::move(audience))
+        , maxLifetime(maxLifetime)
     {
     }
 
@@ -94,6 +101,13 @@ public:
             || !id.expiresAt || *id.expiresAt <= std::chrono::system_clock::now()) {
             return std::nullopt;
         }
+        // Both claims are signed. Bound the issued lifetime and, in case the
+        // signer back-dates iat, the remaining lifetime as seen locally.
+        auto const skew = std::chrono::seconds(oidc::clockSkewSecs);
+        if (maxLifetime.count() <= 0 || !id.issuedAt || *id.expiresAt - *id.issuedAt > maxLifetime
+            || *id.expiresAt > std::chrono::system_clock::now() + maxLifetime + skew) {
+            return std::nullopt;
+        }
         auto const boundId = "pod:" + nameSpace + ":" + *id.podUid;
         return Bound{.workerId = boundId, .expiresAt = *id.expiresAt};
     }
@@ -102,6 +116,14 @@ public:
     {
         auto bound = verify(token);
         return bound && bound->workerId == claimedId ? bound : std::nullopt;
+    }
+
+    // A rotated token may only extend a session for the pod it was opened
+    // for; it never changes identity.
+    auto renew(const std::string & token, std::string_view boundId) -> std::optional<std::chrono::system_clock::time_point>
+    {
+        auto bound = verify(token);
+        return bound && bound->workerId == boundId ? std::optional(bound->expiresAt) : std::nullopt;
     }
 };
 

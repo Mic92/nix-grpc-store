@@ -183,6 +183,13 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.reverseServiceAccount = next();
         } else if (arg == "--reverse-audience") {
             options.reverseAudience = next();
+        } else if (arg == "--reverse-max-token-lifetime") {
+            auto secs = parseInt<unsigned>(next());
+            // Kubernetes refuses projected tokens shorter than 10 minutes.
+            if (!secs || *secs < 600 || *secs > 3600) {
+                throw nix::Error("--reverse-max-token-lifetime expects seconds in 600..3600");
+            }
+            options.reverseMaxTokenLifetime = std::chrono::seconds(*secs);
         } else if (arg == "--niks3") {
             options.niks3.url = next();
         } else if (arg == "--niks3-token-file") {
