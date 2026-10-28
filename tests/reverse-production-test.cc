@@ -863,6 +863,7 @@ int main(int argc, char ** argv)
         auto replacementStream = replacement->Register(&replacementContext);
         nix::remote::ReverseWorkerMsg registrationFrame;
         registrationFrame.set_worker_id(displaced.pod);
+        registrationFrame.set_protocol(nixgrpc::reverseProtocolVersion);
         assert(replacementStream->Write(registrationFrame));
         nix::remote::ReverseFarmMsg replacementAck;
         assert(replacementStream->Read(&replacementAck) && replacementAck.generation() > oldSession->generation);

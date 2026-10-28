@@ -24,6 +24,7 @@
 #include "idle.hh"
 #include "logfmt.hh"
 #include "nix_remote.pb.h"
+#include "reverse-protocol.hh"
 
 namespace nixgrpc {
 
@@ -106,6 +107,9 @@ public:
         }
         try {
             onMsgs(in);
+        } catch (ReverseProtocolMismatch & err) {
+            finish({grpc::StatusCode::FAILED_PRECONDITION, err.what()});
+            return;
         } catch (std::exception & err) {
             finish({grpc::StatusCode::INVALID_ARGUMENT, err.what()});
             return;

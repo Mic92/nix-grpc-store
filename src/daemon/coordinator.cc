@@ -54,6 +54,7 @@
 #include "nix_remote.pb.h"
 #include "options.hh"
 #include "reverse-capability.hh"
+#include "reverse-protocol.hh"
 #include "reverse-worker.hh"
 #include "sched-reactor.hh"
 
@@ -232,6 +233,7 @@ auto Builder::hello() const -> WorkerMsg
     hel->set_addr(options.advertise);
     if (!options.reverseWorkerId.empty()) {
         hel->set_reverse_worker_id(options.reverseWorkerId);
+        hel->set_reverse_protocol(reverseProtocolVersion);
     }
     hel->add_systems(nix::settings.thisSystem.get());
     for (const auto & extra : nix::settings.extraPlatforms.get()) {
@@ -526,8 +528,16 @@ void Coordinator::runReverseSession(const std::stop_token & stop)
         auto stream = stub->Register(&ctx);
         nix::remote::ReverseWorkerMsg registration;
         registration.set_worker_id(options.reverseWorkerId);
+        registration.set_protocol(reverseProtocolVersion);
         nix::remote::ReverseFarmMsg ack;
-        if (stream->Write(registration) && stream->Read(&ack) && ack.stream_id() == 0
+        bool const acked = stream->Write(registration) && stream->Read(&ack);
+        if (acked && ack.protocol() != reverseProtocolVersion) {
+            // An older scheduler omits the field; it cannot acknowledge
+            // results. Never run reverse builds against it.
+            logLine(LogLevel::info, {{"event", "reverse_protocol_mismatch"}, {"addr", options.schedulerAddr},
+                                     {"error", reverseProtocolMismatch(ack.protocol())}});
+            ctx.TryCancel();
+        } else if (acked && ack.stream_id() == 0
             && ack.frame_case() == nix::remote::ReverseFarmMsg::FRAME_NOT_SET && ack.generation() != 0
             && ack.session_key().size() == ReverseCapability::keyBytes) {
             logLine(LogLevel::info, {{"event", "reverse_registered"}, {"addr", options.schedulerAddr}});

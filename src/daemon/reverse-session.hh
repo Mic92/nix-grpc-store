@@ -19,6 +19,7 @@
 #include "nix_remote.grpc.pb.h"
 #include "auth.hh"
 #include "reverse-capability.hh"
+#include "reverse-protocol.hh"
 #include "reverse-registry.hh"
 #include "worker-identity.hh"
 
@@ -112,6 +113,9 @@ public:
             || !msg.credential().empty()) {
             return {grpc::StatusCode::INVALID_ARGUMENT, "first message must be registration only"};
         }
+        if (msg.protocol() != reverseProtocolVersion) {
+            return {grpc::StatusCode::FAILED_PRECONDITION, reverseProtocolMismatch(msg.protocol())};
+        }
         auto bound = identity.bind(std::string(value.substr(prefix.size())), msg.worker_id());
         if (!bound) {
             return {grpc::StatusCode::UNAUTHENTICATED, "invalid tunnel credential or worker ID"};
@@ -161,6 +165,7 @@ public:
         nix::remote::ReverseFarmMsg ack;
         ack.set_generation((*handle)->generation);
         ack.set_session_key((*handle)->sessionKey);
+        ack.set_protocol(reverseProtocolVersion);
         if (!registry.current(*handle) || !stream->Write(ack)) {
             return {grpc::StatusCode::UNAVAILABLE, "reverse session replaced"};
         }

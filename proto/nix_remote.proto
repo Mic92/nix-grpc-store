@@ -249,6 +249,8 @@ message Hello {
   // independently verified to this exact pod UID. Never trust this field on
   // a certificate-only control stream.
   string reverse_worker_id = 6;
+  // Required with reverse_worker_id; must equal the scheduler's version.
+  uint32 reverse_protocol = 7;
 }
 
 message Done {
@@ -382,6 +384,8 @@ message ReverseWorkerMsg {
   // Only on stream 0 without a frame: a rotated tunnel token that must
   // verify to the registered pod. It extends the session's expiry.
   string credential = 5;
+  // Required on the first message; must equal the scheduler's version.
+  uint32 protocol = 6;
 }
 
 message ReverseFarmMsg {
@@ -400,6 +404,8 @@ message ReverseFarmMsg {
   // Set only on the first, registration-ack message. Per-registration HMAC
   // key; never log, persist, or forward to a client. Rotated on reconnect.
   bytes session_key = 7;
+  // Set only on the registration ack: the scheduler's reverse protocol.
+  uint32 protocol = 9;
 }
 
 service ReverseSession {

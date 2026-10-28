@@ -42,6 +42,7 @@
 #include "reverse-relay.hh"
 #include "reverse-request.hh"
 #include "oidc.hh"
+#include "reverse-protocol.hh"
 #include "reverse-session.hh"
 #include "worker-identity.hh"
 
@@ -607,6 +608,7 @@ auto run(const std::string &dir, const std::string &base) -> int
             auto noCertStream = noCertStub->Register(&noCertCtx);
             nix::remote::ReverseWorkerMsg registration;
             registration.set_worker_id(workerId);
+            registration.set_protocol(nixgrpc::reverseProtocolVersion);
             noCertStream->Write(registration);
             nix::remote::ReverseFarmMsg ack;
             check(!noCertStream->Read(&ack) && noCertStream->Finish().error_code() == grpc::StatusCode::UNAUTHENTICATED,
@@ -622,6 +624,7 @@ auto run(const std::string &dir, const std::string &base) -> int
             auto stream = stub->Register(&ctx);
             nix::remote::ReverseWorkerMsg hello;
             hello.set_worker_id(claim);
+            hello.set_protocol(nixgrpc::reverseProtocolVersion);
             stream->Write(hello);
             nix::remote::ReverseFarmMsg ack;
             bool accepted = stream->Read(&ack);
@@ -660,6 +663,7 @@ auto run(const std::string &dir, const std::string &base) -> int
             auto stream = plaintext->Register(&ctx);
             nix::remote::ReverseWorkerMsg hello;
             hello.set_worker_id(workerId);
+            hello.set_protocol(nixgrpc::reverseProtocolVersion);
             stream->Write(hello);
             nix::remote::ReverseFarmMsg ack;
             check(!stream->Read(&ack) && stream->Finish().error_code() == grpc::StatusCode::UNAUTHENTICATED,
@@ -671,6 +675,37 @@ auto run(const std::string &dir, const std::string &base) -> int
             auto [stream, gen] = open(ctx, {}, workerId);
             check(gen == 0 && stream->Finish().error_code() == grpc::StatusCode::UNAUTHENTICATED,
                   "missing bearer denied over TLS");
+        }
+        for (uint32_t const version : {0U, nixgrpc::reverseProtocolVersion + 1}) {
+            grpc::ClientContext ctx;
+            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
+            ctx.AddMetadata("authorization", "Bearer " + token);
+            auto stream = stub->Register(&ctx);
+            nix::remote::ReverseWorkerMsg hello;
+            hello.set_worker_id(workerId);
+            hello.set_protocol(version);
+            stream->Write(hello);
+            nix::remote::ReverseFarmMsg ack;
+            auto const status = stream->Read(&ack) ? grpc::Status::OK : stream->Finish();
+            check(status.error_code() == grpc::StatusCode::FAILED_PRECONDITION &&
+                      status.error_message().contains("roll out scheduler and reverse workers together") &&
+                      !registry.find(workerId),
+                  "data registration with another reverse protocol is refused explicitly");
+        }
+        {
+            grpc::ClientContext ctx;
+            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
+            ctx.AddMetadata("authorization", "Bearer " + token);
+            auto stream = stub->Register(&ctx);
+            nix::remote::ReverseWorkerMsg hello;
+            hello.set_worker_id(workerId);
+            hello.set_protocol(nixgrpc::reverseProtocolVersion);
+            stream->Write(hello);
+            nix::remote::ReverseFarmMsg ack;
+            check(stream->Read(&ack) && ack.protocol() == nixgrpc::reverseProtocolVersion,
+                  "registration ack announces the scheduler's reverse protocol");
+            ctx.TryCancel();
+            stream->Finish();
         }
         {
             grpc::ClientContext ctx;
@@ -687,6 +722,7 @@ auto run(const std::string &dir, const std::string &base) -> int
             auto stream = stub->Register(&ctx);
             nix::remote::ReverseWorkerMsg hello;
             hello.set_worker_id(workerId);
+            hello.set_protocol(nixgrpc::reverseProtocolVersion);
             stream->Write(hello);
             nix::remote::ReverseFarmMsg ack;
             check(!stream->Read(&ack) && stream->Finish().error_code() == grpc::StatusCode::UNAUTHENTICATED,
@@ -932,6 +968,7 @@ auto run(const std::string &dir, const std::string &base) -> int
             hello->add_systems("x");
             hello->set_max_jobs(1);
             hello->set_reverse_worker_id(std::string(claim));
+            hello->set_reverse_protocol(nixgrpc::reverseProtocolVersion);
             stream->Write(messages);
             return stream;
         };
@@ -946,6 +983,7 @@ auto run(const std::string &dir, const std::string &base) -> int
             hello->set_addr(std::string(controlAddr));
             hello->add_systems("x");
             hello->set_reverse_worker_id(workerId);
+            hello->set_reverse_protocol(nixgrpc::reverseProtocolVersion);
             stream->Write(messages);
             nix::remote::SchedCmds commands;
             check(!stream->Read(&commands) && !stream->Finish().ok() && dispatcher.membership()->empty(),
@@ -1015,6 +1053,24 @@ auto run(const std::string &dir, const std::string &base) -> int
             while (stream->Read(&commands)) { }
             check(stream->Finish().ok(), "direct TLS control stream ends normally");
         }
+        {
+            grpc::ClientContext ctx;
+            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
+            ctx.AddMetadata("authorization", "Bearer " + token);
+            auto stream = controlStub->WorkerSession(&ctx);
+            nix::remote::WorkerMsgs messages;
+            auto *hello = messages.add_msgs()->mutable_hello();
+            hello->set_addr("127.0.0.6:50051");
+            hello->add_systems("x");
+            hello->set_reverse_worker_id(workerId);
+            stream->Write(messages);
+            nix::remote::SchedCmds commands;
+            auto const status = stream->Read(&commands) ? grpc::Status::OK : stream->Finish();
+            check(status.error_code() == grpc::StatusCode::FAILED_PRECONDITION &&
+                      status.error_message().contains("roll out scheduler and reverse workers together") &&
+                      dispatcher.membership()->empty(),
+                  "control Hello without reverse protocol is refused explicitly");
+        }
         auto reauth = [](std::string tokenValue) {
             nix::remote::WorkerMsgs messages;
             messages.add_msgs()->mutable_reauth()->set_token(std::move(tokenValue));
@@ -1081,6 +1137,7 @@ auto run(const std::string &dir, const std::string &base) -> int
             auto dataStream = dataStub->Register(&dataCtx);
             nix::remote::ReverseWorkerMsg registration;
             registration.set_worker_id(workerId);
+            registration.set_protocol(nixgrpc::reverseProtocolVersion);
             check(dataStream->Write(registration), "same pod opens independent reverse data registration");
             nix::remote::ReverseFarmMsg ack;
             check(dataStream->Read(&ack) && ack.generation() != 0 && controlRegistry.find(workerId),

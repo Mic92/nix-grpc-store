@@ -1,4 +1,5 @@
 #include "dispatcher.hh"
+#include "reverse-protocol.hh"
 
 #include <algorithm>
 #include <chrono>
@@ -673,6 +674,9 @@ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
 {
     if (worker.verifiedPodId != hel.reverse_worker_id()) {
         throw nix::Error("WorkerSession: reverse identity does not match verified pod credential");
+    }
+    if (!worker.verifiedPodId.empty() && hel.reverse_protocol() != reverseProtocolVersion) {
+        throw ReverseProtocolMismatch("WorkerSession: %s", reverseProtocolMismatch(hel.reverse_protocol()));
     }
     if (!worker.id) {
         // A replacement control stream must not adopt another pod's
