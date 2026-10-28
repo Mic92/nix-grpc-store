@@ -51,6 +51,7 @@
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
 #include <nix/store/store-open.hh>
+#include <nix/util/types.hh>
 #include <nix/store/worker-protocol.hh>
 // Generic definitions for the std::vector serialiser wrappers used by
 // BuildPaths, which libnixstore does not instantiate explicitly.
@@ -122,10 +123,16 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
 
     // Without the path info cache a path deleted behind our back (gc) is
     // invalid here too, instead of failing later when its NAR is read.
-    [[nodiscard]] auto openLocalStore() const -> nix::ref<nix::Store>
+    [[nodiscard]] auto openLocalStore(nix::StringMap params = {}) const -> nix::ref<nix::Store>
     {
-        return nix::openStore(storeUri, {{"path-info-cache-size", "0"}});
+        params.emplace("path-info-cache-size", "0");
+        return nix::openStore(storeUri, params);
     }
+
+    // Aged-out connections release their temp roots. Not sooner: a fresh
+    // nix-daemon probes every substituter again.
+    static constexpr auto sharedConnections = "16";
+    static constexpr auto sharedConnectionAge = "600";
 
     // The Store connects lazily and pools connections, but opening it can
     // still throw (e.g. daemon socket missing), so defer to first use.
@@ -133,7 +140,8 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     {
         std::scoped_lock const lock(storeMutex);
         if (!store) {
-            store = openLocalStore().get_ptr();
+            store = openLocalStore({{"max-connections", sharedConnections}, {"max-connection-age", sharedConnectionAge}})
+                        .get_ptr();
         }
         return nix::ref<nix::Store>(store);
     }
@@ -162,7 +170,7 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         return gone;
     }
 
-    // nix-daemon keeps temp roots per connection, so writes get their own.
+    // For writes (temp roots end with the RPC) and anything long.
     auto openScopedStore() -> nix::ref<nix::Store>
     {
         return openLocalStore();
@@ -884,7 +892,7 @@ public:
         return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "FetchNars", nixgrpc::Role::readOnly);
             nixgrpc::Metrics::Held const held(metrics, "FetchNars"); // the drain waits for it
-            auto const localStore = getStore();
+            auto const localStore = openScopedStore();
 
             class TaggingWriter
             {
