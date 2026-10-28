@@ -279,9 +279,12 @@ load_assignment:
 {{- $w := mustMergeOverwrite (deepCopy $root.Values.workerDefaults) ((index $root.Values.workers $g) | default dict) }}
 {{- $svc := include "farm.workerService" (dict "root" $root "group" $g) }}
 {{- $isDefault := eq $g $defaultGroup }}
+{{- /* Reverse workers are reached only through their session, never by EDS. */}}
+{{- if not $w.reverse.enabled }}
 {{- if not $w.system }}{{ fail (printf "workers.%s.system is required, the scheduler names the endpoints of a group by system" $g) }}{{ end }}
 {{- $clusters = append $clusters (include "farm.envoy.workerCluster" (dict "root" $root "name" $g "edsSystem" $w.system) | fromYaml) }}
 {{- $routes = append $routes (include "farm.envoy.route" (dict "prefix" "/" "cluster" $g "system" $w.system "isDefault" $isDefault) | fromYaml) }}
+{{- end }}
 {{- end }}
 {{- $clusters = append $clusters (include "farm.envoy.clusterCommon" (dict "root" $root "name" "sched" "service" (include "farm.schedulerNames" $root) "healthService" "nix.scheduler") | fromYaml) }}
 {{- $listener := include "farm.envoy.listener" (dict "Values" .Values "Chart" .Chart "Release" .Release "routes" $routes) | fromYaml }}
