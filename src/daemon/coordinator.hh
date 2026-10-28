@@ -2,6 +2,7 @@
 // Scheduler gRPC service, the builder's session to it (in-process or remote),
 // and the Expect table that gates BuildDerivation.
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -59,6 +60,8 @@ struct Expected
         std::atomic<unsigned> attached{0};  // callers waiting in attach(); the build outlives its first caller for them
         bool finished = false;
         std::string resultWire; // BuildDerivationDone serialised
+        // Written before `finished`.
+        std::array<uint64_t, 3> settings{};
         LogSpill spill; // the owner's build log, replayed to whoever attaches
 
         // Owner only. Waking under the lock keeps an attacher that just

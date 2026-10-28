@@ -7,6 +7,7 @@
 // avoids the tunnel's per-batch zstd flushes and per-path round trips.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -654,6 +655,7 @@ public:
             metrics.event("unexpected_build");
             return {grpc::StatusCode::FAILED_PRECONDITION, "not scheduled here: " + drvName};
         }
+        std::array<uint64_t, 3> const settings{static_cast<uint64_t>(mode), limits.buildTimeout, limits.maxSilentTime};
         if (adm->attach) {
             metrics.event("attached");
             auto wire = attach(context, *adm->shared, log);
@@ -666,6 +668,10 @@ public:
             if (wire->empty()) {
                 return {grpc::StatusCode::UNAVAILABLE, "the build this call attached to did not finish, retry"};
             }
+            // Its result (a timeout, or no check) is not ours. Retrying after it finished builds anew.
+            if (adm->shared->settings != settings) {
+                return {grpc::StatusCode::UNAVAILABLE, "the build this call attached to ran with other mode or limits, retry"};
+            }
             if (!done.ParseFromString(*wire)) {
                 return {grpc::StatusCode::INTERNAL, "corrupt shared result"};
             }
@@ -673,6 +679,7 @@ public:
         }
 
         // From here on we own the Expect and must report Done exactly once.
+        adm->shared->settings = settings;
         auto outcome = nix::remote::Done::FAILED;
         std::vector<std::pair<std::string, uint64_t>> outputs;
         std::string wire;
