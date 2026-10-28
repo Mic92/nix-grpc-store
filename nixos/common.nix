@@ -26,8 +26,9 @@ in
       type = lib.types.bool;
       default = false;
       description = ''
-        Give clients that no {option}`accessRules` entry matches the
-        `trusted` role instead of `write`, and add the proxy user to
+        Give clients the `trusted` role instead of `write` while
+        {option}`accessRules` is empty (with rules, unmatched clients stay
+        denied), and add the proxy user to
         `nix.settings.trusted-users`. Needed to use this daemon as a remote
         builder without access rules (clients import unsigned store paths).
       '';
@@ -146,8 +147,9 @@ in
       description = ''
         Ordered access-control rules mapping client certificate CNs to
         roles; the first matching rule wins and clients matching no rule
-        are denied. Requires {option}`tls.clientCaFile`. When empty, every
-        authenticated client has full access.
+        are denied. Requires {option}`tls.clientCaFile`. When empty,
+        authenticated clients get `write`, or `trusted` with
+        {option}`trustClients`.
       '';
     };
 

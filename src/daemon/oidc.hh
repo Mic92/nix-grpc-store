@@ -488,13 +488,14 @@ private:
         auto res = pick();
         auto const mono = std::chrono::steady_clock::now();
         if (fetchDue(set.fetched, set.attempted, mono, !res.empty(), refetchOnMiss)) {
-            set.attempted = mono;
             try {
                 set.keys = fetchKeys(provider);
                 set.fetched = mono;
             } catch (std::exception & err) {
                 logLine(LogLevel::info, {{"event", "oidc_jwks_failed"}, {"provider", provider.name}, {"error", err.what()}});
             }
+            // From the end: a fetch that timed out must not start the next one at once.
+            set.attempted = std::chrono::steady_clock::now();
             res = pick();
         }
         if (res.empty()) {
