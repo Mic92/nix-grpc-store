@@ -38,7 +38,8 @@ inline auto goneAway(const grpc::Status & status) -> bool
         return transportError(msg) || msg.contains("upstream") || msg.contains("shutting down")
                || msg.contains("local nix-daemon connection lost");
     case grpc::StatusCode::CANCELLED:
-        return msg.contains("Cancelling all calls");
+        // Empty: the daemon shut down before a handler took the call.
+        return msg.empty() || msg.contains("Cancelling all calls");
     default:
         return false;
     }
