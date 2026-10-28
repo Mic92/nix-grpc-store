@@ -207,6 +207,18 @@ pub fn farm_ready() {
         wait_members(&system(), &WORKERS);
         retry(60, "one scheduler with both workers", settled);
     });
+    // A test that stopped a daemon and then failed must not fail every later one.
+    for w in WORKERS {
+        run_t(
+            w,
+            &[
+                "sh",
+                "-c",
+                "systemctl is-active -q nix-grpc-daemon.service || systemctl start nix-grpc-daemon.service",
+            ],
+            60,
+        );
+    }
     retry(60, "one scheduler with both workers", settled);
 }
 
