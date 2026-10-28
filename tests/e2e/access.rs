@@ -93,14 +93,18 @@ fn acl_read_only_role() {
     ]);
     let deny = deny_file(&dir);
     fail(&["nix", "store", "add", "--store", &ro, &deny]);
+    // Not on the server yet: a held output is answered without a build.
+    write_file(&format!("{dir}/ro.nix"), &drv_expr("ro-blob", "echo ro > $out"));
     fail(&[
         "nix",
         "build",
         "--store",
         &ro,
+        "--eval-store",
+        "auto",
         "--impure",
         "-f",
-        "/etc/hello.nix",
+        &format!("{dir}/ro.nix"),
         "--no-link",
     ]);
     assert_journal(
@@ -284,14 +288,20 @@ fn oidc_bearer_tokens() {
         format!("grpc://localhost:50052?ca-cert={d}/ca.pem&token-file={dir}/wrongaud.jwt");
 
     succeed(&["nix", "path-info", "--store", &reader, p]);
+    write_file(
+        &format!("{dir}/reader.nix"),
+        &drv_expr("reader-blob", "echo reader > $out"),
+    );
     fail(&[
         "nix",
         "build",
         "--store",
         &reader,
+        "--eval-store",
+        "auto",
         "--impure",
         "-f",
-        "/etc/hello.nix",
+        &format!("{dir}/reader.nix"),
         "--no-link",
     ]);
     write_file(

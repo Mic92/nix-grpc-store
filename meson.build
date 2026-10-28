@@ -339,6 +339,13 @@ if build_server
     dependencies : common_deps + [nix_store_dep, nix_util_dep],
   ), timeout : 30)
 
+  test('nix-compat', executable('nix-compat-test',
+    sources : ['tests/nix-compat-test.cc'],
+    include_directories : [src_inc],
+    cpp_args : nix_compat_args + ['-UNDEBUG'],
+    dependencies : [nix_store_dep, nix_util_dep],
+  ))
+
   test('top-down', executable('top-down-test',
     sources : ['tests/top-down-test.cc'],
     include_directories : [src_inc],
