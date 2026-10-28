@@ -155,6 +155,9 @@ private:
     static constexpr unsigned defaultMaxBuilds = 64;
 
     static constexpr unsigned defaultRescheduleRetries = 8;
+    Setting<bool> reverseUploads{this, false, "reverse-uploads",
+                                 "Upload a missing input closure to a reverse (worker-initiated) builder and "
+                                 "retry the pinned build. Off: such a build fails instead."};
     Setting<unsigned> rescheduleRetries{this, defaultRescheduleRetries, "reschedule-retries",
         "How often a derivation bounced by its assigned worker is handed back to the scheduler."};
     Setting<unsigned> maxBuilds{

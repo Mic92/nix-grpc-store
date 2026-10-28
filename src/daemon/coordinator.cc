@@ -560,8 +560,17 @@ void Coordinator::runReverseSession(const std::stop_token & stop)
                         status = {grpc::StatusCode::CANCELLED, "reverse call cancelled"};
                     }
                     if (auto * upload = std::get_if<ReverseRequest::Upload>(&job)) upload->pipe->cancel();
-                    auto const finished = outgoing.finish(id, status, workStop, true, std::move(afterFinish));
-                    if (!finished) { ctx.TryCancel(); break; }
+                    // A lost data session may close the response queue before
+                    // Finish can register the deferred control-plane Done.
+                    // Retire that assignment here instead of leaving a stale
+                    // slot which the worker no longer expects. If Finish was
+                    // queued, acknowledgement or session teardown owns Done.
+                    auto const finished = outgoing.finish(id, status, workStop, true, afterFinish);
+                    if (!finished) {
+                        if (afterFinish) afterFinish();
+                        ctx.TryCancel();
+                        break;
+                    }
                     if (!requests.finished(id)) { ctx.TryCancel(); break; }
                     std::scoped_lock lock(mutex);
                     cancellations.erase(id);

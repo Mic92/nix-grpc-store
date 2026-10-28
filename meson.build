@@ -325,20 +325,25 @@ if build_server
     cpp_args : nix_compat_args + ['-UNDEBUG'],
   ))
 
-  reverse_production_test = executable('reverse-production-test',
-    sources : ['tests/reverse-production-test.cc', 'src/client/channel.cc',
-               'src/daemon/elector.cc', 'src/daemon/auth.cc', 'src/daemon/backend.cc',
-               'src/daemon/coordinator.cc', 'src/daemon/scheduler-service.cc',
-               'src/daemon/eds.cc', 'src/daemon/options.cc',
-               {'darwin': 'src/daemon/sandbox-darwin.cc', 'linux': 'src/daemon/sandbox-linux.cc'}.get(host_machine.system(), 'src/daemon/sandbox-unsupported.cc'),
-               gen, eds_gen] + (host_machine.system() == 'darwin' ? ['src/daemon/sbpl.cc'] : []),
-    include_directories : [gen_inc, src_inc],
-    cpp_pch : do_pch ? ['pch/daemon_pch.hh'] : [],
-    cpp_args : nix_compat_args + ['-UNDEBUG', '-DNIX_GRPC_DAEMON_EMBED_TEST'],
-    dependencies : common_deps + prometheus_dep + [dispatcher_dep, nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep, jemalloc_dep],
-  )
-  test('reverse-production', find_program('tests/reverse-production-test.sh'),
-    args : [reverse_production_test], timeout : 120)
+  if get_option('reverse-production-test')
+    reverse_production_test = executable('reverse-production-test',
+      sources : ['tests/reverse-production-test.cc', 'tests/reverse-production-client.cc', 'src/client/store.cc',
+                 'src/client/build.cc', 'src/client/transfer.cc', 'src/client/channel.cc',
+                 'src/daemon/elector.cc', 'src/daemon/auth.cc', 'src/daemon/backend.cc',
+                 'src/daemon/coordinator.cc', 'src/daemon/scheduler-service.cc',
+                 'src/daemon/eds.cc', 'src/daemon/options.cc',
+                 {'darwin': 'src/daemon/sandbox-darwin.cc', 'linux': 'src/daemon/sandbox-linux.cc'}.get(host_machine.system(), 'src/daemon/sandbox-unsupported.cc'),
+                 gen, eds_gen] + (host_machine.system() == 'darwin' ? ['src/daemon/sbpl.cc'] : []),
+      include_directories : [gen_inc, src_inc],
+      cpp_pch : do_pch ? ['pch/daemon_pch.hh'] : [],
+      cpp_args : nix_compat_args + ['-UNDEBUG', '-DNIX_GRPC_DAEMON_EMBED_TEST',
+                                   '-DNIX_GRPC_TEST_REVERSE_RETRY',
+                                   '-DNIX_GRPC_BUILT_AGAINST_NIX="' + nix_store_dep.version() + '"'],
+      dependencies : common_deps + prometheus_dep + [dispatcher_dep, nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep, jemalloc_dep],
+    )
+    test('reverse-production', find_program('tests/reverse-production-test.sh'),
+      args : [reverse_production_test], timeout : 120)
+  endif
 
   test('reverse-responses', executable('reverse-responses-test',
     sources : ['tests/reverse-responses-test.cc', gen],

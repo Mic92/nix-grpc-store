@@ -132,6 +132,13 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     std::shared_ptr<nix::Store> store;
     nixgrpc::UploadClaims uploads;
     nixgrpc::SessionRoots sessions{[this] -> nix::ref<nix::Store> { return openScopedStore(); }};
+#ifdef NIX_GRPC_DAEMON_EMBED_TEST
+    // Fixture-only pause after the importer consumes bytes, before it checks
+    // whether the assignment survived that read. Not built into the daemon.
+    std::function<void(const std::string &, size_t)> reverseUploadReadHook;
+    // After importPaths spools the entire NAR, before the existing apply gate.
+    std::function<void(const std::string &)> reverseUploadSpooledHook;
+#endif
 
     // Without the path info cache a path deleted behind our back (gc) is
     // invalid here too, instead of failing later when its NAR is read.
@@ -211,6 +218,16 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     }
 
 public:
+#ifdef NIX_GRPC_DAEMON_EMBED_TEST
+    void setReverseUploadReadHook(std::function<void(const std::string &, size_t)> hook)
+    {
+        reverseUploadReadHook = std::move(hook);
+    }
+    void setReverseUploadSpooledHook(std::function<void(const std::string &)> hook)
+    {
+        reverseUploadSpooledHook = std::move(hook);
+    }
+#endif
     // begin() throws this for callers the ACL refuses.
     struct Denied : std::exception
     {
@@ -412,16 +429,36 @@ public:
             class CheckedSource : public nix::Source {
                 nix::Source & inner;
                 std::function<bool()> valid;
+#ifdef NIX_GRPC_DAEMON_EMBED_TEST
+                std::function<void(size_t)> afterRead;
+                size_t bytesRead = 0;
+#endif
             public:
+#ifndef NIX_GRPC_DAEMON_EMBED_TEST
                 CheckedSource(nix::Source & inner, std::function<bool()> valid)
                     : inner(inner), valid(std::move(valid)) { }
+#else
+                CheckedSource(nix::Source & inner, std::function<bool()> valid, std::function<void(size_t)> afterRead)
+                    : inner(inner), valid(std::move(valid)), afterRead(std::move(afterRead)) { }
+#endif
                 auto read(char * data, size_t length) -> size_t override {
                     if (!valid()) throw nix::Error("reverse upload assignment revoked");
                     auto const got = inner.read(data, length);
+#ifdef NIX_GRPC_DAEMON_EMBED_TEST
+                    bytesRead += got;
+                    if (got && afterRead) afterRead(bytesRead);
+#endif
                     if (!valid()) throw nix::Error("reverse upload assignment revoked");
                     return got;
                 }
-            } checked(source, live);
+            }
+#ifdef NIX_GRPC_DAEMON_EMBED_TEST
+            checked(source, live, [this, drv = call.delegated.drvPath](size_t got) {
+                if (reverseUploadReadHook) reverseUploadReadHook(drv, got);
+            });
+#else
+            checked(source, live);
+#endif
             auto const stats = importUploads(*localStore, checked,
                 call.delegated.caller.role == nixgrpc::Role::write ? nix::NoRepair : repair,
                 call.delegated.caller.role == nixgrpc::Role::write ? nix::CheckSigs : checkSigs,
@@ -429,6 +466,9 @@ public:
                 [&] {
                     // NARs are on disk, not in the store. Also recheck before
                     // each path (including after a reference lock wait).
+#ifdef NIX_GRPC_DAEMON_EMBED_TEST
+                    if (reverseUploadSpooledHook) reverseUploadSpooledHook(call.delegated.drvPath);
+#endif
                     source.finishFrame();
                     if (!call.pipe->endWithoutTrailingData() || !live())
                         throw nix::Error("reverse upload incomplete or assignment changed");

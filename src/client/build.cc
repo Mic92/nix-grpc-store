@@ -4,6 +4,11 @@
 
 #include <algorithm>
 #include <cassert>
+#ifdef NIX_GRPC_TEST_REVERSE_RETRY
+#include <atomic>
+std::atomic<unsigned> reverseProbeNotFound{0};
+std::atomic<unsigned> reverseClosureUploaded{0};
+#endif
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -171,17 +176,22 @@ auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & 
   std::string missing;
   auto status = tryBuildDerivation(request, headers, res, missing);
   if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
-    // Do not activate the client retry until a real pinned build and
-    // readback through the production path have passed an integration test.
-    // In particular, a scheduler-store upload cannot repair this assignment.
-    if (where.reverse) {
-      throw Error("reverse worker is missing build inputs; pinned build proof is required before retry");
+#ifdef NIX_GRPC_TEST_REVERSE_RETRY
+    if (where.reverse) ++reverseProbeNotFound;
+#endif
+    // Opt-in while reverse workers are new.
+    if (where.reverse && !config->reverseUploads) {
+      throw Error("reverse worker is missing build inputs; set the store setting reverse-uploads=true to send them");
     }
-    auto upload = uploadDrvClosure(evalStore, {job.drvPath}, headers);
+    auto upload = uploadDrvClosure(evalStore, {job.drvPath}, headers,
+                                   where.reverse ? std::optional(std::pair{job.drvPath, where.assignId}) : std::nullopt);
     if (!upload.ok()) {
       checkInterrupt();
-      checkStatus(upload, "AddMultipleToStore");
+      checkStatus(upload, where.reverse ? "UploadBuildInputs" : "AddMultipleToStore");
     }
+#ifdef NIX_GRPC_TEST_REVERSE_RETRY
+    if (where.reverse) ++reverseClosureUploaded;
+#endif
     status = tryBuildDerivation(request, headers, res, missing);
   }
   // Our own cancel ends the stream CANCELLED, and a dead worker looks the same.
@@ -368,6 +378,13 @@ struct GrpcStore::Run {
       if (auto * missing = std::get_if<MissingInput>(&res)) {
         res = recover(*work, missing->path);
       }
+      // A reverse data session reconnects asynchronously to WorkerSession.
+      // Immediate re-Wants can exhaust the bounded retry budget before the
+      // registration and the previous assignment's Done have been processed.
+      // Do not change the existing direct-worker retry behavior.
+      if (std::holds_alternative<Bounced>(res) && work->where.reverse) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      }
       std::scoped_lock const lock(mutex);
       if (auto * result = std::get_if<BuildResult>(&res)) {
         bool const succeeded = nixcompat::succeeded(*result);
@@ -392,13 +409,19 @@ struct GrpcStore::Run {
     }
     auto const producer = work.job->farmInputs.find(path);
     if (producer == work.job->farmInputs.end()) {
-      if (work.where.reverse) {
-        throw Error("reverse worker is missing build inputs; pinned build proof is required before retry");
+      if (work.where.reverse && !store.config->reverseUploads) {
+        throw Error("reverse worker is missing build inputs; set the store setting reverse-uploads=true to send them");
       }
       warn("%s: worker lacks '%s', uploading it again", work.job->drvPath.to_string(), pathS);
-      store.checkStatus(store.uploadDrvClosure(evalStore, {work.job->drvPath},
-                                         store.routingFor(work.job->drv, work.where.addr, work.where.system)),
-                  "AddMultipleToStore");
+      auto headers = store.routingFor(work.job->drv, work.where.reverse ? "" : work.where.addr, work.where.system);
+      if (work.where.reverse) {
+        headers.emplace_back("x-nix-reverse", "1");
+      }
+      store.checkStatus(
+          store.uploadDrvClosure(evalStore, {work.job->drvPath}, headers,
+                                 work.where.reverse ? std::optional(std::pair{work.job->drvPath, work.where.assignId})
+                                                    : std::nullopt),
+          work.where.reverse ? "UploadBuildInputs" : "AddMultipleToStore");
       return Bounced{};
     }
     warn("%s: farm lacks '%s', building '%s' too", work.job->drvPath.to_string(), pathS,
