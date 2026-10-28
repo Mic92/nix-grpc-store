@@ -312,6 +312,14 @@ public:
     // restart does not fail the build; TLS rejections fail at once.
     void connect() override { isTrustedClient(); }
 
+    // The tunnel is for trusted callers only, `nix store info` is for all.
+    auto getVersion() -> std::optional<std::string> override {
+      if (isTrustedClient() != Trusted) {
+        return std::nullopt;
+      }
+      return RemoteStore::getVersion();
+    }
+
     [[nodiscard]] auto restartGrace() const -> std::chrono::seconds {
       return std::chrono::seconds(config->restartGrace.get());
     }
