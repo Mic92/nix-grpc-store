@@ -211,6 +211,12 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
     jq -e '[.listeners[0].filter_chains[0].filters[0].typed_config.route_config.virtual_hosts[0].routes[]
       | select(.match.path == "/nix.remote.NixRemote/UploadBuildInputs")]
       | length == 1 and .[0].route.cluster == "sched" and (.[0].match | has("headers") | not)' chart.json
+    # Reverse workers' data sessions reach the scheduler, ahead of the
+    # worker catch-all.
+    jq -e '.listeners[0].filter_chains[0].filters[0].typed_config.route_config.virtual_hosts[0].routes
+      | (map(.match.prefix) | index("/nix.remote.ReverseSession/")) as $i
+      | $i != null and .[$i].route.cluster == "sched" and (.[$i].match | has("headers") | not)
+        and $i < (map(.match.prefix) | index("/"))' chart.json
 
     # Default placement: workers spread, scheduler replicas on distinct nodes.
     pick() { yq "select(.kind == \"$1\" and .metadata.name == \"$2\") | $3" "$4"; }

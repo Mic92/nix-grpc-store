@@ -170,6 +170,12 @@ void Dispatcher::membershipChangedLocked()
         if (!wkr.up) {
             continue;
         }
+        // The balancer cannot dial a reverse worker; it is reached only
+        // through its data session. Never publish it as an EDS endpoint.
+        if (auto const it = workers.find(static_cast<sched::WorkerId>(wid));
+            it != workers.end() && !it->second->verifiedPodId.empty()) {
+            continue;
+        }
         for (const auto & system : wkr.systems) {
             (*next)[system].push_back({.addr = wkr.addr, .draining = wkr.draining || wkr.maxJobs == 0});
         }
@@ -640,6 +646,21 @@ auto Dispatcher::assignmentPod(std::string_view drvPath, uint64_t assignId) cons
         return std::nullopt;
     }
     return connected->second->verifiedPodId;
+}
+
+auto Dispatcher::podConnected(std::string_view podId) const -> bool
+{
+    if (podId.empty()) {
+        return false;
+    }
+    const absl::MutexLock lock(mutex);
+    auto const now = std::chrono::system_clock::now();
+    for (const auto & [wid, worker] : workers) {
+        if (worker->verifiedPodId == podId && worker->credentialExpiresAt > now && core.worker(wid).up) {
+            return true;
+        }
+    }
+    return false;
 }
 
 auto Dispatcher::podOwnsAssignment(std::string_view podId, std::string_view drvPath, uint64_t assignId) const -> bool

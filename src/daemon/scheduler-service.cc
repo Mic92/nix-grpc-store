@@ -75,7 +75,7 @@ auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
     // The tunnel audience is exclusive and not in client Auth. For reverse
     // control sessions, independently authorize the TLS certificate; a token
     // must not itself grant WorkerSession permission.
-    auto caller = verifiedPodId.empty() ? auth->identify(*context) : auth->identifyDirect(*context);
+    auto caller = verifiedPodId.empty() ? auth->identify(*context) : auth->identifyCertificate(*context);
     if (!verifiedPodId.empty() && caller.kind != Caller::Kind::named) {
         return new RejectReactor<WorkerMsgs, SchedCmds>(
             {grpc::StatusCode::UNAUTHENTICATED, "reverse control session requires a TLS client certificate"});

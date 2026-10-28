@@ -109,6 +109,8 @@ public:
     // from x-nix-worker. Missing/revoked/displaced assignments have no route.
     [[nodiscard]] auto assignmentWorker(std::string_view drvPath, uint64_t assignId) const -> std::optional<std::string>;
     [[nodiscard]] auto assignmentPod(std::string_view drvPath, uint64_t assignId) const -> std::optional<std::string>;
+    // A live, credentialed control session for this verified pod.
+    [[nodiscard]] auto podConnected(std::string_view podId) const -> bool;
     [[nodiscard]] auto podOwnsAssignment(std::string_view podId, std::string_view drvPath, uint64_t assignId) const
         -> bool;
 

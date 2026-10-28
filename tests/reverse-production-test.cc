@@ -147,11 +147,11 @@ int main(int argc, char ** argv)
         std::this_thread::sleep_until(firstExpiry + std::chrono::seconds(3));
         auto const live = scheduler.reverseRegistry.find(workerOptions.reverseWorkerId);
         assert(live && live->generation == firstGeneration);
+        assert(scheduler.dispatcher->podConnected(workerOptions.reverseWorkerId));
+        // Reachable only through its data session: never an EDS endpoint.
         auto const members = scheduler.dispatcher->membership();
-        bool listed = false;
         for (auto const & [system, list] : *members)
-            for (auto const & member : list) listed = listed || member.addr == workerOptions.advertise;
-        assert(listed);
+            for (auto const & member : list) assert(member.addr != workerOptions.advertise);
         assert(metrics.eventCounter("worker_credential_expired").Value() == 0);
         std::cerr << "rotated tunnel token kept data and control sessions past first expiry\n";
     }

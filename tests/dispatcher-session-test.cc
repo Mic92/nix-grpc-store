@@ -177,6 +177,8 @@ int main()
     }
     reverseHello.mutable_msgs(0)->mutable_hello()->set_reverse_protocol(nixgrpc::reverseProtocolVersion);
     dispatcher.workerMsgs(reverse, reverseHello);
+    // Schedulable, but never an EDS endpoint: the balancer cannot dial it.
+    assert(dispatcher.podConnected(pod) && dispatcher.membership()->empty());
     auto reverseClient = dispatcher.connectClient([](const nix::remote::SchedMsg &) { return true; }, [] {});
     dispatcher.clientMsgs(reverseClient, want);
     assert(!reverseCommands.empty() && reverseCommands.back().has_expect());

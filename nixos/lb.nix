@@ -251,6 +251,20 @@ let
     };
   };
 
+  # Reverse workers register their data session with the active scheduler.
+  # Envoy forwards the worker certificate it verified in XFCC.
+  reverseSessionRoute = {
+    match = {
+      prefix = "/nix.remote.ReverseSession/";
+      grpc = { };
+    };
+    route = {
+      cluster = "sched";
+      timeout = "0s";
+      retry_policy = retryDeadHost;
+    };
+  };
+
   reverseBuildRoute = {
     match = {
       path = "/nix.remote.NixRemote/BuildDerivation";
@@ -520,7 +534,7 @@ in
                           {
                             name = "farm";
                             domains = [ "*" ];
-                            routes = [ edsRoute schedRoute uploadBuildInputsRoute reverseBuildRoute ] ++ lib.concatMap routesFor ordered;
+                            routes = [ edsRoute schedRoute reverseSessionRoute uploadBuildInputsRoute reverseBuildRoute ] ++ lib.concatMap routesFor ordered;
                           }
                         ];
                         http_filters = [

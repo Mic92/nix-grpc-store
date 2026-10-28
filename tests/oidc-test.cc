@@ -1076,11 +1076,8 @@ auto run(const std::string &dir, const std::string &base) -> int
             messages.add_msgs()->mutable_reauth()->set_token(std::move(tokenValue));
             return messages;
         };
-        auto memberCount = [&] {
-            auto const members = dispatcher.membership();
-            auto const it = members->find("x");
-            return it == members->end() ? size_t{0} : it->second.size();
-        };
+        // Pod-bound workers are never EDS endpoints; count them directly.
+        auto memberCount = [&] { return dispatcher.podConnected(workerId) ? size_t{1} : size_t{0}; };
         {
             grpc::ClientContext ctx;
             ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));

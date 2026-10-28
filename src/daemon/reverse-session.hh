@@ -69,7 +69,8 @@ public:
         -> grpc::Status override
     {
         // Explicitly require TLS even if the rest of this server allows
-        // plaintext for local direct workers. Never trust XFCC for workers.
+        // plaintext for local direct workers. XFCC counts only from a
+        // configured trusted proxy (see identifyCertificate below).
         auto const auth = context->auth_context();
         if (!auth) {
             return {grpc::StatusCode::UNAUTHENTICATED, "reverse registration requires TLS"};
@@ -81,10 +82,11 @@ public:
             return {grpc::StatusCode::UNAUTHENTICATED, "reverse registration requires TLS"};
         }
         // The projected pod token proves which pod owns the route; it does
-        // not grant permission to be a worker. Never use identify() here:
-        // forwarded identity and ordinary client bearers cannot authorize a
-        // data session in place of the peer's own TLS certificate.
-        auto const caller = workerAuth.identifyDirect(*context);
+        // not grant permission to be a worker. Never use identify() here: an
+        // ordinary client bearer must not stand in for the worker's TLS
+        // certificate. Through the balancer, that certificate is the one it
+        // verified and forwarded (trusted proxies only).
+        auto const caller = workerAuth.identifyCertificate(*context);
         if (caller.kind != Caller::Kind::named) {
             return {grpc::StatusCode::UNAUTHENTICATED, "reverse registration requires a TLS client certificate"};
         }

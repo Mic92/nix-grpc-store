@@ -56,6 +56,21 @@ auto Auth::identifyDirect(const grpc::ServerContextBase & context) const -> Call
         .kind = cert ? Caller::Kind::named : Caller::Kind::anonymous};
 }
 
+auto Auth::identifyCertificate(const grpc::ServerContextBase & context) const -> Caller
+{
+    auto cert = clientCommonName(context);
+    if (proxies.matches(cert)) {
+        // The balancer overwrites the header, so a client cannot inject one.
+        // Without a forwarded certificate the caller is anonymous, not the
+        // balancer's own identity.
+        cert = xfcc::forwardedCommonName(context);
+    }
+    return {
+        .name = cert.value_or("-"),
+        .role = acl.roleFor(cert),
+        .kind = cert ? Caller::Kind::named : Caller::Kind::anonymous};
+}
+
 auto Auth::authorize(const Caller & caller, std::string_view method, Role minRole) -> grpc::Status
 {
     auto const & role = caller.role;
