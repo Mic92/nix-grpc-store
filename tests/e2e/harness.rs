@@ -301,8 +301,47 @@ fn line_matches(line: &str, pattern: &str) -> bool {
     true
 }
 
+/// `pattern` as a regular expression for `journalctl --grep`.
+fn grep_pattern(pattern: &str) -> String {
+    pattern
+        .split(".*")
+        .map(|part| {
+            part.chars()
+                .map(|c| {
+                    if r".[]()*+?{}|^$\".contains(c) {
+                        format!("\\{c}")
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join(".*")
+}
+
+/// Filters on the node: long journals over the vsock ssh sometimes stall.
 pub fn journal_matches(node: Node, unit: &str, pattern: &str) -> Vec<String> {
-    journal(node, unit)
+    let regex = grep_pattern(pattern);
+    let argv = [
+        "journalctl",
+        "-u",
+        unit,
+        "--no-pager",
+        "--case-sensitive=true",
+        "--grep",
+        &regex,
+    ];
+    let o = run(node, &argv, 300, true);
+    // 1: no line matched.
+    assert!(
+        o.code <= 1,
+        "[{}] failed ({}): journalctl\n{}",
+        node.0,
+        o.code,
+        o.combined()
+    );
+    o.stdout
         .lines()
         .filter(|l| line_matches(l, pattern))
         .map(String::from)
@@ -314,12 +353,13 @@ pub fn journal_count(node: Node, unit: &str, pattern: &str) -> u64 {
 }
 
 pub fn assert_journal(node: Node, unit: &str, pattern: &str) {
-    let log = journal(node, unit);
-    assert!(
-        log.lines().any(|l| line_matches(l, pattern)),
-        "[{}] journal of {unit} has no line matching: {pattern}\n{log}",
-        node.0
-    );
+    if journal_matches(node, unit, pattern).is_empty() {
+        panic!(
+            "[{}] journal of {unit} has no line matching: {pattern}\n{}",
+            node.0,
+            journal(node, unit)
+        );
+    }
 }
 
 pub fn assert_no_journal(node: Node, unit: &str, pattern: &str) {
