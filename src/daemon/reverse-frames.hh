@@ -10,6 +10,7 @@
 #include <stop_token>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "nix_remote.pb.h"
@@ -95,11 +96,15 @@ public:
     auto acknowledge(uint64_t id) -> bool
     {
         const std::scoped_lock lock(mutex);
-        if (closed || !streams.contains(id)) return false;
+        // One acknowledgement per result; a second one would make the worker
+        // treat its next deferred completion as already accepted.
+        if (closed || !streams.contains(id) || acknowledged.contains(id)) return false;
         nix::remote::ReverseFarmMsg msg;
         msg.set_stream_id(id);
         msg.set_acknowledged(true);
-        return enqueue(std::move(msg));
+        if (!enqueue(std::move(msg))) return false;
+        acknowledged.insert(id);
+        return true;
     }
 
     // A later transport reader would own gRPC Write and call take() only when
@@ -134,14 +139,25 @@ public:
         return true;
     }
 
-    // Called on response finish (or tunnel teardown). Stale stream IDs are
-    // rejected, never mapped to another worker or a newly registered stream.
+    // Called on response finish (or tunnel teardown). Leave an acknowledged
+    // build result's reservation alive until the writer sends its pending ack.
+    // Stale stream IDs are never mapped to a new call.
     auto finished(uint64_t id) -> bool
     {
         const std::scoped_lock lock(mutex);
+        if (streams.contains(id) && acknowledged.contains(id)) return true;
         auto const removed = streams.erase(id) != 0;
         if (removed) cv.notify_all();
         return removed;
+    }
+
+    // The writer retires this reservation after gRPC accepts the ack. A
+    // failed Write closes the enclosing data session instead.
+    void acknowledgementSent(uint64_t id)
+    {
+        const std::scoped_lock lock(mutex);
+        if (acknowledged.erase(id)) streams.erase(id);
+        cv.notify_all();
     }
 
     void close()
@@ -149,6 +165,7 @@ public:
         const std::scoped_lock lock(mutex);
         closed = true;
         streams.clear();
+        acknowledged.clear();
         queue.clear();
         queuedBytes = 0;
         cv.notify_all();
@@ -160,6 +177,7 @@ private:
     std::deque<nix::remote::ReverseFarmMsg> queue;
     // true after a request half-close; response may still be in flight.
     std::unordered_map<uint64_t, bool> streams;
+    std::unordered_set<uint64_t> acknowledged;
     size_t queuedBytes = 0;
     uint64_t lastId = 0;
     bool closed = false;

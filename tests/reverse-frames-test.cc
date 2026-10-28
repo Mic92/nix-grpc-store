@@ -28,9 +28,13 @@ int main()
     assert(frames.take(msg) && msg.stream_id() == 1 && msg.data().data() == "hello");
     assert(frames.take(msg) && msg.stream_id() == 1 && msg.half_close());
     assert(frames.acknowledge(1));
+    assert(!frames.acknowledge(1)); // exactly one ack per result
+    // The response finishing before the writer sends the ack keeps the
+    // reservation; only the sent ack retires it.
+    assert(frames.finished(1));
     assert(frames.take(msg) && msg.stream_id() == 1 && msg.acknowledged());
     assert(!frames.take(msg));
-    assert(frames.finished(1));
+    frames.acknowledgementSent(1);
     assert(!frames.acknowledge(1));
     assert(!frames.finished(1));
 

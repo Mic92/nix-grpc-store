@@ -168,6 +168,7 @@ public:
                     cancellation->cancel();
                     break;
                 }
+                if (frame.acknowledged()) transport->outgoing.acknowledgementSent(frame.stream_id());
             }
         });
         while (stream->Read(&msg)) {

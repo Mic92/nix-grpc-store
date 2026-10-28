@@ -151,6 +151,27 @@ int main(int argc, char **argv)
             assert(session->transport->outgoing.take(queued) && queued.has_open() && queued.stream_id() == 1);
             assert(session->transport->outgoing.finished(1));
             assert(session->transport->responses.cancel(1));
+            // A terminal build result's acknowledgement must survive relay
+            // cleanup until the session writer takes it. A normal finish must
+            // still retire the stream immediately.
+            nixgrpc::ReverseFrames ackFrames;
+            nix::remote::ReverseOpen ackOpen;
+            ackOpen.set_method("BuildDerivation");
+            ackOpen.set_capability("scoped-capability");
+            assert(ackFrames.open(1, ackOpen));
+            assert(ackFrames.halfClose(1));
+            assert(ackFrames.acknowledge(1));
+            assert(ackFrames.finished(1));
+            nix::remote::ReverseFarmMsg ackFrame;
+            assert(ackFrames.take(ackFrame) && ackFrame.has_open());
+            assert(ackFrames.take(ackFrame) && ackFrame.half_close());
+            assert(ackFrames.finished(1));
+            assert(ackFrames.take(ackFrame) && ackFrame.acknowledged());
+            assert(ackFrames.finished(1)); // gRPC Write may still be pending
+            ackFrames.acknowledgementSent(1);
+            assert(!ackFrames.finished(1));
+            assert(ackFrames.open(2, ackOpen));
+            assert(ackFrames.finished(2));
             assert(gateway.enqueue(*service.prepared, 1).error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED);
             auto tampered = *service.prepared;
             tampered.drvPath = "another.drv";
