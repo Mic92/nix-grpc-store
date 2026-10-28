@@ -47,17 +47,21 @@ public:
     {
         std::scoped_lock lock(mutex);
         ready.reset();
+        rejection = "";
         auto event = inbound.accept(frame);
-        if (!event) return false;
+        if (!event) { rejection = inbound.lastRejection(); return false; }
         auto const id = event->streamId;
         switch (event->kind) {
         case ReverseInbound::Event::Kind::open:
-            if (!event->caller) return false;
+            if (!event->caller) { rejection = "open without caller"; return false; }
             // Builds use the bounded unary decoder. Uploads get a separate
             // bounded pipe, never the 1 MiB request accumulator.
             if (frame.open().method() == "UploadBuildInputs") {
                 auto delegated = std::move(*event->caller);
-                if (!expects || !expects(delegated.drvPath, delegated.assignId)) return false;
+                if (!expects || !expects(delegated.drvPath, delegated.assignId)) {
+                    rejection = "upload for an assignment this worker does not expect";
+                    return false;
+                }
                 auto pipe = std::make_shared<ReverseUploadPipe>(delegated,
                     [check = expects, drv = delegated.drvPath, assign = delegated.assignId] {
                         return check(drv, assign);
@@ -66,7 +70,7 @@ public:
                 uploadReady = Upload{.id = id, .delegated = std::move(delegated), .pipe = std::move(pipe)};
                 return true;
             }
-            if (frame.open().method() != "BuildDerivation") return false;
+            if (frame.open().method() != "BuildDerivation") { rejection = "method not served"; return false; }
             requests.emplace(id, Pending{.method = frame.open().method(), .delegated = std::move(*event->caller)});
             return true;
         case ReverseInbound::Event::Kind::data: {
@@ -75,13 +79,13 @@ public:
             auto & pending = requests.at(id);
             auto const size = frame.data().data().size();
             if (pending.wire.size() > ReverseRelay::maxRequestBytes + 4
-                || size > ReverseRelay::maxRequestBytes + 4 - pending.wire.size()) return false;
+                || size > ReverseRelay::maxRequestBytes + 4 - pending.wire.size()) { rejection = "request too large"; return false; }
             pending.wire += frame.data().data();
             if (!pending.length && pending.wire.size() >= 4) {
                 uint32_t length = 0;
                 for (unsigned i = 0; i != 4; ++i)
                     length |= static_cast<uint32_t>(static_cast<unsigned char>(pending.wire[i])) << (8 * i);
-                if (length > ReverseRelay::maxRequestBytes) return false;
+                if (length > ReverseRelay::maxRequestBytes) { rejection = "request too large"; return false; }
                 pending.length = length;
             }
             return !pending.length || pending.wire.size() <= static_cast<size_t>(*pending.length) + 4;
@@ -89,8 +93,10 @@ public:
         case ReverseInbound::Event::Kind::halfClose: {
             if (auto it = uploads.find(id); it != uploads.end()) return it->second->finish();
             auto it = requests.find(id);
-            if (it == requests.end() || !it->second.length || it->second.wire.size() != *it->second.length + 4)
+            if (it == requests.end() || !it->second.length || it->second.wire.size() != *it->second.length + 4) {
+                rejection = "incomplete request at half-close";
                 return false;
+            }
             auto pending = std::move(it->second);
             requests.erase(it);
             pending.wire.erase(0, 4);
@@ -110,6 +116,9 @@ public:
         }
         return false;
     }
+
+    // Why the last accept() returned false; for logs only.
+    [[nodiscard]] auto lastRejection() const -> const char * { std::scoped_lock lock(mutex); return rejection; }
 
     [[nodiscard]] auto takeReady() -> std::optional<Ready> { std::scoped_lock lock(mutex); return std::exchange(ready, std::nullopt); }
     [[nodiscard]] auto takeUploadReady() -> std::optional<Upload> { std::scoped_lock lock(mutex); return std::exchange(uploadReady, std::nullopt); }
@@ -144,7 +153,8 @@ public:
     }
 
 private:
-    std::mutex mutex;
+    mutable std::mutex mutex;
+    const char * rejection = "";
     struct Pending
     {
         std::string method;

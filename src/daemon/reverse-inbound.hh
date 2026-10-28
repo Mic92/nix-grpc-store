@@ -44,6 +44,7 @@ class ReverseInbound
     {
         if (closed || frame.generation() != 0 || !frame.session_key().empty() || frame.stream_id() == 0)
         {
+            rejection = closed ? "session closed" : "bad frame header";
             return std::nullopt;
         }
         auto const id = frame.stream_id();
@@ -51,11 +52,13 @@ class ReverseInbound
         {
             if (id <= lastId || streams.size() >= ReverseFrames::maxStreams)
             {
+                rejection = id <= lastId ? "stream id not increasing" : "too many streams";
                 return std::nullopt;
             }
             auto caller = ReverseCapability::authorizeOpen(sessionKey, frame.open(), workerId, generation, id);
             if (!caller)
             {
+                rejection = "capability rejected";
                 return std::nullopt;
             }
             streams.emplace(id, false);
@@ -70,12 +73,14 @@ class ReverseInbound
             if (frame.frame_case() == nix::remote::ReverseFarmMsg::kCancel && frame.cancel()
                 && finishedIds.erase(id))
                 return Event{.kind = Event::Kind::cancel, .streamId = id};
+            rejection = "unknown stream";
             return std::nullopt;
         }
         if (frame.has_data())
         {
             if (it->second || frame.data().data().empty() || frame.data().data().size() > ReverseFrames::maxFrameBytes)
             {
+                rejection = "bad data frame";
                 return std::nullopt;
             }
             return Event{.kind = Event::Kind::data, .streamId = id};
@@ -87,13 +92,17 @@ class ReverseInbound
         }
         if (frame.frame_case() == nix::remote::ReverseFarmMsg::kCancel && frame.cancel())
         {
-            if (cancelledIds.size() >= maxCancelled) { closed = true; return std::nullopt; }
+            if (cancelledIds.size() >= maxCancelled) { closed = true; rejection = "too many cancels"; return std::nullopt; }
             streams.erase(it);
             cancelledIds.insert(id);
             return Event{.kind = Event::Kind::cancel, .streamId = id};
         }
+        rejection = "unexpected frame";
         return std::nullopt;
     }
+
+    // Why the last accept() returned nothing; for logs only.
+    [[nodiscard]] auto lastRejection() const -> const char * { return rejection; }
 
     // Called after response status was sent. A late frame cannot revive a
     // finished stream or use the same ID for a different caller.
@@ -126,6 +135,7 @@ class ReverseInbound
     std::string sessionKey;
     uint64_t lastId = 0;
     bool closed = false;
+    const char * rejection = "";
     std::unordered_map<uint64_t, bool> streams;
     static constexpr size_t maxFinished = 4096;
     std::unordered_set<uint64_t> finishedIds;

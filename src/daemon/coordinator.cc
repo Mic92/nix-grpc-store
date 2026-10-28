@@ -71,6 +71,8 @@ namespace {
 constexpr int minReconnectBackoffMs = 2'000;
 constexpr std::chrono::milliseconds minBackoff{200};
 constexpr std::chrono::milliseconds maxBackoff{5000};
+// A scheduler session that lasted this long was real, not a balancer refusal.
+constexpr std::chrono::seconds stableSession{10};
 } // namespace
 
 // ---------------------------------------------------------------- Builder
@@ -631,31 +633,39 @@ void Coordinator::runReverseSession(const std::stop_token & stop)
             for (size_t i = 0; i < std::min<size_t>(maxExecutors, std::max(1u, options.maxJobs)); ++i)
                 executors.emplace_back(execute);
             nix::remote::ReverseFarmMsg frame;
+            // Every fatal path below ends the data session; say which one.
+            auto const drop = [&](std::string_view why) {
+                logLine(LogLevel::info, {{"event", "reverse_frame_rejected"}, {"why", std::string(why)},
+                                         {"stream", std::to_string(frame.stream_id())},
+                                         {"frame", std::to_string(static_cast<int>(frame.frame_case()))},
+                                         {"method", frame.has_open() ? frame.open().method() : ""}});
+                ctx.TryCancel();
+            };
             while (!stop.stop_requested() && stream->Read(&frame)) {
                 if (frame.frame_case() == nix::remote::ReverseFarmMsg::kAcknowledged) {
                     if (!frame.acknowledged() || frame.stream_id() == 0 || frame.generation() != 0
                         || !frame.session_key().empty() || !outgoing.acknowledged(frame.stream_id())) {
-                        ctx.TryCancel();
+                        drop("unexpected acknowledgement");
                         break;
                     }
                     continue;
                 }
                 if (frame.has_open() && frame.open().method() != "BuildDerivation"
                     && frame.open().method() != "UploadBuildInputs") {
-                    ctx.TryCancel();
+                    drop("method not served");
                     break;
                 }
-                if (!requests.accept(frame)) { ctx.TryCancel(); break; }
+                if (!requests.accept(frame)) { drop(requests.lastRejection()); break; }
                 if (frame.has_open()) {
                     std::scoped_lock lock(mutex);
                     if (!cancellations.emplace(frame.stream_id(), std::make_shared<std::atomic<bool>>(false)).second) {
-                        ctx.TryCancel();
+                        drop("stream reopened");
                         break;
                     }
                 }
                 if (frame.cancel()) {
                     outgoing.cancel(frame.stream_id());
-                    if (!outgoing.healthy()) { ctx.TryCancel(); break; }
+                    if (!outgoing.healthy()) { drop("too many cancelled streams"); break; }
                     bool beforeRequest = false;
                     {
                         std::scoped_lock lock(mutex);
@@ -667,10 +677,10 @@ void Coordinator::runReverseSession(const std::stop_token & stop)
                     }
                     if (beforeRequest && !outgoing.finish(frame.stream_id(),
                             {grpc::StatusCode::CANCELLED, "reverse request cancelled"}, stop, false)) {
-                        ctx.TryCancel();
+                        drop("cannot answer cancel");
                         break;
                     }
-                    if (beforeRequest && !requests.finished(frame.stream_id())) { ctx.TryCancel(); break; }
+                    if (beforeRequest && !requests.finished(frame.stream_id())) { drop("cancel of unknown stream"); break; }
                 }
                 if (auto upload = requests.takeUploadReady()) {
                     std::scoped_lock lock(mutex);
@@ -757,10 +767,12 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
             const std::scoped_lock lock(*writeMutex);
             return *live && raw->Write(one);
         });
+        // A buffered Hello succeeds even when the balancer then answers "no
+        // healthy upstream", so only a session that stayed up resets backoff.
         const bool helloed = bld.greet();
+        auto const connectedAt = std::chrono::steady_clock::now();
         if (helloed) {
             logLine(LogLevel::info, {{"event", "scheduler_connected"}, {"addr", options.schedulerAddr}});
-            backoff = minBackoff;
         }
         const std::stop_callback onStop(stop, [&ctx] -> void { ctx.TryCancel(); });
         std::jthread rotation;
@@ -807,6 +819,9 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
             logLine(
                 LogLevel::info,
                 {{"event", "scheduler_disconnected"}, {"addr", options.schedulerAddr}, {"error", status.error_message()}});
+            if (helloed && std::chrono::steady_clock::now() - connectedAt >= stableSession) {
+                backoff = minBackoff;
+            }
         }
         std::this_thread::sleep_for(backoff);
         backoff = std::min(backoff * 2, maxBackoff);

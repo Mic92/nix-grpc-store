@@ -1164,6 +1164,32 @@ int main(int argc, char ** argv)
             assert(cachedNar.s == autoNar.s);
         }
         std::cerr << "one client invocation recovered a disconnected reverse build and read its output\n";
+        {
+            // A build whose publish fails delivers no result, so the gateway
+            // never acknowledges it. The worker must still retire the
+            // assignment at once; otherwise the scheduler keeps the slot busy
+            // until the data session drops and a retry finds "not scheduled
+            // here" (as when a worker cannot reach the cache).
+            auto const failPath = source->parseStorePath(nix::chomp(nix::readFile(dir + "/publishfail.drv")));
+            auto const failDrv = std::string(failPath.to_string());
+            std::atomic<int> failedPublishes{0};
+            auto const failOnce = [&](const std::string & drv) {
+                if (drv == failDrv && failedPublishes.fetch_add(1) == 0)
+                    throw nix::Error("fixture: cache unreachable");
+            };
+            workerService.setPublishHook(failOnce);
+            worker2Service.setPublishHook(failOnce);
+            auto const givenBack = metrics.eventCounter("done_GIVEN_BACK").Value();
+            clientDrivenRecoveredReverseBuild(farmUri, "local?root=" + dir + "/source-store",
+                                              source->printStorePath(failPath));
+            workerService.setPublishHook({});
+            worker2Service.setPublishHook({});
+            // Exactly one failed publish, given back with a Done, then a retry
+            // that built and published.
+            assert(failedPublishes.load() == 2);
+            assert(metrics.eventCounter("done_GIVEN_BACK").Value() == givenBack + 1);
+            std::cerr << "a failed publish retired its assignment and the retry built the output\n";
+        }
         worker.setReverseUpload([&workerService](auto const & call, auto const & cancelled) {
             return workerService.reverseUpload(call, cancelled);
         });

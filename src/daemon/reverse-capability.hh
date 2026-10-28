@@ -33,6 +33,10 @@ class ReverseCapability
     // of an Open. Once accepted, the call's lifetime is bounded separately
     // by its assignment/session and the operation's deadline/limits.
     static constexpr auto lifetime = std::chrono::seconds(30);
+    // The gateway mints with its clock, the worker verifies with its own.
+    // Without a margin a worker a few milliseconds behind sees more than
+    // `lifetime` remaining and rejects a fresh capability.
+    static constexpr auto clockSkew = std::chrono::seconds(5);
 
     static auto newKey() -> std::optional<std::string>
     {
@@ -189,7 +193,7 @@ class ReverseCapability
         }
         auto const deadline = std::chrono::milliseconds(payload.expires_at_ms());
         auto const remaining = deadline - std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
-        if (remaining <= std::chrono::milliseconds::zero() || remaining > lifetime ||
+        if (remaining <= -std::chrono::milliseconds(clockSkew) || remaining > lifetime + clockSkew ||
             static_cast<Role>(payload.caller_role()) < *required)
         {
             return std::nullopt;

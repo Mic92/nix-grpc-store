@@ -42,8 +42,13 @@ int main()
     assert(!ReverseCapability::verify(*key, *token, worker, 8, 42, "BuildDerivation", now));
     assert(!ReverseCapability::verify(*key, *token, worker, 7, 43, "BuildDerivation", now));
     assert(!ReverseCapability::verify(*key, *token, worker, 7, 42, "StoreInfo", now));
-    assert(!ReverseCapability::verify(*key, *token, worker, 7, 42, "BuildDerivation", now + std::chrono::seconds(31)));
-    assert(!ReverseCapability::verify(*key, *token, worker, 7, 42, "BuildDerivation", now - std::chrono::seconds(1)));
+    // A worker clock slightly behind or ahead of the gateway's still accepts
+    // a fresh capability; beyond the skew margin it does not.
+    assert(ReverseCapability::verify(*key, *token, worker, 7, 42, "BuildDerivation", now - std::chrono::milliseconds(50)));
+    assert(ReverseCapability::verify(*key, *token, worker, 7, 42, "BuildDerivation", now - std::chrono::seconds(4)));
+    assert(ReverseCapability::verify(*key, *token, worker, 7, 42, "BuildDerivation", now + std::chrono::seconds(34)));
+    assert(!ReverseCapability::verify(*key, *token, worker, 7, 42, "BuildDerivation", now + std::chrono::seconds(36)));
+    assert(!ReverseCapability::verify(*key, *token, worker, 7, 42, "BuildDerivation", now - std::chrono::seconds(6)));
     auto tampered = *token;
     tampered.at(tampered.size() - 1) ^= 1;
     assert(!ReverseCapability::verify(*key, tampered, worker, 7, 42, "BuildDerivation", now));
