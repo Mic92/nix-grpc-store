@@ -201,7 +201,7 @@ struct GrpcStore::Run {
   nixgrpc::exec::Executor exe;
   std::deque<Job *> byId; // deque: build threads keep references while jobs are added
   std::map<std::string, JobId, std::less<>> byName;
-  std::set<StorePath> recovered; // missing inputs, each handled once
+  std::set<std::pair<JobId, StorePath>> recovered; // (job, missing input) pairs already recovered
   bool closed = false;           // WritesDone sent
   grpc::ClientReaderWriter<remote::ClientMsgs, remote::SchedMsgs> * stream = nullptr;
 
@@ -348,7 +348,7 @@ struct GrpcStore::Run {
     auto const pathS = store.printStorePath(path);
     {
       std::scoped_lock const lock(mutex);
-      if (!recovered.insert(path).second) {
+      if (!recovered.emplace(work.jid, path).second) {
         return nixcompat::failed(nixcompat::FailureStatus::MiscFailure,
                                  fmt("input '%s' is missing on the farm", pathS));
       }
