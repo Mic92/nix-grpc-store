@@ -30,11 +30,20 @@ class Cache
     {
         Niks3Client client;
         PushProcess push;
+        // For publish(verify); its child starts on first use (ensureChild).
+        PushProcess verifyingPush;
 
         explicit Remote(const Niks3Config & cfg)
             : client(cfg)
             , push(cfg.pushArgv)
+            , verifyingPush(withVerify(cfg.pushArgv))
         {
+        }
+
+        static auto withVerify(PushProcess::Argv argv) -> PushProcess::Argv
+        {
+            argv.emplace_back("--verify-s3-integrity");
+            return argv;
         }
     };
     std::optional<Remote> remote;
@@ -84,19 +93,24 @@ public:
     }
 
     // Make locally valid paths visible to other nodes. No-op without niks3.
-    auto publish(const std::vector<std::string> & paths, const Cancelled & cancelled = never) -> PushProcess::Signatures
+    // `verify`: niks3 skips what its database lists, so for paths whose
+    // objects the bucket may have lost it checks the bucket instead, at an S3
+    // lookup per object of their closures.
+    auto publish(const std::vector<std::string> & paths, const Cancelled & cancelled = never, bool verify = false)
+        -> PushProcess::Signatures
     {
         if (!remote || paths.empty()) {
             return {};
         }
-        return remote->push.pushWait(paths, cancelled);
+        return (verify ? remote->verifyingPush : remote->push).pushWait(paths, cancelled);
     }
 
     // Also puts the cache's signatures on the local paths: built here they are
     // only "ultimate", and a client checking signatures would refuse them.
-    void publish(nix::Store & store, const std::vector<std::string> & paths, const Cancelled & cancelled = never)
+    void publish(
+        nix::Store & store, const std::vector<std::string> & paths, const Cancelled & cancelled = never, bool verify = false)
     {
-        for (const auto & [path, sigs] : publish(paths, cancelled)) {
+        for (const auto & [path, sigs] : publish(paths, cancelled, verify)) {
             nixcompat::addSignatures(store, store.parseStorePath(path), sigs);
         }
     }

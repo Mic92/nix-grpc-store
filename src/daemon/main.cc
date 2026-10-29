@@ -187,10 +187,14 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     };
 
     // Publishing makes our paths everyone's. Without it the client may not rely on them.
-    void publish(nix::Store & localStore, const std::vector<std::string> & paths, const nixgrpc::Cancelled & cancelled)
+    void publish(
+        nix::Store & localStore,
+        const std::vector<std::string> & paths,
+        const nixgrpc::Cancelled & cancelled,
+        bool verify = false)
     {
         try {
-            coord.cache.publish(localStore, paths, cancelled);
+            coord.cache.publish(localStore, paths, cancelled, verify);
         } catch (nixgrpc::CancelledWait &) {
             throw;
         } catch (nix::Error & err) {
@@ -911,7 +915,9 @@ public:
                 outputs.emplace_back(built.back(), localStore.queryPathInfo(path)->narSize);
             }
             phase.next("publish");
-            publish(localStore, built, cancelled);
+            // Built because the farm counted them as held but a worker could
+            // not get them: the cache may have lost their objects.
+            publish(localStore, built, cancelled, context.client_metadata().contains("x-nix-cache-lost"));
             phase.done();
             outcome = nix::remote::Done::BUILT;
         } else if (nixcompat::failureStatus(res) == nixcompat::FailureStatus::TransientFailure && nixcompat::isSandboxed(drv)) {

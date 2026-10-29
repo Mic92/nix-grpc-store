@@ -44,6 +44,8 @@ in
       };
     };
   };
+  # For tests that delete objects behind niks3's back.
+  environment.etc."niks3-test/s3-credentials".text = "${s3Key}:${s3Secret}";
   # Garage refuses to start with less than 1 GiB free.
   virtualisation.diskSize = pkgs.lib.mkDefault 2048;
   systemd.services.garage-setup = {

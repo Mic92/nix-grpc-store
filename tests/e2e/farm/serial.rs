@@ -341,6 +341,98 @@ fn upload_whose_reference_the_worker_lacks_is_completed_from_the_cache() {
     wait_members(&sys, &WORKERS);
 }
 
+/// Deletes the NAR of `path` from the cache's bucket behind niks3's back,
+/// which keeps listing the path.
+fn lose_nar(path: &str) {
+    succeed(
+        LB,
+        &[
+            "sh",
+            "-c",
+            r#"set -e
+nar=$(curl -sf "$1/$2.narinfo" | sed -n 's/^URL: //p')
+test -n "$nar"
+curl -sf -X DELETE --aws-sigv4 aws:amz:us-east-1:s3 --user "$(cat /etc/niks3-test/s3-credentials)" "http://lb:9000/farm/$nar"
+test "$(curl -s -o /dev/null -w '%{http_code}' "$1/$nar")" = 404"#,
+            "sh",
+            &env("NGS_NIKS3_URL"),
+            &path["/nix/store/".len()..][..32],
+        ],
+    );
+}
+
+/// An input that niks3 lists but whose NAR the cache lost is built again in
+/// the run that needs it, and published so that every worker can fetch it.
+/// Its users, one on each worker, miss it at the same time and both wait.
+#[test]
+fn an_input_whose_nar_the_cache_lost_is_built_again() {
+    farm_ready();
+    let (tag, dep) = ("lostnar", expr("DEP"));
+    // Only worker1 can build it (vip). It reaches niks3 through worker1.
+    let input = succeed(
+        CLIENT,
+        &[
+            "nix-build",
+            "--no-out-link",
+            "--option",
+            "extra-system-features",
+            "vip",
+            &dep,
+            "-A",
+            "input",
+            "--argstr",
+            "tag",
+            tag,
+            "--arg",
+            "features",
+            r#"["vip"]"#,
+        ],
+    )
+    .trim()
+    .to_string();
+    succeed(
+        CLIENT,
+        &[
+            "nix",
+            "copy",
+            "--no-check-sigs",
+            "--to",
+            &direct(WORKER1),
+            &input,
+        ],
+    );
+    succeed(CLIENT, &["nix-store", "--delete", &input]);
+    succeed(WORKER1, &["nix-store", "--delete", &input]);
+    lose_nar(&input);
+    let missed = |w| events(w, "input_not_substitutable");
+    let (missed1, missed2) = (missed(WORKER1), missed(WORKER2));
+    let users = format!(
+        r#"map (f: (import {dep} {{ tag = "{tag}"; salt = f; features = [ "vip" ]; jobFeatures = [ f ]; }}).job) [ "vip" "w2" ]"#
+    );
+    let o = run_t(
+        CLIENT,
+        &[
+            "nix",
+            "build",
+            "-L",
+            "--no-link",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "--impure",
+            "--expr",
+            &users,
+        ],
+        300,
+    );
+    assert_eq!(o.code, 0, "{}", o.combined());
+    assert!(
+        missed(WORKER1) > missed1 && missed(WORKER2) > missed2,
+        "not both users missed {input}"
+    );
+}
+
 #[test]
 fn a_niks3_restart_does_not_cost_the_leader_its_role() {
     farm_ready();

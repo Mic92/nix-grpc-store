@@ -128,6 +128,11 @@ public:
             return;
         }
         jobs.at(input).dependants.push_back(jid);
+        // Placed again while it waits, it would hold a slot, maybe the only
+        // one the input can build in: the scheduler forgets it until then.
+        if (stream) {
+            cancels.push_back(jid);
+        }
         to(jid, state::Blocked{.waiting = 1});
     }
 

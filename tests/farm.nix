@@ -146,11 +146,12 @@ let
     mk' top "farm-top" [ a b ]
   '';
   depExpr = pkgs.writeText "dep.nix" ''
-    { tag, salt ? "", inputPath ? null }:
+    { tag, salt ? "", inputPath ? null, features ? [ ], jobFeatures ? features }:
     rec {
       input = if inputPath != null then builtins.storePath inputPath else derivation {
         name = "local-input-''${tag}";
         system = builtins.currentSystem;
+        requiredSystemFeatures = features;
         builder = "/bin/sh";
         args = [ "-c" "echo ''${tag} > $out" ];
       };
@@ -163,6 +164,7 @@ let
       job = derivation {
         name = "uses-input-''${tag}''${salt}";
         system = builtins.currentSystem;
+        requiredSystemFeatures = jobFeatures;
         builder = "/bin/sh";
         args = [ "-c" "read x < ''${input}; echo $x > $out" ];
       };
@@ -205,7 +207,8 @@ pkgs.testers.runNixOSTest {
     };
     worker2 = {
       imports = [ (worker "worker2") ];
-      nix.settings.system-features = [ ];
+      # Lets a test place a build on worker2 alone, as vip does on worker1.
+      nix.settings.system-features = [ "w2" ];
       services.nix-grpc-daemon.schedulerTokenFile = "/run/scheduler-token";
       systemd.services.scheduler-token = {
         requiredBy = [ "nix-grpc-daemon.service" ];

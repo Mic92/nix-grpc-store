@@ -140,7 +140,10 @@ auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & 
     nixcompat::writeDrv(sink, *this, job.drv);
     *request.mutable_drv() = std::move(sink.s);
   }
-  auto const headers = routingFor(job.drv, where.addr, where.system);
+  auto headers = routingFor(job.drv, where.addr, where.system);
+  if (job.cacheLost) {
+    headers.emplace_back("x-nix-cache-lost", "1"); // published checking the cache
+  }
   std::optional<BuildResult> res;
   std::string missing;
   auto status = tryBuildDerivation(request, headers, res, missing);
@@ -201,7 +204,7 @@ struct GrpcStore::Run {
   nixgrpc::exec::Executor exe;
   std::deque<Job *> byId; // deque: build threads keep references while jobs are added
   std::map<std::string, JobId, std::less<>> byName;
-  std::set<StorePath> recovered; // missing inputs, each handled once
+  std::set<std::pair<JobId, StorePath>> recovered; // missing inputs, each handled once per job
   bool closed = false;           // WritesDone sent
   grpc::ClientReaderWriter<remote::ClientMsgs, remote::SchedMsgs> * stream = nullptr;
 
@@ -256,7 +259,8 @@ struct GrpcStore::Run {
   void fillWant(remote::Want * want, const Job & job) const {
     want->set_drv_path(std::string(job.drvPath.to_string()));
     for (const auto & [name, out] : job.drv.outputs) {
-      if (auto path = out.path(store, job.drv.name, name)) {
+      // No keys, no Cached: the cache's answer is what a worker could not get.
+      if (auto path = out.path(store, job.drv.name, name); path && !job.cacheLost) {
         want->add_out_keys(std::string(path->hashPart()) + ".narinfo");
       }
     }
@@ -348,7 +352,7 @@ struct GrpcStore::Run {
     auto const pathS = store.printStorePath(path);
     {
       std::scoped_lock const lock(mutex);
-      if (!recovered.insert(path).second) {
+      if (!recovered.emplace(work.jid, path).second) {
         return nixcompat::failed(nixcompat::FailureStatus::MiscFailure,
                                  fmt("input '%s' is missing on the farm", pathS));
       }
@@ -369,6 +373,7 @@ struct GrpcStore::Run {
       auto noJobs = [](const StorePath &) -> bool { return false; };
       auto & job = jobs.emplace(drvPath, store.farmJob(evalStore, drvPath, full, noJobs)).first->second;
       job.cpHintMs = work.job->cpHintMs + 1; // ahead of the build waiting for it
+      job.cacheLost = true;
       addLocked(job, {});
     }
     exe.blockOn(work.jid, byName.at(name));
