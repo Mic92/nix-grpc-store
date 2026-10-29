@@ -149,6 +149,7 @@ void missingInput()
     auto const input = exe.add(0, {});
     exe.blockOn(job, input);
     assert(std::holds_alternative<st::Blocked>(exe.at(job)));
+    assert((exe.takeCancels() == std::vector<JobId>{job}));
     assert((exe.takeWants() == std::vector<JobId>{input}));
     exe.onCached(input);
     assert((exe.takeWants() == std::vector<JobId>{job}));
