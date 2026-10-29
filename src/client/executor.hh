@@ -128,6 +128,11 @@ public:
             return;
         }
         jobs.at(input).dependants.push_back(jid);
+        // Re-placed while waiting, it could hold the only slot that can build
+        // the input.
+        if (stream) {
+            cancels.push_back(jid);
+        }
         to(jid, state::Blocked{.waiting = 1});
     }
 
