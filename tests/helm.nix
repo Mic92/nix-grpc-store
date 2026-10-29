@@ -207,6 +207,8 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
 
     # Default placement: workers spread, scheduler replicas on distinct nodes.
     pick() { yq "select(.kind == \"$1\" and .metadata.name == \"$2\") | $3" "$4"; }
+    # Not `| grep -q`: grep exits at its first match, and yq, if still
+    # writing, dies of SIGPIPE, which fails the pipeline (pipefail).
     test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.topologySpreadConstraints[0].topologyKey' out.yaml)" = kubernetes.io/hostname
     test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.topologySpreadConstraints[0].whenUnsatisfiable' out.yaml)" = ScheduleAnyway
     test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.topologySpreadConstraints[0].nodeTaintsPolicy' out.yaml)" = Honor
@@ -226,7 +228,7 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
       test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.containers[] | select(.name == "nix-grpc-daemon") | .readinessProbe.exec.command | join(" ")' "$f")" = 'nix store info --store daemon'
     done
     for n in t-nix-grpc-farm-scheduler-0.default.svc t-nix-grpc-farm-scheduler-1.default.svc t-nix-grpc-farm.default.svc; do
-      pick Certificate t-nix-grpc-farm-worker '.spec.dnsNames[]' cm.yaml | grep -qx "$n"
+      pick Certificate t-nix-grpc-farm-worker '.spec.dnsNames[]' cm.yaml | grep -x "$n" > /dev/null
     done
     test "$(pick Certificate t-nix-grpc-farm-lb '.spec.commonName' cm.yaml)" = lb
     test "$(pick Service t-nix-grpc-farm '.spec.ports[0].appProtocol' cm.yaml)" = kubernetes.io/h2c
@@ -254,7 +256,7 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
     test "$(yq ea '[select(.kind == "Deployment") | .metadata.name] | sort | join(" ")' ext.yaml)" = 't-nix-grpc-farm-worker-arm t-nix-grpc-farm-worker-x86'
     ! grep -q 't-nix-grpc-farm-lb' ext.yaml
     daemon() { pick Deployment "t-nix-grpc-farm-worker-$1" ".spec.template.spec.containers[] | select(.name == \"nix-grpc-daemon\") | $2" ext.yaml; }
-    daemon x86 '.args[]' | grep -qx -- --scheduler=farm.example.com:50051
+    daemon x86 '.args[]' | grep -x -- --scheduler=farm.example.com:50051 > /dev/null
     test "$(daemon x86 '.ports[] | select(.name == "grpc") | .hostPort')" = 50052
     test "$(daemon x86 '.command[0]')" = /bin/sh
     test "$(daemon x86 '.ports[] | select(.name == "metrics") | .hostPort')" = 9465
@@ -273,7 +275,7 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
     # A second pod cannot take the port on the same node, so no surge.
     test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.strategy.rollingUpdate.maxSurge' ext.yaml)" = 0
     # Without a map the node's InternalIP is the address.
-    daemon arm '.args[]' | grep -qx -- '--advertise=$(HOST_IP):50052'
+    daemon arm '.args[]' | grep -x -- '--advertise=$(HOST_IP):50052' > /dev/null
     test "$(daemon arm '.command[0]')" = /bin/nix-grpc-daemon
 
     # The CA secret also holds the CA key under cert-manager: mount only ca.crt.
@@ -300,7 +302,7 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
     envoy public-cm.yaml | jq -e '.static_resources.listeners[0].filter_chains[0] | (.filter_chain_match.server_names | index("t-nix-grpc-farm.default.svc")) and .transport_socket.typed_config.common_tls_context.tls_certificate_sds_secret_configs[0].name == "lb"'
 
     # Worker settings that must reach nix-daemon, and a changed cache must roll workers.
-    pick ConfigMap t-nix-grpc-farm-worker-x86 '.data."farm.conf"' out.yaml | grep -qx 'build-dir = /build'
+    pick ConfigMap t-nix-grpc-farm-worker-x86 '.data."farm.conf"' out.yaml | grep -x 'build-dir = /build' > /dev/null
     helm template t chart -f ${valuesFile} --set 'upstreamCaches.urls={https://other}' --api-versions monitoring.coreos.com/v1/PodMonitor > caches.yaml
     sum() { pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.metadata.annotations."checksum/config"' "$1"; }
     test "$(sum out.yaml)" != "$(sum caches.yaml)"
