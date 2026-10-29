@@ -140,7 +140,10 @@ auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & 
     nixcompat::writeDrv(sink, *this, job.drv);
     *request.mutable_drv() = std::move(sink.s);
   }
-  auto const headers = routingFor(job.drv, where.addr, where.system);
+  auto headers = routingFor(job.drv, where.addr, where.system);
+  if (job.cacheLost) {
+    headers.emplace_back("x-nix-cache-lost", "1");
+  }
   std::optional<BuildResult> res;
   std::string missing;
   auto status = tryBuildDerivation(request, headers, res, missing);
@@ -256,7 +259,9 @@ struct GrpcStore::Run {
   void fillWant(remote::Want * want, const Job & job) const {
     want->set_drv_path(std::string(job.drvPath.to_string()));
     for (const auto & [name, out] : job.drv.outputs) {
-      if (auto path = out.path(store, job.drv.name, name)) {
+      // Without output keys the scheduler can't answer Cached from the
+      // listing that claims the lost NAR still exists.
+      if (auto path = out.path(store, job.drv.name, name); path && !job.cacheLost) {
         want->add_out_keys(std::string(path->hashPart()) + ".narinfo");
       }
     }
@@ -369,6 +374,7 @@ struct GrpcStore::Run {
       auto noJobs = [](const StorePath &) -> bool { return false; };
       auto & job = jobs.emplace(drvPath, store.farmJob(evalStore, drvPath, full, noJobs)).first->second;
       job.cpHintMs = work.job->cpHintMs + 1; // ahead of the build waiting for it
+      job.cacheLost = true;
       addLocked(job, {});
     }
     exe.blockOn(work.jid, byName.at(name));
