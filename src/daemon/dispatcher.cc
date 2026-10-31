@@ -652,7 +652,13 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
 {
     metrics.event("done_" + nix::remote::Done::Outcome_Name(done.outcome()));
     if (done.outcome() == nix::remote::Done::GIVEN_BACK || done.outcome() == nix::remote::Done::NO_SHOW) {
-        core.giveBack(wid, done.drv_path());
+        // A worker whose draining flag (from its last Load or Hello) is set
+        // takes nothing until it is back, so its give-back for DRAINING is
+        // not remembered. Any other is, including one for DRAINING before the
+        // Load or after it is back, and passes the worker over while the drv
+        // is wanted and another worker can run it.
+        bool const draining = done.reason() == nix::remote::Done::DRAINING && core.worker(wid).draining;
+        core.giveBack(wid, done.drv_path(), !draining);
         metrics.event("given_back_" + nix::remote::Done::Reason_Name(done.reason()));
         placeabilityChangedLocked(); // its followers may have no worker left
         return;
