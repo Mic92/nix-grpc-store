@@ -82,6 +82,8 @@ let
         common
         module
       ];
+      # The recovery test uploads a floating content-addressed derivation.
+      nix.settings.experimental-features = [ "ca-derivations" ];
       services.nix-grpc-daemon = {
         enable = true;
         listen = "[::]:50051";

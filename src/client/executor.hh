@@ -95,7 +95,8 @@ public:
     auto add(double prio, const std::vector<JobId> & inputs) -> JobId
     {
         auto const jid = static_cast<JobId>(jobs.size());
-        jobs.push_back({.state = state::Blocked{.waiting = 0}, .prio = prio, .dependants = {}, .failedInput = {}, .bounced = 0});
+        jobs.push_back(
+            {.state = state::Blocked{.waiting = 0}, .prio = prio, .dependants = {}, .failedInput = {}, .bounced = 0, .followed = false});
         remaining++;
         size_t waiting = 0;
         for (auto const input : inputs) {
@@ -130,9 +131,7 @@ public:
         jobs.at(input).dependants.push_back(jid);
         // Re-placed while waiting, it could hold the only slot that can build
         // the input.
-        if (stream) {
-            cancels.push_back(jid);
-        }
+        unfollow(jid);
         to(jid, state::Blocked{.waiting = 1});
     }
 
@@ -175,9 +174,13 @@ public:
         }
     }
 
+    // The scheduler drops a client's follows when its stream ends.
     void disconnected()
     {
         stream = false;
+        for (auto & job : jobs) {
+            job.followed = false;
+        }
     }
 
     // Capped at the build threads, so the scheduler holds no slot we can't use.
@@ -188,6 +191,9 @@ public:
             return out;
         }
         out = std::exchange(rewant, {});
+        for (auto const jid : out) {
+            jobs.at(jid).followed = true;
+        }
         std::erase_if(wantable, [&](JobId jid) -> bool { return !std::holds_alternative<state::Wantable>(jobs.at(jid).state); });
         auto const room = std::min(wantable.size(), cfg.threads > active ? cfg.threads - active : 0);
         std::ranges::partial_sort(
@@ -195,6 +201,7 @@ public:
             [&](JobId lhs, JobId rhs) -> bool { return jobs.at(lhs).prio > jobs.at(rhs).prio; });
         for (size_t idx = 0; idx < room; idx++) {
             to(wantable.at(idx), state::Wanted{});
+            jobs.at(wantable.at(idx)).followed = true;
             out.push_back(wantable.at(idx));
         }
         wantable.erase(wantable.begin(), wantable.begin() + static_cast<std::ptrdiff_t>(room));
@@ -205,6 +212,7 @@ public:
     void unsent(const std::vector<JobId> & ids)
     {
         for (auto const jid : ids) {
+            jobs.at(jid).followed = false;
             if (std::holds_alternative<state::Wanted>(jobs.at(jid).state)) {
                 to(jid, state::Wantable{});
                 wantable.push_back(jid);
@@ -360,6 +368,9 @@ private:
         std::vector<JobId> dependants;
         std::optional<JobId> failedInput;
         unsigned bounced;
+        // We sent a Want and no Cancel since. While set, the scheduler may
+        // keep the job queued or placed for us.
+        bool followed;
     };
 
     Config cfg;
@@ -436,12 +447,7 @@ private:
             if (std::holds_alternative<state::Done>(job.state)) {
                 continue;
             }
-            // The scheduler would place it for nobody.
-            bool const placed =
-                std::holds_alternative<state::Wanted>(job.state) || std::holds_alternative<state::Assigned>(job.state);
-            if (placed && stream && result.outcome != Outcome::cached) {
-                cancels.push_back(jid);
-            }
+            unfollow(jid);
             bool const failed = !result.succeeded;
             to(jid, std::move(result));
             remaining--;
@@ -450,6 +456,16 @@ private:
             if (failed && !cfg.keepGoing && !stopping) {
                 stopAll(work);
             }
+        }
+    }
+
+    // Every job we stop following is cancelled, whatever its state or
+    // outcome: the scheduler ignores a Cancel for an entry it already ended,
+    // and would otherwise keep placing it for nobody.
+    void unfollow(JobId jid)
+    {
+        if (std::exchange(jobs.at(jid).followed, false)) {
+            cancels.push_back(jid);
         }
     }
 

@@ -97,7 +97,7 @@ void stopsWithoutKeepGoing()
     exe.next();
     exe.finished(bad, false);
     assert(outcome(exe, other) == Outcome::cancelled && outcome(exe, later) == Outcome::cancelled);
-    assert((exe.takeCancels() == std::vector<JobId>{other}));
+    assert((exe.takeCancels() == std::vector<JobId>{bad, other}));
 }
 
 // Unplaceable fails a job only after the grace, Placeable resets it.
@@ -155,6 +155,43 @@ void missingInput()
     assert((exe.takeWants() == std::vector<JobId>{job}));
 }
 
+// Whatever ends a job we follow, the scheduler hears a Cancel for it, once.
+void everyEndCancels()
+{
+    Executor exe({.threads = 4, .rescheduleRetries = 0, .keepGoing = true});
+    auto const built = exe.add(0, {});
+    auto const failed = exe.add(0, {});
+    auto const cached = exe.add(0, {});
+    auto const gaveUp = exe.add(0, {});
+    exe.connected();
+    exe.takeWants();
+    for (auto const jid : {built, failed, gaveUp}) {
+        exe.onAssigned(jid, place("a"));
+        exe.next();
+    }
+    exe.finished(built, true);
+    exe.finished(failed, false);
+    exe.onCached(cached);
+    exe.bounced(gaveUp);
+    assert((exe.takeCancels() == std::vector<JobId>{built, failed, cached, gaveUp}));
+    exe.finished(built, true);
+    assert(exe.takeCancels().empty());
+}
+
+// A dropped stream ends the scheduler's follows: nothing left to cancel.
+void disconnectForgetsFollows()
+{
+    Executor exe({.threads = 1, .rescheduleRetries = Executor::defaultRescheduleRetries, .keepGoing = true});
+    auto const job = exe.add(0, {});
+    exe.connected();
+    exe.takeWants();
+    exe.onAssigned(job, place("a"));
+    exe.next();
+    exe.disconnected();
+    exe.finished(job, true);
+    assert(exe.takeCancels().empty());
+}
+
 } // namespace
 
 auto main() -> int
@@ -167,6 +204,8 @@ auto main() -> int
         unplaceableGrace();
         reconnectAndAbandon();
         missingInput();
+        everyEndCancels();
+        disconnectForgetsFollows();
     } catch (const std::exception & err) {
         std::cerr << err.what() << "\n";
         return 1;
