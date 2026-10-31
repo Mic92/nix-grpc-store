@@ -431,6 +431,99 @@ fn an_input_whose_nar_the_cache_lost_is_built_again() {
     );
 }
 
+/// A recovery that throws fails its job, not the whole client. The cache
+/// lost the output of a fixed-output producer whose input is floating
+/// content-addressed, which recover() cannot turn into a job.
+#[test]
+fn a_recovery_that_throws_fails_only_its_job() {
+    farm_ready();
+    let tag = "recoverthrows";
+    let fixed = succeed(
+        CLIENT,
+        &[
+            "sh",
+            "-c",
+            r#"set -e
+d=$(mktemp -d)
+echo fixed > "$d/fod-on-ca"
+nix-store --add-fixed sha256 "$d/fod-on-ca""#,
+        ],
+    )
+    .trim()
+    .to_string();
+    succeed(
+        CLIENT,
+        &["nix", "copy", "--no-check-sigs", "--to", &direct(WORKER1), &fixed],
+    );
+    succeed(CLIENT, &["nix-store", "--delete", &fixed]);
+    succeed(WORKER1, &["nix-store", "--delete", &fixed]);
+    lose_nar(&fixed);
+    let file = format!("/root/{tag}.nix");
+    write_file(
+        CLIENT,
+        &file,
+        &format!(
+            r#"let
+  system = builtins.currentSystem;
+  floating = derivation {{
+    name = "floating-ca";
+    inherit system;
+    builder = "/bin/sh";
+    args = [ "-c" "echo ca > $out" ];
+    __contentAddressed = true;
+    outputHashMode = "recursive";
+    outputHashAlgo = "sha256";
+  }};
+  producer = derivation {{
+    name = "fod-on-ca";
+    inherit system;
+    builder = "/bin/sh";
+    args = [ "-c" "read x < ${{floating}}; echo fixed > $out" ];
+    outputHashMode = "flat";
+    outputHash = "sha256-DDBxQY5jVuYUiYyE7QZMqV6IVRvAgRtTS98ZUuza5TQ=";
+  }};
+in
+{{
+  requester = derivation {{
+    name = "uses-fod-on-ca";
+    inherit system;
+    builder = "/bin/sh";
+    args = [ "-c" "read x < ${{producer}}; echo $x > $out" ];
+  }};
+  other = derivation {{
+    name = "{tag}-other";
+    inherit system;
+    builder = "/bin/sh";
+    args = [ "-c" "echo {tag} > $out" ];
+  }};
+}}"#
+        ),
+    );
+    let out = fail(
+        CLIENT,
+        &[
+            "nix",
+            "build",
+            "--no-link",
+            "--keep-going",
+            "--extra-experimental-features",
+            "ca-derivations",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "-f",
+            &file,
+            "requester",
+            "other",
+        ],
+    );
+    assert!(out.contains("has no statically known path"), "{out}");
+    assert!(!out.contains("Nix crashed"), "{out}");
+    let other = succeed(CLIENT, &["nix", "eval", "--raw", "-f", &file, "other.outPath"]);
+    succeed(CLIENT, &["nix", "path-info", "--store", &envoy(), other.trim()]);
+}
+
 #[test]
 fn a_niks3_restart_does_not_cost_the_leader_its_role() {
     farm_ready();
