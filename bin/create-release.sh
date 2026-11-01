@@ -11,8 +11,16 @@ if [[ -z $version ]]; then
   exit 1
 fi
 
-# Strip "v" prefix if provided
 version="${version#v}"
+if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-z]+\.[0-9]+)?$ ]]; then
+  echo "version must match X.Y.Z[-pre.N], got: ${version}" >&2
+  exit 1
+fi
+tag="v${version}"
+prerelease=()
+if [[ $version == *-* ]]; then
+  prerelease=(--prerelease)
+fi
 
 if [[ "$(git symbolic-ref --short HEAD)" != "main" ]]; then
   echo "must be on main branch" >&2
@@ -43,8 +51,8 @@ if [[ $unpushed_commits != "" ]]; then
   exit 1
 fi
 # make sure tag does not exist
-if git tag -l | grep -q "^v${version}\$"; then
-  echo "Tag v${version} already exists, exiting" >&2
+if git tag -l | grep -q "^${tag}\$"; then
+  echo "Tag ${tag} already exists, exiting" >&2
   exit 1
 fi
 
@@ -75,4 +83,4 @@ git checkout main
 
 waitForPr "release-${version}"
 git pull git@github.com:Mic92/nix-grpc-store main
-gh release create "v${version}" --draft --title "v${version}" --notes ""
+gh release create "${tag}" --title "${tag}" --generate-notes "${prerelease[@]}"
