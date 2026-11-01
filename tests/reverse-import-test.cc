@@ -1,42 +1,73 @@
 #include <cassert>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <exception>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 #include <openssl/rand.h>
 
-#include <nix/store/store-api.hh>
 #include <nix/store/globals.hh>
+#include <nix/store/store-api.hh>
 #include <nix/store/store-open.hh>
 #include <nix/store/worker-protocol.hh>
 #include <nix/util/archive.hh>
+#include <nix/util/error.hh>
 #include <nix/util/file-system.hh>
+#include <nix/util/repair-flag.hh>
 #include <nix/util/serialise.hh>
 #include <nix/util/signature/local-keys.hh>
 #include <nix/util/signature/signer.hh>
 
+#include "acl.hh"
+#include "auth.hh"
 #include "import-paths.hh"
 #include "nix-compat.hh"
+#include "nix_remote.pb.h"
 #include "pump.hh"
+#include "reverse-capability.hh"
+#include "reverse-frames.hh"
 #include "reverse-upload-pipe.hh"
 #include "upload-spool.hh"
 
-int main()
+namespace {
+
+constexpr size_t mebibyte = size_t{1024} * 1024;
+constexpr size_t extraRandomBytes = 2 * mebibyte;
+constexpr size_t producerChunkBytes = 256 * size_t{1024};
+constexpr uint64_t assignedId = 42;
+
+auto appendLengthPrefixed(std::string & out, std::string_view payload) -> void
 {
+    constexpr unsigned prefixBytes = 4;
+    constexpr unsigned bitsPerByte = 8;
+    constexpr uint32_t byteMask = 0xff;
+    auto const length = static_cast<uint32_t>(payload.size());
+    for (unsigned index = 0; index < prefixBytes; ++index) {
+        out.push_back(static_cast<char>((length >> (bitsPerByte * index)) & byteMask));
+    }
+    out += payload;
+}
+
+} // namespace
+
+auto main() -> int
+try {
     nix::initLibStore(false);
     auto const root = nix::createTempDir();
-    nix::AutoDelete cleanup(root);
+    nix::AutoDelete const cleanup(root);
     auto sourceStore = nix::openStore("local?root=" + (root / "source").string());
     auto destination = nix::openStore("local?root=" + (root / "destination").string());
 
     // Compress poorly so the wire stream, not merely the decompressed NAR,
     // exceeds the registration reader's bounded 4 MiB queue.
-    std::string random(nixgrpc::ReverseFrames::maxQueuedBytes + 2 * 1024 * 1024, '\0');
+    std::string random(nixgrpc::ReverseFrames::maxQueuedBytes + extraRandomBytes, '\0');
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL RAND_bytes takes unsigned char *.
     assert(RAND_bytes(reinterpret_cast<unsigned char *>(random.data()), static_cast<int>(random.size())) == 1);
     nix::StringSink nar;
     nix::dumpString(random, nar);
@@ -62,7 +93,7 @@ int main()
     assert(denied && !rejected->isValidPath(path));
     auto signingKey = nix::SecretKey::generate("reverse-import-test");
     auto publicKey = signingKey.toPublicKey();
-    nix::LocalSigner signer(std::move(signingKey));
+    nix::LocalSigner const signer(std::move(signingKey));
     unsignedOutput.sign(*sourceStore, signer);
     nix::PublicKeys keys;
     keys.emplace(publicKey.name, std::move(publicKey));
@@ -82,30 +113,30 @@ int main()
     sourceStore->narFromPath(path, body);
     assert(body.s.size() > info->narSize);
 
-    nixgrpc::Caller trusted{.name = "test-writer", .role = nixgrpc::Role::trusted,
+    nixgrpc::Caller const trusted{.name = "test-writer", .role = nixgrpc::Role::trusted,
                              .kind = nixgrpc::Caller::Kind::named};
     auto key = nixgrpc::ReverseCapability::newKey();
     assert(key);
     std::string const pod = "pod:test:01234567-89ab-cdef-0123-456789abcdef";
     auto token = nixgrpc::ReverseCapability::mint(*key, pod, 1, 1, "UploadBuildInputs",
-                                                  trusted, "assigned.drv", 42);
+                                                  trusted, "assigned.drv", assignedId);
     assert(token);
     auto delegated = nixgrpc::ReverseCapability::verify(*key, *token, pod, 1, 1, "UploadBuildInputs");
     assert(delegated);
-    nixgrpc::ReverseUploadPipe pipe(*delegated, [] { return true; });
-    auto send = [&](const nix::remote::UploadBuildInputsChunk & frame) {
+    nixgrpc::ReverseUploadPipe pipe(*delegated, [] -> bool { return true; });
+    auto send = [&](const nix::remote::UploadBuildInputsChunk & frame) -> void {
         auto bytes = frame.SerializeAsString();
         std::string wire;
-        auto const length = static_cast<uint32_t>(bytes.size());
-        for (unsigned i = 0; i < 4; ++i) wire.push_back(static_cast<char>((length >> (8 * i)) & 0xff));
-        wire += bytes;
-        for (size_t offset = 0; offset < wire.size(); offset += nixgrpc::ReverseFrames::maxFrameBytes)
-            if (!pipe.feed(std::string_view(wire).substr(offset, nixgrpc::ReverseFrames::maxFrameBytes)))
+        appendLengthPrefixed(wire, bytes);
+        for (size_t offset = 0; offset < wire.size(); offset += nixgrpc::ReverseFrames::maxFrameBytes) {
+            if (!pipe.feed(std::string_view(wire).substr(offset, nixgrpc::ReverseFrames::maxFrameBytes))) {
                 throw std::runtime_error("bounded upload handoff overflowed");
+            }
+        }
     };
     nix::remote::UploadBuildInputsChunk header;
     header.set_drv_path("assigned.drv");
-    header.set_assign_id(42);
+    header.set_assign_id(assignedId);
     header.mutable_chunk()->set_check_sigs(true);
     send(header);
 
@@ -116,18 +147,20 @@ int main()
     packed.resize(size);
     assert(packed.size() > nixgrpc::ReverseFrames::maxQueuedBytes);
     std::exception_ptr producerError;
-    std::thread producer([&] {
+    std::thread producer([&] -> void {
         try {
-            for (size_t offset = 0; offset < packed.size(); offset += 256 * 1024) {
+            for (size_t offset = 0; offset < packed.size(); offset += producerChunkBytes) {
                 nix::remote::UploadBuildInputsChunk chunk;
-                chunk.mutable_chunk()->set_data(packed.substr(offset, 256 * 1024));
+                chunk.mutable_chunk()->set_data(packed.substr(offset, producerChunkBytes));
                 send(chunk);
                 // This test drives the pipe directly, without the gRPC writer
                 // and importer's normal scheduling. An unpaced producer is
                 // expected to exhaust the bounded handoff and fail closed.
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
-            if (!pipe.finish()) throw std::runtime_error("upload half-close rejected");
+            if (!pipe.finish()) {
+                throw std::runtime_error("upload half-close rejected");
+            }
         } catch (...) {
             producerError = std::current_exception();
             pipe.cancel();
@@ -141,7 +174,7 @@ int main()
         nixgrpc::ZstdReaderSource<nixgrpc::ReverseUploadPipe, nix::remote::AddMultipleChunk> decoded(
             pipe, std::move(*flags.mutable_data()));
         auto stats = nixgrpc::importPaths(*destination, decoded,
-            [&](const nix::ValidPathInfo & imported, nix::Source & stream) {
+            [&](const nix::ValidPathInfo & imported, nix::Source & stream) -> void {
                 assert(imported.path == path);
                 range = spool.add(stream, imported.narSize);
             });
@@ -155,11 +188,16 @@ int main()
         throw;
     }
     producer.join();
-    if (producerError) std::rethrow_exception(producerError);
+    if (producerError) {
+        std::rethrow_exception(producerError);
+    }
     auto narReader = spool.reader(range);
     destination->addToStore(*info, narReader, nix::NoRepair, nix::NoCheckSigs);
     assert(destination->isValidPath(path));
     nix::StringSink restored;
     destination->narFromPath(path, restored);
     assert(restored.s == nar.s);
+    return 0;
+} catch (...) {
+    return 1;
 }

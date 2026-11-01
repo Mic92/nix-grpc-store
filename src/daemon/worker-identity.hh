@@ -17,6 +17,7 @@ namespace nixgrpc {
 
 class WorkerIdentity
 {
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members): the verifier is owned by main and outlives this
     oidc::Verifier & verifier; // configured with a tunnel-only audience
     std::string provider;
     std::string nameSpace;
@@ -26,8 +27,8 @@ class WorkerIdentity
 
     static auto safeName(std::string_view value, size_t limit) -> bool
     {
-        return !value.empty() && value.size() <= limit && std::ranges::all_of(value, [](unsigned char c) {
-            return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.';
+        return !value.empty() && value.size() <= limit && std::ranges::all_of(value, [](unsigned char chr) -> bool {
+            return (chr >= 'a' && chr <= 'z') || (chr >= '0' && chr <= '9') || chr == '-' || chr == '.';
         });
     }
 
@@ -36,15 +37,20 @@ class WorkerIdentity
         // Kubernetes pod metadata.uid is a UUID; reject ambiguous or
         // unbounded identifiers before they can become routing keys.
         constexpr size_t uuidLength = 36;
+        constexpr size_t firstDash = 8;
+        constexpr size_t secondDash = 13;
+        constexpr size_t thirdDash = 18;
+        constexpr size_t fourthDash = 23;
         if (uid.size() != uuidLength) {
             return false;
         }
         for (size_t i = 0; i < uid.size(); ++i) {
-            if (i == 8 || i == 13 || i == 18 || i == 23) {
-                if (uid[i] != '-') {
+            char const chr = uid.at(i);
+            if (i == firstDash || i == secondDash || i == thirdDash || i == fourthDash) {
+                if (chr != '-') {
                     return false;
                 }
-            } else if (!((uid[i] >= '0' && uid[i] <= '9') || (uid[i] >= 'a' && uid[i] <= 'f'))) {
+            } else if ((chr < '0' || chr > '9') && (chr < 'a' || chr > 'f')) {
                 return false;
             }
         }
@@ -93,23 +99,28 @@ public:
         if (!result.identity || result.identity->role != Role::trusted) {
             return std::nullopt;
         }
-        auto const & id = *result.identity;
-        if (id.singleAudience != audience
-            || id.subject != "oidc:" + provider + ":system:serviceaccount:" + nameSpace + ":" + serviceAccount
-            || id.podNamespace != nameSpace || id.serviceAccountName != serviceAccount
-            || !id.podName || !safeName(*id.podName, maxDnsNameLength) || !id.podUid || !validUid(*id.podUid)
-            || !id.expiresAt || *id.expiresAt <= std::chrono::system_clock::now()) {
+        auto const & claims = *result.identity;
+        if (claims.singleAudience != audience
+            || claims.subject != "oidc:" + provider + ":system:serviceaccount:" + nameSpace + ":" + serviceAccount
+            || claims.podNamespace != nameSpace || claims.serviceAccountName != serviceAccount
+            || !claims.podName || !safeName(*claims.podName, maxDnsNameLength) || !claims.podUid
+            || !validUid(*claims.podUid) || !claims.expiresAt
+            || *claims.expiresAt <= std::chrono::system_clock::now()) {
             return std::nullopt;
         }
         // Both claims are signed. Bound the issued lifetime and, in case the
         // signer back-dates iat, the remaining lifetime as seen locally.
         auto const skew = std::chrono::seconds(oidc::clockSkewSecs);
-        if (maxLifetime.count() <= 0 || !id.issuedAt || *id.expiresAt - *id.issuedAt > maxLifetime
-            || *id.expiresAt > std::chrono::system_clock::now() + maxLifetime + skew) {
+        if (maxLifetime.count() <= 0 || !claims.issuedAt || !claims.expiresAt || !claims.podUid) {
             return std::nullopt;
         }
-        auto const boundId = "pod:" + nameSpace + ":" + *id.podUid;
-        return Bound{.workerId = boundId, .expiresAt = *id.expiresAt};
+        auto const expiresAt = *claims.expiresAt;
+        auto const issuedAt = *claims.issuedAt;
+        if (expiresAt - issuedAt > maxLifetime || expiresAt > std::chrono::system_clock::now() + maxLifetime + skew) {
+            return std::nullopt;
+        }
+        auto const boundId = "pod:" + nameSpace + ":" + *claims.podUid;
+        return Bound{.workerId = boundId, .expiresAt = expiresAt};
     }
 
     auto bind(const std::string & token, std::string_view claimedId) -> std::optional<Bound>

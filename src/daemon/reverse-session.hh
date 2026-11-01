@@ -39,7 +39,7 @@ class ReverseSessionService final : public nix::remote::ReverseSession::Service
         void cancel()
         {
             const std::scoped_lock lock(mutex);
-            if (context) {
+            if (context != nullptr) {
                 context->TryCancel();
             }
         }
@@ -51,8 +51,11 @@ class ReverseSessionService final : public nix::remote::ReverseSession::Service
         }
     };
 
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members): owned by main, outlives the service
     WorkerIdentity & identity;
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members): owned by main, outlives the service
     ReverseRegistry & registry;
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members): owned by main, outlives the service
     Auth & workerAuth;
 
 public:
@@ -63,6 +66,7 @@ public:
     {
     }
 
+    // NOLINTNEXTLINE(readability-function-cognitive-complexity): security-sensitive linear registration checks
     auto Register(
         grpc::ServerContext * context,
         grpc::ServerReaderWriter<nix::remote::ReverseFarmMsg, nix::remote::ReverseWorkerMsg> * stream)
@@ -101,7 +105,7 @@ public:
             return {grpc::StatusCode::UNAUTHENTICATED, "one tunnel credential required"};
         }
         constexpr std::string_view prefix = "Bearer ";
-        std::string_view value(first->second.data(), first->second.size());
+        std::string_view const value(first->second.data(), first->second.size());
         if (!value.starts_with(prefix) || value.size() <= prefix.size()) {
             return {grpc::StatusCode::UNAUTHENTICATED, "tunnel bearer required"};
         }
@@ -131,13 +135,15 @@ public:
         auto cancellation = std::make_shared<Cancellation>(context);
         auto transport = std::make_shared<ReverseTransport>();
         auto handle = registry.registerWorker(
-            bound->workerId, msg.worker_id(), [cancellation] { cancellation->cancel(); },
+            bound->workerId, msg.worker_id(), [cancellation] -> void { cancellation->cancel(); },
             std::move(*sessionKey), transport);
         if (!handle) {
             return {grpc::StatusCode::UNAVAILABLE, "scheduler not accepting reverse sessions"};
         }
+        // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions): aggregate scope guard, never copied or moved
         struct Cleanup
         {
+            // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members): scope guard over the service's registry
             ReverseRegistry & registry;
             ReverseRegistry::Handle handle;
             std::shared_ptr<Cancellation> cancellation;
@@ -146,19 +152,19 @@ public:
                 cancellation->retire();
                 registry.disconnected(handle, false);
             }
-        } cleanup{registry, *handle, cancellation};
+        } const cleanup{.registry = registry, .handle = *handle, .cancellation = cancellation};
 
 
         // A stream must never outlive its verified projected token. A rotated
         // token for the same pod moves the deadline; stop_token wakes the
         // timer immediately on normal close/replacement.
         std::mutex mutex;
-        std::condition_variable_any cv;
+        std::condition_variable_any deadlineChanged;
         auto deadline = bound->expiresAt;
-        std::jthread expiry([&, cancellation](std::stop_token stop) {
+        std::jthread const expiry([&, cancellation](const std::stop_token & stop) -> void {
             std::unique_lock lock(mutex);
             while (!stop.stop_requested() && std::chrono::system_clock::now() < deadline) {
-                cv.wait_until(lock, stop, deadline, [] { return false; });
+                deadlineChanged.wait_until(lock, stop, deadline, [] -> bool { return false; });
             }
             if (!stop.stop_requested()) {
                 cancellation->cancel();
@@ -174,14 +180,16 @@ public:
         // gRPC permits one concurrent reader and one concurrent writer. Only
         // this thread calls Read, and only the dedicated writer calls Write
         // after the registration ack. Closing the session wakes the writer.
-        std::jthread writer([&, cancellation](std::stop_token stop) {
+        std::jthread const writer([&, cancellation](const std::stop_token & stop) -> void {
             nix::remote::ReverseFarmMsg frame;
             while (transport->outgoing.waitTake(frame, stop)) {
                 if (!registry.current(*handle) || !stream->Write(frame)) {
                     cancellation->cancel();
                     break;
                 }
-                if (frame.acknowledged()) transport->outgoing.acknowledgementSent(frame.stream_id());
+                if (frame.acknowledged()) {
+                    transport->outgoing.acknowledgementSent(frame.stream_id());
+                }
             }
         });
         while (stream->Read(&msg)) {
@@ -198,7 +206,7 @@ public:
                     const std::scoped_lock lock(mutex);
                     deadline = std::max(deadline, *renewed);
                 }
-                cv.notify_all();
+                deadlineChanged.notify_all();
                 msg.Clear();
                 continue;
             }

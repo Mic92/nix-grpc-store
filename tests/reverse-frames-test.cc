@@ -1,11 +1,14 @@
 #include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <stop_token>
 #include <thread>
 
+#include "nix_remote.pb.h"
 #include "reverse-frames.hh"
 
-int main()
+auto main() -> int
 {
     nixgrpc::ReverseFrames frames;
     nix::remote::ReverseOpen start;
@@ -67,7 +70,7 @@ int main()
     nixgrpc::ReverseFrames blocking;
     std::stop_source stop;
     bool woke = false;
-    std::jthread waiter([&] {
+    std::jthread waiter([&] -> void {
         nix::remote::ReverseFarmMsg next;
         woke = blocking.waitTake(next, stop.get_token()) && next.stream_id() == 1 && next.has_open();
     });
@@ -84,13 +87,13 @@ int main()
     while (streamed.data(1, payload)) { }
     std::stop_source uploadStop;
     bool enqueued = false;
-    std::jthread producer([&] { enqueued = streamed.waitData(1, payload, uploadStop.get_token()); });
+    std::jthread producer([&] -> void { enqueued = streamed.waitData(1, payload, uploadStop.get_token()); });
     assert(streamed.take(msg) && msg.has_data());
     producer.join();
     assert(enqueued); // freeing queue space wakes the producer
 
     while (streamed.data(1, payload)) { }
-    std::jthread interrupted([&] { enqueued = streamed.waitData(1, payload, uploadStop.get_token()); });
+    std::jthread interrupted([&] -> void { enqueued = streamed.waitData(1, payload, uploadStop.get_token()); });
     uploadStop.request_stop();
     interrupted.join();
     assert(!enqueued); // cancellation wakes a backpressured upload
@@ -100,7 +103,7 @@ int main()
     assert(cancelled.open(1, upload));
     while (cancelled.data(1, payload)) { }
     std::stop_source stillRunning;
-    std::jthread discarded([&] { enqueued = cancelled.waitData(1, payload, stillRunning.get_token()); });
+    std::jthread discarded([&] -> void { enqueued = cancelled.waitData(1, payload, stillRunning.get_token()); });
     assert(cancelled.cancel(1));
     discarded.join();
     assert(!enqueued); // removal of the stream wakes a blocked producer

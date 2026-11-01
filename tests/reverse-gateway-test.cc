@@ -1,20 +1,58 @@
 #include <cassert>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <iostream>
+#include <iterator>
 #include <memory>
+#include <optional>
+#include <span>
+#include <stop_token>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
 
+#include <nix/store/store-api.hh>
 #include <nix/util/file-system.hh>
 
 #include <grpc/grpc.h>
+#include <grpc/grpc_security_constants.h>
 #include <grpcpp/grpcpp.h>
+#include <grpcpp/security/credentials.h>
+#include <grpcpp/security/server_credentials.h>
+#include <grpcpp/support/status.h>
+#include <grpcpp/support/status_code_enum.h>
 #include <openssl/crypto.h>
 
+#include "acl.hh"
+#include "auth.hh"
 #include "nix_remote.grpc.pb.h"
+#include "nix_remote.pb.h"
+#include "oidc.hh"
+#include "reverse-capability.hh"
 #include "reverse-gateway.hh"
+#include "reverse-registry.hh"
+#include "reverse-transport.hh"
 #include "reverse-upload-relay.hh"
+#include "reverse-upload.hh"
+
+namespace {
+
+constexpr uint64_t assignedId = 42;
+constexpr uint64_t wrongAssignId = 41;
+constexpr uint64_t staleAssignId = 43;
+constexpr auto rejectDeadline = std::chrono::seconds(5);
+constexpr auto uploadDeadline = std::chrono::seconds(20);
+constexpr size_t largeChunkBytes = size_t{96} * 1024;
 
 class ClientService final : public nix::remote::NixRemote::Service
 {
   public:
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members): test helper bound to main's gateway.
     nixgrpc::ReverseGateway &gateway;
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members): test helper bound to main's registry.
     nixgrpc::ReverseRegistry &registry;
     std::string worker;
     grpc::Status last;
@@ -34,40 +72,53 @@ class ClientService final : public nix::remote::NixRemote::Service
 
     auto UploadBuildInputs(grpc::ServerContext *ctx,
                            grpc::ServerReader<nix::remote::UploadBuildInputsChunk> * reader,
-                           nix::remote::AddMultipleReply *) -> grpc::Status override
+                           nix::remote::AddMultipleReply * /*reply*/) -> grpc::Status override
     {
-        if (!uploadRelayEnabled) return {grpc::StatusCode::UNIMPLEMENTED, "test upload disabled"};
+        if (!uploadRelayEnabled) {
+            return {grpc::StatusCode::UNIMPLEMENTED, "test upload disabled"};
+        }
         nix::remote::UploadBuildInputsChunk first;
-        if (!reader->Read(&first)) return {grpc::StatusCode::INVALID_ARGUMENT, "empty upload"};
+        if (!reader->Read(&first)) {
+            return {grpc::StatusCode::INVALID_ARGUMENT, "empty upload"};
+        }
         auto const drv = first.drv_path();
         auto const assignId = first.assign_id();
-        nixgrpc::ReverseUploadRelay relay(gateway, registry);
-        return relay.call(*ctx, [&, drv, assignId](uint64_t id) {
+        nixgrpc::ReverseUploadRelay const relay(gateway, registry);
+        return relay.call(*ctx, [&, drv, assignId](uint64_t streamId) -> nixgrpc::ReverseGateway::Result {
             return gateway.prepareBuildInputs(*ctx, [&](std::string_view drv, uint64_t assign)
                 -> std::optional<std::string> {
-                if (*assignmentLive && drv == "assigned.drv" && assign == 42) return worker;
+                if (*assignmentLive && drv == "assigned.drv" && assign == assignedId) {
+                    return worker;
+                }
                 return std::nullopt;
-            }, id, drv, assignId);
-        }, [&] { return *assignmentLive; },
-        [&](nix::remote::UploadBuildInputsChunk & chunk) { return reader->Read(&chunk); }, std::move(first));
+            }, streamId, drv, assignId);
+        }, [&] -> bool { return *assignmentLive; },
+        [&](nix::remote::UploadBuildInputsChunk & chunk) -> bool { return reader->Read(&chunk); }, first);
     }
 
-    auto StoreInfo(grpc::ServerContext *ctx, const nix::remote::StoreInfoRequest *, nix::remote::StoreInfoReply *reply)
-        -> grpc::Status override
+    auto StoreInfo(grpc::ServerContext *ctx, const nix::remote::StoreInfoRequest * /*request*/,
+                   nix::remote::StoreInfoReply *reply) -> grpc::Status override
     {
-        auto result = uploadRoute
-                          ? gateway.prepareBuildInputs(*ctx, [&](std::string_view drv, uint64_t id) -> std::optional<std::string> {
-                                ++resolverCalls;
-                                if (drv == "assigned.drv" && id == 42) return worker;
-                                return std::nullopt;
-                            }, 1, drvPath, assignId)
-                          : schedulerRoute
-                          ? gateway.prepareBuild(*ctx, [&](std::string_view drv, uint64_t id) -> std::optional<std::string> {
-                                ++resolverCalls;
-                                if (drv == "assigned.drv" && id == 42) return worker;
-                                return std::nullopt;
-                            }, 1, drvPath, assignId, buildMode)
-                          : gateway.prepare(*ctx, worker, 1, method, drvPath, assignId, buildMode);
+        nixgrpc::ReverseGateway::Result result;
+        if (uploadRoute) {
+            result = gateway.prepareBuildInputs(*ctx, [&](std::string_view drv, uint64_t assign) -> std::optional<std::string> {
+                ++resolverCalls;
+                if (drv == "assigned.drv" && assign == assignedId) {
+                    return worker;
+                }
+                return std::nullopt;
+            }, 1, drvPath, assignId);
+        } else if (schedulerRoute) {
+            result = gateway.prepareBuild(*ctx, [&](std::string_view drv, uint64_t assign) -> std::optional<std::string> {
+                ++resolverCalls;
+                if (drv == "assigned.drv" && assign == assignedId) {
+                    return worker;
+                }
+                return std::nullopt;
+            }, 1, drvPath, assignId, buildMode);
+        } else {
+            result = gateway.prepare(*ctx, worker, 1, method, drvPath, assignId, buildMode);
+        }
         last = result.status;
         prepared = std::move(result.prepared);
         if (prepared)
@@ -81,9 +132,13 @@ class ClientService final : public nix::remote::NixRemote::Service
     }
 };
 
-int main(int argc, char **argv)
-{
+} // namespace
+
+auto main(int argc, char **argv) -> int
+try {
     assert(argc == 2);
+    std::span const args(argv, static_cast<size_t>(argc));
+    std::string const certDir = *std::next(args.begin());
     // gRPC event-engine threads may outlive process-level OpenSSL cleanup on
     // Darwin; keep crypto providers alive until the OS reclaims the process.
     assert(OPENSSL_init_crypto(OPENSSL_INIT_NO_ATEXIT, nullptr) == 1);
@@ -94,16 +149,18 @@ int main(int argc, char **argv)
         auto key = nixgrpc::ReverseCapability::newKey();
         assert(key);
         auto const worker = std::string("pod:staging:01234567-89ab-cdef-0123-456789abcdef");
-        auto session = *registry.registerWorker(worker, worker, [] {}, *key,
-                                                std::make_shared<nixgrpc::ReverseTransport>());
+        auto registered = registry.registerWorker(worker, worker, [] -> void {}, *key,
+                                                  std::make_shared<nixgrpc::ReverseTransport>());
+        assert(registered);
+        auto session = *registered;
         nixgrpc::Auth auth;
         std::optional<nixgrpc::oidc::Verifier> oidc;
         auth.oidc = &oidc;
         auth.acl.addRule("localhost=read-only");
         bool assigned = true;
         nixgrpc::ReverseGateway gateway(auth, registry,
-                                         [&](std::string_view selected, std::string_view drv, uint64_t id)
-                                         { return assigned && selected == worker && drv == "assigned.drv" && id == 42; });
+                                         [&](std::string_view selected, std::string_view drv, uint64_t assign)
+                                         -> bool { return assigned && selected == worker && drv == "assigned.drv" && assign == assignedId; });
         ClientService service(gateway, registry, worker);
         service.assignmentLive = &assigned;
         grpc::ServerBuilder builder;
@@ -111,8 +168,8 @@ int main(int argc, char **argv)
         int tlsPort = 0;
         builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
         grpc::SslServerCredentialsOptions tls;
-        tls.pem_root_certs = nix::readFile(std::string(argv[1]) + "/server.crt");
-        tls.pem_key_cert_pairs.push_back({nix::readFile(std::string(argv[1]) + "/server.key"), tls.pem_root_certs});
+        tls.pem_root_certs = nix::readFile(certDir + "/server.crt");
+        tls.pem_key_cert_pairs.push_back({.private_key = nix::readFile(certDir + "/server.key"), .cert_chain = tls.pem_root_certs});
         tls.client_certificate_request = GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
         builder.AddListeningPort("127.0.0.1:0", grpc::SslServerCredentials(tls), &tlsPort);
         builder.RegisterService(&service);
@@ -122,7 +179,7 @@ int main(int argc, char **argv)
             grpc::CreateChannel("127.0.0.1:" + std::to_string(port), grpc::InsecureChannelCredentials()));
         {
             grpc::ClientContext context;
-            nix::remote::StoreInfoRequest req;
+            nix::remote::StoreInfoRequest const req;
             nix::remote::StoreInfoReply reply;
             // Metadata pretending to be a TLS peer or worker ID cannot create a
             // client identity. The gateway uses Auth::identify on the actual context.
@@ -185,14 +242,14 @@ int main(int argc, char **argv)
 
             service.method = "BuildDerivation";
             service.drvPath = "assigned.drv";
-            service.assignId = 41;
+            service.assignId = wrongAssignId;
             grpc::ClientContext wrongAssignment;
             assert(tlsStub->StoreInfo(&wrongAssignment, req, &reply).error_code() ==
                    grpc::StatusCode::PERMISSION_DENIED); // read-only role checked first
             assert(!service.prepared);
             service.uploadRoute = true;
             service.drvPath = "assigned.drv";
-            service.assignId = 42;
+            service.assignId = assignedId;
             auto const uploadsBeforeAnonymous = service.resolverCalls;
             grpc::ClientContext anonymousUpload;
             assert(stub->StoreInfo(&anonymousUpload, req, &reply).error_code() == grpc::StatusCode::UNAUTHENTICATED);
@@ -202,13 +259,13 @@ int main(int argc, char **argv)
             assert(service.resolverCalls == uploadsBeforeAnonymous && !service.prepared);
             service.uploadRoute = false;
             service.drvPath = "assigned.drv";
-            service.assignId = 41;
+            service.assignId = wrongAssignId;
             auth.acl = nixgrpc::Acl{};
             auth.acl.addRule("localhost=write");
             grpc::ClientContext wrongAssignmentWriter;
             assert(tlsStub->StoreInfo(&wrongAssignmentWriter, req, &reply).error_code() ==
                    grpc::StatusCode::FAILED_PRECONDITION);
-            service.assignId = 42;
+            service.assignId = assignedId;
             service.schedulerRoute = true;
             // Anonymous callers are refused before the resolver can reveal
             // whether this derivation has an active assignment.
@@ -221,7 +278,7 @@ int main(int argc, char **argv)
             assert(service.prepared && service.prepared->session == session);
             auto delegated = nixgrpc::ReverseCapability::authorizeOpen(session->sessionKey, service.prepared->open,
                                                                        worker, session->generation, 1);
-            assert(delegated && delegated->assignId == 42 && delegated->drvPath == "assigned.drv" &&
+            assert(delegated && delegated->assignId == assignedId && delegated->drvPath == "assigned.drv" &&
                    delegated->caller.role == nixgrpc::Role::write);
             service.worker = "another-pod";
             grpc::ClientContext noFallback;
@@ -255,15 +312,15 @@ int main(int argc, char **argv)
             grpc::ClientContext upload;
             assert(tlsStub->StoreInfo(&upload, req, &reply).ok());
             assert(service.prepared && service.prepared->drvPath == "assigned.drv" &&
-                   service.prepared->assignId == 42);
+                   service.prepared->assignId == assignedId);
             auto pinnedUpload = *service.prepared;
             assigned = false;
             assert(gateway.enqueue(std::move(pinnedUpload), 2).error_code() == grpc::StatusCode::FAILED_PRECONDITION);
             assigned = true;
-            service.assignId = 43;
+            service.assignId = staleAssignId;
             grpc::ClientContext staleUpload;
             assert(tlsStub->StoreInfo(&staleUpload, req, &reply).error_code() == grpc::StatusCode::FAILED_PRECONDITION);
-            service.assignId = 42;
+            service.assignId = assignedId;
             grpc::ClientContext validUpload;
             assert(tlsStub->StoreInfo(&validUpload, req, &reply).ok());
             assert(service.prepared);
@@ -271,7 +328,7 @@ int main(int argc, char **argv)
             auto stalePrepared = *service.prepared;
             auto newKey = nixgrpc::ReverseCapability::newKey();
             assert(newKey);
-            session = *registry.registerWorker(worker, worker, [] {}, *newKey,
+            session = *registry.registerWorker(worker, worker, [] -> void {}, *newKey,
                                                 std::make_shared<nixgrpc::ReverseTransport>());
             assert(!registry.current(oldSession));
             assert(gateway.enqueue(std::move(stalePrepared), 1).error_code() == grpc::StatusCode::UNAVAILABLE);
@@ -288,14 +345,14 @@ int main(int argc, char **argv)
             assert(service.prepared && service.prepared->session == session);
 
             service.uploadRelayEnabled = true;
-            auto rejectUpload = [&](nix::remote::NixRemote::Stub & client, grpc::StatusCode expected) {
+            auto rejectUpload = [&](nix::remote::NixRemote::Stub & client, grpc::StatusCode expected) -> void {
                 grpc::ClientContext context;
-                context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+                context.set_deadline(std::chrono::system_clock::now() + rejectDeadline);
                 nix::remote::AddMultipleReply result;
                 auto stream = client.UploadBuildInputs(&context, &result);
                 nix::remote::UploadBuildInputsChunk header;
                 header.set_drv_path("assigned.drv");
-                header.set_assign_id(42);
+                header.set_assign_id(assignedId);
                 header.mutable_chunk()->set_check_sigs(true);
                 (void) stream->Write(header);
                 stream->WritesDone();
@@ -306,26 +363,31 @@ int main(int argc, char **argv)
             rejectUpload(*tlsStub, grpc::StatusCode::FAILED_PRECONDITION);
             assigned = true;
             assert(!session->transport->outgoing.take(queued));
-            std::string const large(96 * 1024, 'x');
+            std::string const large(largeChunkBytes, 'x');
             constexpr size_t uploadChunks = 48; // >4 MiB through a 4 MiB bounded queue
-            std::jthread uploadWorker([&] {
+            std::jthread uploadWorker([&] -> void {
                 nix::remote::ReverseFarmMsg frame;
                 assert(session->transport->outgoing.waitTake(frame, std::stop_token{}) && frame.has_open());
                 auto const streamId = frame.stream_id();
                 auto delegated = nixgrpc::ReverseCapability::authorizeOpen(session->sessionKey, frame.open(),
                     worker, session->generation, streamId);
-                assert(delegated && delegated->method == "UploadBuildInputs" && delegated->assignId == 42);
+                assert(delegated && delegated->method == "UploadBuildInputs" && delegated->assignId == assignedId);
                 nixgrpc::ReverseUpload::Decoder decoder(*delegated);
                 size_t chunks = 0;
                 while (session->transport->outgoing.waitTake(frame, std::stop_token{}) && frame.stream_id() == streamId) {
                     if (frame.has_data()) {
-                        assert(decoder.feed(frame.data().data(), [&](nix::remote::UploadBuildInputsChunk && chunk) {
+                        auto const fed = decoder.feed(frame.data().data(), [&](nix::remote::UploadBuildInputsChunk && chunk) -> bool {
+                            auto const received = std::move(chunk);
                             ++chunks;
-                            return chunks == 1 ? chunk.chunk().check_sigs() && chunk.drv_path() == "assigned.drv"
-                                               : chunk.chunk().data() == large;
-                        }));
-                    } else if (frame.half_close()) break;
-                    else assert(false);
+                            return chunks == 1 ? received.chunk().check_sigs() && received.drv_path() == "assigned.drv"
+                                               : received.chunk().data() == large;
+                        });
+                        assert(fed);
+                    } else if (frame.half_close()) {
+                        break;
+                    } else {
+                        assert(false);
+                    }
                 }
                 assert(chunks == uploadChunks + 1 && decoder.complete());
                 nix::remote::ReverseWorkerMsg reply;
@@ -335,18 +397,20 @@ int main(int argc, char **argv)
                 assert(session->transport->responses.accept(std::move(reply)));
             });
             grpc::ClientContext uploadCtx;
-            uploadCtx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(20));
+            uploadCtx.set_deadline(std::chrono::system_clock::now() + uploadDeadline);
             uploadCtx.AddMetadata("x-nix-worker", "another-pod");
             nix::remote::AddMultipleReply uploadReply;
             auto uploader = tlsStub->UploadBuildInputs(&uploadCtx, &uploadReply);
             nix::remote::UploadBuildInputsChunk firstUpload;
             firstUpload.set_drv_path("assigned.drv");
-            firstUpload.set_assign_id(42);
+            firstUpload.set_assign_id(assignedId);
             firstUpload.mutable_chunk()->set_check_sigs(true);
             assert(uploader->Write(firstUpload));
             nix::remote::UploadBuildInputsChunk nextUpload;
             nextUpload.mutable_chunk()->set_data(large);
-            for (size_t i = 0; i < uploadChunks; ++i) assert(uploader->Write(nextUpload));
+            for (size_t i = 0; i < uploadChunks; ++i) {
+                assert(uploader->Write(nextUpload));
+            }
             uploader->WritesDone();
             auto uploadStatus = uploader->Finish();
             assert(uploadStatus.error_code() == grpc::StatusCode::UNIMPLEMENTED);
@@ -365,4 +429,10 @@ int main(int argc, char **argv)
     }
     // Wait for channel event-engine threads before OpenSSL static teardown.
     grpc_shutdown_blocking();
+    return 0;
+} catch (const std::exception & err) {
+    std::cerr << "error: " << err.what() << "\n";
+    return 1;
+} catch (...) {
+    return 1;
 }

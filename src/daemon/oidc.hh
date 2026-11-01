@@ -516,6 +516,7 @@ private:
         return res;
     }
 
+    // NOLINTNEXTLINE(readability-function-cognitive-complexity): security-sensitive linear claim validation
     auto doVerify(const std::string & token, std::chrono::system_clock::time_point now) -> Result
     {
         auto parsed = parseToken(token);
@@ -550,20 +551,21 @@ private:
             auto const role = roleFor(provider, claims);
             Identity identity{.subject = "oidc:" + provider.name + ":" + sub, .role = role};
             if (auto const * namespaceClaim = lookupClaim(claims, "kubernetes.io.namespace");
-                namespaceClaim && namespaceClaim->is_string()) {
+                (namespaceClaim != nullptr) && namespaceClaim->is_string()) {
                 identity.podNamespace = namespaceClaim->get<std::string>();
             }
-            if (auto const * pod = lookupClaim(claims, "kubernetes.io.pod"); pod && pod->is_object()) {
-                if (auto it = pod->find("name"); it != pod->end() && it->is_string()) {
-                    identity.podName = it->get<std::string>();
+            if (auto const * pod = lookupClaim(claims, "kubernetes.io.pod"); (pod != nullptr) && pod->is_object()) {
+                if (auto name = pod->find("name"); name != pod->end() && name->is_string()) {
+                    identity.podName = name->get<std::string>();
                 }
-                if (auto it = pod->find("uid"); it != pod->end() && it->is_string()) {
-                    identity.podUid = it->get<std::string>();
+                if (auto uid = pod->find("uid"); uid != pod->end() && uid->is_string()) {
+                    identity.podUid = uid->get<std::string>();
                 }
             }
-            if (auto const * sa = lookupClaim(claims, "kubernetes.io.serviceaccount"); sa && sa->is_object()) {
-                if (auto it = sa->find("name"); it != sa->end() && it->is_string()) {
-                    identity.serviceAccountName = it->get<std::string>();
+            if (auto const * account = lookupClaim(claims, "kubernetes.io.serviceaccount");
+                (account != nullptr) && account->is_object()) {
+                if (auto name = account->find("name"); name != account->end() && name->is_string()) {
+                    identity.serviceAccountName = name->get<std::string>();
                 }
             }
             if (auto const aud = claims.find("aud"); aud != claims.end()) {

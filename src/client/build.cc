@@ -83,7 +83,9 @@ auto GrpcStore::uploadDrvClosure(Store & evalStore, std::vector<StorePath> drvPa
   // verifies signatures for write-role clients, as for direct uploads.
   StorePathSet missing;
   if (reverseAssignment) {
-    for (auto const & drvPath : drvPaths) evalStore.computeFSClosure(drvPath, missing);
+    for (auto const & drvPath : drvPaths) {
+      evalStore.computeFSClosure(drvPath, missing);
+    }
   } else {
     missing = nixgrpc::missingTopDown(
         std::move(drvPaths),
@@ -123,7 +125,9 @@ auto GrpcStore::uploadDrvClosure(Store & evalStore, std::vector<StorePath> drvPa
   std::vector<std::pair<ValidPathInfo, ReplayableNar>> paths;
   paths.reserve(sources.size());
   auto const spool = std::make_shared<UploadSpool>();
-  for (auto & [info, nar] : sources) paths.emplace_back(info, ReplayableNar(std::move(nar), spool, info.narSize));
+  for (auto & [info, nar] : sources) {
+    paths.emplace_back(info, ReplayableNar(std::move(nar), spool, info.narSize));
+  }
   return addMultipleToStoreOnce(paths, act, NoRepair, CheckSigs, headers,
                                 std::pair{std::string(reverseAssignment->first.to_string()), reverseAssignment->second});
 }
@@ -151,6 +155,7 @@ auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & reques
   return status;
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity): reverse and direct build paths kept side by side
 auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & where, Store & evalStore)
     -> Attempt {
   remote::BuildDerivationRequest request;
@@ -383,7 +388,8 @@ struct GrpcStore::Run {
       // registration and the previous assignment's Done have been processed.
       // Do not change the existing direct-worker retry behavior.
       if (std::holds_alternative<Bounced>(res) && work->where.reverse) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        constexpr std::chrono::milliseconds reverseBounceDelay{250};
+        std::this_thread::sleep_for(reverseBounceDelay);
       }
       std::scoped_lock const lock(mutex);
       if (auto * result = std::get_if<BuildResult>(&res)) {

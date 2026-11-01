@@ -10,7 +10,6 @@
 #include <map>
 #include <atomic>
 #include <chrono>
-#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -87,7 +86,7 @@ public:
         std::optional<sched::WorkerId> id; // under Dispatcher::mutex; reset when replaced
         // Set only by a verified WorkerSession credential, never by Hello.
         std::string verifiedPodId;
-        std::chrono::system_clock::time_point credentialExpiresAt{};
+        std::chrono::system_clock::time_point credentialExpiresAt;
     };
 
     // Throws on protocol violations; the caller closes the stream.

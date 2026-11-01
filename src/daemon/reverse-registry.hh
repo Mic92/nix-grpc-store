@@ -2,6 +2,7 @@
 // Exact-worker lookup for future worker-initiated data sessions. This is only
 // the lifetime/identity boundary; no RPC is routed through it yet.
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -32,6 +33,8 @@ public:
     };
     using Handle = std::shared_ptr<const Session>;
 
+    static constexpr size_t maxWorkerIdBytes = 128;
+
     // `peerId` must come from a verified *unique* worker credential, never
     // from RPC metadata or Hello. The chart's shared worker certificate is
     // insufficient; a pod-bound, tunnel-audience JWT is one possible source.
@@ -41,7 +44,7 @@ public:
         std::string sessionKey = {}, std::shared_ptr<ReverseTransport> transport = {})
         -> std::optional<Handle>
     {
-        if (peerId.empty() || peerId != workerId || workerId.size() > 128 || workerId.contains('\0') || !cancel) {
+        if (peerId.empty() || peerId != workerId || workerId.size() > maxWorkerIdBytes || workerId.contains('\0') || !cancel) {
             return std::nullopt;
         }
         Handle previous;
@@ -79,8 +82,8 @@ public:
         if (!active) {
             return {};
         }
-        auto it = sessions.find(std::string(workerId));
-        return it == sessions.end() ? Handle{} : it->second;
+        auto found = sessions.find(std::string(workerId));
+        return found == sessions.end() ? Handle{} : found->second;
     }
 
     [[nodiscard]] auto current(const Handle & handle) const -> bool
@@ -89,8 +92,8 @@ public:
             return false;
         }
         const std::scoped_lock lock(mutex);
-        auto it = sessions.find(handle->workerId);
-        return active && it != sessions.end() && it->second == handle;
+        auto found = sessions.find(handle->workerId);
+        return active && found != sessions.end() && found->second == handle;
     }
 
     // External disconnects cancel in-flight transport work. A stream owner
@@ -104,10 +107,10 @@ public:
         Handle removed;
         {
             const std::scoped_lock lock(mutex);
-            auto it = sessions.find(handle->workerId);
-            if (it != sessions.end() && it->second == handle) {
-                removed = std::move(it->second);
-                sessions.erase(it);
+            auto found = sessions.find(handle->workerId);
+            if (found != sessions.end() && found->second == handle) {
+                removed = std::move(found->second);
+                sessions.erase(found);
             }
         }
         if (removed) {
@@ -127,7 +130,7 @@ public:
             const std::scoped_lock lock(mutex);
             active = value;
             if (!value) {
-                for (auto & [id, session] : sessions) {
+                for (auto & [workerId, session] : sessions) {
                     previous.push_back(std::move(session));
                 }
                 sessions.clear();

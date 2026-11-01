@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <stop_token>
 #include <string>
@@ -25,6 +26,7 @@
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
 #include <nix/store/worker-protocol.hh>
+#include <nix/util/error.hh>
 #include <nix/util/logging.hh>
 #include <nix/util/repair-flag.hh>
 #include <nix/util/serialise.hh>
@@ -242,6 +244,7 @@ auto GrpcStore::addMultipleToStoreOnce(
     if (reverseAssignment) {
       auto writer = stub->UploadBuildInputs(&call.ctx(), &reply);
       struct AssignedWriter {
+        // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members): local adapter over the writer it outlives
         grpc::ClientWriter<remote::UploadBuildInputsChunk> & writer;
         auto Write(const remote::AddMultipleChunk & data) -> bool {
           remote::UploadBuildInputsChunk frame;
@@ -255,7 +258,9 @@ auto GrpcStore::addMultipleToStoreOnce(
         first.set_assign_id(reverseAssignment->second);
         first.mutable_chunk()->set_repair(repair == Repair);
         first.mutable_chunk()->set_check_sigs(checkSigs == CheckSigs);
-        if (!writer->Write(first)) throw Error("reverse upload closed before header");
+        if (!writer->Write(first)) {
+          throw Error("reverse upload closed before header");
+        }
         nixgrpc::ZstdWriterSink<AssignedWriter, remote::AddMultipleChunk> sink(assigned);
         sink << paths.size();
         size_t done = 0;
@@ -270,7 +275,9 @@ auto GrpcStore::addMultipleToStoreOnce(
         writer->WritesDone();
       } catch (...) {
         auto status = writer->Finish();
-        if (status.ok()) throw;
+        if (status.ok()) {
+          throw;
+        }
         return status;
       }
       return writer->Finish();

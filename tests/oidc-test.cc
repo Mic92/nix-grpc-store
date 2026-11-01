@@ -1,7 +1,6 @@
 // Signs tokens with fresh keys, serves the JWKS from a directory given on the
 // command line (python http.server in the wrapper) and checks the verifier.
 
-#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -9,10 +8,12 @@
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <openssl/bn.h>
@@ -32,13 +33,24 @@
 #include <nix/util/file-system.hh>
 
 #include <grpcpp/grpcpp.h>
+#include <grpcpp/security/credentials.h>
+#include <grpcpp/security/server_credentials.h>
+#include <grpcpp/support/status.h>
+#include <grpcpp/support/status_code_enum.h>
 #include <grpc/grpc.h>
+#include <grpc/grpc_security_constants.h>
 
 #include "acl.hh"
+#include "auth.hh"
 #include "coordinator.hh"
 #include "dispatcher.hh"
+#include "idle.hh"
 #include "metrics.hh"
+#include "nix_remote.grpc.pb.h"
+#include "nix_remote.pb.h"
+#include "reverse-capability.hh"
 #include "reverse-gateway.hh"
+#include "reverse-registry.hh"
 #include "reverse-relay.hh"
 #include "reverse-request.hh"
 #include "oidc.hh"
@@ -61,6 +73,13 @@ constexpr size_t ed25519Bytes = 32;
 constexpr unsigned rsaBits = 2048;
 constexpr int64_t validFor = 300;
 constexpr int64_t longAgo = 3600;
+constexpr std::chrono::seconds shortDeadline{5};
+constexpr std::chrono::seconds longDeadline{10};
+constexpr std::chrono::seconds expiryDeadline{15};
+constexpr std::chrono::milliseconds pollInterval{20};
+constexpr unsigned lengthPrefixBits = 32;
+constexpr unsigned byteBits = 8;
+constexpr size_t byteMask = 0xff;
 
 auto ossl(char *ptr) -> unsigned char * { return reinterpret_cast<unsigned char *>(ptr); }
 
@@ -242,33 +261,36 @@ class Checks
 
 class BuildRouteService final : public nix::remote::NixRemote::Service
 {
-    nixgrpc::ReverseGateway & gateway;
-    nixgrpc::Dispatcher & dispatcher;
+    nixgrpc::ReverseGateway * gateway;
+    nixgrpc::Dispatcher * dispatcher;
     nixgrpc::ReverseRelay relay;
 
 public:
+    // NOLINTBEGIN(*-non-private-member-variables-in-classes): the test drives
+    // these knobs directly between RPCs.
     std::string drvPath;
     uint64_t assignId = 0;
     std::string selectedPod;
     bool relayEnabled = false;
     bool buildRelayEnabled = false;
+    // NOLINTEND(*-non-private-member-variables-in-classes)
 
     BuildRouteService(nixgrpc::ReverseGateway & gateway, nixgrpc::ReverseRegistry & registry,
                       nixgrpc::Dispatcher & dispatcher)
-        : gateway(gateway), dispatcher(dispatcher), relay(gateway, registry) { }
+        : gateway(&gateway), dispatcher(&dispatcher), relay(gateway, registry) { }
 
     auto StoreInfo(grpc::ServerContext * context, const nix::remote::StoreInfoRequest * request,
                    nix::remote::StoreInfoReply * reply) -> grpc::Status override
     {
         if (relayEnabled) {
-            return relay.call(*context, [&](uint64_t id) {
-                return gateway.prepareBuild(*context,
-                    [this](std::string_view drv, uint64_t assign) { return dispatcher.assignmentPod(drv, assign); },
-                    id, drvPath, assignId, 0);
-            }, *request, [&](std::string_view data) { return reply->ParseFromArray(data.data(), static_cast<int>(data.size())); });
+            return relay.call(*context, [&](uint64_t streamId) -> nixgrpc::ReverseGateway::Result {
+                return gateway->prepareBuild(*context,
+                    [this](std::string_view drv, uint64_t assign) -> std::optional<std::string> { return dispatcher->assignmentPod(drv, assign); },
+                    streamId, drvPath, assignId, 0);
+            }, *request, [&](std::string_view data) -> bool { return reply->ParseFromArray(data.data(), static_cast<int>(data.size())); });
         }
-        auto result = gateway.prepareBuild(
-            *context, [this](std::string_view drv, uint64_t id) { return dispatcher.assignmentPod(drv, id); },
+        auto result = gateway->prepareBuild(
+            *context, [this](std::string_view drv, uint64_t assign) -> std::optional<std::string> { return dispatcher->assignmentPod(drv, assign); },
             1, drvPath, assignId, 0);
         selectedPod = result.prepared ? result.prepared->session->workerId : std::string{};
         return result.status;
@@ -277,20 +299,24 @@ public:
     auto BuildDerivation(grpc::ServerContext * context, const nix::remote::BuildDerivationRequest * request,
                          grpc::ServerWriter<nix::remote::BuildDerivationChunk> * writer) -> grpc::Status override
     {
-        if (!buildRelayEnabled) return {grpc::StatusCode::UNIMPLEMENTED, "test build relay disabled"};
+        if (!buildRelayEnabled) {
+            return {grpc::StatusCode::UNIMPLEMENTED, "test build relay disabled"};
+        }
         bool done = false;
-        auto status = relay.call(*context, [&](uint64_t id) {
-            return gateway.prepareBuild(*context,
-                [this](std::string_view drv, uint64_t assign) { return dispatcher.assignmentPod(drv, assign); },
-                id, request->drv_path(), request->assign_id(), request->build_mode());
-        }, *request, [&](std::string_view data) {
+        auto status = relay.call(*context, [&](uint64_t streamId) -> nixgrpc::ReverseGateway::Result {
+            return gateway->prepareBuild(*context,
+                [this](std::string_view drv, uint64_t assign) -> std::optional<std::string> { return dispatcher->assignmentPod(drv, assign); },
+                streamId, request->drv_path(), request->assign_id(), request->build_mode());
+        }, *request, [&](std::string_view data) -> bool {
             nix::remote::BuildDerivationChunk chunk;
             if (!chunk.ParseFromArray(data.data(), static_cast<int>(data.size())) || done ||
-                chunk.event_case() == nix::remote::BuildDerivationChunk::EVENT_NOT_SET) return false;
+                chunk.event_case() == nix::remote::BuildDerivationChunk::EVENT_NOT_SET) {
+                return false;
+            }
             done = chunk.has_done();
             return writer->Write(chunk);
-        }, [this, drv = request->drv_path(), assign = request->assign_id()] {
-            return dispatcher.podOwnsAssignment(dispatcher.assignmentPod(drv, assign).value_or(""), drv, assign);
+        }, [this, drv = request->drv_path(), assign = request->assign_id()] -> bool {
+            return dispatcher->podOwnsAssignment(dispatcher->assignmentPod(drv, assign).value_or(""), drv, assign);
         });
         return status.ok() && !done ? grpc::Status{grpc::StatusCode::DATA_LOSS, "missing build result"} : status;
     }
@@ -454,8 +480,8 @@ auto run(const std::string &dir, const std::string &base) -> int
         check(!verifier.verify("a.b.c.d").identity, "four parts");
         constexpr size_t huge = 100000;
         check(!verifier.verify(std::string(huge, 'a')).identity, "oversized");
-        check(!verifier.verify(ecKey.sign(claims({{"sub", 42}}))).identity,
-              "non-string sub"); // NOLINT(*-magic-numbers)
+        constexpr int nonStringSub = 42;
+        check(!verifier.verify(ecKey.sign(claims({{"sub", nonStringSub}}))).identity, "non-string sub");
     }
     {
         constexpr int64_t minute = 60;
@@ -504,56 +530,60 @@ auto run(const std::string &dir, const std::string &base) -> int
         check(controlBound && controlBound->workerId == workerId,
               "control-session identity derives pod UID from verified token alone");
         auto projectedAudience = tokenClaims(uid);
-        projectedAudience["aud"] = {"grpc://worker-tunnel"};
+        projectedAudience.at("aud") = {"grpc://worker-tunnel"};
         auto projected = binding.bind(ecKey.sign(projectedAudience), workerId);
         check(projected && projected->workerId == workerId, "Kubernetes audience array");
         check(!binding.bind(token, "pod:staging:other"), "claimed ID cannot override signed pod UID");
         check(!binding.bind(token, "pod:staging:12345678-1234-1234-1234-123456789abd"), "cannot claim another pod");
         auto replacement = tokenClaims("12345678-1234-1234-1234-123456789abd");
-        replacement["kubernetes.io"]["pod"]["name"] = "worker-pod-2";
-        auto const replacementId = "pod:staging:12345678-1234-1234-1234-123456789abd";
+        replacement.at("kubernetes.io").at("pod").at("name") = "worker-pod-2";
+        const auto *const replacementId = "pod:staging:12345678-1234-1234-1234-123456789abd";
         auto rotated = binding.bind(ecKey.sign(replacement), replacementId);
         check(rotated && rotated->workerId == replacementId, "new pod gets its own identity");
         check(!binding.bind(token, replacementId), "old token cannot claim replacement pod");
         auto otherAudience = tokenClaims(uid);
-        otherAudience["aud"] = "grpc://cache";
+        otherAudience.at("aud") = "grpc://cache";
         check(!binding.bind(ecKey.sign(otherAudience), workerId), "client audience cannot register worker");
         auto mixedAudience = tokenClaims(uid);
-        mixedAudience["aud"] = {"grpc://worker-tunnel", "grpc://cache"};
+        mixedAudience.at("aud") = {"grpc://worker-tunnel", "grpc://cache"};
         check(!binding.bind(ecKey.sign(mixedAudience), workerId), "multi-audience token cannot register worker");
         check(!binding.verify(ecKey.sign(mixedAudience)), "multi-audience token cannot bind control session");
         auto wrongNamespace = tokenClaims(uid);
-        wrongNamespace["kubernetes.io"]["namespace"] = "production";
+        wrongNamespace.at("kubernetes.io").at("namespace") = "production";
         check(!binding.bind(ecKey.sign(wrongNamespace), workerId), "namespace mismatch denied");
         auto wrongSa = tokenClaims(uid);
-        wrongSa["kubernetes.io"]["serviceaccount"]["name"] = "client";
+        wrongSa.at("kubernetes.io").at("serviceaccount").at("name") = "client";
         check(!binding.bind(ecKey.sign(wrongSa), workerId), "service account mismatch denied");
         auto noUid = tokenClaims(uid);
-        noUid["kubernetes.io"]["pod"].erase("uid");
+        noUid.at("kubernetes.io").at("pod").erase("uid");
         check(!binding.bind(ecKey.sign(noUid), workerId), "legacy unbound service account token denied");
         check(!binding.bind(ecKey.sign(tokenClaims("bad-uid")), workerId), "malformed pod UID denied");
         auto noPod = tokenClaims(uid);
-        noPod["kubernetes.io"].erase("pod");
+        noPod.at("kubernetes.io").erase("pod");
         check(!binding.bind(ecKey.sign(noPod), workerId), "missing pod identity denied");
         auto noSa = tokenClaims(uid);
-        noSa["kubernetes.io"].erase("serviceaccount");
+        noSa.at("kubernetes.io").erase("serviceaccount");
         check(!binding.bind(ecKey.sign(noSa), workerId), "missing service-account claim denied");
         auto expired = tokenClaims(uid);
-        expired["exp"] = now() - longAgo;
+        expired.at("exp") = now() - longAgo;
         check(!binding.bind(ecKey.sign(expired), workerId), "expired worker token denied");
         auto noIat = tokenClaims(uid);
         noIat.erase("iat");
         check(!binding.bind(ecKey.sign(noIat), workerId), "worker token without iat denied");
         auto longLived = tokenClaims(uid);
-        longLived["exp"] = now() + 3600;
+        constexpr int64_t hourLong = 3600;
+        longLived.at("exp") = now() + hourLong;
         check(!binding.bind(ecKey.sign(longLived), workerId), "hour-long worker token exceeds revocation window");
         auto backdated = tokenClaims(uid);
-        backdated["iat"] = now() - 3000;
-        backdated["exp"] = now() + 3000;
+        constexpr int64_t backdateBy = 3000;
+        backdated.at("iat") = now() - backdateBy;
+        backdated.at("exp") = now() + backdateBy;
         check(!binding.bind(ecKey.sign(backdated), workerId), "back-dated iat cannot hide a long lifetime");
         auto futureIat = tokenClaims(uid);
-        futureIat["iat"] = now() + 1200;
-        futureIat["exp"] = now() + 1500;
+        constexpr int64_t futureIatAhead = 1200;
+        constexpr int64_t futureExpAhead = 1500;
+        futureIat.at("iat") = now() + futureIatAhead;
+        futureIat.at("exp") = now() + futureExpAhead;
         check(!binding.bind(ecKey.sign(futureIat), workerId), "future-dated iat cannot extend the window");
         {
             nixgrpc::WorkerIdentity hourly(tunnelVerifier, "worker-tunnel", "staging", "worker",
@@ -561,7 +591,8 @@ auto run(const std::string &dir, const std::string &base) -> int
             check(hourly.bind(ecKey.sign(longLived), workerId).has_value(), "configured lifetime accepts hour token");
         }
         auto later = tokenClaims(uid);
-        later["exp"] = now() + validFor + 60;
+        constexpr int64_t renewExtension = 60;
+        later.at("exp") = now() + validFor + renewExtension;
         auto renewed = binding.renew(ecKey.sign(later), workerId);
         check(renewed && bound && *renewed > bound->expiresAt, "rotated token for same pod renews");
         check(!binding.renew(ecKey.sign(tokenClaims("12345678-1234-1234-1234-123456789abd")), workerId),
@@ -579,7 +610,7 @@ auto run(const std::string &dir, const std::string &base) -> int
         grpc::SslServerCredentialsOptions tls;
         tls.pem_root_certs = nix::readFile(dir + "/server.crt");
         tls.client_certificate_request = GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY;
-        tls.pem_key_cert_pairs.push_back({nix::readFile(dir + "/server.key"), nix::readFile(dir + "/server.crt")});
+        tls.pem_key_cert_pairs.push_back({.private_key = nix::readFile(dir + "/server.key"), .cert_chain = nix::readFile(dir + "/server.crt")});
         grpc::ServerBuilder builder;
         int port = 0;
         int insecurePort = 0;
@@ -615,8 +646,9 @@ auto run(const std::string &dir, const std::string &base) -> int
                   "pod token without TLS client certificate cannot register data session");
         }
         std::string lastAckKey;
+        // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): test helper, arguments named at each call.
         auto open = [&](grpc::ClientContext &ctx, const std::string &credential, const std::string &claim)
-        {
+        -> std::pair<std::unique_ptr<grpc::ClientReaderWriter<nix::remote::ReverseWorkerMsg, nix::remote::ReverseFarmMsg>>, unsigned long> {
             if (!credential.empty())
             {
                 ctx.AddMetadata("authorization", "Bearer " + credential);
@@ -627,7 +659,7 @@ auto run(const std::string &dir, const std::string &base) -> int
             hello.set_protocol(nixgrpc::reverseProtocolVersion);
             stream->Write(hello);
             nix::remote::ReverseFarmMsg ack;
-            bool accepted = stream->Read(&ack);
+            bool const accepted = stream->Read(&ack);
             lastAckKey = accepted ? ack.session_key() : std::string{};
             return std::pair{std::move(stream), accepted ? ack.generation() : uint64_t{0}};
         };
@@ -746,7 +778,8 @@ auto run(const std::string &dir, const std::string &base) -> int
             auto [stream, gen] = open(ctx, token, workerId);
             check(gen != 0, "registration before unknown stream response");
             nix::remote::ReverseWorkerMsg extra;
-            extra.set_stream_id(99);
+            constexpr uint64_t unreservedStream = 99;
+            extra.set_stream_id(unreservedStream);
             extra.mutable_data()->set_data("unsolicited result");
             stream->Write(extra);
             stream->WritesDone();
@@ -757,7 +790,7 @@ auto run(const std::string &dir, const std::string &base) -> int
             // Real bidirectional TLS transport, but not a client-facing RPC:
             // the test explicitly reserves the stream as a gateway would.
             grpc::ClientContext ctx;
-            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+            ctx.set_deadline(std::chrono::system_clock::now() + shortDeadline);
             auto [stream, gen] = open(ctx, token, workerId);
             auto session = registry.find(workerId);
             check(gen != 0 && session && session->transport, "live reverse transport attached to registration");
@@ -769,7 +802,9 @@ auto run(const std::string &dir, const std::string &base) -> int
                                     .kind = nixgrpc::Caller::Kind::named});
                 nix::remote::ReverseOpen start;
                 start.set_method("StoreInfo");
-                if (capability) start.set_capability(*capability);
+                if (capability) {
+                    start.set_capability(*capability);
+                }
                 check(capability && transport.responses.open(1) && transport.outgoing.open(1, std::move(start)) &&
                           transport.outgoing.data(1, "request") && transport.outgoing.halfClose(1),
                       "gateway queues one scoped request");
@@ -785,7 +820,9 @@ auto run(const std::string &dir, const std::string &base) -> int
                                     .kind = nixgrpc::Caller::Kind::named});
                 nix::remote::ReverseOpen secondStart;
                 secondStart.set_method("StoreInfo");
-                if (secondCapability) secondStart.set_capability(*secondCapability);
+                if (secondCapability) {
+                    secondStart.set_capability(*secondCapability);
+                }
                 check(secondCapability && transport.responses.open(2) &&
                           transport.outgoing.open(2, std::move(secondStart)) && transport.outgoing.halfClose(2),
                       "second client reserves independent stream");
@@ -825,7 +862,7 @@ auto run(const std::string &dir, const std::string &base) -> int
         // gRPC's Darwin teardown otherwise intermittently crashes at exit.
         {
             grpc::ClientContext firstCtx;
-            firstCtx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+            firstCtx.set_deadline(std::chrono::system_clock::now() + longDeadline);
             auto [firstStream, firstGen] = open(firstCtx, token, workerId);
             check(firstGen != 0 && registry.find(workerId) && registry.find(workerId)->generation == firstGen,
                   "registered exact worker");
@@ -837,7 +874,7 @@ auto run(const std::string &dir, const std::string &base) -> int
                 nixgrpc::Caller{.name = "read-client", .role = Role::readOnly, .kind = nixgrpc::Caller::Kind::named});
             check(firstCapability.has_value(), "leader can mint scoped capability for registered worker");
             grpc::ClientContext secondCtx;
-            secondCtx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+            secondCtx.set_deadline(std::chrono::system_clock::now() + longDeadline);
             auto [secondStream, secondGen] = open(secondCtx, token, workerId);
             check(secondGen > firstGen && registry.find(workerId) && registry.find(workerId)->generation == secondGen,
                   "reconnect displaces old session");
@@ -850,7 +887,7 @@ auto run(const std::string &dir, const std::string &base) -> int
                                                           workerId, secondGen, 1, "StoreInfo"),
                   "reconnect cannot reuse old caller capability");
             grpc::ClientContext otherCtx;
-            otherCtx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+            otherCtx.set_deadline(std::chrono::system_clock::now() + longDeadline);
             auto [otherStream, otherGen] = open(otherCtx, ecKey.sign(replacement), replacementId);
             check(otherGen != 0 && registry.find(replacementId) && registry.find(workerId),
                   "different pod registers independently");
@@ -865,9 +902,9 @@ auto run(const std::string &dir, const std::string &base) -> int
             registry.setActive(true);
             {
                 grpc::ClientContext ctx;
-                ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+                ctx.set_deadline(std::chrono::system_clock::now() + shortDeadline);
                 auto soon = tokenClaims(uid);
-                soon["exp"] = now() + 2;
+                soon.at("exp") = now() + 2;
                 auto [stream, gen] = open(ctx, ecKey.sign(soon), workerId);
                 check(gen != 0, "short-lived token registers");
                 nix::remote::ReverseFarmMsg ack;
@@ -877,9 +914,9 @@ auto run(const std::string &dir, const std::string &base) -> int
             }
             {
                 grpc::ClientContext ctx;
-                ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+                ctx.set_deadline(std::chrono::system_clock::now() + longDeadline);
                 auto soon = tokenClaims(uid);
-                soon["exp"] = now() + 2;
+                soon.at("exp") = now() + 2;
                 auto [stream, gen] = open(ctx, ecKey.sign(soon), workerId);
                 nix::remote::ReverseWorkerMsg rotated;
                 rotated.set_credential(ecKey.sign(tokenClaims(uid)));
@@ -897,7 +934,7 @@ auto run(const std::string &dir, const std::string &base) -> int
             }
             {
                 grpc::ClientContext ctx;
-                ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+                ctx.set_deadline(std::chrono::system_clock::now() + shortDeadline);
                 auto [stream, gen] = open(ctx, token, workerId);
                 nix::remote::ReverseWorkerMsg smuggled;
                 smuggled.set_stream_id(1);
@@ -928,8 +965,8 @@ auto run(const std::string &dir, const std::string &base) -> int
         controlRegistry.setActive(true);
         nixgrpc::ReverseGateway gateway(
             controlAuth, controlRegistry,
-            [&dispatcher](std::string_view pod, std::string_view drv, uint64_t id) {
-                return dispatcher.podOwnsAssignment(pod, drv, id);
+            [&dispatcher](std::string_view pod, std::string_view drv, uint64_t assign) -> bool {
+                return dispatcher.podOwnsAssignment(pod, drv, assign);
             });
         nixgrpc::IdleTracker idle;
         nixgrpc::SchedulerService control(dispatcher, controlAuth, idle);
@@ -939,8 +976,8 @@ auto run(const std::string &dir, const std::string &base) -> int
         grpc::SslServerCredentialsOptions controlTls;
         controlTls.pem_root_certs = nix::readFile(dir + "/server.crt");
         controlTls.client_certificate_request = GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
-        controlTls.pem_key_cert_pairs.push_back({nix::readFile(dir + "/server.key"),
-                                                 nix::readFile(dir + "/server.crt")});
+        controlTls.pem_key_cert_pairs.push_back({.private_key = nix::readFile(dir + "/server.key"),
+                                                 .cert_chain=nix::readFile(dir + "/server.crt")});
         grpc::ServerBuilder controlBuilder;
         int controlPort = 0;
         controlBuilder.AddListeningPort("127.0.0.1:0", grpc::SslServerCredentials(controlTls), &controlPort);
@@ -949,7 +986,9 @@ auto run(const std::string &dir, const std::string &base) -> int
         controlBuilder.RegisterService(&buildRoute);
         auto controlServer = controlBuilder.BuildAndStart();
         check(controlServer && controlPort > 0, "production scheduler TLS control server started");
-        if (!controlServer) return check.result();
+        if (!controlServer) {
+            return check.result();
+        }
         grpc::SslCredentialsOptions clientTls;
         clientTls.pem_root_certs = nix::readFile(dir + "/server.crt");
         clientTls.pem_private_key = nix::readFile(dir + "/server.key");
@@ -960,7 +999,8 @@ auto run(const std::string &dir, const std::string &base) -> int
         auto routeStub = nix::remote::NixRemote::NewStub(controlChannel);
         auto noCertChannel = grpc::CreateChannel("localhost:" + std::to_string(controlPort), grpc::SslCredentials(roots));
         auto noCertStub = nix::remote::Scheduler::NewStub(noCertChannel);
-        auto sendHello = [&](grpc::ClientContext &ctx, std::string_view claim, std::string_view addr) {
+        // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): test helper, arguments named at each call.
+        auto sendHello = [&](grpc::ClientContext &ctx, std::string_view claim, std::string_view addr) -> std::unique_ptr< ::grpc::ClientReaderWriter< ::nix::remote::WorkerMsgs, ::nix::remote::SchedCmds>> {
             auto stream = controlStub->WorkerSession(&ctx);
             nix::remote::WorkerMsgs messages;
             auto *hello = messages.add_msgs()->mutable_hello();
@@ -1030,10 +1070,10 @@ auto run(const std::string &dir, const std::string &base) -> int
             // Existing direct workers remain schedulable; no pod route can
             // result from their TLS certificate alone.
             grpc::ClientContext ctx;
-            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+            ctx.set_deadline(std::chrono::system_clock::now() + longDeadline);
             constexpr std::string_view directAddr = "127.0.0.2:50051";
             auto stream = sendHello(ctx, {}, directAddr);
-            auto client = dispatcher.connectClient([](const nix::remote::SchedMsg &) { return true; }, [] {});
+            auto client = dispatcher.connectClient([](const nix::remote::SchedMsg &) -> bool { return true; }, [] -> void {});
             nix::remote::ClientMsgs want;
             auto * request = want.add_msgs()->mutable_want();
             request->set_drv_path("/nix/store/test-direct-route.drv");
@@ -1043,9 +1083,9 @@ auto run(const std::string &dir, const std::string &base) -> int
             check(stream->Read(&commands) && commands.msgs_size() == 1 && commands.msgs(0).has_expect(),
                   "direct worker still receives a scheduler Expect");
             if (commands.msgs_size() == 1 && commands.msgs(0).has_expect()) {
-                auto const id = commands.msgs(0).expect().assign_id();
-                check(dispatcher.assignmentWorker(request->drv_path(), id) == directAddr &&
-                          !dispatcher.assignmentPod(request->drv_path(), id),
+                auto const assignedId = commands.msgs(0).expect().assign_id();
+                check(dispatcher.assignmentWorker(request->drv_path(), assignedId) == directAddr &&
+                          !dispatcher.assignmentPod(request->drv_path(), assignedId),
                       "direct worker assignment has no reverse pod route");
             }
             dispatcher.clientGone(client);
@@ -1071,13 +1111,13 @@ auto run(const std::string &dir, const std::string &base) -> int
                       dispatcher.membership()->empty(),
                   "control Hello without reverse protocol is refused explicitly");
         }
-        auto reauth = [](std::string tokenValue) {
+        auto reauth = [](std::string tokenValue) -> nix::remote::WorkerMsgs {
             nix::remote::WorkerMsgs messages;
             messages.add_msgs()->mutable_reauth()->set_token(std::move(tokenValue));
             return messages;
         };
         // Pod-bound workers are never EDS endpoints; count them directly.
-        auto memberCount = [&] { return dispatcher.podConnected(workerId) ? size_t{1} : size_t{0}; };
+        auto memberCount = [&] -> size_t { return dispatcher.podConnected(workerId) ? size_t{1} : size_t{0}; };
         {
             grpc::ClientContext ctx;
             ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
@@ -1089,9 +1129,9 @@ auto run(const std::string &dir, const std::string &base) -> int
         }
         {
             grpc::ClientContext ctx;
-            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(15));
+            ctx.set_deadline(std::chrono::system_clock::now() + expiryDeadline);
             auto soon = tokenClaims(uid);
-            soon["exp"] = now() + 2;
+            soon.at("exp") = now() + 2;
             ctx.AddMetadata("authorization", "Bearer " + ecKey.sign(soon));
             auto stream = sendHello(ctx, workerId, "127.0.0.4:50051");
             check(stream->Write(reauth(ecKey.sign(tokenClaims(uid)))), "rotated token sent on control session");
@@ -1106,14 +1146,14 @@ auto run(const std::string &dir, const std::string &base) -> int
         }
         {
             grpc::ClientContext ctx;
-            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(15));
+            ctx.set_deadline(std::chrono::system_clock::now() + expiryDeadline);
             auto soon = tokenClaims(uid);
-            soon["exp"] = now() + 2;
+            soon.at("exp") = now() + 2;
             ctx.AddMetadata("authorization", "Bearer " + ecKey.sign(soon));
             auto stream = sendHello(ctx, workerId, "127.0.0.5:50051");
             auto const joined = std::chrono::steady_clock::now() + std::chrono::seconds(2);
             while (memberCount() == 0 && std::chrono::steady_clock::now() < joined) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                std::this_thread::sleep_for(pollInterval);
             }
             check(memberCount() == 1, "short-lived control session joins");
             std::this_thread::sleep_for(std::chrono::seconds(3));
@@ -1125,11 +1165,11 @@ auto run(const std::string &dir, const std::string &base) -> int
         }
         {
             grpc::ClientContext ctx;
-            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+            ctx.set_deadline(std::chrono::system_clock::now() + longDeadline);
             ctx.AddMetadata("authorization", "Bearer " + token);
             auto stream = sendHello(ctx, workerId, controlAddr);
             grpc::ClientContext dataCtx;
-            dataCtx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+            dataCtx.set_deadline(std::chrono::system_clock::now() + longDeadline);
             dataCtx.AddMetadata("authorization", "Bearer " + token);
             auto dataStream = dataStub->Register(&dataCtx);
             nix::remote::ReverseWorkerMsg registration;
@@ -1144,13 +1184,13 @@ auto run(const std::string &dir, const std::string &base) -> int
             // Wait for Hello processing via an ordinary client Want, which
             // yields Expect only after the worker joins the scheduler.
             std::string selected;
-            auto client = dispatcher.connectClient([&](const nix::remote::SchedMsg &msg) {
+            auto client = dispatcher.connectClient([&](const nix::remote::SchedMsg &msg) -> bool {
                 if (msg.has_assigned()) {
                     selected = msg.assigned().worker_addr();
                     check(msg.assigned().reverse(), "pod-bound assignment selects scheduler reverse route");
                 }
                 return true;
-            }, [] {});
+            }, [] -> void {});
             nix::remote::ClientMsgs want;
             auto * request = want.add_msgs()->mutable_want();
             request->set_drv_path("/nix/store/test-control-route.drv");
@@ -1162,36 +1202,40 @@ auto run(const std::string &dir, const std::string &base) -> int
             check(stream->Read(&commands) && commands.msgs_size() == 1 && commands.msgs(0).has_expect(),
                   "verified control stream receives a real Expect");
             if (commands.msgs_size() == 1 && commands.msgs(0).has_expect()) {
-                auto const id = commands.msgs(0).expect().assign_id();
-                auto const assignedPod = dispatcher.assignmentPod(request->drv_path(), id);
+                auto const assignedId = commands.msgs(0).expect().assign_id();
+                auto const assignedPod = dispatcher.assignmentPod(request->drv_path(), assignedId);
                 check(selected == controlAddr && assignedPod == workerId &&
-                          dispatcher.podOwnsAssignment(workerId, request->drv_path(), id),
+                          dispatcher.podOwnsAssignment(workerId, request->drv_path(), assignedId),
                       "production TLS control stream binds live assignment to signed pod UID");
                 check(controlRegistry.current(controlRegistry.find(workerId)) &&
-                          dispatcher.assignmentPod(request->drv_path(), id) == controlRegistry.find(workerId)->workerId,
+                          dispatcher.assignmentPod(request->drv_path(), assignedId) == controlRegistry.find(workerId)->workerId,
                       "live assignment and data registration resolve to the same verified pod");
                 buildRoute.drvPath = request->drv_path();
-                buildRoute.assignId = id;
+                buildRoute.assignId = assignedId;
                 grpc::ClientContext routeCtx;
                 routeCtx.AddMetadata("x-nix-worker", replacementId);
-                nix::remote::StoreInfoRequest routeReq;
+                nix::remote::StoreInfoRequest const routeReq;
                 nix::remote::StoreInfoReply routeReply;
                 check(routeStub->StoreInfo(&routeCtx, routeReq, &routeReply).ok() && buildRoute.selectedPod == workerId,
                       "authenticated build route ignores forged client worker metadata");
                 buildRoute.relayEnabled = true;
-                std::jthread responder([&] {
+                std::jthread responder([&] -> void {
                     nix::remote::ReverseFarmMsg requestFrame;
                     check(dataStream->Read(&requestFrame) && requestFrame.has_open() &&
                               requestFrame.open().method() == "BuildDerivation" && requestFrame.stream_id() != 0,
                           "client RPC opens scoped frame on selected TLS registration");
                     auto const streamId = requestFrame.stream_id();
                     auto selected = controlRegistry.find(workerId);
-                    if (!selected) return;
+                    if (!selected) {
+                        return;
+                    }
                     nixgrpc::ReverseRequest incoming(workerId, selected->generation, selected->sessionKey);
                     check(incoming.accept(requestFrame), "worker validates scoped open on TLS registration");
                     while (dataStream->Read(&requestFrame) && requestFrame.stream_id() == streamId) {
                         check(incoming.accept(requestFrame), "worker accepts bounded reverse request frame");
-                        if (requestFrame.half_close()) break;
+                        if (requestFrame.half_close()) {
+                            break;
+                        }
                     }
                     auto ready = incoming.takeReady();
                     nix::remote::StoreInfoRequest parsedRequest;
@@ -1205,7 +1249,9 @@ auto run(const std::string &dir, const std::string &base) -> int
                     nix::remote::ReverseWorkerMsg answer;
                     answer.set_stream_id(streamId);
                     std::string encoded;
-                    for (unsigned shift = 0; shift != 32; shift += 8) encoded.push_back(static_cast<char>((payload.size() >> shift) & 0xff));
+                    for (unsigned shift = 0; shift != lengthPrefixBits; shift += byteBits) {
+                        encoded.push_back(static_cast<char>((payload.size() >> shift) & byteMask));
+                    }
                     encoded += payload;
                     answer.mutable_data()->set_data(encoded);
                     check(dataStream->Write(answer), "worker sends encoded reverse response");
@@ -1214,24 +1260,30 @@ auto run(const std::string &dir, const std::string &base) -> int
                     check(incoming.finished(streamId), "worker releases completed reverse stream");
                 });
                 grpc::ClientContext relayCtx;
-                relayCtx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+                relayCtx.set_deadline(std::chrono::system_clock::now() + shortDeadline);
                 relayCtx.AddMetadata("x-nix-worker", replacementId);
                 check(routeStub->StoreInfo(&relayCtx, routeReq, &routeReply).ok() && routeReply.trusted(),
                       "authenticated client RPC receives reverse response despite forged worker metadata");
                 responder.join();
                 buildRoute.relayEnabled = false;
                 buildRoute.buildRelayEnabled = true;
-                std::jthread buildResponder([&] {
+                std::jthread buildResponder([&] -> void {
                     nix::remote::ReverseFarmMsg frame;
-                    if (!dataStream->Read(&frame)) return;
+                    if (!dataStream->Read(&frame)) {
+                        return;
+                    }
                     auto selected = controlRegistry.find(workerId);
-                    if (!selected) return;
+                    if (!selected) {
+                        return;
+                    }
                     nixgrpc::ReverseRequest incoming(workerId, selected->generation, selected->sessionKey);
                     check(frame.has_open() && incoming.accept(frame), "build RPC opens verified worker stream");
                     auto const streamId = frame.stream_id();
                     while (dataStream->Read(&frame) && frame.stream_id() == streamId) {
                         check(incoming.accept(frame), "worker accepts bounded build request");
-                        if (frame.half_close()) break;
+                        if (frame.half_close()) {
+                            break;
+                        }
                     }
                     auto ready = incoming.takeReady();
                     nix::remote::BuildDerivationRequest parsed;
@@ -1243,7 +1295,9 @@ auto run(const std::string &dir, const std::string &base) -> int
                     result.mutable_done()->set_result("simulated-result");
                     auto const payload = result.SerializeAsString();
                     std::string encoded;
-                    for (unsigned shift = 0; shift != 32; shift += 8) encoded.push_back(static_cast<char>((payload.size() >> shift) & 0xff));
+                    for (unsigned shift = 0; shift != lengthPrefixBits; shift += byteBits) {
+                        encoded.push_back(static_cast<char>((payload.size() >> shift) & byteMask));
+                    }
                     encoded += payload;
                     nix::remote::ReverseWorkerMsg answer;
                     answer.set_stream_id(streamId);
@@ -1254,7 +1308,7 @@ auto run(const std::string &dir, const std::string &base) -> int
                     check(incoming.finished(streamId), "worker releases completed build stream");
                 });
                 grpc::ClientContext buildCtx;
-                buildCtx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+                buildCtx.set_deadline(std::chrono::system_clock::now() + shortDeadline);
                 buildCtx.AddMetadata("x-nix-worker", replacementId);
                 nix::remote::BuildDerivationRequest buildRequest;
                 buildRequest.set_drv_path(buildRoute.drvPath);
@@ -1266,26 +1320,26 @@ auto run(const std::string &dir, const std::string &base) -> int
                       "authenticated build RPC streams response from exact signed pod despite forged header");
                 buildResponder.join();
                 buildRoute.buildRelayEnabled = false;
-                check(!dispatcher.podOwnsAssignment(replacementId, request->drv_path(), id),
+                check(!dispatcher.podOwnsAssignment(replacementId, request->drv_path(), assignedId),
                       "another signed pod cannot own this assignment");
                 // The data registration may be replaced while the control
                 // assignment remains live. The old handle must fail closed.
                 auto firstData = controlRegistry.find(workerId);
                 grpc::ClientContext replacementCtx;
-                replacementCtx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+                replacementCtx.set_deadline(std::chrono::system_clock::now() + longDeadline);
                 replacementCtx.AddMetadata("authorization", "Bearer " + token);
                 auto replacementStream = dataStub->Register(&replacementCtx);
                 check(replacementStream->Write(registration), "same pod reconnects data registration");
                 nix::remote::ReverseFarmMsg replacementAck;
                 check(replacementStream->Read(&replacementAck) && replacementAck.generation() > ack.generation() &&
                           !controlRegistry.current(firstData) && controlRegistry.current(controlRegistry.find(workerId)) &&
-                          dispatcher.podOwnsAssignment(workerId, request->drv_path(), id),
+                          dispatcher.podOwnsAssignment(workerId, request->drv_path(), assignedId),
                       "replacing data generation fences old handle without stealing control assignment");
                 dataStream->Finish();
                 replacementStream->WritesDone();
                 check(replacementStream->Finish().ok() && !controlRegistry.find(workerId),
                       "last data registration closes without a fallback route");
-                check(dispatcher.podOwnsAssignment(workerId, request->drv_path(), id),
+                check(dispatcher.podOwnsAssignment(workerId, request->drv_path(), assignedId),
                       "control assignment alone remains live after data disconnect");
                 grpc::ClientContext missingData;
                 check(routeStub->StoreInfo(&missingData, routeReq, &routeReply).error_code() ==
@@ -1294,7 +1348,7 @@ auto run(const std::string &dir, const std::string &base) -> int
             }
             dispatcher.clientGone(client);
             grpc::ClientContext cancelledBuild;
-            nix::remote::StoreInfoRequest cancelledReq;
+            nix::remote::StoreInfoRequest const cancelledReq;
             nix::remote::StoreInfoReply cancelledReply;
             check(routeStub->StoreInfo(&cancelledBuild, cancelledReq, &cancelledReply).error_code() ==
                       grpc::StatusCode::FAILED_PRECONDITION,
@@ -1308,7 +1362,9 @@ auto run(const std::string &dir, const std::string &base) -> int
             nix::remote::SchedCmds remaining;
             while (stream->Read(&remaining)) { }
             auto status = stream->Finish();
-            if (!status.ok()) std::cerr << "control Finish: " << status.error_message() << "\n";
+            if (!status.ok()) {
+                std::cerr << "control Finish: " << status.error_message() << "\n";
+            }
             check(status.ok(), "verified TLS control stream ends normally");
         }
         controlStub.reset();

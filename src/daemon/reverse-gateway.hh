@@ -60,9 +60,9 @@ class ReverseGateway
         // empty ACL; reverse delegation deliberately requires an identity.
         if (caller.kind != Caller::Kind::named)
         {
-            return {{grpc::StatusCode::UNAUTHENTICATED, "reverse calls require an authenticated client"}, {}};
+            return {.status = {grpc::StatusCode::UNAUTHENTICATED, "reverse calls require an authenticated client"}, .prepared = {}};
         }
-        Role minRole;
+        Role minRole = Role::readOnly;
         if (method == "Connect")
         {
             minRole = Role::trusted;
@@ -78,49 +78,49 @@ class ReverseGateway
         }
         else
         {
-            return {{grpc::StatusCode::UNIMPLEMENTED, "unknown reverse method"}, {}};
+            return {.status = {grpc::StatusCode::UNIMPLEMENTED, "unknown reverse method"}, .prepared = {}};
         }
         if (auto const status = Auth::authorize(caller, method, minRole, buildMode); !status.ok())
         {
-            return {status, {}};
+            return {.status = status, .prepared = {}};
         }
         if (method == "BuildDerivation" || method == "UploadBuildInputs")
         {
             if (method == "UploadBuildInputs" && buildMode != 0)
             {
-                return {{grpc::StatusCode::INVALID_ARGUMENT, "upload does not accept a build mode"}, {}};
+                return {.status = {grpc::StatusCode::INVALID_ARGUMENT, "upload does not accept a build mode"}, .prepared = {}};
             }
             if (buildMode > static_cast<uint32_t>(nix::bmCheck))
             {
-                return {{grpc::StatusCode::INVALID_ARGUMENT, "unsupported build mode"}, {}};
+                return {.status = {grpc::StatusCode::INVALID_ARGUMENT, "unsupported build mode"}, .prepared = {}};
             }
             if (!assignment || drvPath.empty() || assignId == 0 || !assignment(selectedWorker, drvPath, assignId))
             {
-                return {{grpc::StatusCode::FAILED_PRECONDITION, "no matching live assignment"}, {}};
+                return {.status = {grpc::StatusCode::FAILED_PRECONDITION, "no matching live assignment"}, .prepared = {}};
             }
         }
         else if (!drvPath.empty() || assignId != 0 || buildMode != 0)
         {
-            return {{grpc::StatusCode::INVALID_ARGUMENT, "unexpected build assignment"}, {}};
+            return {.status = {grpc::StatusCode::INVALID_ARGUMENT, "unexpected build assignment"}, .prepared = {}};
         }
         auto session = registry.find(selectedWorker);
         if (!registry.current(session) || !session->transport || session->sessionKey.size() != ReverseCapability::keyBytes)
         {
-            return {{grpc::StatusCode::UNAVAILABLE, "selected worker session unavailable"}, {}};
+            return {.status = {grpc::StatusCode::UNAVAILABLE, "selected worker session unavailable"}, .prepared = {}};
         }
         auto token = ReverseCapability::mint(session->sessionKey, session->workerId, session->generation, streamId,
                                              method, caller, drvPath, assignId, buildMode);
         if (!token || !registry.current(session))
         {
-            return {{grpc::StatusCode::UNAVAILABLE, "selected worker session changed"}, {}};
+            return {.status = {grpc::StatusCode::UNAVAILABLE, "selected worker session changed"}, .prepared = {}};
         }
         nix::remote::ReverseOpen open;
         open.set_method(method);
         open.set_capability(std::move(*token));
         // Still a snapshot. Before enqueueing an eventual RPC, check
         // registry.current(session) again and fence the transport on revoke.
-        return {grpc::Status::OK, Prepared{std::move(session), std::move(open),
-                                            std::string(drvPath), assignId}};
+        return {.status = grpc::Status::OK, .prepared = Prepared{.session = std::move(session), .open = std::move(open),
+                                            .drvPath = std::string(drvPath), .assignId = assignId}};
     }
 
     // Reserve the response before sending the open. The caller must choose a
@@ -182,24 +182,24 @@ class ReverseGateway
         auto const caller = auth.identify(context);
         if (caller.kind != Caller::Kind::named)
         {
-            return {{grpc::StatusCode::UNAUTHENTICATED, "reverse calls require an authenticated client"}, {}};
+            return {.status = {grpc::StatusCode::UNAUTHENTICATED, "reverse calls require an authenticated client"}, .prepared = {}};
         }
         if (auto const status = Auth::authorize(caller, "BuildDerivation", Role::write, buildMode); !status.ok())
         {
-            return {status, {}};
+            return {.status = status, .prepared = {}};
         }
         if (buildMode > static_cast<uint32_t>(nix::bmCheck))
         {
-            return {{grpc::StatusCode::INVALID_ARGUMENT, "unsupported build mode"}, {}};
+            return {.status = {grpc::StatusCode::INVALID_ARGUMENT, "unsupported build mode"}, .prepared = {}};
         }
         if (!resolve || drvPath.empty() || assignId == 0)
         {
-            return {{grpc::StatusCode::FAILED_PRECONDITION, "no scheduler-owned build route"}, {}};
+            return {.status = {grpc::StatusCode::FAILED_PRECONDITION, "no scheduler-owned build route"}, .prepared = {}};
         }
         auto pod = resolve(drvPath, assignId);
         if (!pod || pod->empty())
         {
-            return {{grpc::StatusCode::FAILED_PRECONDITION, "no live pod-bound build assignment"}, {}};
+            return {.status = {grpc::StatusCode::FAILED_PRECONDITION, "no live pod-bound build assignment"}, .prepared = {}};
         }
         return prepare(context, *pod, streamId, "BuildDerivation", drvPath, assignId, buildMode);
     }
@@ -211,26 +211,28 @@ class ReverseGateway
         auto const caller = auth.identify(context);
         if (caller.kind != Caller::Kind::named)
         {
-            return {{grpc::StatusCode::UNAUTHENTICATED, "reverse calls require an authenticated client"}, {}};
+            return {.status = {grpc::StatusCode::UNAUTHENTICATED, "reverse calls require an authenticated client"}, .prepared = {}};
         }
         if (auto const status = Auth::authorize(caller, "UploadBuildInputs", Role::write); !status.ok())
         {
-            return {status, {}};
+            return {.status = status, .prepared = {}};
         }
         if (!resolve || drvPath.empty() || assignId == 0)
         {
-            return {{grpc::StatusCode::FAILED_PRECONDITION, "no scheduler-owned upload route"}, {}};
+            return {.status = {grpc::StatusCode::FAILED_PRECONDITION, "no scheduler-owned upload route"}, .prepared = {}};
         }
         auto pod = resolve(drvPath, assignId);
         if (!pod || pod->empty())
         {
-            return {{grpc::StatusCode::FAILED_PRECONDITION, "no live pod-bound upload assignment"}, {}};
+            return {.status = {grpc::StatusCode::FAILED_PRECONDITION, "no live pod-bound upload assignment"}, .prepared = {}};
         }
         return prepare(context, *pod, streamId, "UploadBuildInputs", drvPath, assignId);
     }
 
   private:
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members): non-owning; the daemon outlives the gateway.
     Auth &auth;
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members): non-owning; the daemon outlives the gateway.
     ReverseRegistry &registry;
     Assignment assignment;
 };

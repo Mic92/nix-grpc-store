@@ -19,7 +19,7 @@ namespace nixgrpc {
 class ReverseUpload
 {
 public:
-    static constexpr size_t maxChunkBytes = 1024 * 1024;
+    static constexpr size_t maxChunkBytes = size_t{1024} * 1024;
 
     [[nodiscard]] static auto first(const ReverseCapability::Verified & delegated,
                                     const nix::remote::UploadBuildInputsChunk & frame) -> bool
@@ -46,24 +46,30 @@ public:
 
         [[nodiscard]] auto feed(std::string_view bytes, const Consume & consume) -> bool
         {
-            if (failed || bytes.empty() || !consume) return fail();
+            if (failed || bytes.empty() || !consume) {
+                return fail();
+            }
             while (!bytes.empty()) {
                 auto const target = expected ? static_cast<size_t>(*expected) + 4 : 4;
                 auto const count = std::min(bytes.size(), target - buffer.size());
-                buffer.append(bytes.data(), count);
+                buffer.append(bytes.substr(0, count));
                 bytes.remove_prefix(count);
                 if (!expected && buffer.size() == 4) {
                     uint32_t length = 0;
-                    for (unsigned i = 0; i < 4; ++i)
-                        length |= static_cast<uint32_t>(static_cast<unsigned char>(buffer[i])) << (8 * i);
-                    if (length == 0 || length > maxChunkBytes) return fail();
+                    for (unsigned i = 0; i < 4; ++i) {
+                        length |= static_cast<uint32_t>(static_cast<unsigned char>(buffer.at(i))) << (bitsPerByte * i);
+                    }
+                    if (length == 0 || length > maxChunkBytes) {
+                        return fail();
+                    }
                     expected = length;
                 }
                 if (expected && buffer.size() == *expected + 4) {
                     nix::remote::UploadBuildInputsChunk frame;
-                    if (!frame.ParseFromArray(buffer.data() + 4, static_cast<int>(*expected))
-                        || !(seenFirst ? next(frame) : first(delegated, frame)) || !consume(std::move(frame)))
+                    if (!frame.ParseFromArray(&buffer.at(4), static_cast<int>(*expected))
+                        || !(seenFirst ? next(frame) : first(delegated, frame)) || !consume(std::move(frame))) {
                         return fail();
+                    }
                     seenFirst = true;
                     expected.reset();
                     buffer.clear();
@@ -75,6 +81,8 @@ public:
         [[nodiscard]] auto complete() const -> bool { return !failed && seenFirst && buffer.empty() && !expected; }
 
     private:
+        static constexpr unsigned bitsPerByte = 8;
+
         [[nodiscard]] auto fail() -> bool { failed = true; buffer.clear(); expected.reset(); return false; }
         ReverseCapability::Verified delegated;
         std::string buffer;

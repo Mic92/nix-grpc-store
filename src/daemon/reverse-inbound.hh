@@ -40,6 +40,7 @@ class ReverseInbound
     // Called serially by the single worker stream reader. The caller may
     // hand a validated event to a bounded dispatcher, but must never treat
     // an open as a complete RPC: it must validate the decoded request too.
+    // NOLINTNEXTLINE(readability-function-cognitive-complexity): one cohesive per-frame state machine.
     [[nodiscard]] auto accept(const nix::remote::ReverseFarmMsg &frame) -> std::optional<Event>
     {
         if (closed || frame.generation() != 0 || !frame.session_key().empty() || frame.stream_id() == 0)
@@ -47,55 +48,57 @@ class ReverseInbound
             rejection = closed ? "session closed" : "bad frame header";
             return std::nullopt;
         }
-        auto const id = frame.stream_id();
+        auto const streamId = frame.stream_id();
         if (frame.has_open())
         {
-            if (id <= lastId || streams.size() >= ReverseFrames::maxStreams)
+            if (streamId <= lastId || streams.size() >= ReverseFrames::maxStreams)
             {
-                rejection = id <= lastId ? "stream id not increasing" : "too many streams";
+                rejection = streamId <= lastId ? "stream id not increasing" : "too many streams";
                 return std::nullopt;
             }
-            auto caller = ReverseCapability::authorizeOpen(sessionKey, frame.open(), workerId, generation, id);
+            auto caller = ReverseCapability::authorizeOpen(sessionKey, frame.open(), workerId, generation, streamId);
             if (!caller)
             {
                 rejection = "capability rejected";
                 return std::nullopt;
             }
-            streams.emplace(id, false);
-            lastId = id;
-            return Event{.kind = Event::Kind::open, .streamId = id, .caller = std::move(caller)};
+            streams.emplace(streamId, false);
+            lastId = streamId;
+            return Event{.kind = Event::Kind::open, .streamId = streamId, .caller = std::move(caller)};
         }
-        auto it = streams.find(id);
-        if (it == streams.end())
+        auto stream = streams.find(streamId);
+        if (stream == streams.end())
         {
             // A cancel can arrive after the final response crossed the wire.
             // Discard it once, without opening another stream or accepting data.
             if (frame.frame_case() == nix::remote::ReverseFarmMsg::kCancel && frame.cancel()
-                && finishedIds.erase(id))
-                return Event{.kind = Event::Kind::cancel, .streamId = id};
+                && (finishedIds.erase(streamId) != 0U))
+            {
+                return Event{.kind = Event::Kind::cancel, .streamId = streamId};
+            }
             rejection = "unknown stream";
             return std::nullopt;
         }
         if (frame.has_data())
         {
-            if (it->second || frame.data().data().empty() || frame.data().data().size() > ReverseFrames::maxFrameBytes)
+            if (stream->second || frame.data().data().empty() || frame.data().data().size() > ReverseFrames::maxFrameBytes)
             {
                 rejection = "bad data frame";
                 return std::nullopt;
             }
-            return Event{.kind = Event::Kind::data, .streamId = id};
+            return Event{.kind = Event::Kind::data, .streamId = streamId};
         }
-        if (frame.frame_case() == nix::remote::ReverseFarmMsg::kHalfClose && frame.half_close() && !it->second)
+        if (frame.frame_case() == nix::remote::ReverseFarmMsg::kHalfClose && frame.half_close() && !stream->second)
         {
-            it->second = true;
-            return Event{.kind = Event::Kind::halfClose, .streamId = id};
+            stream->second = true;
+            return Event{.kind = Event::Kind::halfClose, .streamId = streamId};
         }
         if (frame.frame_case() == nix::remote::ReverseFarmMsg::kCancel && frame.cancel())
         {
             if (cancelledIds.size() >= maxCancelled) { closed = true; rejection = "too many cancels"; return std::nullopt; }
-            streams.erase(it);
-            cancelledIds.insert(id);
-            return Event{.kind = Event::Kind::cancel, .streamId = id};
+            streams.erase(stream);
+            cancelledIds.insert(streamId);
+            return Event{.kind = Event::Kind::cancel, .streamId = streamId};
         }
         rejection = "unexpected frame";
         return std::nullopt;
@@ -106,16 +109,22 @@ class ReverseInbound
 
     // Called after response status was sent. A late frame cannot revive a
     // finished stream or use the same ID for a different caller.
-    auto finished(uint64_t id) -> bool
+    auto finished(uint64_t streamId) -> bool
     {
-        if (cancelledIds.erase(id)) return true;
-        if (!streams.erase(id)) return false;
+        if (cancelledIds.erase(streamId) != 0U)
+        {
+            return true;
+        }
+        if (streams.erase(streamId) == 0U)
+        {
+            return false;
+        }
         if (finishedOrder.size() == maxFinished) {
             finishedIds.erase(finishedOrder.front());
             finishedOrder.pop_front();
         }
-        finishedIds.insert(id);
-        finishedOrder.push_back(id);
+        finishedIds.insert(streamId);
+        finishedOrder.push_back(streamId);
         return true;
     }
 

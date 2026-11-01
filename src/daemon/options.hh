@@ -18,6 +18,11 @@
 
 namespace nixgrpc {
 
+// Kubernetes refuses projected tokens shorter than 10 minutes and the tunnel
+// accepts at most an hour.
+constexpr unsigned minReverseTokenLifetimeSecs = 600;
+constexpr unsigned maxReverseTokenLifetimeSecs = 3600;
+
 struct Options
 {
     std::string listen = "0.0.0.0:50051";
@@ -42,7 +47,7 @@ struct Options
     std::string reverseAudience;
     // Longest accepted tunnel token lifetime. Offline verification cannot
     // see pod deletion, so this is also the revocation window.
-    std::chrono::seconds reverseMaxTokenLifetime{600};
+    std::chrono::seconds reverseMaxTokenLifetime{minReverseTokenLifetimeSecs};
     Niks3Config niks3;
 
     bool builder = true;

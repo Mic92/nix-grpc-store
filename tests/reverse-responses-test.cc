@@ -1,11 +1,25 @@
 #include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <stop_token>
 #include <thread>
 
+#include <grpcpp/support/status_code_enum.h>
+
+#include "nix_remote.pb.h"
+#include "reverse-frames.hh"
 #include "reverse-responses.hh"
 
-int main()
+namespace {
+
+constexpr uint32_t invalidStatusCode = 123;
+constexpr uint64_t otherStream = 5;
+constexpr uint64_t isolatedStream = 6;
+
+} // namespace
+
+auto main() -> int
 {
     nixgrpc::ReverseResponses replies;
     assert(!replies.open(0));
@@ -37,7 +51,7 @@ int main()
 
     assert(replies.open(2));
     response.set_stream_id(2);
-    response.mutable_finish()->set_code(123);
+    response.mutable_finish()->set_code(invalidStatusCode);
     assert(!replies.accept(response));
     response.mutable_finish()->set_code(static_cast<uint32_t>(grpc::StatusCode::UNAVAILABLE));
     response.mutable_finish()->set_message(std::string(nixgrpc::ReverseResponses::maxStatusBytes + 1, 'x'));
@@ -70,25 +84,25 @@ int main()
     assert(replies.accept(response)); // data saturation cannot starve final status
     assert(replies.cancel(4));
     assert(!replies.take(taken));
-    assert(replies.open(5));
-    assert(replies.open(6));
+    assert(replies.open(otherStream));
+    assert(replies.open(isolatedStream));
     std::stop_source stop;
     bool received = false;
-    std::jthread waiter([&] {
+    std::jthread waiter([&] -> void {
         nix::remote::ReverseWorkerMsg isolated;
-        received = replies.waitTake(6, isolated, stop.get_token())
-            && isolated.stream_id() == 6 && isolated.data().data() == "only six";
+        received = replies.waitTake(isolatedStream, isolated, stop.get_token())
+            && isolated.stream_id() == isolatedStream && isolated.data().data() == "only six";
     });
-    response.set_stream_id(5);
+    response.set_stream_id(otherStream);
     response.mutable_data()->set_data("only five");
     assert(replies.accept(response));
-    response.set_stream_id(6);
+    response.set_stream_id(isolatedStream);
     response.mutable_data()->set_data("only six");
     assert(replies.accept(response));
     waiter.join();
     assert(received);
-    assert(replies.take(taken) && taken.stream_id() == 5);
-    assert(replies.cancel(5));
+    assert(replies.take(taken) && taken.stream_id() == otherStream);
+    assert(replies.cancel(otherStream));
     replies.close();
     assert(!replies.open(7) && !replies.accept(response) && !replies.take(taken));
 }

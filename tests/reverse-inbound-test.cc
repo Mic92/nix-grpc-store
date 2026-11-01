@@ -1,9 +1,14 @@
 #include <cassert>
 #include <string>
 
+#include "acl.hh"
+#include "auth.hh"
+#include "nix_remote.pb.h"
+#include "reverse-capability.hh"
+#include "reverse-frames.hh"
 #include "reverse-inbound.hh"
 
-int main()
+auto main() -> int
 {
     using nixgrpc::Caller;
     using nixgrpc::ReverseCapability;
@@ -12,7 +17,7 @@ int main()
 
     auto key = ReverseCapability::newKey();
     assert(key);
-    auto const worker = "pod:staging:01234567-89ab-cdef-0123-456789abcdef";
+    const auto *const worker = "pod:staging:01234567-89ab-cdef-0123-456789abcdef";
     ReverseInbound inbound(worker, 4, *key);
     Caller reader{.name = "client", .role = Role::readOnly, .kind = Caller::Kind::named};
     auto const capability = ReverseCapability::mint(*key, worker, 4, 1, "StoreInfo", reader);

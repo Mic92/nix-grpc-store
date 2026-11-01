@@ -2,16 +2,22 @@
 
 #include <chrono>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 
 #include <grpc/grpc_security_constants.h>
 #include <grpcpp/server_context.h>
+#include <grpcpp/support/server_callback.h>
+#include <grpcpp/support/status_code_enum.h>
 
+#include "acl.hh"
 #include "auth.hh"
 #include "dispatcher.hh"
+#include "idle.hh"
 #include "logfmt.hh"
+#include "nix_remote.pb.h"
 #include "sched-reactor.hh"
 #include "worker-identity.hh"
 
@@ -47,7 +53,7 @@ auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
     }
     std::string verifiedPodId;
     std::chrono::system_clock::time_point credentialExpiresAt{};
-    if (reverseIdentity) {
+    if (reverseIdentity != nullptr) {
         auto const tls = context->auth_context();
         if (tls) {
             auto const transports = tls->FindPropertyValues(GRPC_TRANSPORT_SECURITY_TYPE_PROPERTY_NAME);
@@ -58,7 +64,7 @@ auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
                 (std::string_view(transports.front().data(), transports.front().size()) == "ssl" ||
                  std::string_view(transports.front().data(), transports.front().size()) == "tls")
                 && first != last && std::next(first) == last) {
-                std::string_view token(first->second.data(), first->second.size());
+                std::string_view const token(first->second.data(), first->second.size());
                 if (token.starts_with(prefix)) {
                     if (auto bound = reverseIdentity->verify(std::string(token.substr(prefix.size())))) {
                         verifiedPodId = std::move(bound->workerId);
@@ -86,7 +92,7 @@ auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
     logLine(LogLevel::info, {{"event", "worker_session_open"}, {"cn", caller.name}, {"peer", context->peer()}});
     WorkerSessionReactor::Renew renew;
     if (!verifiedPodId.empty()) {
-        renew = [identity = reverseIdentity, podId = verifiedPodId](const std::string & token) {
+        renew = [identity = reverseIdentity, podId = verifiedPodId](const std::string & token) -> std::optional<std::chrono::system_clock::time_point> {
             return identity->renew(token, podId);
         };
     }

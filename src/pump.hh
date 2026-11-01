@@ -324,18 +324,24 @@ public:
     // Do not use read() to probe for EOF: it accepts concatenated zstd frames.
     void finishFrame()
     {
-        char extra;
+        char extra = 0;
         while (remaining != 0) {
             if (zin.pos == zin.size) {
-                if (!reader->Read(&msg)) throw nix::EndOfFile("incomplete zstd frame");
+                if (!reader->Read(&msg)) {
+                    throw nix::EndOfFile("incomplete zstd frame");
+                }
                 zin = {.src = msg.data().data(), .size = msg.data().size(), .pos = 0};
             }
             ZSTD_outBuffer out{.dst = &extra, .size = 1, .pos = 0};
             remaining = ZSTD_decompressStream(dctx.get(), &out, &zin);
             zstdCheck(remaining, "decompress");
-            if (out.pos != 0) throw nix::Error("trailing decompressed upload data");
+            if (out.pos != 0) {
+                throw nix::Error("trailing decompressed upload data");
+            }
         }
-        if (zin.pos != zin.size) throw nix::Error("trailing compressed upload data");
+        if (zin.pos != zin.size) {
+            throw nix::Error("trailing compressed upload data");
+        }
     }
 };
 

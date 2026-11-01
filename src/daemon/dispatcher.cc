@@ -172,8 +172,8 @@ void Dispatcher::membershipChangedLocked()
         }
         // The balancer cannot dial a reverse worker; it is reached only
         // through its data session. Never publish it as an EDS endpoint.
-        if (auto const it = workers.find(static_cast<sched::WorkerId>(wid));
-            it != workers.end() && !it->second->verifiedPodId.empty()) {
+        if (auto const connected = workers.find(static_cast<sched::WorkerId>(wid));
+            connected != workers.end() && !connected->second->verifiedPodId.empty()) {
             continue;
         }
         for (const auto & system : wkr.systems) {
@@ -572,8 +572,10 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
 void Dispatcher::onCancel(Client & client, const nix::remote::Cancel & cancel)
 {
     if (auto wid = core.cancel(client.id, cancel.drv_path())) {
-        if (auto drv = core.findDrv(cancel.drv_path()); drv && core.entry(*drv)) {
-            revokeOn(*wid, cancel.drv_path(), core.entry(*drv)->assignId);
+        if (auto drv = core.findDrv(cancel.drv_path()); drv) {
+            if (const auto & ent = core.entry(*drv); ent) {
+                revokeOn(*wid, cancel.drv_path(), ent->assignId);
+            }
         }
     }
 }
@@ -597,6 +599,7 @@ void Dispatcher::clientGone(const ClientPtr & clientPtr)
 
 // ------------------------------------------------------------------ workers
 
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters): established public API used by sessions and tests
 auto Dispatcher::ownsAssignment(std::string_view workerAddr, std::string_view drvPath, uint64_t assignId) const -> bool
 {
     auto selected = assignmentWorker(drvPath, assignId);
@@ -631,11 +634,11 @@ auto Dispatcher::assignmentPod(std::string_view drvPath, uint64_t assignId) cons
         return std::nullopt;
     }
     const absl::MutexLock lock(mutex);
-    auto const it = core.findDrv(drvPath);
-    if (!it) {
+    auto const drv = core.findDrv(drvPath);
+    if (!drv) {
         return std::nullopt;
     }
-    auto const & slot = core.entry(*it);
+    auto const & slot = core.entry(*drv);
     if (!slot || slot->followers.empty() || slot->worker == sched::noWorker || slot->assignId != assignId
         || slot->drvPath != drvPath || !core.worker(slot->worker).up) {
         return std::nullopt;
@@ -655,6 +658,7 @@ auto Dispatcher::podConnected(std::string_view podId) const -> bool
     }
     const absl::MutexLock lock(mutex);
     auto const now = std::chrono::system_clock::now();
+    // NOLINTNEXTLINE(readability-use-anyofallof): a lambda would hide the held mutex from -Wthread-safety
     for (const auto & [wid, worker] : workers) {
         if (worker->verifiedPodId == podId && worker->credentialExpiresAt > now && core.worker(wid).up) {
             return true;
@@ -663,6 +667,7 @@ auto Dispatcher::podConnected(std::string_view podId) const -> bool
     return false;
 }
 
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters): established public API used by sessions and tests
 auto Dispatcher::podOwnsAssignment(std::string_view podId, std::string_view drvPath, uint64_t assignId) const -> bool
 {
     auto selected = assignmentPod(drvPath, assignId);

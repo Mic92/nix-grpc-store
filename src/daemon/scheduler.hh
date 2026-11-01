@@ -320,7 +320,8 @@ public:
         // assignments a different generation so an RPC from the old leader
         // cannot match a reused small counter on this one.
         std::random_device entropy;
-        lastAssignId = (static_cast<uint64_t>(entropy()) << 32) | entropy();
+        constexpr unsigned entropyWordBits = 32;
+        lastAssignId = (static_cast<uint64_t>(entropy()) << entropyWordBits) | entropy();
         drvIds.reserve(initialEntries);
         entries.reserve(initialEntries);
         // To its cap so it never grows: even a flat rehash of 2^18 slots is
@@ -368,8 +369,8 @@ public:
 
     [[nodiscard]] auto findWorker(std::string_view addr) const -> std::optional<WorkerId>
     {
-        auto const it = workerIds.find(std::string(addr));
-        return it == workerIds.end() ? std::nullopt : std::optional(it->second);
+        auto const iter = workerIds.find(std::string(addr));
+        return iter == workerIds.end() ? std::nullopt : std::optional(iter->second);
     }
 
     [[nodiscard]] auto entry(DrvId drv) const -> const std::optional<Entry> &

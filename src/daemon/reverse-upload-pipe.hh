@@ -29,24 +29,30 @@ public:
     [[nodiscard]] auto feed(std::string_view bytes) -> bool
     {
         if (assigned && !assigned()) { cancel(); return false; }
-        auto const ok = decoder.feed(bytes, [&](nix::remote::UploadBuildInputsChunk && frame) {
-            if (assigned && !assigned()) return false;
+        auto const accepted = decoder.feed(bytes, [&](nix::remote::UploadBuildInputsChunk frame) -> bool {
+            if (assigned && !assigned()) {
+                return false;
+            }
             auto const size = frame.ByteSizeLong();
-            std::scoped_lock lock(mutex);
-            if (closed || ended || size > maxQueuedBytes || queuedBytes > maxQueuedBytes - size) return false;
+            std::scoped_lock const lock(mutex);
+            if (closed || ended || size > maxQueuedBytes || queuedBytes > maxQueuedBytes - size) {
+                return false;
+            }
             queuedBytes += size;
             chunks.push_back(std::move(*frame.mutable_chunk()));
             cv.notify_all();
             return true;
         });
-        if (!ok) cancel();
-        return ok;
+        if (!accepted) {
+            cancel();
+        }
+        return accepted;
     }
 
     [[nodiscard]] auto finish() -> bool
     {
         if (assigned && !assigned()) { cancel(); return false; }
-        std::scoped_lock lock(mutex);
+        std::scoped_lock const lock(mutex);
         if (!decoder.complete() || closed) {
             closed = true;
             chunks.clear();
@@ -65,7 +71,9 @@ public:
     {
         std::unique_lock lock(mutex);
         while (true) {
-            if (closed) return false;
+            if (closed) {
+                return false;
+            }
             lock.unlock();
             bool const live = !assigned || assigned();
             lock.lock();
@@ -76,10 +84,14 @@ public:
                 cv.notify_all();
                 return false;
             }
-            if (ended || !chunks.empty()) break;
-            cv.wait_for(lock, std::chrono::milliseconds(25));
+            if (ended || !chunks.empty()) {
+                break;
+            }
+            cv.wait_for(lock, livenessPollInterval);
         }
-        if (chunks.empty()) return false;
+        if (chunks.empty()) {
+            return false;
+        }
         *chunk = std::move(chunks.front());
         queuedBytes -= chunk->ByteSizeLong();
         chunks.pop_front();
@@ -89,7 +101,7 @@ public:
 
     [[nodiscard]] auto complete() const -> bool
     {
-        std::scoped_lock lock(mutex);
+        std::scoped_lock const lock(mutex);
         return ended && !closed && chunks.empty();
     }
 
@@ -100,7 +112,7 @@ public:
     {
         std::unique_lock lock(mutex);
         while (!closed && !ended && chunks.empty()) {
-            cv.wait_for(lock, std::chrono::milliseconds(25));
+            cv.wait_for(lock, livenessPollInterval);
             lock.unlock();
             bool const live = !assigned || assigned();
             lock.lock();
@@ -110,14 +122,16 @@ public:
                 queuedBytes = 0;
             }
         }
-        if (!ended || closed || !chunks.empty()) return false;
+        if (!ended || closed || !chunks.empty()) {
+            return false;
+        }
         lock.unlock();
         return !assigned || assigned();
     }
 
     void cancel()
     {
-        std::scoped_lock lock(mutex);
+        std::scoped_lock const lock(mutex);
         closed = true;
         chunks.clear();
         queuedBytes = 0;
@@ -126,12 +140,13 @@ public:
 
     [[nodiscard]] auto cancelled() const -> bool
     {
-        std::scoped_lock lock(mutex);
+        std::scoped_lock const lock(mutex);
         return closed;
     }
 
 private:
     static constexpr size_t maxQueuedBytes = ReverseFrames::maxQueuedBytes;
+    static constexpr std::chrono::milliseconds livenessPollInterval{25};
     ReverseUpload::Decoder decoder;
     std::function<bool()> assigned;
     mutable std::mutex mutex;

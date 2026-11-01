@@ -1,16 +1,37 @@
 #include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
 
+#include <grpcpp/support/status.h>
+#include <grpcpp/support/status_code_enum.h>
+
+#include "nix_remote.pb.h"
+#include "reverse-frames.hh"
+#include "reverse-relay.hh"
 #include "reverse-worker.hh"
 
-int main()
+namespace {
+
+constexpr size_t lengthPrefixBytes = 4;
+constexpr unsigned bitsPerByte = 8;
+constexpr size_t multiFrameResultBytes = 130000;
+constexpr uint64_t saturationAttempts = 10000;
+constexpr size_t statusTextBytes = 1024;
+constexpr uint64_t retiredStream = 10;
+constexpr uint64_t lostStream = 11;
+
+} // namespace
+
+auto main() -> int
 {
     nixgrpc::ReverseWorkerOutbound replies;
-    std::stop_source stop;
+    std::stop_source const stop;
     nix::remote::BuildDerivationChunk chunk;
-    chunk.mutable_done()->set_result(std::string(130000, 'x'));
+    chunk.mutable_done()->set_result(std::string(multiFrameResultBytes, 'x'));
     assert(replies.message(1, chunk, stop.get_token()));
     assert(replies.finish(1, grpc::Status::OK, stop.get_token()));
     nix::remote::ReverseWorkerMsg frame;
@@ -24,23 +45,27 @@ int main()
         assert(frame.data().data().size() <= nixgrpc::ReverseFrames::maxFrameBytes);
         wire += frame.data().data();
     }
-    assert(wire.size() >= 4);
+    assert(wire.size() >= lengthPrefixBytes);
     uint32_t length = 0;
-    for (unsigned i = 0; i != 4; ++i)
-        length |= static_cast<uint32_t>(static_cast<unsigned char>(wire[i])) << (8 * i);
+    for (unsigned index = 0; index != lengthPrefixBytes; ++index) {
+        length |= static_cast<uint32_t>(static_cast<unsigned char>(wire.at(index))) << (bitsPerByte * index);
+    }
     nix::remote::BuildDerivationChunk decoded;
-    assert(wire.size() == length + 4 && decoded.ParseFromArray(wire.data() + 4, static_cast<int>(length)));
+    auto const body = std::string_view(wire).substr(lengthPrefixBytes);
+    assert(wire.size() == length + lengthPrefixBytes && decoded.ParseFromArray(body.data(), static_cast<int>(length)));
     assert(decoded.done().result() == chunk.done().result());
 
     bool retired = false;
-    assert(replies.finish(10, grpc::Status::OK, stop.get_token(), true, [&] { retired = true; }));
-    assert(replies.take(frame, stop.get_token()) && frame.stream_id() == 10 && frame.has_finish());
+    bool const finishQueued = replies.finish(retiredStream, grpc::Status::OK, stop.get_token(), true, [&] -> void { retired = true; });
+    assert(finishQueued);
+    assert(replies.take(frame, stop.get_token()) && frame.stream_id() == retiredStream && frame.has_finish());
     assert(!retired); // writing a finish does not retire the assignment
-    assert(replies.acknowledged(10) && retired);
-    assert(!replies.acknowledged(10)); // duplicate acknowledgements fail closed
+    assert(replies.acknowledged(retiredStream) && retired);
+    assert(!replies.acknowledged(retiredStream)); // duplicate acknowledgements fail closed
     nixgrpc::ReverseWorkerOutbound lost;
     bool abandoned = false;
-    assert(lost.finish(11, grpc::Status::OK, stop.get_token(), true, [&] { abandoned = true; }));
+    bool const lostQueued = lost.finish(lostStream, grpc::Status::OK, stop.get_token(), true, [&] -> void { abandoned = true; });
+    assert(lostQueued);
     lost.close();
     assert(!abandoned);
     lost.abandonUnacknowledged();
@@ -60,8 +85,8 @@ int main()
 
     nixgrpc::ReverseWorkerOutbound saturated;
     bool full = false;
-    for (uint64_t id = 1; id <= 10000; ++id) {
-        if (!saturated.finish(id, {grpc::StatusCode::CANCELLED, std::string(1024, 'x')},
+    for (uint64_t streamId = 1; streamId <= saturationAttempts; ++streamId) {
+        if (!saturated.finish(streamId, {grpc::StatusCode::CANCELLED, std::string(statusTextBytes, 'x')},
                               stop.get_token(), false)) {
             full = true;
             break;
@@ -71,17 +96,17 @@ int main()
     saturated.close();
 
     nixgrpc::ReverseWorkerOutbound blocked;
-    std::string const statusText(1024, 'x');
+    std::string const statusText(statusTextBytes, 'x');
     bool queued = true;
-    for (uint64_t id = 1; id <= 10000; ++id) {
-        if (!blocked.finish(id, {grpc::StatusCode::CANCELLED, statusText}, stop.get_token(), false)) {
+    for (uint64_t streamId = 1; streamId <= saturationAttempts; ++streamId) {
+        if (!blocked.finish(streamId, {grpc::StatusCode::CANCELLED, statusText}, stop.get_token(), false)) {
             queued = false;
             break;
         }
     }
     assert(!queued);
-    std::jthread producer([&](std::stop_token workStop) {
-        queued = blocked.finish(10001, {grpc::StatusCode::CANCELLED, statusText}, workStop);
+    std::jthread producer([&](const std::stop_token & workStop) -> void {
+        queued = blocked.finish(saturationAttempts + 1, {grpc::StatusCode::CANCELLED, statusText}, workStop);
     });
     blocked.close();
     producer.join();

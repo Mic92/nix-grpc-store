@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <cstdint>
 #include <vector>
 
 #include <nix/util/error.hh>
@@ -11,7 +12,7 @@
 #include "nix_remote.pb.h"
 #include "reverse-protocol.hh"
 
-int main()
+auto main() -> int
 {
     nixgrpc::Metrics metrics{""};
     nixgrpc::Dispatcher dispatcher({.defaultSystem = "x"}, metrics);
@@ -67,9 +68,11 @@ int main()
 
     bool directAssigned = false;
     auto client = dispatcher.connectClient([&](const nix::remote::SchedMsg & msg) -> bool {
-        if (msg.has_assigned()) directAssigned = !msg.assigned().reverse();
+        if (msg.has_assigned()) {
+            directAssigned = !msg.assigned().reverse();
+        }
         return true;
-    }, [] {});
+    }, [] -> void {});
     nix::remote::ClientMsgs want;
     auto * request = want.add_msgs()->mutable_want();
     request->set_drv_path("a.drv");
@@ -84,7 +87,7 @@ int main()
     assert(dispatcher.assignmentWorker("a.drv", assignedId) == "127.0.0.1:50051");
     assert(!dispatcher.assignmentPod("a.drv", assignedId)); // direct worker is not a reverse route
     nixgrpc::Dispatcher::Worker claimedPod{
-        .send = [](const nix::remote::SchedCmd &) { return true; },
+        .send = [](const nix::remote::SchedCmd &) -> bool { return true; },
         .verifiedPodId = "pod:staging:01234567-89ab-cdef-0123-456789abcdef",
         .credentialExpiresAt = std::chrono::system_clock::now() + std::chrono::minutes(1)};
     auto claimedHello = hello;
@@ -126,7 +129,7 @@ int main()
     // Replacing WorkerSession ownership invalidates a previously returned
     // assignment even before the old stream's delayed close arrives.
     dispatcher.workerMsgs(first, hello);
-    auto follower = dispatcher.connectClient([](const nix::remote::SchedMsg &) -> bool { return true; }, [] {});
+    auto follower = dispatcher.connectClient([](const nix::remote::SchedMsg &) -> bool { return true; }, [] -> void {});
     dispatcher.clientMsgs(follower, want);
     assert(!firstCommands.empty() && firstCommands.back().has_expect());
     auto freshId = firstCommands.back().expect().assign_id();
@@ -147,7 +150,7 @@ int main()
     auto const pod = std::string("pod:staging:01234567-89ab-cdef-0123-456789abcdef");
     std::vector<nix::remote::SchedCmd> reverseCommands;
     nixgrpc::Dispatcher::Worker reverse{
-        .send = [&](const nix::remote::SchedCmd & cmd) {
+        .send = [&](const nix::remote::SchedCmd & cmd) -> bool {
             reverseCommands.push_back(cmd);
             return true;
         },
@@ -179,7 +182,7 @@ int main()
     dispatcher.workerMsgs(reverse, reverseHello);
     // Schedulable, but never an EDS endpoint: the balancer cannot dial it.
     assert(dispatcher.podConnected(pod) && dispatcher.membership()->empty());
-    auto reverseClient = dispatcher.connectClient([](const nix::remote::SchedMsg &) { return true; }, [] {});
+    auto reverseClient = dispatcher.connectClient([](const nix::remote::SchedMsg &) -> bool { return true; }, [] -> void {});
     dispatcher.clientMsgs(reverseClient, want);
     assert(!reverseCommands.empty() && reverseCommands.back().has_expect());
     auto reverseId = reverseCommands.back().expect().assign_id();
@@ -187,7 +190,7 @@ int main()
     assert(dispatcher.podOwnsAssignment(pod, "a.drv", reverseId));
     assert(!dispatcher.podOwnsAssignment("pod:staging:fedcba98-7654-3210-fedc-ba9876543210", "a.drv", reverseId));
     nixgrpc::Dispatcher::Worker impostor{
-        .send = [](const nix::remote::SchedCmd &) { return true; },
+        .send = [](const nix::remote::SchedCmd &) -> bool { return true; },
         .verifiedPodId = "pod:staging:fedcba98-7654-3210-fedc-ba9876543210",
         .credentialExpiresAt = std::chrono::system_clock::now() + std::chrono::minutes(1)};
     reverseHello.mutable_msgs(0)->mutable_hello()->set_reverse_worker_id(impostor.verifiedPodId);

@@ -29,14 +29,14 @@ public:
 
     // Reserve before sending an authenticated request on the *same* active
     // session. A failed request enqueue must cancel this reservation.
-    [[nodiscard]] auto open(uint64_t id) -> bool
+    [[nodiscard]] auto open(uint64_t streamId) -> bool
     {
         const std::scoped_lock lock(mutex);
-        if (closed || id == 0 || id <= lastId || streams.size() >= ReverseFrames::maxStreams) {
+        if (closed || streamId == 0 || streamId <= lastId || streams.size() >= ReverseFrames::maxStreams) {
             return false;
         }
-        streams.emplace(id, false);
-        lastId = id;
+        streams.emplace(streamId, false);
+        lastId = streamId;
         return true;
     }
 
@@ -48,13 +48,17 @@ public:
         if (closed || !frame.worker_id().empty() || frame.stream_id() == 0) {
             return false;
         }
-        auto it = streams.find(frame.stream_id());
-        if (it == streams.end()) {
+        auto stream = streams.find(frame.stream_id());
+        if (stream == streams.end()) {
             // A cancelled call may already have been sent when its caller
             // disconnected. Only explicitly cancelled IDs are tolerated;
             // late replies after normal completion remain protocol errors.
-            if (!cancelled.contains(frame.stream_id())) return false;
-            if (frame.has_data()) return !frame.data().data().empty() && frame.data().data().size() <= ReverseFrames::maxFrameBytes;
+            if (!cancelled.contains(frame.stream_id())) {
+                return false;
+            }
+            if (frame.has_data()) {
+                return !frame.data().data().empty() && frame.data().data().size() <= ReverseFrames::maxFrameBytes;
+            }
             if (frame.has_finish() && frame.finish().code() <= static_cast<uint32_t>(grpc::StatusCode::UNAUTHENTICATED)
                 && frame.finish().message().size() <= maxStatusBytes) {
                 cancelled.erase(frame.stream_id());
@@ -62,7 +66,7 @@ public:
             }
             return false;
         }
-        if (it->second) {
+        if (stream->second) {
             return false;
         }
         if (frame.has_data()) {
@@ -88,7 +92,7 @@ public:
             return false;
         }
         if (frame.has_finish()) {
-            it->second = true;
+            stream->second = true;
         }
         queuedBytes += size;
         queue.push_back(std::move(frame));
@@ -98,23 +102,23 @@ public:
 
     // A client can only consume responses for its own stream. A global FIFO
     // consumer could steal a different client's result under concurrency.
-    [[nodiscard]] auto waitTake(uint64_t id, nix::remote::ReverseWorkerMsg & frame, std::stop_token stop) -> bool
+    [[nodiscard]] auto waitTake(uint64_t streamId, nix::remote::ReverseWorkerMsg & frame, const std::stop_token & stop) -> bool
     {
         std::unique_lock lock(mutex);
-        auto pending = [&] {
-            return std::find_if(queue.begin(), queue.end(), [id](auto const & next) { return next.stream_id() == id; });
+        auto pending = [&] -> std::deque<nix::remote::ReverseWorkerMsg>::iterator {
+            return std::ranges::find_if(queue, [streamId](auto const & next) -> auto { return next.stream_id() == streamId; });
         };
-        cv.wait(lock, stop, [&] { return closed || !streams.contains(id) || pending() != queue.end(); });
-        if (closed || stop.stop_requested() || !streams.contains(id)) {
+        cv.wait(lock, stop, [&] -> bool { return closed || !streams.contains(streamId) || pending() != queue.end(); });
+        if (closed || stop.stop_requested() || !streams.contains(streamId)) {
             return false;
         }
-        auto it = pending();
-        if (it == queue.end()) {
+        auto found = pending();
+        if (found == queue.end()) {
             return false;
         }
-        frame = std::move(*it);
+        frame = std::move(*found);
         queuedBytes -= frame.ByteSizeLong();
-        queue.erase(it);
+        queue.erase(found);
         return true;
     }
 
@@ -132,10 +136,10 @@ public:
 
     // Once a client cancels, stale bytes/status for that ID are discarded;
     // this ID can never be reused within the registration.
-    [[nodiscard]] auto cancel(uint64_t id, bool sent = true) -> bool
+    [[nodiscard]] auto cancel(uint64_t streamId, bool sent = true) -> bool
     {
         const std::scoped_lock lock(mutex);
-        auto stream = streams.find(id);
+        auto stream = streams.find(streamId);
         if (stream == streams.end()) {
             return false;
         }
@@ -152,9 +156,11 @@ public:
             cv.notify_all();
             return false;
         }
-        if (sent && !finishAlreadyQueued) cancelled.insert(id);
+        if (sent && !finishAlreadyQueued) {
+            cancelled.insert(streamId);
+        }
         for (auto it = queue.begin(); it != queue.end();) {
-            if (it->stream_id() == id) {
+            if (it->stream_id() == streamId) {
                 queuedBytes -= it->ByteSizeLong();
                 it = queue.erase(it);
             } else {
@@ -165,14 +171,14 @@ public:
         return true;
     }
 
-    [[nodiscard]] auto finished(uint64_t id) -> bool
+    [[nodiscard]] auto finished(uint64_t streamId) -> bool
     {
         const std::scoped_lock lock(mutex);
-        auto it = streams.find(id);
-        if (it == streams.end() || !it->second) {
+        auto stream = streams.find(streamId);
+        if (stream == streams.end() || !stream->second) {
             return false;
         }
-        streams.erase(it);
+        streams.erase(stream);
         cv.notify_all();
         return true;
     }

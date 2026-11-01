@@ -3,6 +3,8 @@
 // and the matching TLS-connected worker know the HMAC key; never accept a
 // capability from ordinary client metadata. No data dispatch uses this yet.
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -29,6 +31,8 @@ class ReverseCapability
     static constexpr size_t keyBytes = 32;
     static constexpr size_t macBytes = 32;
     static constexpr size_t maxPayloadBytes = 1024;
+    static constexpr size_t maxCallerNameBytes = 256;
+    static constexpr unsigned bitsPerByte = 8;
     // Bounds the time between authorization at the gateway and acceptance
     // of an Open. Once accepted, the call's lifetime is bounded separately
     // by its assignment/session and the operation's deadline/limits.
@@ -41,6 +45,7 @@ class ReverseCapability
     static auto newKey() -> std::optional<std::string>
     {
         std::string key(keyBytes, '\0');
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL takes unsigned char bytes
         if (RAND_bytes(reinterpret_cast<unsigned char *>(key.data()), static_cast<int>(key.size())) != 1)
         {
             return std::nullopt;
@@ -59,7 +64,7 @@ class ReverseCapability
     {
         auto const required = requiredRole(method, buildMode, drvPath, assignId);
         if (key.size() != keyBytes || workerId.empty() || generation == 0 || streamId == 0 || !caller.role ||
-            caller.kind != Caller::Kind::named || caller.name.empty() || caller.name.size() > 256 ||
+            caller.kind != Caller::Kind::named || caller.name.empty() || caller.name.size() > maxCallerNameBytes ||
             caller.name.contains('\0') || !required || *caller.role < *required)
         {
             return std::nullopt;
@@ -93,7 +98,7 @@ class ReverseCapability
         result.reserve(4 + wire.size() + mac->size());
         for (unsigned i = 0; i < 4; ++i)
         {
-            result.push_back(static_cast<char>(size >> (i * 8)));
+            result.push_back(static_cast<char>(size >> (i * bitsPerByte)));
         }
         result += wire;
         result += *mac;
@@ -153,6 +158,7 @@ class ReverseCapability
         return verify(key, open.capability(), workerId, generation, streamId, open.method(), now);
     }
 
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): established API used by gateway, workers and tests
     static auto verify(std::string_view key, std::string_view token, std::string_view workerId, uint64_t generation,
                        uint64_t streamId, std::string_view method,
                        std::chrono::system_clock::time_point now = std::chrono::system_clock::now())
@@ -165,7 +171,7 @@ class ReverseCapability
         uint32_t size = 0;
         for (unsigned i = 0; i < 4; ++i)
         {
-            size |= static_cast<uint32_t>(static_cast<unsigned char>(token[i])) << (i * 8);
+            size |= static_cast<uint32_t>(static_cast<unsigned char>(token.at(i))) << (i * bitsPerByte);
         }
         if (size > maxPayloadBytes || size != token.size() - 4 - macBytes)
         {
@@ -173,15 +179,15 @@ class ReverseCapability
         }
         auto wire = token.substr(4, size);
         auto expected = sign(key, wire);
-        if (!expected || CRYPTO_memcmp(expected->data(), token.data() + 4 + size, macBytes) != 0)
+        if (!expected || CRYPTO_memcmp(expected->data(), token.substr(4 + size, macBytes).data(), macBytes) != 0)
         {
             return std::nullopt;
         }
         nix::remote::ReverseCapability payload;
         if (!payload.ParseFromArray(wire.data(), static_cast<int>(wire.size())) || payload.worker_id() != workerId ||
             payload.generation() != generation || payload.stream_id() != streamId || streamId == 0 ||
-            payload.method() != method || payload.caller_name().empty() || payload.caller_name().size() > 256 ||
-            payload.caller_name().contains('\0') || payload.caller_role() > static_cast<uint32_t>(Role::trusted) ||
+            payload.method() != method || payload.caller_name().empty() ||
+            payload.caller_name().size() > maxCallerNameBytes || payload.caller_name().contains('\0') || payload.caller_role() > static_cast<uint32_t>(Role::trusted) ||
             payload.caller_kind() != static_cast<uint32_t>(Caller::Kind::named))
         {
             return std::nullopt;
@@ -212,7 +218,10 @@ class ReverseCapability
     {
         if (method == "UploadBuildInputs")
         {
-            if (drv.empty() || assign == 0 || mode != 0) return std::nullopt;
+            if (drv.empty() || assign == 0 || mode != 0)
+            {
+                return std::nullopt;
+            }
             return Role::write;
         }
         if (method == "BuildDerivation")
@@ -247,15 +256,18 @@ class ReverseCapability
 
     static auto sign(std::string_view key, std::string_view data) -> std::optional<std::string>
     {
-        unsigned char mac[EVP_MAX_MD_SIZE];
+        std::array<unsigned char, EVP_MAX_MD_SIZE> mac{};
         unsigned length = 0;
-        if (!HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
-                  reinterpret_cast<const unsigned char *>(data.data()), data.size(), mac, &length) ||
+        if ((HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
+                  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL HMAC takes unsigned char bytes
+                  reinterpret_cast<const unsigned char *>(data.data()), data.size(), mac.data(), &length) == nullptr) ||
             length != macBytes)
         {
             return std::nullopt;
         }
-        return std::string(reinterpret_cast<const char *>(mac), macBytes);
+        std::string result(macBytes, '\0');
+        std::copy_n(mac.begin(), macBytes, result.begin());
+        return result;
     }
 };
 
