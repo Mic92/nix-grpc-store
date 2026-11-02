@@ -221,9 +221,9 @@ try {
     } catch (const nix::Error &) {
         rejected = true;
     }
-    assert(rejected && !dispatcher.assignmentPod("a.drv", freshId));
-    // An old assignment cannot be recovered using the new pod credential.
-    assert(!dispatcher.assignmentPod("a.drv", freshId));
+    // An expired credential neither registers nor displaces the live pod.
+    assert(rejected && dispatcher.assignmentPod("a.drv", reverseId) == pod);
+    assert(!dispatcher.podOwnsAssignment(impostor.verifiedPodId, "a.drv", reverseId));
     dispatcher.clientGone(reverseClient);
     assert(!dispatcher.assignmentPod("a.drv", reverseId));
     assert(!dispatcher.podOwnsAssignment(pod, "a.drv", reverseId));
