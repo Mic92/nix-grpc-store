@@ -95,9 +95,6 @@ stdenv.mkDerivation {
   };
 
   mesonFlags = lib.optional (!server) "-Dcomponents=plugin";
-  # ld64 can silently omit Meson test executables when generating a UUID on
-  # Darwin. This is a linker (not clang -Wl) flag passed through the Nix wrapper.
-  NIX_LDFLAGS = lib.optionalString stdenv.hostPlatform.isDarwin "-no_uuid";
 
   doCheck = server;
   nativeCheckInputs = [ python3 openssl ];
