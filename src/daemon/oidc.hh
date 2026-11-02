@@ -61,6 +61,18 @@ struct Identity
 {
     std::string subject;      // "oidc:<provider>:<sub>"
     std::optional<Role> role; // nullopt: verified but no rule matched
+    // Only populated from signature-verified, audience-checked JWT claims.
+    // A Kubernetes service-account subject alone identifies a deployment,
+    // not a particular pod (all its replicas share that subject).
+    std::optional<std::string> podNamespace;
+    std::optional<std::string> podName;
+    std::optional<std::string> podUid;
+    std::optional<std::string> serviceAccountName;
+    // Preserve the original claim shape: a token accepted for both client
+    // and tunnel audiences must not be treated as a tunnel-only credential.
+    std::optional<std::string> singleAudience;
+    std::optional<std::chrono::system_clock::time_point> expiresAt;
+    std::optional<std::chrono::system_clock::time_point> issuedAt;
 };
 
 constexpr size_t maxTokenBytes = 16UL * 1024;
@@ -504,6 +516,7 @@ private:
         return res;
     }
 
+    // NOLINTNEXTLINE(readability-function-cognitive-complexity): security-sensitive linear claim validation
     auto doVerify(const std::string & token, std::chrono::system_clock::time_point now) -> Result
     {
         auto parsed = parseToken(token);
@@ -536,9 +549,37 @@ private:
                 return fail("token lacks sub");
             }
             auto const role = roleFor(provider, claims);
-            return {
-                .identity = Identity{.subject = "oidc:" + provider.name + ":" + sub, .role = role},
-                .error = role ? "" : "no rule matched"};
+            Identity identity{.subject = "oidc:" + provider.name + ":" + sub, .role = role};
+            if (auto const * namespaceClaim = lookupClaim(claims, "kubernetes.io.namespace");
+                (namespaceClaim != nullptr) && namespaceClaim->is_string()) {
+                identity.podNamespace = namespaceClaim->get<std::string>();
+            }
+            if (auto const * pod = lookupClaim(claims, "kubernetes.io.pod"); (pod != nullptr) && pod->is_object()) {
+                if (auto name = pod->find("name"); name != pod->end() && name->is_string()) {
+                    identity.podName = name->get<std::string>();
+                }
+                if (auto uid = pod->find("uid"); uid != pod->end() && uid->is_string()) {
+                    identity.podUid = uid->get<std::string>();
+                }
+            }
+            if (auto const * account = lookupClaim(claims, "kubernetes.io.serviceaccount");
+                (account != nullptr) && account->is_object()) {
+                if (auto name = account->find("name"); name != account->end() && name->is_string()) {
+                    identity.serviceAccountName = name->get<std::string>();
+                }
+            }
+            if (auto const aud = claims.find("aud"); aud != claims.end()) {
+                if (aud->is_string()) {
+                    identity.singleAudience = aud->get<std::string>();
+                } else if (aud->is_array() && aud->size() == 1 && aud->front().is_string()) {
+                    identity.singleAudience = aud->front().get<std::string>();
+                }
+            }
+            identity.expiresAt = parsed->get_expires_at();
+            if (parsed->has_issued_at()) {
+                identity.issuedAt = parsed->get_issued_at();
+            }
+            return {.identity = std::move(identity), .error = role ? "" : "no rule matched"};
         }
         return fail("unknown issuer '" + iss + "'");
     }

@@ -4,6 +4,11 @@
 
 #include <algorithm>
 #include <cassert>
+#ifdef NIX_GRPC_TEST_REVERSE_RETRY
+#include <atomic>
+std::atomic<unsigned> reverseProbeNotFound{0};
+std::atomic<unsigned> reverseClosureUploaded{0};
+#endif
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -69,14 +74,27 @@ auto GrpcStore::routingFor(const BasicDerivation & drv, const std::string & work
   return meta;
 }
 
-void GrpcStore::uploadDrvClosure(Store & evalStore, std::vector<StorePath> drvPaths, const Metadata & headers) {
-  auto const missing = nixgrpc::missingTopDown(
-      std::move(drvPaths),
-      [](const StorePath & path) -> std::vector<StorePath> { return {path}; },
-      [&](const StorePath & path) -> StorePathSet { return evalStore.queryPathInfo(path)->references; },
-      [&](const StorePathSet & paths) -> StorePathSet { return queryValidPathsRouted(paths, NoSubstitute, headers); });
+auto GrpcStore::uploadDrvClosure(Store & evalStore, std::vector<StorePath> drvPaths, const Metadata & headers,
+                                 std::optional<std::pair<StorePath, uint64_t>> reverseAssignment) -> grpc::Status {
+  // The scheduler's store cannot answer what a reverse worker has locally.
+  // Upload the entire closure to the pinned worker; duplicate paths are
+  // handled by the worker importer. Never query/transfer through a direct
+  // worker or the scheduler store for this assignment. The worker still
+  // verifies signatures for write-role clients, as for direct uploads.
+  StorePathSet missing;
+  if (reverseAssignment) {
+    for (auto const & drvPath : drvPaths) {
+      evalStore.computeFSClosure(drvPath, missing);
+    }
+  } else {
+    missing = nixgrpc::missingTopDown(
+        std::move(drvPaths),
+        [](const StorePath & path) -> std::vector<StorePath> { return {path}; },
+        [&](const StorePath & path) -> StorePathSet { return evalStore.queryPathInfo(path)->references; },
+        [&](const StorePathSet & paths) -> StorePathSet { return queryValidPathsRouted(paths, NoSubstitute, headers); });
+  }
   if (missing.empty()) {
-    return;
+    return grpc::Status::OK;
   }
   PathsSource sources;
   // addMultipleToStore wants references before referrers.
@@ -100,7 +118,18 @@ void GrpcStore::uploadDrvClosure(Store & evalStore, std::vector<StorePath> drvPa
       evalStore.narFromPath(info->path, tee);
     }));
   }
-  addMultipleToStoreRouted(std::move(sources), act, NoRepair, CheckSigs, headers);
+  if (!reverseAssignment) {
+    addMultipleToStoreRouted(std::move(sources), act, NoRepair, CheckSigs, headers);
+    return grpc::Status::OK;
+  }
+  std::vector<std::pair<ValidPathInfo, ReplayableNar>> paths;
+  paths.reserve(sources.size());
+  auto const spool = std::make_shared<UploadSpool>();
+  for (auto & [info, nar] : sources) {
+    paths.emplace_back(info, ReplayableNar(std::move(nar), spool, info.narSize));
+  }
+  return addMultipleToStoreOnce(paths, act, NoRepair, CheckSigs, headers,
+                                std::pair{std::string(reverseAssignment->first.to_string()), reverseAssignment->second});
 }
 
 auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & request, const Metadata & headers,
@@ -126,6 +155,7 @@ auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & reques
   return status;
 }
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity): reverse and direct build paths kept side by side
 auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & where, Store & evalStore)
     -> Attempt {
   remote::BuildDerivationRequest request;
@@ -140,15 +170,37 @@ auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & 
     nixcompat::writeDrv(sink, *this, job.drv);
     *request.mutable_drv() = std::move(sink.s);
   }
-  auto headers = routingFor(job.drv, where.addr, where.system);
+  auto headers = routingFor(job.drv, where.reverse ? "" : where.addr, where.system);
   if (job.cacheLost) {
     headers.emplace_back("x-nix-cache-lost", "1");
+  }
+  if (where.reverse) {
+    headers.emplace_back("x-nix-reverse", "1"); // Envoy route only; server uses the live assignment.
   }
   std::optional<BuildResult> res;
   std::string missing;
   auto status = tryBuildDerivation(request, headers, res, missing);
   if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
-    uploadDrvClosure(evalStore, {job.drvPath}, headers);
+#ifdef NIX_GRPC_TEST_REVERSE_RETRY
+    if (where.reverse) ++reverseProbeNotFound;
+#endif
+    // Opt-in while reverse workers are new.
+    if (where.reverse && !config->reverseUploads) {
+      throw Error("reverse worker is missing build inputs; set the store setting reverse-uploads=true to send them");
+    }
+    auto upload = uploadDrvClosure(evalStore, {job.drvPath}, headers,
+                                   where.reverse ? std::optional(std::pair{job.drvPath, where.assignId}) : std::nullopt);
+    if (!upload.ok()) {
+      checkInterrupt();
+      if (where.reverse && reverseUploadBounced(upload)) {
+        printError("%s: %s, asking the scheduler again", job.drvPath.to_string(), firstLine(upload.error_message()));
+        return Bounced{};
+      }
+      checkStatus(upload, where.reverse ? "UploadBuildInputs" : "AddMultipleToStore");
+    }
+#ifdef NIX_GRPC_TEST_REVERSE_RETRY
+    if (where.reverse) ++reverseClosureUploaded;
+#endif
     status = tryBuildDerivation(request, headers, res, missing);
   }
   // Our own cancel ends the stream CANCELLED, and a dead worker looks the same.
@@ -335,6 +387,14 @@ struct GrpcStore::Run {
       if (auto * missing = std::get_if<MissingInput>(&res)) {
         res = recover(*work, missing->path);
       }
+      // A reverse data session reconnects asynchronously to WorkerSession.
+      // Immediate re-Wants can exhaust the bounded retry budget before the
+      // registration and the previous assignment's Done have been processed.
+      // Do not change the existing direct-worker retry behavior.
+      if (std::holds_alternative<Bounced>(res) && work->where.reverse) {
+        constexpr std::chrono::milliseconds reverseBounceDelay{250};
+        std::this_thread::sleep_for(reverseBounceDelay);
+      }
       std::scoped_lock const lock(mutex);
       if (auto * result = std::get_if<BuildResult>(&res)) {
         bool const succeeded = nixcompat::succeeded(*result);
@@ -359,8 +419,27 @@ struct GrpcStore::Run {
     }
     auto const producer = work.job->farmInputs.find(path);
     if (producer == work.job->farmInputs.end()) {
+      if (work.where.reverse && !store.config->reverseUploads) {
+        throw Error("reverse worker is missing build inputs; set the store setting reverse-uploads=true to send them");
+      }
       warn("%s: worker lacks '%s', uploading it again", work.job->drvPath.to_string(), pathS);
-      store.uploadDrvClosure(evalStore, {work.job->drvPath}, store.routingFor(work.job->drv, work.where.addr, work.where.system));
+      auto headers = store.routingFor(work.job->drv, work.where.reverse ? "" : work.where.addr, work.where.system);
+      if (work.where.reverse) {
+        headers.emplace_back("x-nix-reverse", "1");
+      }
+      auto const upload =
+          store.uploadDrvClosure(evalStore, {work.job->drvPath}, headers,
+                                 work.where.reverse ? std::optional(std::pair{work.job->drvPath, work.where.assignId})
+                                                    : std::nullopt);
+      if (!upload.ok()) {
+        if (!(work.where.reverse && GrpcStore::reverseUploadBounced(upload))) {
+          store.checkStatus(upload, work.where.reverse ? "UploadBuildInputs" : "AddMultipleToStore");
+        }
+        // The input never arrived: let the next placement upload it again.
+        // The executor's reschedule limit still bounds the retries.
+        std::scoped_lock const lock(mutex);
+        recovered.erase({work.jid, path});
+      }
       return Bounced{};
     }
     warn("%s: farm lacks '%s', building '%s' too", work.job->drvPath.to_string(), pathS,
@@ -427,7 +506,8 @@ struct GrpcStore::Run {
       debug("grpc: assigned %s -> %s", name, msg.assigned().worker_addr());
       exe.onAssigned(jid, {.addr = msg.assigned().worker_addr(),
                           .assignId = msg.assigned().assign_id(),
-                          .system = msg.assigned().worker_system()});
+                          .system = msg.assigned().worker_system(),
+                          .reverse = msg.assigned().reverse()});
       break;
     case remote::SchedMsg::kCached:
       exe.onCached(jid);
@@ -607,7 +687,7 @@ void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, Store & evalStore) {
   for (const auto & [drvPath, job] : jobs) {
     drvPaths.push_back(drvPath);
   }
-  uploadDrvClosure(evalStore, std::move(drvPaths), headers);
+  checkStatus(uploadDrvClosure(evalStore, std::move(drvPaths), headers), "AddMultipleToStore");
   std::vector<std::jthread> threads(threadCount);
   for (auto & thread : threads) {
     thread = std::jthread([&run] -> void { run.work(); });

@@ -3,3 +3,7 @@ option('fuzzers', type : 'boolean', value : false, description : 'Build libFuzze
 # not. 'plugin' keeps those matrix builds down to src/client.
 option('components', type : 'combo', choices : ['all', 'plugin'], value : 'all',
   description : 'Which components to build')
+# Needs nix-daemon, nix-instantiate and writable rooted stores; not in the
+# package build sandbox. Run it on a host: tests/reverse-production-test.sh.
+option('reverse-production-test', type : 'boolean', value : false,
+  description : 'Build the reverse-worker production fixture')

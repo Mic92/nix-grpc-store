@@ -18,6 +18,11 @@
 
 namespace nixgrpc {
 
+// Kubernetes refuses projected tokens shorter than 10 minutes and the tunnel
+// accepts at most an hour.
+constexpr unsigned minReverseTokenLifetimeSecs = 600;
+constexpr unsigned maxReverseTokenLifetimeSecs = 3600;
+
 struct Options
 {
     std::string listen = "0.0.0.0:50051";
@@ -34,6 +39,15 @@ struct Options
     Acl acl;
     xfcc::TrustedProxies proxies;
     std::string oidcConfig;
+    // Registration-only OIDC provider; never added to the client Auth verifier.
+    std::string reverseOidcConfig;
+    std::string reverseProvider;
+    std::string reverseNamespace;
+    std::string reverseServiceAccount;
+    std::string reverseAudience;
+    // Longest accepted tunnel token lifetime. Offline verification cannot
+    // see pod deletion, so this is also the revocation window.
+    std::chrono::seconds reverseMaxTokenLifetime{minReverseTokenLifetimeSecs};
     Niks3Config niks3;
 
     bool builder = true;
@@ -41,6 +55,10 @@ struct Options
     // Empty: in-process scheduler. Else the balancer URL (host:port) to dial.
     std::string schedulerAddr;
     std::string schedulerTokenFile; // bearer towards a remote scheduler, optional
+    // Opt-in reverse worker. UID comes from the pod's downward API; the
+    // scheduler independently checks it against the projected tunnel JWT.
+    std::string reverseWorkerId;
+    std::string reverseTokenFile;
     // How the balancer reaches this worker. Goes into Assigned.worker_addr.
     std::string advertise;
     unsigned maxJobs = 0; // 0 = take nix's max-jobs

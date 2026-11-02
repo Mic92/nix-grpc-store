@@ -21,6 +21,7 @@
 #include <exception>
 #include <future>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -82,6 +83,14 @@
 #include "keepalive.hh"
 #include "logfmt.hh"
 #include "oidc.hh"
+#include "reverse-session.hh"
+#include "reverse-capability.hh"
+#include "reverse-gateway.hh"
+#include "reverse-relay.hh"
+#include "reverse-request.hh"
+#include "reverse-upload.hh"
+#include "reverse-upload-pipe.hh"
+#include "reverse-upload-relay.hh"
 #include "path-info-wire.hh"
 #include "metrics.hh"
 #include "nix-compat.hh"
@@ -119,11 +128,23 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     nixgrpc::Auth & auth;
     nixgrpc::Backends backends;
     nixgrpc::Coordinator & coord;
+    std::unique_ptr<nixgrpc::ReverseGateway> reverseGateway;
+    std::unique_ptr<nixgrpc::ReverseRelay> reverseRelay;
+    std::unique_ptr<nixgrpc::ReverseUploadRelay> reverseUploadRelay;
 
     std::mutex storeMutex;
     std::shared_ptr<nix::Store> store;
     nixgrpc::UploadClaims uploads;
     nixgrpc::SessionRoots sessions{[this] -> nix::ref<nix::Store> { return openScopedStore(); }};
+#ifdef NIX_GRPC_DAEMON_EMBED_TEST
+    // Fixture-only pause after the importer consumes bytes, before it checks
+    // whether the assignment survived that read. Not built into the daemon.
+    std::function<void(const std::string &, size_t)> reverseUploadReadHook;
+    // After importPaths spools the entire NAR, before the existing apply gate.
+    std::function<void(const std::string &)> reverseUploadSpooledHook;
+    // Before publishing a built output; throwing simulates an unreachable cache.
+    std::function<void(const std::string &)> publishHook;
+#endif
 
     // Without the path info cache a path deleted behind our back (gc) is
     // invalid here too, instead of failing later when its NAR is read.
@@ -203,6 +224,20 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     }
 
 public:
+#ifdef NIX_GRPC_DAEMON_EMBED_TEST
+    void setReverseUploadReadHook(std::function<void(const std::string &, size_t)> hook)
+    {
+        reverseUploadReadHook = std::move(hook);
+    }
+    void setReverseUploadSpooledHook(std::function<void(const std::string &)> hook)
+    {
+        reverseUploadSpooledHook = std::move(hook);
+    }
+    void setPublishHook(std::function<void(const std::string &)> hook)
+    {
+        publishHook = std::move(hook);
+    }
+#endif
     // begin() throws this for callers the ACL refuses.
     struct Denied : std::exception
     {
@@ -321,6 +356,188 @@ public:
         , backends{.socketPath = std::move(socketPath)}
         , coord(coord)
     {
+        if (coord.dispatcher) {
+            reverseGateway = std::make_unique<nixgrpc::ReverseGateway>(
+                auth, coord.reverseRegistry,
+                [&coord](std::string_view pod, std::string_view drv, uint64_t assignment) -> bool {
+                    return coord.dispatcher->podOwnsAssignment(pod, drv, assignment);
+                });
+            reverseRelay = std::make_unique<nixgrpc::ReverseRelay>(*reverseGateway, coord.reverseRegistry);
+            reverseUploadRelay = std::make_unique<nixgrpc::ReverseUploadRelay>(*reverseGateway, coord.reverseRegistry);
+        }
+    }
+
+    // Called only by the authenticated, pod-bound reverse registration after
+    // its capability and complete request were checked. Never re-identify a
+    // loopback connection as the original caller.
+    auto reverseBuild(const nixgrpc::ReverseRequest::Ready & call,
+                       const nixgrpc::Coordinator::ReverseEmit & emit,
+                       const std::function<bool()> & cancelled,
+                       std::function<void()> & afterFinish) -> grpc::Status
+    {
+        return guarded([&] -> grpc::Status {
+            nix::remote::BuildDerivationRequest request;
+            if (!request.ParseFromString(call.payload) || !nixgrpc::ReverseRequest::matchesBuild(call, request)
+                || request.protocol() != nixcompat::kBuildProtocolWire ||
+                request.build_mode() > static_cast<uint32_t>(nix::bmCheck)) {
+                return {grpc::StatusCode::INVALID_ARGUMENT, "invalid delegated build request"};
+            }
+            if (auto status = nixgrpc::Auth::authorize(call.delegated.caller, "BuildDerivation",
+                    nixgrpc::Role::write, request.build_mode()); !status.ok()) {
+                return status;
+            }
+            // As on the direct path: a stopping worker is UNAVAILABLE, which the
+            // client hands back to the scheduler. CANCELLED would read as the
+            // client's own cancel and fail the build.
+            if (stopSignal != 0) {
+                return {grpc::StatusCode::UNAVAILABLE, "worker draining"};
+            }
+            if (cancelled()) {
+                return {grpc::StatusCode::CANCELLED, "reverse build cancelled"};
+            }
+            if (!coord.builder) {
+                return {grpc::StatusCode::FAILED_PRECONDITION, "not a builder"};
+            }
+            metrics.countRpc("BuildDerivation", call.delegated.caller.name);
+            auto const localStore = getStore();
+            nix::StorePath const drvPath(request.drv_path());
+            nix::StringSource drvSource(request.drv());
+            nix::BasicDerivation drv;
+            nixcompat::readDrv(drvSource, *localStore, drv, nix::Derivation::nameFromPath(drvPath));
+            auto const sendLog = [&](nixgrpc::BuildEvent event) -> void {
+                if (!emit(nixgrpc::toChunk<nix::remote::BuildDerivationChunk>(std::move(event)))) {
+                    throw nixgrpc::CancelledWait("reverse build response closed");
+                }
+            };
+            nixgrpc::Metrics::Inputs inputs;
+            nix::remote::BuildDerivationChunk chunk;
+            // The gateway acknowledges only a delivered result. Without one
+            // (publish failure, cancel, timeout) no acknowledgement comes, so
+            // the deferred Done must go out now or the scheduler keeps this
+            // slot busy until the session drops.
+            auto const retireUnacknowledged = [&] -> void {
+                if (afterFinish) {
+                    std::exchange(afterFinish, nullptr)();
+                }
+            };
+            grpc::Status status;
+            try {
+                status = build(cancelled, *localStore, drvPath, drv,
+                    static_cast<nix::BuildMode>(request.build_mode()),
+                    {.buildTimeout = request.build_timeout(), .maxSilentTime = request.max_silent_time()},
+                    request.assign_id(), sendLog, inputs, *chunk.mutable_done(), &afterFinish);
+            } catch (...) {
+                retireUnacknowledged();
+                throw;
+            }
+            if (status.ok() && !emit(chunk)) {
+                status = {grpc::StatusCode::CANCELLED, "reverse response closed"};
+            }
+            if (!status.ok()) {
+                retireUnacknowledged();
+            }
+            return status;
+        });
+    }
+
+    // NOLINTNEXTLINE(readability-function-cognitive-complexity): security-sensitive delegated upload checks
+    auto reverseUpload(const nixgrpc::ReverseRequest::Upload & call,
+                       const std::function<bool()> & cancelled) -> grpc::Status
+    {
+        return guarded([&] -> grpc::Status {
+            if (!coord.builder || !nixgrpc::ReverseCapability::matchesBuildInputs(call.delegated,
+                    call.delegated.drvPath, call.delegated.assignId)) {
+                return {grpc::StatusCode::PERMISSION_DENIED, "invalid delegated upload"};
+            }
+            if (auto status = nixgrpc::Auth::authorize(call.delegated.caller, "UploadBuildInputs",
+                    nixgrpc::Role::write); !status.ok()) {
+                return status;
+            }
+            auto const live = [&] -> bool {
+                return !cancelled() && !call.pipe->cancelled() && stopSignal == 0
+                    && coord.builder->expects(call.delegated.drvPath, call.delegated.assignId);
+            };
+            if (!live()) {
+                return {grpc::StatusCode::FAILED_PRECONDITION, "upload assignment no longer live"};
+            }
+            nix::remote::AddMultipleChunk first;
+            if (!call.pipe->Read(&first) || !nixgrpc::ReverseCapability::permitsImport(call.delegated, first)
+                || !live()) {
+                return {grpc::StatusCode::FAILED_PRECONDITION, "invalid or interrupted upload"};
+            }
+            auto const repair = first.repair() ? nix::Repair : nix::NoRepair;
+            auto const checkSigs = first.check_sigs() ? nix::CheckSigs : nix::NoCheckSigs;
+            auto localStore = openScopedStore();
+            nixgrpc::ZstdReaderSource<nixgrpc::ReverseUploadPipe, nix::remote::AddMultipleChunk> source(
+                *call.pipe, std::move(*first.mutable_data()));
+            nixgrpc::Metrics::Held const held(metrics, "UploadBuildInputs");
+            nixgrpc::Metrics::Phase phase(metrics, "UploadBuildInputs", "recv");
+            std::vector<std::string> imported;
+            // Keep the source live while importUploads reads. A cancelled or
+            // replaced assignment must not finish consuming an already
+            // buffered NAR as if it still belonged to this worker.
+            class CheckedSource : public nix::Source {
+                // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members): local wrapper over a source outliving it
+                nix::Source & inner;
+                std::function<bool()> valid;
+#ifdef NIX_GRPC_DAEMON_EMBED_TEST
+                std::function<void(size_t)> afterRead;
+                size_t bytesRead = 0;
+#endif
+            public:
+#ifndef NIX_GRPC_DAEMON_EMBED_TEST
+                CheckedSource(nix::Source & inner, std::function<bool()> valid)
+                    : inner(inner), valid(std::move(valid)) { }
+#else
+                CheckedSource(nix::Source & inner, std::function<bool()> valid, std::function<void(size_t)> afterRead)
+                    : inner(inner), valid(std::move(valid)), afterRead(std::move(afterRead)) { }
+#endif
+                auto read(char * data, size_t length) -> size_t override {
+                    if (!valid()) {
+                        throw nix::Error("reverse upload assignment revoked");
+                    }
+                    auto const got = inner.read(data, length);
+#ifdef NIX_GRPC_DAEMON_EMBED_TEST
+                    bytesRead += got;
+                    if (got && afterRead) afterRead(bytesRead);
+#endif
+                    if (!valid()) {
+                        throw nix::Error("reverse upload assignment revoked");
+                    }
+                    return got;
+                }
+            }
+#ifdef NIX_GRPC_DAEMON_EMBED_TEST
+            checked(source, live, [this, drv = call.delegated.drvPath](size_t got) {
+                if (reverseUploadReadHook) reverseUploadReadHook(drv, got);
+            });
+#else
+            checked(source, live);
+#endif
+            auto const stats = importUploads(*localStore, checked,
+                call.delegated.caller.role == nixgrpc::Role::write ? nix::NoRepair : repair,
+                call.delegated.caller.role == nixgrpc::Role::write ? nix::CheckSigs : checkSigs,
+                [&] -> bool { return !live(); }, imported,
+                [&] -> void {
+                    // NARs are on disk, not in the store. Also recheck before
+                    // each path (including after a reference lock wait).
+#ifdef NIX_GRPC_DAEMON_EMBED_TEST
+                    if (reverseUploadSpooledHook) reverseUploadSpooledHook(call.delegated.drvPath);
+#endif
+                    source.finishFrame();
+                    if (!call.pipe->endWithoutTrailingData() || !live()) {
+                        throw nix::Error("reverse upload incomplete or assignment changed");
+                    }
+                });
+            phase.next("publish");
+            coord.cache.publish(*localStore, imported, [&] -> bool { return !live(); });
+            if (!live()) {
+                return {grpc::StatusCode::FAILED_PRECONDITION, "upload assignment changed"};
+            }
+            phase.done();
+            metrics.countNarBytes("in", call.delegated.caller.name, stats.narBytes);
+            return grpc::Status::OK;
+        });
     }
 
     auto Connect(grpc::ServerContext * context, GrpcStream * stream) -> grpc::Status override
@@ -413,7 +630,8 @@ public:
         nix::RepairFlag repair,
         nix::CheckSigsFlag checkSigs,
         const nixgrpc::Cancelled & cancelled,
-        std::vector<std::string> & imported) -> nixgrpc::ImportStats
+        std::vector<std::string> & imported,
+        const std::function<void()> & beforeApply = {}) -> nixgrpc::ImportStats
     {
         struct Owned
         {
@@ -456,6 +674,11 @@ public:
                 throw Unavailable("a concurrent upload of '%s' failed", name);
             }
         };
+        // For reverse uploads the callback verifies both the complete wire
+        // body and the current assignment; ordinary uploads have no gate.
+        if (beforeApply) {
+            beforeApply();
+        }
         // Only references are awaited, so two uploads cannot wait on each other.
         for (auto & item : owned) {
             for (const auto & ref : item.info->references) {
@@ -464,7 +687,13 @@ public:
                 }
             }
             auto reader = spool.reader(item.nar);
+            if (beforeApply) {
+                beforeApply();
+            }
             coord.cache.completeRefs(localStore, *item.info);
+            if (beforeApply) {
+                beforeApply();
+            }
             localStore.addToStore(*item.info, reader, repair, checkSigs);
             imported.push_back(localStore.printStorePath(item.info->path));
             item.promise.set_value();
@@ -520,6 +749,50 @@ public:
             rpc.done({{"paths", std::to_string(stats.paths)}, {"nar_bytes_in", std::to_string(stats.narBytes)}});
             metrics.countNarBytes("in", rpc.caller.name, stats.narBytes);
             return grpc::Status::OK;
+        });
+    }
+
+    auto UploadBuildInputs(grpc::ServerContext * context,
+                           grpc::ServerReader<nix::remote::UploadBuildInputsChunk> * reader,
+                           nix::remote::AddMultipleReply * /*reply*/) -> grpc::Status override
+    {
+        return guarded([&] -> grpc::Status {
+            if (!reverseUploadRelay || !reverseGateway || !coord.dispatcher || coord.builder) {
+                return {grpc::StatusCode::FAILED_PRECONDITION, "upload requires a scheduler-only gateway"};
+            }
+            nix::remote::UploadBuildInputsChunk first;
+            if (!reader->Read(&first)) {
+                return {grpc::StatusCode::INVALID_ARGUMENT, "empty build-input upload"};
+            }
+            auto const drv = first.drv_path();
+            auto const assignment = first.assign_id();
+            if (first.ByteSizeLong() > nixgrpc::ReverseUpload::maxChunkBytes || !first.has_chunk()
+                || drv.empty() || assignment == 0) {
+                return {grpc::StatusCode::INVALID_ARGUMENT, "invalid upload header"};
+            }
+            auto const caller = auth.identify(*context);
+            if (caller.kind != nixgrpc::Caller::Kind::named) {
+                return {grpc::StatusCode::UNAUTHENTICATED, "reverse upload requires an authenticated client"};
+            }
+            if (auto status = nixgrpc::Auth::authorize(caller, "UploadBuildInputs", nixgrpc::Role::write);
+                !status.ok()) {
+                return status;
+            }
+            auto const pod = coord.dispatcher->assignmentPod(drv, assignment);
+            if (!pod) {
+                return {grpc::StatusCode::FAILED_PRECONDITION, "no live pod-bound upload assignment"};
+            }
+            auto const assigned = [this, pod = *pod, drv = drv, assignment] -> bool {
+                return coord.dispatcher->podOwnsAssignment(pod, drv, assignment);
+            };
+            return reverseUploadRelay->call(*context,
+                [&](uint64_t streamId) -> nixgrpc::ReverseGateway::Result {
+                    return reverseGateway->prepareBuildInputs(*context,
+                        [this](std::string_view path, uint64_t assignId) -> std::optional<std::string> {
+                            return coord.dispatcher->assignmentPod(path, assignId);
+                        }, streamId, drv, assignment);
+                }, assigned, [&](nix::remote::UploadBuildInputsChunk & frame) -> bool { return reader->Read(&frame); },
+                first);
         });
     }
 
@@ -664,14 +937,14 @@ public:
     }
 
     // Second caller for a drv that already builds here: wait for its result.
-    static auto attach(grpc::ServerContext & context, nixgrpc::Expected::Shared & shared, const nixgrpc::BuildEventSink & log)
+    static auto attach(const std::function<bool()> & cancelled, nixgrpc::Expected::Shared & shared, const nixgrpc::BuildEventSink & log)
         -> std::optional<std::string>
     {
         log({.text = "attached to the build already running on this worker"});
         shared.attached++;
         auto const completed = nixgrpc::followSpill(
             shared.spill, shared.mutex, shared.cv, shared.finished, nixgrpc::cancelPoll,
-            [&] -> bool { return context.IsCancelled() || stopSignal >= nixgrpc::kCancelBuilds; },
+            [&] -> bool { return cancelled() || stopSignal >= nixgrpc::kCancelBuilds; },
             [&](nixgrpc::SpillKind kind, std::string_view text) -> void {
                 log({.kind = static_cast<nixgrpc::BuildEvent::Kind>(kind), .text = std::string(text)});
             });
@@ -684,14 +957,14 @@ public:
     }
 
     auto attached(
-        grpc::ServerContext & context,
+        const std::function<bool()> & cancelled,
         nixgrpc::Expected::Shared & shared,
         const nixgrpc::BuildEventSink & log,
         const std::array<uint64_t, 3> & settings,
         nix::remote::BuildDerivationDone & done) -> grpc::Status
     {
         metrics.event("attached");
-        auto wire = attach(context, shared, log);
+        auto wire = attach(cancelled, shared, log);
         if (shared.revoked) {
             return {grpc::StatusCode::ABORTED, "superseded, another worker was already building this"};
         }
@@ -716,12 +989,13 @@ public:
     class OwnerRelay
     {
     public:
-        OwnerRelay(grpc::ServerContext & context, nixgrpc::Expected::Shared & shared, const nixgrpc::BuildEventSink & log)
+        OwnerRelay(const std::function<bool()> & cancelled, nixgrpc::Expected::Shared & shared,
+                   const nixgrpc::BuildEventSink & log)
             : shared_(shared)
-            , thread_([&context, &shared, &log] -> void {
+            , thread_([&cancelled, &shared, &log] -> void {
                 (void) nixgrpc::followSpill(
                     shared.spill, shared.mutex, shared.cv, shared.finished, nixgrpc::cancelPoll,
-                    [&] -> bool { return context.IsCancelled() || stopSignal >= nixgrpc::kCancelBuilds; },
+                    [&] -> bool { return cancelled() || stopSignal >= nixgrpc::kCancelBuilds; },
                     [&](nixgrpc::SpillKind kind, std::string_view text) -> void {
                         log({.kind = static_cast<nixgrpc::BuildEvent::Kind>(kind), .text = std::string(text)});
                     });
@@ -752,15 +1026,19 @@ public:
 
     // gRPC errors mean "ask the scheduler again", build outcomes travel as BuildResult.
     auto build(
-        grpc::ServerContext & context,
+        const std::function<bool()> & cancelled,
         nix::Store & localStore,
         const nix::StorePath & drvPath,
         const nix::BasicDerivation & drv,
         nix::BuildMode mode,
         nixgrpc::Backends::Limits limits,
+        uint64_t assignId,
         const nixgrpc::BuildEventSink & log,
         nixgrpc::Metrics::Inputs & inputs,
-        nix::remote::BuildDerivationDone & done) -> grpc::Status
+        nix::remote::BuildDerivationDone & done,
+        std::function<void()> * deferredDone = nullptr,
+        std::string * missingInput = nullptr,
+        bool verifyPublish = false) -> grpc::Status
     {
         if (!coord.builder) {
             return {grpc::StatusCode::FAILED_PRECONDITION, "not a builder"};
@@ -784,14 +1062,17 @@ public:
                 return {grpc::StatusCode::NOT_FOUND, "missing: " + localStore.printStorePath(drvPath)};
             }
         }
-        auto adm = builder.admit(drvName);
+        if (cancelled()) {
+            return {grpc::StatusCode::CANCELLED, "build cancelled before admission"};
+        }
+        auto adm = builder.admit(drvName, assignId);
         if (!adm) {
             metrics.event("unexpected_build");
             return {grpc::StatusCode::FAILED_PRECONDITION, "not scheduled here: " + drvName};
         }
         std::array<uint64_t, 3> const settings{static_cast<uint64_t>(mode), limits.buildTimeout, limits.maxSilentTime};
         if (adm->attach) {
-            return attached(context, *adm->shared, log, settings, done);
+            return attached(cancelled, *adm->shared, log, settings, done);
         }
 
         // From here on we own the Expect and must report Done exactly once.
@@ -800,16 +1081,18 @@ public:
         auto reason = nix::remote::Done::REASON_UNSPECIFIED;
         std::vector<std::pair<std::string, uint64_t>> outputs;
         std::string wire;
-        auto const report = [&] -> void { builder.finished(drvName, outcome, outputs, wire, reason); };
+        auto const report = [&] -> void {
+            builder.finished(drvName, adm->assignId, outcome, outputs, wire, reason, deferredDone);
+        };
         auto const tee = [&](const nixgrpc::BuildEvent & event) -> void {
             adm->shared->logged(static_cast<nixgrpc::SpillKind>(event.kind), event.text);
         };
-        OwnerRelay const relay(context, *adm->shared, log);
+        OwnerRelay const relay(cancelled, *adm->shared, log);
         try {
             auto status =
                 buildExpected(
-                    context, *adm->shared, localStore, drvPath, drv, mode, limits, tee, inputs, outPaths, done, outcome,
-                    outputs);
+                    cancelled, *adm->shared, localStore, drvPath, drv, mode, limits, tee, inputs, outPaths, done, outcome,
+                    outputs, missingInput, verifyPublish);
             // No result to share unless the build produced one: attachers of a
             // failed owner must retry, not return an empty Done as success.
             if (status.ok()) {
@@ -855,7 +1138,7 @@ public:
     }
 
     auto buildExpected(
-        grpc::ServerContext & context,
+        const std::function<bool()> & isCancelled,
         nixgrpc::Expected::Shared & shared,
         nix::Store & localStore,
         const nix::StorePath & drvPath,
@@ -867,18 +1150,20 @@ public:
         const std::map<std::string, nix::StorePath> & outPaths,
         nix::remote::BuildDerivationDone & done,
         nix::remote::Done::Outcome & outcome,
-        std::vector<std::pair<std::string, uint64_t>> & outputs) -> grpc::Status
+        std::vector<std::pair<std::string, uint64_t>> & outputs,
+        std::string * missingInput,
+        bool verifyPublish) -> grpc::Status
     {
         auto const cancelled = [&] -> bool {
-            return (context.IsCancelled() && shared.attached == 0) || shared.revoked || stopSignal >= nixgrpc::kCancelBuilds;
+            return (isCancelled() && shared.attached == 0) || shared.revoked || stopSignal >= nixgrpc::kCancelBuilds;
         };
         nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "substitute");
         // Roots inputs and outputs until publish is done.
         auto const roots = openScopedStore();
         std::string missing;
         if (auto status = gatherInputs(localStore, drv, *roots, inputs, missing); !status.ok()) {
-            if (!missing.empty()) {
-                context.AddTrailingMetadata("x-nix-missing-input", missing);
+            if (!missing.empty() && (missingInput != nullptr)) {
+                *missingInput = missing;
             }
             return status;
         }
@@ -915,8 +1200,17 @@ public:
                 outputs.emplace_back(built.back(), localStore.queryPathInfo(path)->narSize);
             }
             phase.next("publish");
+#ifdef NIX_GRPC_DAEMON_EMBED_TEST
+            if (publishHook) {
+                try {
+                    publishHook(std::string(drvPath.to_string()));
+                } catch (nix::Error & err) {
+                    throw Unavailable("publish failed: %s", err.what());
+                }
+            }
+#endif
             // The client rebuilt this because the cache lost its NAR.
-            publish(localStore, built, cancelled, context.client_metadata().contains("x-nix-cache-lost"));
+            publish(localStore, built, cancelled, verifyPublish);
             phase.done();
             outcome = nix::remote::Done::BUILT;
         } else if (nixcompat::failureStatus(res) == nixcompat::FailureStatus::TransientFailure && nixcompat::isSandboxed(drv)) {
@@ -928,6 +1222,7 @@ public:
         return grpc::Status::OK;
     }
 
+    // NOLINTNEXTLINE(readability-function-cognitive-complexity): security-sensitive reverse/local build routing
     auto BuildDerivation(
         grpc::ServerContext * context,
         const nix::remote::BuildDerivationRequest * request,
@@ -940,6 +1235,46 @@ public:
             if (request->protocol() != nixcompat::kBuildProtocolWire
                 || request->build_mode() > static_cast<uint32_t>(nix::bmCheck)) {
                 return {grpc::StatusCode::INVALID_ARGUMENT, "unsupported build protocol or mode"};
+            }
+            // Only a signed pod-bound scheduler assignment may select the
+            // reverse data route. No x-nix-worker metadata participates.
+            // Direct workers continue through the existing local handler.
+            auto const selectedPod = reverseRelay && coord.dispatcher
+                ? coord.dispatcher->assignmentPod(request->drv_path(), request->assign_id()) : std::nullopt;
+            if (selectedPod) {
+                std::atomic<bool> receivedDone{false};
+                auto const status = reverseRelay->call(*context,
+                    [&](uint64_t streamId) -> nixgrpc::ReverseGateway::Result {
+                        return reverseGateway->prepareBuild(*context,
+                            [this](std::string_view drv, uint64_t assignment) -> std::optional<std::string> {
+                                return coord.dispatcher->assignmentPod(drv, assignment);
+                            }, streamId, request->drv_path(), request->assign_id(), request->build_mode());
+                    }, *request, [&](std::string_view wire) -> bool {
+                        nix::remote::BuildDerivationChunk chunk;
+                        if (!chunk.ParseFromArray(wire.data(), static_cast<int>(wire.size()))
+                            || chunk.event_case() == nix::remote::BuildDerivationChunk::EVENT_NOT_SET || receivedDone.load()) {
+                            return false;
+                        }
+                        if (!writer->Write(chunk)) {
+                            return false;
+                        }
+                        if (chunk.has_done()) {
+                            receivedDone = true;
+                        }
+                        return true;
+                    }, [this, drv = request->drv_path(), assignment = request->assign_id(),
+                        pod = *selectedPod] -> bool {
+                        return coord.dispatcher->podOwnsAssignment(pod, drv, assignment);
+                    }, [&] -> bool { return receivedDone.load(); });
+                return status.ok() && !receivedDone.load()
+                    ? grpc::Status{grpc::StatusCode::DATA_LOSS, "reverse build completed without a result"} : status;
+            }
+            // Scheduler-only frontends never build locally: a stale or
+            // certificate-only assignment must not fall back to the
+            // scheduler's own Nix store. Direct clients still dial the worker
+            // through the existing balancer and use the ordinary handler.
+            if (!coord.builder) {
+                return {grpc::StatusCode::FAILED_PRECONDITION, "no pod-bound build assignment on this frontend"};
             }
             // No drain check: the scheduler stops sending new work, and what it already sent runs.
             auto const localStore = getStore();
@@ -964,9 +1299,16 @@ public:
 
             nix::remote::BuildDerivationChunk chunk;
             nixgrpc::Metrics::Inputs inputs;
+            std::string missingInput;
             if (auto const status =
-                    build(*context, *localStore, drvPath, drv, mode, limits, sendLogLine, inputs, *chunk.mutable_done());
+                    build([&] -> bool { return context->IsCancelled(); }, *localStore, drvPath, drv, mode, limits,
+                          request->assign_id(), sendLogLine, inputs, *chunk.mutable_done(), nullptr, &missingInput,
+                          // The client rebuilt this because the cache lost its NAR.
+                          context->client_metadata().contains("x-nix-cache-lost"));
                 !status.ok()) {
+                if (!missingInput.empty()) {
+                    context->AddTrailingMetadata("x-nix-missing-input", missingInput);
+                }
                 return {status.error_code(), workerName + ": " + status.error_message()};
             }
             writer->Write(chunk);
@@ -1140,6 +1482,7 @@ auto sandboxPolicy(const nixgrpc::Options & options, bool listenFdsEmpty) -> nix
 
 } // namespace
 
+#ifndef NIX_GRPC_DAEMON_EMBED_TEST
 auto main(int argc, char ** argv) -> int
 try {
     // Pump threads write to a socket whose peer may already be gone; we want
@@ -1189,8 +1532,23 @@ try {
         }
         oidc.emplace(std::move(cfg));
     }
+    std::optional<nixgrpc::oidc::Verifier> reverseOidc;
+    std::optional<nixgrpc::WorkerIdentity> reverseIdentity;
+    std::unique_ptr<nixgrpc::ReverseSessionService> reverseService;
+    if (!options.reverseOidcConfig.empty()) {
+        reverseOidc.emplace(nixgrpc::oidc::loadConfig(options.reverseOidcConfig));
+        reverseIdentity.emplace(
+            *reverseOidc, options.reverseProvider, options.reverseNamespace, options.reverseServiceAccount,
+            options.reverseAudience, options.reverseMaxTokenLifetime);
+    }
     nixgrpc::Auth auth{.acl = options.acl, .proxies = options.proxies, .oidc = &oidc};
     nixgrpc::Coordinator coord(options, auth, metrics, idle);
+    if (reverseIdentity) {
+        reverseService = std::make_unique<nixgrpc::ReverseSessionService>(*reverseIdentity, coord.reverseRegistry, auth);
+        if (coord.scheduler) {
+            coord.scheduler->setReverseIdentity(*reverseIdentity);
+        }
+    }
     nixgrpc::logLine(
         nixgrpc::LogLevel::info,
         {{"event", "roles"},
@@ -1202,6 +1560,14 @@ try {
          {"max_jobs", std::to_string(options.maxJobs)}});
     NixRemoteService service(
         options.socketPath, options.storeUri, options.workerName, metrics, idle, options.logLevel, auth, coord);
+    if (coord.builder && !options.reverseTokenFile.empty()) {
+        coord.setReverseBuild([&service](auto const & call, auto const & emit, auto const & cancelled, auto & afterFinish) -> auto {
+            return service.reverseBuild(call, emit, cancelled, afterFinish);
+        });
+        coord.setReverseUpload([&service](auto const & call, auto const & cancelled) -> auto {
+            return service.reverseUpload(call, cancelled);
+        });
+    }
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
@@ -1235,6 +1601,9 @@ try {
     if (coord.scheduler) {
         builder.RegisterService(coord.scheduler.get());
         builder.RegisterService(coord.eds.get());
+        if (reverseService) {
+            builder.RegisterService(reverseService.get());
+        }
     }
 
     auto server = builder.BuildAndStart();
@@ -1275,3 +1644,4 @@ try {
     static_cast<void>(std::fputc('\n', stderr));
     return 1;
 }
+#endif
