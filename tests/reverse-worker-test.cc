@@ -113,6 +113,20 @@ try {
     blocked.close();
     producer.join();
     assert(!queued); // disconnect wakes a response producer waiting for space
+
+    // A long-lived registration sees many cancels. Each one is answered by a
+    // terminal frame, which retires its tombstone, so the session stays up.
+    nixgrpc::ReverseWorkerOutbound longLived;
+    constexpr uint64_t manyCancels = uint64_t{3} * 4096;
+    nix::remote::ReverseWorkerMsg drained;
+    for (uint64_t streamId = 1; streamId <= manyCancels; ++streamId) {
+        longLived.cancel(streamId);
+        bool const answered = longLived.finish(streamId, {grpc::StatusCode::CANCELLED, statusText}, stop.get_token());
+        assert(answered);
+        bool const taken = longLived.take(drained, stop.get_token());
+        assert(taken && drained.has_finish());
+    }
+    assert(longLived.healthy());
     return 0;
 } catch (std::exception & err) {
     std::cerr << err.what() << '\n';

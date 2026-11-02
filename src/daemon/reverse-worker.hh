@@ -186,9 +186,14 @@ private:
             }
         }
         queued += size;
+        auto const streamId = frame.stream_id();
         queue.push_back(std::move(frame));
-        // Cancelled IDs are kept for this registration, bounded by the
-        // fail-closed cap in cancel().
+        // A tombstone only has to stop late data frames until the stream's
+        // terminal frame is queued; nothing is pushed for it afterwards. The
+        // cap in cancel() still bounds cancels that are never answered.
+        if (terminal && this->cancelled.erase(streamId) != 0) {
+            std::erase(cancelOrder, streamId);
+        }
         cv.notify_all();
         return true;
     }
