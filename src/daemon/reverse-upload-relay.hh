@@ -50,6 +50,7 @@ public:
         if (!assigned()) {
             return {grpc::StatusCode::FAILED_PRECONDITION, "upload assignment changed"};
         }
+        std::unique_lock reserved(session->transport->reserve);
         auto const streamId = session->transport->nextStreamId.fetch_add(1);
         if (streamId == 0) {
             return {grpc::StatusCode::RESOURCE_EXHAUSTED, "reverse stream IDs exhausted"};
@@ -73,6 +74,7 @@ public:
         }
         auto & transport = *session->transport;
         auto status = gateway.enqueue(std::move(*selection.prepared), streamId);
+        reserved.unlock();
         if (!status.ok()) {
             return status;
         }

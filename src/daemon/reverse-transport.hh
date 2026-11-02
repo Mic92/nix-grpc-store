@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 
 #include "reverse-frames.hh"
 #include "reverse-responses.hh"
@@ -15,6 +16,10 @@ struct ReverseTransport
     // Stream IDs must never be reused within one registration, even after a
     // canceled or failed reservation. Other registrations have new keys.
     std::atomic<uint64_t> nextStreamId{1};
+    // Held from taking an ID until it is opened on both queues. Both reject
+    // an ID below the last one opened, so concurrent calls must open in
+    // allocation order.
+    std::mutex reserve;
     ReverseFrames outgoing;
     ReverseResponses responses;
 

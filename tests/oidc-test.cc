@@ -1,6 +1,7 @@
 // Signs tokens with fresh keys, serves the JWKS from a directory given on the
 // command line (python http.server in the wrapper) and checks the verifier.
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -1271,6 +1272,65 @@ auto run(const std::string &dir, const std::string &base) -> int
                 check(routeStub->StoreInfo(&relayCtx, routeReq, &routeReply).ok() && routeReply.trusted(),
                       "authenticated client RPC receives reverse response despite forged worker metadata");
                 responder.join();
+                {
+                    // Concurrent calls to one worker each reserve a stream ID
+                    // and open it; the queues reject an ID below the last one
+                    // opened, so allocation and opening must not interleave.
+                    constexpr unsigned concurrentCalls = 16;
+                    auto selected = controlRegistry.find(workerId);
+                    check(selected != nullptr, "worker still registered for concurrent relays");
+                    std::jthread concurrentResponder([&] -> void {
+                        if (!selected) {
+                            return;
+                        }
+                        nixgrpc::ReverseRequest incoming(workerId, selected->generation, selected->sessionKey);
+                        unsigned answered = 0;
+                        nix::remote::ReverseFarmMsg requestFrame;
+                        while (answered != concurrentCalls && dataStream->Read(&requestFrame)) {
+                            if (!incoming.accept(requestFrame) || !requestFrame.half_close()) {
+                                continue;
+                            }
+                            auto ready = incoming.takeReady();
+                            if (!ready) {
+                                continue;
+                            }
+                            nix::remote::StoreInfoReply response;
+                            response.set_trusted(true);
+                            auto const payload = response.SerializeAsString();
+                            std::string encoded;
+                            for (unsigned shift = 0; shift != lengthPrefixBits; shift += byteBits) {
+                                encoded.push_back(static_cast<char>((payload.size() >> shift) & byteMask));
+                            }
+                            encoded += payload;
+                            nix::remote::ReverseWorkerMsg answer;
+                            answer.set_stream_id(ready->id);
+                            answer.mutable_data()->set_data(encoded);
+                            dataStream->Write(answer);
+                            answer.mutable_finish()->set_code(0);
+                            dataStream->Write(answer);
+                            (void) incoming.finished(ready->id);
+                            ++answered;
+                        }
+                    });
+                    std::atomic<unsigned> succeeded{0};
+                    {
+                        std::vector<std::jthread> callers;
+                        callers.reserve(concurrentCalls);
+                        for (unsigned call = 0; call != concurrentCalls; ++call) {
+                            callers.emplace_back([&] -> void {
+                                grpc::ClientContext concurrentCtx;
+                                concurrentCtx.set_deadline(std::chrono::system_clock::now() + longDeadline);
+                                nix::remote::StoreInfoReply concurrentReply;
+                                if (routeStub->StoreInfo(&concurrentCtx, routeReq, &concurrentReply).ok()
+                                    && concurrentReply.trusted()) {
+                                    ++succeeded;
+                                }
+                            });
+                        }
+                    }
+                    concurrentResponder.join();
+                    check(succeeded == concurrentCalls, "concurrent relays to one worker all succeed");
+                }
                 buildRoute.relayEnabled = false;
                 buildRoute.buildRelayEnabled = true;
                 std::jthread buildResponder([&] -> void {
