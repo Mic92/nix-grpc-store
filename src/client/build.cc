@@ -192,6 +192,10 @@ auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & 
                                    where.reverse ? std::optional(std::pair{job.drvPath, where.assignId}) : std::nullopt);
     if (!upload.ok()) {
       checkInterrupt();
+      if (where.reverse && reverseUploadBounced(upload)) {
+        printError("%s: %s, asking the scheduler again", job.drvPath.to_string(), firstLine(upload.error_message()));
+        return Bounced{};
+      }
       checkStatus(upload, where.reverse ? "UploadBuildInputs" : "AddMultipleToStore");
     }
 #ifdef NIX_GRPC_TEST_REVERSE_RETRY
@@ -423,11 +427,13 @@ struct GrpcStore::Run {
       if (work.where.reverse) {
         headers.emplace_back("x-nix-reverse", "1");
       }
-      store.checkStatus(
+      auto const upload =
           store.uploadDrvClosure(evalStore, {work.job->drvPath}, headers,
                                  work.where.reverse ? std::optional(std::pair{work.job->drvPath, work.where.assignId})
-                                                    : std::nullopt),
-          work.where.reverse ? "UploadBuildInputs" : "AddMultipleToStore");
+                                                    : std::nullopt);
+      if (!upload.ok() && !(work.where.reverse && GrpcStore::reverseUploadBounced(upload))) {
+        store.checkStatus(upload, work.where.reverse ? "UploadBuildInputs" : "AddMultipleToStore");
+      }
       return Bounced{};
     }
     warn("%s: farm lacks '%s', building '%s' too", work.job->drvPath.to_string(), pathS,

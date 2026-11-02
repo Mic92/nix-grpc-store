@@ -426,6 +426,14 @@ public:
       return msg.substr(0, msg.find('\n'));
     }
 
+    // A reverse upload that failed because its data session ended or the
+    // assignment moved: the scheduler should place the build again.
+    static auto reverseUploadBounced(const grpc::Status & status) -> bool {
+      return status.error_code() == grpc::StatusCode::UNAVAILABLE
+             || status.error_code() == grpc::StatusCode::FAILED_PRECONDITION
+             || status.error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED;
+    }
+
     // An actBuild activity opened on the first streamed log line or phase.
     class BuildLogActivity {
       std::string text;
