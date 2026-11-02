@@ -683,7 +683,9 @@ void Coordinator::runReverseSession(const std::stop_token & stop)
                         break;
                     }
                 }
-                if (frame.cancel()) {
+                // A late cancel's stream already queued its terminal frame,
+                // which would never retire a new tombstone.
+                if (frame.cancel() && !requests.lastCancelWasLate()) {
                     outgoing.cancel(frame.stream_id());
                     if (!outgoing.healthy()) {
                         drop("too many cancelled streams");

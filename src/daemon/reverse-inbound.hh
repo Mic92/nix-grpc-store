@@ -30,6 +30,8 @@ class ReverseInbound
         } kind;
         uint64_t streamId;
         std::optional<ReverseCapability::Verified> caller;
+        // A cancel for a stream that already finished: nothing to stop.
+        bool late = false;
     };
 
     ReverseInbound(std::string workerId, uint64_t generation, std::string sessionKey)
@@ -74,7 +76,7 @@ class ReverseInbound
             if (frame.frame_case() == nix::remote::ReverseFarmMsg::kCancel && frame.cancel()
                 && (finishedIds.erase(streamId) != 0U))
             {
-                return Event{.kind = Event::Kind::cancel, .streamId = streamId};
+                return Event{.kind = Event::Kind::cancel, .streamId = streamId, .caller = std::nullopt, .late = true};
             }
             rejection = "unknown stream";
             return std::nullopt;

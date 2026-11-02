@@ -113,9 +113,29 @@ try {
     frame.set_half_close(true);
     assert(running.accept(frame) && running.takeReady());
     frame.set_cancel(true);
-    assert(running.accept(frame));
+    assert(running.accept(frame) && !running.lastCancelWasLate());
     assert(running.finished(2)); // executor completion after a cancelled build
     assert(!running.finished(2));
+
+    // A cancel crossing the final response arrives after the stream finished.
+    // It is accepted once and flagged late, so the worker does not keep a
+    // tombstone that no terminal frame would ever retire.
+    nixgrpc::ReverseRequest crossed(worker, 1, *key);
+    frame.Clear();
+    frame.set_stream_id(2);
+    frame.mutable_open()->set_method("BuildDerivation");
+    frame.mutable_open()->set_capability(*next);
+    assert(crossed.accept(frame));
+    frame.mutable_data()->set_data(std::string(4, '\0'));
+    assert(crossed.accept(frame));
+    frame.set_half_close(true);
+    assert(crossed.accept(frame) && crossed.takeReady());
+    assert(crossed.finished(2));
+    frame.Clear();
+    frame.set_stream_id(2);
+    frame.set_cancel(true);
+    assert(crossed.accept(frame) && crossed.lastCancelWasLate());
+    assert(!crossed.accept(frame)); // only once
 
     nixgrpc::ReverseRequest replacement(worker, 2, *key);
     frame.Clear();

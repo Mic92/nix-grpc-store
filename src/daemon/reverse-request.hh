@@ -49,6 +49,7 @@ public:
         std::scoped_lock const lock(mutex);
         ready.reset();
         rejection = "";
+        lateCancel = false;
         auto event = inbound.accept(frame);
         if (!event) { rejection = inbound.lastRejection(); return false; }
         auto const streamId = event->streamId;
@@ -110,6 +111,7 @@ public:
             return true;
         }
         case ReverseInbound::Event::Kind::cancel:
+            lateCancel = event->late;
             if (auto upload = uploads.find(streamId); upload != uploads.end()) {
                 upload->second->cancel();
                 uploads.erase(upload);
@@ -125,6 +127,9 @@ public:
         }
         return false;
     }
+
+    // The last accept() was a cancel for a stream that had already finished.
+    [[nodiscard]] auto lastCancelWasLate() const -> bool { std::scoped_lock const lock(mutex); return lateCancel; }
 
     // Why the last accept() returned false; for logs only.
     [[nodiscard]] auto lastRejection() const -> const char * { std::scoped_lock const lock(mutex); return rejection; }
@@ -169,6 +174,7 @@ private:
     static constexpr unsigned bitsPerByte = 8;
     mutable std::mutex mutex;
     const char * rejection = "";
+    bool lateCancel = false;
     struct Pending
     {
         std::string method;
