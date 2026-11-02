@@ -430,6 +430,10 @@ in
         assertion = cfg.oidc == null || cfg.tls.certFile != null || (cfg.oidc.allow_insecure or false);
         message = "services.nix-grpc-daemon.oidc sends bearer tokens, enable tls.certFile";
       }
+      {
+        assertion = cfg.reverse.registration == null || cfg.tls.clientCaFile != null;
+        message = "services.nix-grpc-daemon.reverse.registration requires tls.clientCaFile";
+      }
     ];
 
     # Reach the local nix-daemon even when allowed-users is restricted.

@@ -294,6 +294,11 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             || options.reverseServiceAccount.empty() || options.reverseAudience.empty()) {
             throw nix::Error("reverse registration requires scheduler role, TLS, provider, namespace, service account and audience");
         }
+        // Workers register with a client certificate (directly or forwarded
+        // by a trusted proxy); without a client CA none is ever requested.
+        if (options.clientCA.empty()) {
+            throw nix::Error("reverse registration requires --client-ca");
+        }
         auto const config = oidc::loadConfig(options.reverseOidcConfig);
         if (config.allowInsecure || config.providers.size() != 1 || config.providers.front().name != options.reverseProvider
             || config.providers.front().audience != options.reverseAudience
