@@ -909,6 +909,12 @@ auto run(const std::string &dir, const std::string &base) -> int
                 check(gen != 0, "short-lived token registers");
                 nix::remote::ReverseFarmMsg ack;
                 check(!stream->Read(&ack), "registered stream closes at token expiry");
+                // The client sees the cancel before the server handler
+                // returns and its cleanup deregisters the session.
+                auto const evicted = std::chrono::steady_clock::now() + shortDeadline;
+                while (registry.find(workerId) && std::chrono::steady_clock::now() < evicted) {
+                    std::this_thread::sleep_for(pollInterval);
+                }
                 check(!registry.find(workerId), "expired credential evicts worker");
                 stream->Finish();
             }
