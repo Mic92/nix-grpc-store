@@ -9,6 +9,7 @@
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -348,6 +349,135 @@ auto writeConfig(const std::string &dir, const std::string &base) -> void
                             {"jwks_url", base + "/jwks.json"},
                             {"bound_claims", {{"kubernetes.io.namespace", {"builders"}}}}}}}}}
                        .dump());
+}
+
+using DataStream = grpc::ClientReaderWriter<nix::remote::ReverseWorkerMsg, nix::remote::ReverseFarmMsg>;
+
+// Answer one relayed StoreInfo call on the worker side of the data session.
+void answerStoreInfo(DataStream & dataStream, nixgrpc::ReverseRequest & incoming, uint64_t streamId)
+{
+    nix::remote::StoreInfoReply response;
+    response.set_trusted(true);
+    auto const payload = response.SerializeAsString();
+    std::string encoded;
+    for (unsigned shift = 0; shift != lengthPrefixBits; shift += byteBits) {
+        encoded.push_back(static_cast<char>((payload.size() >> shift) & byteMask));
+    }
+    encoded += payload;
+    nix::remote::ReverseWorkerMsg answer;
+    answer.set_stream_id(streamId);
+    answer.mutable_data()->set_data(encoded);
+    dataStream.Write(answer);
+    answer.mutable_finish()->set_code(0);
+    dataStream.Write(answer);
+    (void) incoming.finished(streamId);
+}
+
+// Several relays to one worker at once, and a relay behind a full queue.
+void checkConcurrentRelays(Checks & check, nix::remote::NixRemote::Stub & routeStub, DataStream & dataStream,
+                           nixgrpc::ReverseRegistry & controlRegistry, const std::string & workerId)
+{
+    nix::remote::StoreInfoRequest const routeReq;
+    auto const selected = controlRegistry.find(workerId);
+    check(selected != nullptr && selected->transport != nullptr, "worker still registered for concurrent relays");
+    if (!selected || !selected->transport) {
+        return;
+    }
+    {
+        // Concurrent calls to one worker each reserve a stream ID and open
+        // it; the queues reject an ID below the last one opened, so
+        // allocation and opening must not interleave.
+        constexpr unsigned concurrentCalls = 16;
+        std::jthread responder([&] -> void {
+            nixgrpc::ReverseRequest incoming(workerId, selected->generation, selected->sessionKey);
+            unsigned answered = 0;
+            nix::remote::ReverseFarmMsg requestFrame;
+            while (answered != concurrentCalls && dataStream.Read(&requestFrame)) {
+                if (!incoming.accept(requestFrame) || !requestFrame.half_close()) {
+                    continue;
+                }
+                if (auto ready = incoming.takeReady()) {
+                    answerStoreInfo(dataStream, incoming, ready->id);
+                    ++answered;
+                }
+            }
+        });
+        std::atomic<unsigned> succeeded{0};
+        {
+            std::vector<std::jthread> callers;
+            callers.reserve(concurrentCalls);
+            for (unsigned call = 0; call != concurrentCalls; ++call) {
+                callers.emplace_back([&] -> void {
+                    grpc::ClientContext ctx;
+                    ctx.set_deadline(std::chrono::system_clock::now() + longDeadline);
+                    nix::remote::StoreInfoReply reply;
+                    if (routeStub.StoreInfo(&ctx, routeReq, &reply).ok() && reply.trusted()) {
+                        ++succeeded;
+                    }
+                });
+            }
+        }
+        responder.join();
+        check(succeeded == concurrentCalls, "concurrent relays to one worker all succeed");
+    }
+    // An upload to the same worker can keep the shared queue full; a build
+    // request must wait for space, not fail.
+    auto & outgoing = selected->transport->outgoing;
+    uint64_t fillerId = 0;
+    {
+        const std::scoped_lock reserved(selected->transport->reserve);
+        fillerId = selected->transport->nextStreamId.fetch_add(1);
+        nix::remote::ReverseOpen fillerOpen;
+        fillerOpen.set_method("UploadBuildInputs");
+        fillerOpen.set_capability("filler");
+        check(outgoing.open(fillerId, fillerOpen), "filler stream opens");
+    }
+    // The session writer drains into gRPC until HTTP/2 flow control blocks
+    // it (nobody is reading), so keep filling until even a tiny frame stays
+    // rejected.
+    constexpr size_t smallestFiller = 16;
+    constexpr std::chrono::milliseconds settle{100};
+    auto const fillUntil = std::chrono::steady_clock::now() + longDeadline;
+    bool full = false;
+    while (!full && std::chrono::steady_clock::now() < fillUntil) {
+        for (size_t bytes = nixgrpc::ReverseFrames::maxFrameBytes; bytes >= smallestFiller; bytes /= 2) {
+            std::string const chunk(bytes, 'f');
+            while (outgoing.data(fillerId, chunk)) { }
+        }
+        std::this_thread::sleep_for(settle);
+        full = !outgoing.data(fillerId, std::string(smallestFiller, 'f'));
+    }
+    check(full, "worker queue fills while nobody reads");
+    check(outgoing.halfClose(fillerId), "filler stream half-closes");
+    std::atomic<bool> callOk{false};
+    std::jthread caller([&] -> void {
+        grpc::ClientContext ctx;
+        ctx.set_deadline(std::chrono::system_clock::now() + longDeadline);
+        nix::remote::StoreInfoReply reply;
+        callOk = routeStub.StoreInfo(&ctx, routeReq, &reply).ok() && reply.trusted();
+    });
+    constexpr std::chrono::milliseconds letCallerBlock{200};
+    std::this_thread::sleep_for(letCallerBlock);
+    nixgrpc::ReverseRequest incoming(workerId, selected->generation, selected->sessionKey);
+    bool fillerDone = false;
+    bool answered = false;
+    nix::remote::ReverseFarmMsg requestFrame;
+    while ((!fillerDone || !answered) && dataStream.Read(&requestFrame)) {
+        if (requestFrame.stream_id() == fillerId) {
+            fillerDone = requestFrame.half_close();
+            continue;
+        }
+        if (!incoming.accept(requestFrame) || !requestFrame.half_close()) {
+            continue;
+        }
+        if (auto ready = incoming.takeReady()) {
+            answerStoreInfo(dataStream, incoming, ready->id);
+            answered = true;
+        }
+    }
+    caller.join();
+    (void) outgoing.finished(fillerId);
+    check(callOk, "build request waits for queue space behind a full upload");
 }
 
 auto run(const std::string &dir, const std::string &base) -> int
@@ -1272,65 +1402,7 @@ auto run(const std::string &dir, const std::string &base) -> int
                 check(routeStub->StoreInfo(&relayCtx, routeReq, &routeReply).ok() && routeReply.trusted(),
                       "authenticated client RPC receives reverse response despite forged worker metadata");
                 responder.join();
-                {
-                    // Concurrent calls to one worker each reserve a stream ID
-                    // and open it; the queues reject an ID below the last one
-                    // opened, so allocation and opening must not interleave.
-                    constexpr unsigned concurrentCalls = 16;
-                    auto selected = controlRegistry.find(workerId);
-                    check(selected != nullptr, "worker still registered for concurrent relays");
-                    std::jthread concurrentResponder([&] -> void {
-                        if (!selected) {
-                            return;
-                        }
-                        nixgrpc::ReverseRequest incoming(workerId, selected->generation, selected->sessionKey);
-                        unsigned answered = 0;
-                        nix::remote::ReverseFarmMsg requestFrame;
-                        while (answered != concurrentCalls && dataStream->Read(&requestFrame)) {
-                            if (!incoming.accept(requestFrame) || !requestFrame.half_close()) {
-                                continue;
-                            }
-                            auto ready = incoming.takeReady();
-                            if (!ready) {
-                                continue;
-                            }
-                            nix::remote::StoreInfoReply response;
-                            response.set_trusted(true);
-                            auto const payload = response.SerializeAsString();
-                            std::string encoded;
-                            for (unsigned shift = 0; shift != lengthPrefixBits; shift += byteBits) {
-                                encoded.push_back(static_cast<char>((payload.size() >> shift) & byteMask));
-                            }
-                            encoded += payload;
-                            nix::remote::ReverseWorkerMsg answer;
-                            answer.set_stream_id(ready->id);
-                            answer.mutable_data()->set_data(encoded);
-                            dataStream->Write(answer);
-                            answer.mutable_finish()->set_code(0);
-                            dataStream->Write(answer);
-                            (void) incoming.finished(ready->id);
-                            ++answered;
-                        }
-                    });
-                    std::atomic<unsigned> succeeded{0};
-                    {
-                        std::vector<std::jthread> callers;
-                        callers.reserve(concurrentCalls);
-                        for (unsigned call = 0; call != concurrentCalls; ++call) {
-                            callers.emplace_back([&] -> void {
-                                grpc::ClientContext concurrentCtx;
-                                concurrentCtx.set_deadline(std::chrono::system_clock::now() + longDeadline);
-                                nix::remote::StoreInfoReply concurrentReply;
-                                if (routeStub->StoreInfo(&concurrentCtx, routeReq, &concurrentReply).ok()
-                                    && concurrentReply.trusted()) {
-                                    ++succeeded;
-                                }
-                            });
-                        }
-                    }
-                    concurrentResponder.join();
-                    check(succeeded == concurrentCalls, "concurrent relays to one worker all succeed");
-                }
+                checkConcurrentRelays(check, *routeStub, *dataStream, controlRegistry, workerId);
                 buildRoute.relayEnabled = false;
                 buildRoute.buildRelayEnabled = true;
                 std::jthread buildResponder([&] -> void {

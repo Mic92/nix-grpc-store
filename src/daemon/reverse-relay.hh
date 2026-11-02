@@ -123,29 +123,6 @@ public:
 
         // A synchronous gRPC handler may be blocked downstream waiting for a
         // response. Always bound the wait even if the client set no deadline.
-
-        std::string wire;
-        wire.reserve(bytes.size() + 4);
-        auto const size = static_cast<uint32_t>(bytes.size());
-        for (unsigned i = 0; i != 4; ++i) {
-            wire.push_back(static_cast<char>((size >> (bitsPerByte * i)) & byteMask));
-        }
-        wire += bytes;
-        for (size_t offset = 0; offset < wire.size(); offset += ReverseFrames::maxFrameBytes) {
-            if (context.IsCancelled()) {
-                return {grpc::StatusCode::CANCELLED, "client cancelled reverse call"};
-            }
-            if (!registry.current(session) || (stillAssigned && !stillAssigned())) {
-                return {grpc::StatusCode::UNAVAILABLE, "reverse worker or assignment changed"};
-            }
-            if (!transport.outgoing.data(streamId, std::string_view(wire).substr(offset, ReverseFrames::maxFrameBytes))) {
-                return {grpc::StatusCode::RESOURCE_EXHAUSTED, "reverse request queue full"};
-            }
-        }
-        if (!transport.outgoing.halfClose(streamId)) {
-            return {grpc::StatusCode::UNAVAILABLE, "reverse request closed"};
-        }
-
         auto const deadline = std::min(context.deadline(), std::chrono::system_clock::now() + maxCallDuration);
         std::stop_source wake;
         std::mutex waitMutex;
@@ -161,6 +138,35 @@ public:
                 waitCv.wait_for(lock, stop, monitorPollInterval, [] -> auto { return false; });
             }
         });
+        std::string wire;
+        wire.reserve(bytes.size() + 4);
+        auto const size = static_cast<uint32_t>(bytes.size());
+        for (unsigned i = 0; i != 4; ++i) {
+            wire.push_back(static_cast<char>((size >> (bitsPerByte * i)) & byteMask));
+        }
+        wire += bytes;
+        for (size_t offset = 0; offset < wire.size(); offset += ReverseFrames::maxFrameBytes) {
+            if (context.IsCancelled()) {
+                return {grpc::StatusCode::CANCELLED, "client cancelled reverse call"};
+            }
+            if (!registry.current(session) || (stillAssigned && !stillAssigned())) {
+                return {grpc::StatusCode::UNAVAILABLE, "reverse worker or assignment changed"};
+            }
+            // Wait for space: a concurrent upload to the same worker keeps
+            // the shared queue full. The monitor stops the wait on cancel,
+            // deadline, displacement or reassignment.
+            if (!transport.outgoing.waitData(streamId, std::string_view(wire).substr(offset, ReverseFrames::maxFrameBytes),
+                                             wake.get_token())) {
+                if (context.IsCancelled()) {
+                    return {grpc::StatusCode::CANCELLED, "client cancelled reverse call"};
+                }
+                return {grpc::StatusCode::UNAVAILABLE, "reverse request not sent"};
+            }
+        }
+        if (!transport.outgoing.halfClose(streamId)) {
+            return {grpc::StatusCode::UNAVAILABLE, "reverse request closed"};
+        }
+
         std::string pending;
         std::optional<uint32_t> expected;
         nix::remote::ReverseWorkerMsg frame;
