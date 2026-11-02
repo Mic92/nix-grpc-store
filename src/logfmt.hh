@@ -98,4 +98,19 @@ inline auto clientCommonName(const grpc::ServerContextBase & context) -> std::op
     return std::string{values.front().data(), values.front().size()};
 }
 
+// The client certificate's SPIFFE ID. gRPC sets the property only for a
+// certificate whose single URI SAN is a well-formed SPIFFE ID.
+inline auto clientSpiffeId(const grpc::ServerContextBase & context) -> std::optional<std::string>
+{
+    auto const auth = context.auth_context();
+    if (!auth) {
+        return std::nullopt;
+    }
+    auto const values = auth->FindPropertyValues(GRPC_PEER_SPIFFE_ID_PROPERTY_NAME);
+    if (values.size() != 1) {
+        return std::nullopt;
+    }
+    return std::string{values.front().data(), values.front().size()};
+}
+
 } // namespace nixgrpc
