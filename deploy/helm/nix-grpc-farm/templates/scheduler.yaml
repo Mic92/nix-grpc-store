@@ -115,8 +115,8 @@ spec:
             # tls.worker certificate the balancer forwards.
             - --reverse-oidc-config=/secrets/reverse-oidc/oidc.json
             - --reverse-provider=worker-tunnel
-            - --reverse-namespace={{ .namespace }}
-            - --reverse-service-account={{ .serviceAccount }}
+            - --reverse-namespace={{ include "farm.reverseNamespace" $root }}
+            - --reverse-service-account={{ include "farm.reverseServiceAccount" $root }}
             - --reverse-audience={{ .audience }}
             - --reverse-max-token-lifetime={{ .maxTokenLifetime }}
             {{- end }}

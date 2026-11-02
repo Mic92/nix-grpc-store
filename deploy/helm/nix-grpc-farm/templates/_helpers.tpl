@@ -139,6 +139,20 @@ app.kubernetes.io/component: scheduler
 {{- if $providers }}{{ toJson (dict "providers" $providers) }}{{- end }}
 {{- end }}
 
+{{/* Namespace and service account reverse workers run as. With inCluster
+     they default to this release's, so the bound claims cannot drift from
+     the worker pods; workers in another release or cluster set them. */}}
+{{- define "farm.reverseNamespace" -}}
+{{- with .Values.scheduler.reverse }}
+{{- required "scheduler.reverse.namespace is required" (.namespace | default (ternary $.Release.Namespace "" (.inCluster | default false))) }}
+{{- end }}
+{{- end }}
+{{- define "farm.reverseServiceAccount" -}}
+{{- with .Values.scheduler.reverse }}
+{{- required "scheduler.reverse.serviceAccount is required" (.serviceAccount | default (ternary (include "farm.serviceAccountName" $) "" (.inCluster | default false))) }}
+{{- end }}
+{{- end }}
+
 {{/* Reverse-worker registration provider; empty unless scheduler.reverse.enabled.
      Kept apart from farm.oidcProviders: this token must never be a client credential. */}}
 {{- define "farm.reverseOidc" -}}
@@ -148,8 +162,8 @@ app.kubernetes.io/component: scheduler
   "audience" .audience
   "rules" (list (dict
     "bound_claims" (dict
-      "kubernetes.io.namespace" (list (required "scheduler.reverse.namespace is required" .namespace))
-      "kubernetes.io.serviceaccount.name" (list (required "scheduler.reverse.serviceAccount is required" .serviceAccount)))
+      "kubernetes.io.namespace" (list (include "farm.reverseNamespace" $))
+      "kubernetes.io.serviceaccount.name" (list (include "farm.reverseServiceAccount" $)))
     "scopes" (list "admin"))) }}
 {{- if .inCluster }}
 {{- with .issuer }}{{ $_ := set $p "issuer" . }}{{ end }}

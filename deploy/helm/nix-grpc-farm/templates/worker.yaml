@@ -11,7 +11,11 @@
 {{- if or $w.hostPort $w.advertise }}{{ fail (printf "workers.%s: reverse workers are not dialed, drop hostPort and advertise" $g) }}{{ end }}
 {{- if not (or $root.Values.scheduler.external (and $root.Values.scheduler.reverse.enabled (include "farm.lbEnabled" $root))) }}{{ fail (printf "workers.%s.reverse needs scheduler.external, or scheduler.reverse with this release's balancer" $g) }}{{ end }}
 {{- if not (and (include "farm.tlsSecret" (list $root "worker")) (include "farm.tlsSecret" (list $root "clientCA"))) }}{{ fail (printf "workers.%s.reverse needs tls.worker and tls.clientCA" $g) }}{{ end }}
-{{- if gt (int $w.reverse.expirationSeconds) 3600 }}{{ fail (printf "workers.%s.reverse.expirationSeconds above 3600" $g) }}{{ end }}
+{{- if or (lt (int $w.reverse.expirationSeconds) 600) (gt (int $w.reverse.expirationSeconds) 3600) }}{{ fail (printf "workers.%s.reverse.expirationSeconds must be within 600..3600" $g) }}{{ end }}
+{{- with $root.Values.scheduler }}{{ if and .reverse.enabled (not .external) }}
+{{- if gt (int $w.reverse.expirationSeconds) (int .reverse.maxTokenLifetime) }}{{ fail (printf "workers.%s.reverse.expirationSeconds exceeds scheduler.reverse.maxTokenLifetime" $g) }}{{ end }}
+{{- if ne $w.reverse.audience .reverse.audience }}{{ fail (printf "workers.%s.reverse.audience must equal scheduler.reverse.audience" $g) }}{{ end }}
+{{- end }}{{ end }}
 {{- end }}
 {{- $affinity := deepCopy ($w.affinity | default dict) }}
 {{- if $w.advertise }}
