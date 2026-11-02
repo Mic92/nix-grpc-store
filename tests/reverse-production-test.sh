@@ -92,7 +92,9 @@ PY
   rpcport=$(cat "$dir/rpc-port")
   cacheport=$(cat "$dir/cache-port")
   mkdir -p "$dir/garage/meta" "$dir/garage/data" "$dir/postgres" "$dir/pgsocket"
-  chmod 777 "$dir" "$dir/pgsocket"
+  # PostgreSQL runs as nobody: it only needs to traverse $dir, which also
+  # holds keys and the push scripts, so do not make it writable.
+  chmod 711 "$dir"
   chown nobody:nobody "$dir/postgres" "$dir/pgsocket"
   /bin/setpriv --reuid=nobody --regid=nobody --clear-groups "$PG_BIN/initdb" -D "$dir/postgres" -A trust >"$dir/pg-init.log" 2>&1
   /bin/setpriv --reuid=nobody --regid=nobody --clear-groups "$PG_BIN/postgres" -D "$dir/postgres" -k "$dir/pgsocket" -c listen_addresses= -c unix_socket_permissions=0700 >"$dir/pg.log" 2>&1 &
