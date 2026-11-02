@@ -1,8 +1,10 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <string>
+#include <exception>
+#include <iostream>
 #include <stop_token>
+#include <string>
 #include <thread>
 
 #include <grpcpp/support/status_code_enum.h>
@@ -20,7 +22,7 @@ constexpr uint64_t isolatedStream = 6;
 } // namespace
 
 auto main() -> int
-{
+try {
     nixgrpc::ReverseResponses replies;
     assert(!replies.open(0));
     assert(replies.open(1) && !replies.open(1));
@@ -105,4 +107,8 @@ auto main() -> int
     assert(replies.cancel(otherStream));
     replies.close();
     assert(!replies.open(7) && !replies.accept(response) && !replies.take(taken));
+    return 0;
+} catch (std::exception & err) {
+    std::cerr << err.what() << '\n';
+    return 1;
 }

@@ -1,6 +1,8 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <iostream>
 #include <string>
 #include <string_view>
 
@@ -34,7 +36,7 @@ auto appendLengthPrefixed(std::string & out, std::string_view payload) -> void
 } // namespace
 
 auto main() -> int
-{
+try {
     auto key = nixgrpc::ReverseCapability::newKey();
     assert(key);
     std::string const worker = "pod:staging:01234567-89ab-cdef-0123-456789abcdef";
@@ -169,4 +171,8 @@ auto main() -> int
         }
     }
     assert(overflowed && saturated.cancelled() && !saturated.finish());
+    return 0;
+} catch (std::exception & err) {
+    std::cerr << err.what() << '\n';
+    return 1;
 }

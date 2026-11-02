@@ -86,6 +86,7 @@ public:
             Release(Release &&) = delete;
             auto operator=(const Release &) -> Release & = delete;
             auto operator=(Release &&) -> Release & = delete;
+            // NOLINTNEXTLINE(bugprone-exception-escape): only allocation failure can throw here; terminating is fine.
             ~Release() {
                 if (!completed) {
                     (void) transport.outgoing.cancel(streamId);

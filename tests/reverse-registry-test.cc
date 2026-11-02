@@ -1,5 +1,7 @@
 #include <atomic>
 #include <cassert>
+#include <exception>
+#include <iostream>
 #include <memory>
 #include <string_view>
 #include <thread>
@@ -9,7 +11,7 @@
 #include "reverse-transport.hh"
 
 auto main() -> int
-{
+try {
     nixgrpc::ReverseRegistry registry;
     int firstCancelled = 0;
     int secondCancelled = 0;
@@ -89,4 +91,8 @@ auto main() -> int
     auto const & replacement = *replacementHandle;
     closeOld.join();
     assert(registry.current(replacement) && registry.find("worker") == replacement);
+    return 0;
+} catch (std::exception & err) {
+    std::cerr << err.what() << '\n';
+    return 1;
 }

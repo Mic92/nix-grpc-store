@@ -1,4 +1,6 @@
 #include <cassert>
+#include <exception>
+#include <iostream>
 #include <string>
 
 #include "acl.hh"
@@ -9,7 +11,7 @@
 #include "reverse-inbound.hh"
 
 auto main() -> int
-{
+try {
     using nixgrpc::Caller;
     using nixgrpc::ReverseCapability;
     using nixgrpc::ReverseInbound;
@@ -83,4 +85,8 @@ auto main() -> int
     assert(!inbound.finished(2));
     inbound.close();
     assert(!inbound.accept(open));
+    return 0;
+} catch (std::exception & err) {
+    std::cerr << err.what() << '\n';
+    return 1;
 }

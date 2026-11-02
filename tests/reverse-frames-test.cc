@@ -1,15 +1,17 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <string>
+#include <exception>
+#include <iostream>
 #include <stop_token>
+#include <string>
 #include <thread>
 
 #include "nix_remote.pb.h"
 #include "reverse-frames.hh"
 
 auto main() -> int
-{
+try {
     nixgrpc::ReverseFrames frames;
     nix::remote::ReverseOpen start;
     start.set_method("BuildDerivation");
@@ -108,4 +110,8 @@ auto main() -> int
     discarded.join();
     assert(!enqueued); // removal of the stream wakes a blocked producer
     cancelled.close();
+    return 0;
+} catch (std::exception & err) {
+    std::cerr << err.what() << '\n';
+    return 1;
 }

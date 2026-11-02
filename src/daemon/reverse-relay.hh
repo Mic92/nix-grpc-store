@@ -107,6 +107,7 @@ public:
             Release(Release &&) = delete;
             auto operator=(const Release &) -> Release & = delete;
             auto operator=(Release &&) -> Release & = delete;
+            // NOLINTNEXTLINE(bugprone-exception-escape): only allocation failure can throw here; terminating is fine.
             ~Release() {
                 // A worker may still reply after the caller disconnects.
                 // Explicit cancelled-ID tombstones are bounded per session.

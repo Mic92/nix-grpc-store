@@ -3,6 +3,8 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <exception>
+#include <iostream>
 #include <vector>
 
 #include <nix/util/error.hh>
@@ -13,7 +15,7 @@
 #include "reverse-protocol.hh"
 
 auto main() -> int
-{
+try {
     nixgrpc::Metrics metrics{""};
     nixgrpc::Dispatcher dispatcher({.defaultSystem = "x"}, metrics);
     std::vector<nix::remote::SchedCmd> firstCommands;
@@ -226,4 +228,8 @@ auto main() -> int
     assert(!dispatcher.assignmentPod("a.drv", reverseId));
     assert(!dispatcher.podOwnsAssignment(pod, "a.drv", reverseId));
     dispatcher.workerGone(reverse);
+    return 0;
+} catch (std::exception & err) {
+    std::cerr << err.what() << '\n';
+    return 1;
 }

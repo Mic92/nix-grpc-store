@@ -84,7 +84,7 @@ class ClientService final : public nix::remote::NixRemote::Service
         auto const drv = first.drv_path();
         auto const assignId = first.assign_id();
         nixgrpc::ReverseUploadRelay const relay(gateway, registry);
-        return relay.call(*ctx, [&, drv, assignId](uint64_t streamId) -> nixgrpc::ReverseGateway::Result {
+        return relay.call(*ctx, [&, drv = drv, assignId](uint64_t streamId) -> nixgrpc::ReverseGateway::Result {
             return gateway.prepareBuildInputs(*ctx, [&](std::string_view drv, uint64_t assign)
                 -> std::optional<std::string> {
                 if (*assignmentLive && drv == "assigned.drv" && assign == assignedId) {

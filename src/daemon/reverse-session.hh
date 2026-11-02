@@ -147,6 +147,7 @@ public:
             ReverseRegistry & registry;
             ReverseRegistry::Handle handle;
             std::shared_ptr<Cancellation> cancellation;
+            // NOLINTNEXTLINE(bugprone-exception-escape): only allocation failure can throw here; terminating is fine.
             ~Cleanup()
             {
                 cancellation->retire();

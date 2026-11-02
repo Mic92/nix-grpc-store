@@ -782,7 +782,7 @@ public:
             if (!pod) {
                 return {grpc::StatusCode::FAILED_PRECONDITION, "no live pod-bound upload assignment"};
             }
-            auto const assigned = [this, pod = *pod, drv, assignment] -> bool {
+            auto const assigned = [this, pod = *pod, drv = drv, assignment] -> bool {
                 return coord.dispatcher->podOwnsAssignment(pod, drv, assignment);
             };
             return reverseUploadRelay->call(*context,

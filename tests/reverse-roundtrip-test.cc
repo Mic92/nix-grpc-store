@@ -1,5 +1,7 @@
 #include <cassert>
 #include <cstdint>
+#include <exception>
+#include <iostream>
 #include <string>
 #include <utility>
 
@@ -22,7 +24,7 @@ constexpr uint64_t staleAssignId = 43;
 } // namespace
 
 auto main() -> int
-{
+try {
     using nixgrpc::Caller;
     using nixgrpc::ReverseCapability;
     using nixgrpc::ReverseFrames;
@@ -94,4 +96,8 @@ auto main() -> int
     outgoing.close();
     incoming.close();
     responses.close();
+    return 0;
+} catch (std::exception & err) {
+    std::cerr << err.what() << '\n';
+    return 1;
 }

@@ -1,6 +1,8 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <iostream>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -27,7 +29,7 @@ constexpr uint64_t lostStream = 11;
 } // namespace
 
 auto main() -> int
-{
+try {
     nixgrpc::ReverseWorkerOutbound replies;
     std::stop_source const stop;
     nix::remote::BuildDerivationChunk chunk;
@@ -111,4 +113,8 @@ auto main() -> int
     blocked.close();
     producer.join();
     assert(!queued); // disconnect wakes a response producer waiting for space
+    return 0;
+} catch (std::exception & err) {
+    std::cerr << err.what() << '\n';
+    return 1;
 }

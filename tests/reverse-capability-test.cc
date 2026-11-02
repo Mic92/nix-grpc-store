@@ -1,6 +1,8 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <exception>
+#include <iostream>
 #include <optional>
 #include <string>
 
@@ -26,7 +28,7 @@ constexpr uint64_t otherBuildAssignId = 94;
 } // namespace
 
 auto main() -> int
-{
+try {
     using nixgrpc::Caller;
     using nixgrpc::ReverseCapability;
     using nixgrpc::Role;
@@ -129,4 +131,8 @@ auto main() -> int
     anonymous.kind = Caller::Kind::anonymous;
     auto anonymousToken = ReverseCapability::mint(*key, worker, generation, anonymousStream, "StoreInfo", anonymous, {}, 0, 0, now);
     assert(!anonymousToken); // neither gateway nor mint primitive delegates anonymous privilege
+    return 0;
+} catch (std::exception & err) {
+    std::cerr << err.what() << '\n';
+    return 1;
 }

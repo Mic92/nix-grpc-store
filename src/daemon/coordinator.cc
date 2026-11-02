@@ -195,7 +195,7 @@ void Builder::finished(
             // A reverse build must put its terminal response on the data
             // session before retiring the scheduler assignment: the relay
             // fences responses against that live assignment.
-            *deferredDone = [this, drvPath, assignId, outcome, outputs, reason] -> void {
+            *deferredDone = [this, drvPath = drvPath, assignId, outcome, outputs = outputs, reason] -> void {
                 sendDone(drvPath, assignId, outcome, outputs, reason);
             };
         } else {
@@ -468,6 +468,7 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
 
 // Members would go in reverse declaration order: session thread and
 // dispatcher after the Builder they call into. Cut the edges first.
+// NOLINTNEXTLINE(bugprone-exception-escape): only allocation failure can throw here; terminating is fine.
 Coordinator::~Coordinator()
 {
     elector.reset();
