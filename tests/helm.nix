@@ -348,11 +348,11 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
     # a short pod-bound token; nothing else in the release changes.
     helm template t chart -f ${json.generate "values.json" valuesReverseWorkers} --api-versions monitoring.coreos.com/v1/PodMonitor > rev.yaml
     rdaemon() { pick Deployment "t-nix-grpc-farm-worker-$1" ".spec.template.spec.containers[] | select(.name == \"nix-grpc-daemon\") | $2" rev.yaml; }
-    rdaemon x86 '.args[]' | grep -qx -- '--advertise=reverse/$(POD_UID)'
-    rdaemon x86 '.args[]' | grep -qx -- '--reverse-worker-id=pod:default:$(POD_UID)'
-    rdaemon x86 '.args[]' | grep -qx -- --reverse-token-file=/secrets/reverse/token
-    rdaemon x86 '.args[]' | grep -qx -- --scheduler=farm.example.com:50051
-    ! rdaemon x86 '.args[]' | grep -q -- --scheduler-token-file
+    rdaemon x86 '.args[]' | grep -x -- '--advertise=reverse/$(POD_UID)' > /dev/null
+    rdaemon x86 '.args[]' | grep -x -- '--reverse-worker-id=pod:default:$(POD_UID)' > /dev/null
+    rdaemon x86 '.args[]' | grep -x -- --reverse-token-file=/secrets/reverse/token > /dev/null
+    rdaemon x86 '.args[]' | grep -x -- --scheduler=farm.example.com:50051 > /dev/null
+    ! rdaemon x86 '.args[]' | grep -- --scheduler-token-file > /dev/null
     test "$(rdaemon x86 '.env[] | select(.name == "POD_UID") | .valueFrom.fieldRef.fieldPath')" = metadata.uid
     test "$(rdaemon x86 '.ports[] | select(.name == "grpc") | .hostPort')" = null
     test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.volumes[] | select(.name == "reverse-token") | .projected.sources[0].serviceAccountToken.expirationSeconds' rev.yaml)" = 600
@@ -366,11 +366,11 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
     # Reverse scheduler: a dedicated provider in its own Secret, never the client one.
     helm template t chart -f ${json.generate "values.json" valuesReverseScheduler} --api-versions monitoring.coreos.com/v1/PodMonitor > revs.yaml
     sargs() { pick Deployment t-nix-grpc-farm-scheduler-0 '.spec.template.spec.containers[0].args[]' revs.yaml; }
-    sargs | grep -qx -- --reverse-oidc-config=/secrets/reverse-oidc/oidc.json
-    sargs | grep -qx -- --reverse-namespace=builders
-    sargs | grep -qx -- --reverse-service-account=nix-grpc-farm-worker
-    sargs | grep -qx -- --reverse-audience=nix-grpc-farm-worker-tunnel
-    sargs | grep -qx -- --reverse-max-token-lifetime=600
+    sargs | grep -x -- --reverse-oidc-config=/secrets/reverse-oidc/oidc.json > /dev/null
+    sargs | grep -x -- --reverse-namespace=builders > /dev/null
+    sargs | grep -x -- --reverse-service-account=nix-grpc-farm-worker > /dev/null
+    sargs | grep -x -- --reverse-audience=nix-grpc-farm-worker-tunnel > /dev/null
+    sargs | grep -x -- --reverse-max-token-lifetime=600 > /dev/null
     rev_oidc=$(pick Secret t-nix-grpc-farm-reverse-oidc '.stringData."oidc.json"' revs.yaml)
     echo "$rev_oidc" | jq -e '.providers | keys == ["worker-tunnel"]
       and .["worker-tunnel"].audience == "nix-grpc-farm-worker-tunnel"
@@ -384,15 +384,15 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
     # Same release: reverse workers go through the balancer, direct ones are unchanged.
     helm template t chart -f ${json.generate "values.json" valuesReverseLocal} --api-versions monitoring.coreos.com/v1/PodMonitor > revl.yaml
     largs() { pick Deployment "t-nix-grpc-farm-worker-$1" '.spec.template.spec.containers[] | select(.name == "nix-grpc-daemon") | .args[]' revl.yaml; }
-    largs arm | grep -qx -- --scheduler=t-nix-grpc-farm.default.svc:50051
+    largs arm | grep -x -- --scheduler=t-nix-grpc-farm.default.svc:50051 > /dev/null
     helm template t chart -f ${json.generate "values.json" valuesReverseLocal} --api-versions monitoring.coreos.com/v1/PodMonitor --set scheduler.reverse.inCluster=true --set scheduler.reverse.issuer= > revi.yaml
     pick Secret t-nix-grpc-farm-reverse-oidc '.stringData."oidc.json"' revi.yaml | jq -e '.providers["worker-tunnel"]
       | .jwks_url == "https://kubernetes.default.svc/openid/v1/jwks" and (has("issuer") | not)
         and .bearer_token_file == "/var/run/secrets/kubernetes.io/serviceaccount/token"'
     test "$(pick Deployment t-nix-grpc-farm-scheduler-0 '.spec.template.spec.automountServiceAccountToken' revi.yaml)" = true
-    largs arm | grep -qx -- '--advertise=reverse/$(POD_UID)'
-    largs x86 | grep -qx -- '--advertise=$(POD_IP):50051'
-    ! largs x86 | grep -q -- --reverse-
+    largs arm | grep -x -- '--advertise=reverse/$(POD_UID)' > /dev/null
+    largs x86 | grep -x -- '--advertise=$(POD_IP):50051' > /dev/null
+    ! largs x86 | grep -- --reverse- > /dev/null
     # No balancer cluster or route for a reverse group.
     revl_envoy=$(yq -r 'select(.kind == "ConfigMap" and .metadata.name == "t-nix-grpc-farm-lb") | .data."envoy.json"' revl.yaml)
     echo "$revl_envoy" | jq -e '[.static_resources.clusters[].name | select(. != "admin")] | sort == ["sched", "x86"]'
