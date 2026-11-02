@@ -431,8 +431,14 @@ struct GrpcStore::Run {
           store.uploadDrvClosure(evalStore, {work.job->drvPath}, headers,
                                  work.where.reverse ? std::optional(std::pair{work.job->drvPath, work.where.assignId})
                                                     : std::nullopt);
-      if (!upload.ok() && !(work.where.reverse && GrpcStore::reverseUploadBounced(upload))) {
-        store.checkStatus(upload, work.where.reverse ? "UploadBuildInputs" : "AddMultipleToStore");
+      if (!upload.ok()) {
+        if (!(work.where.reverse && GrpcStore::reverseUploadBounced(upload))) {
+          store.checkStatus(upload, work.where.reverse ? "UploadBuildInputs" : "AddMultipleToStore");
+        }
+        // The input never arrived: let the next placement upload it again.
+        // The executor's reschedule limit still bounds the retries.
+        std::scoped_lock const lock(mutex);
+        recovered.erase({work.jid, path});
       }
       return Bounced{};
     }
