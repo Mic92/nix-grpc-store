@@ -26,10 +26,8 @@
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
 #include <nix/store/worker-protocol.hh>
-#include <nix/util/error.hh>
 #include <nix/util/logging.hh>
 #include <nix/util/repair-flag.hh>
-#include <nix/util/serialise.hh>
 #include <nix/util/util.hh>
 
 #include "channel.hh"
@@ -227,6 +225,45 @@ void GrpcStore::addMultipleToStoreRouted(
     });
 }
 
+namespace {
+
+// One upload over an open client stream: the header message, then every path
+// as one zstd stream in worker-protocol AddMultipleToStore framing. Returns
+// the server's status; a client-side failure cancels the call first.
+template<typename Writer, typename Sink, typename Header, typename WritePath>
+auto streamPaths(grpc::ClientContext & ctx, Writer & writer, Sink & sink, const Header & header, size_t count,
+                 const WritePath & writePaths) -> grpc::Status
+{
+  try {
+    if (!writer.Write(header)) {
+      throw nixgrpc::StreamClosed("gRPC stream closed by peer");
+    }
+    sink << count;
+    writePaths(sink);
+    sink.finish();
+    writer.WritesDone();
+  } catch (nixgrpc::StreamClosed &) {
+    // No cancel: it could replace the server's status with CANCELLED.
+    auto status = writer.Finish();
+    if (status.ok()) {
+      throw;
+    }
+    return status;
+  } catch (...) {
+    // The server may still be reading. A status other than our cancel
+    // explains the failure better.
+    ctx.TryCancel();
+    auto status = writer.Finish();
+    if (status.ok() || status.error_code() == grpc::StatusCode::CANCELLED) {
+      throw;
+    }
+    return status;
+  }
+  return writer.Finish();
+}
+
+} // namespace
+
 auto GrpcStore::addMultipleToStoreOnce(
     std::vector<std::pair<ValidPathInfo, ReplayableNar>> & paths, Activity & act, RepairFlag repair,
     CheckSigsFlag checkSigs, const Metadata & headers,
@@ -237,6 +274,17 @@ auto GrpcStore::addMultipleToStoreOnce(
       bytesExpected += pathInfo.narSize;
     }
     act.setExpected(actCopyPath, bytesExpected);
+
+    auto const writePaths = [&](auto & sink) -> void {
+      size_t done = 0;
+      for (auto & [pathInfo, nar] : paths) {
+        act.progress(done, paths.size(), static_cast<size_t>(1), static_cast<size_t>(0));
+        WorkerProto::Serialise<ValidPathInfo>::write(
+            *this, WorkerProto::WriteConn{.to = sink, .version = nixcompat::infoProtocolVersion()}, pathInfo);
+        nar.drainInto(sink);
+        act.progress(++done, paths.size(), static_cast<size_t>(0), static_cast<size_t>(0));
+      }
+    };
 
     nixgrpc::Call call;
     addHeaders(call.ctx(), headers);
@@ -252,79 +300,21 @@ auto GrpcStore::addMultipleToStoreOnce(
           return writer.Write(frame);
         }
       } assigned{*writer};
-      try {
-        remote::UploadBuildInputsChunk first;
-        first.set_drv_path(reverseAssignment->first);
-        first.set_assign_id(reverseAssignment->second);
-        first.mutable_chunk()->set_repair(repair == Repair);
-        first.mutable_chunk()->set_check_sigs(checkSigs == CheckSigs);
-        if (!writer->Write(first)) {
-          throw Error("reverse upload closed before header");
-        }
-        nixgrpc::ZstdWriterSink<AssignedWriter, remote::AddMultipleChunk> sink(assigned);
-        sink << paths.size();
-        size_t done = 0;
-        for (auto & [pathInfo, nar] : paths) {
-          act.progress(done, paths.size(), static_cast<size_t>(1), static_cast<size_t>(0));
-          WorkerProto::Serialise<ValidPathInfo>::write(
-              *this, WorkerProto::WriteConn{.to = sink, .version = nixcompat::infoProtocolVersion()}, pathInfo);
-          nar.drainInto(sink);
-          act.progress(++done, paths.size(), static_cast<size_t>(0), static_cast<size_t>(0));
-        }
-        sink.finish();
-        writer->WritesDone();
-      } catch (...) {
-        auto status = writer->Finish();
-        if (status.ok()) {
-          throw;
-        }
-        return status;
-      }
-      return writer->Finish();
+      remote::UploadBuildInputsChunk first;
+      first.set_drv_path(reverseAssignment->first);
+      first.set_assign_id(reverseAssignment->second);
+      first.mutable_chunk()->set_repair(repair == Repair);
+      first.mutable_chunk()->set_check_sigs(checkSigs == CheckSigs);
+      nixgrpc::ZstdWriterSink<AssignedWriter, remote::AddMultipleChunk> sink(assigned);
+      return streamPaths(call.ctx(), *writer, sink, first, paths.size(), writePaths);
     }
     auto writer = stub->AddMultipleToStore(&call.ctx(), &reply);
-
-    try {
-        // Flags travel on the first message; everything after is one zstd
-        // stream in worker-protocol AddMultipleToStore framing.
-        remote::AddMultipleChunk flags;
-        flags.set_repair(repair == Repair);
-        flags.set_check_sigs(checkSigs == CheckSigs);
-        if (!writer->Write(flags)) {
-          throw nixgrpc::StreamClosed("gRPC stream closed by peer");
-        }
-
-        nixgrpc::ZstdWriterSink<grpc::ClientWriter<remote::AddMultipleChunk>, remote::AddMultipleChunk> sink(
-            *writer);
-        sink << paths.size();
-        size_t done = 0;
-        for (auto & [pathInfo, nar] : paths) {
-            act.progress(done, paths.size(), static_cast<size_t>(1), static_cast<size_t>(0));
-            WorkerProto::Serialise<ValidPathInfo>::write(
-                *this, WorkerProto::WriteConn{.to = sink, .version = nixcompat::infoProtocolVersion()}, pathInfo);
-            nar.drainInto(sink);
-            act.progress(++done, paths.size(), static_cast<size_t>(0), static_cast<size_t>(0));
-        }
-        sink.finish();
-        writer->WritesDone();
-    } catch (nixgrpc::StreamClosed &) {
-        // No cancel: it could replace the server's status with CANCELLED.
-        auto status = writer->Finish();
-        if (status.ok()) {
-          throw;
-        }
-        return status;
-    } catch (...) {
-        // The server may still be reading. A status other than our cancel
-        // explains the failure better.
-        call.ctx().TryCancel();
-        auto status = writer->Finish();
-        if (status.ok() || status.error_code() == grpc::StatusCode::CANCELLED) {
-          throw;
-        }
-        return status;
-    }
-    return writer->Finish();
+    // Flags travel on the first message.
+    remote::AddMultipleChunk flags;
+    flags.set_repair(repair == Repair);
+    flags.set_check_sigs(checkSigs == CheckSigs);
+    nixgrpc::ZstdWriterSink<grpc::ClientWriter<remote::AddMultipleChunk>, remote::AddMultipleChunk> sink(*writer);
+    return streamPaths(call.ctx(), *writer, sink, flags, paths.size(), writePaths);
 }
 
 } // namespace nix
