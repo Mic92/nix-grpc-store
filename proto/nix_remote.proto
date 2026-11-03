@@ -119,6 +119,21 @@ message NarFrame {
   bool eof = 3;
 }
 
+// The build log the server's store keeps for a derivation, as `nix log`
+// reads it there. `drv_path` is a store path base name; INVALID_ARGUMENT
+// if it is not one. NOT_FOUND: the store keeps no log of it;
+// UNIMPLEMENTED: the store keeps no logs; DATA_LOSS: the log file stopped
+// decompressing after part of it was sent; INTERNAL: it cannot be read.
+message GetBuildLogRequest {
+  string drv_path = 1;
+}
+
+// The concatenation of all `data` fields in one GetBuildLog call is a
+// single zstd stream of the log.
+message GetBuildLogChunk {
+  bytes data = 1;
+}
+
 // Bidirectional tunnel that carries the same byte stream `nix-daemon --stdio`
 // would exchange over stdin/stdout. The server side hands the stream to
 // `nix::daemon::processConnection`, the client side to `nix::RemoteStore`.
@@ -133,6 +148,7 @@ service NixRemote {
   rpc BuildDerivation(BuildDerivationRequest) returns (stream BuildDerivationChunk);
   rpc QueryMissing(QueryMissingRequest) returns (QueryMissingReply);
   rpc StoreInfo(StoreInfoRequest) returns (StoreInfoReply);
+  rpc GetBuildLog(GetBuildLogRequest) returns (stream GetBuildLogChunk);
 }
 
 // ---- scheduling ----------------------------------------------------------
