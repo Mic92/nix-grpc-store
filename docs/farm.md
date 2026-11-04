@@ -392,5 +392,10 @@ Look for `event=scheduler_disconnected` in the builders' journal.
 different worker than the scheduler picked. A worker's `advertise` is not
 the address envoy reaches it at.
 
+**`cache upload failed, retrying in …`** — the build finished but niks3
+refused its outputs. The worker keeps the outputs and retries the upload
+for up to ten minutes, then fails the build with `cache upload failing`
+instead of rebuilding it elsewhere. Check niks3 and its S3 storage.
+
 **A worker shows `failed_active_hc`** — it's stopping or envoy can't
 complete mTLS to it. Check `journalctl -u nix-grpc-daemon` on the worker.

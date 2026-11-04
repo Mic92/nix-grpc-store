@@ -1,5 +1,6 @@
 // Drives src/daemon/cache.hh and push.hh against tests/farm-mock.py. Run via `meson test`.
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <exception>
@@ -145,6 +146,64 @@ void testPush(Suite & tst, nixgrpc::PushProcess & push)
         "request line carried both outputs and no claim token");
 }
 
+// A build's outputs stay on the worker while the cache is down: publish
+// retries the upload instead of handing the build back to be rebuilt.
+void testPublishRetry(Suite & tst, nixgrpc::Cache & cache)
+{
+    constexpr std::chrono::milliseconds quickPause{50};
+    {
+        std::vector<std::string> failures;
+        nixgrpc::PublishRetry const patient{
+            .budget = std::chrono::seconds(30),
+            .firstPause = quickPause,
+            .onRetry = [&](const std::string & error, std::chrono::milliseconds) -> void { failures.push_back(error); }};
+        cache.publish({"/nix/store/dddd-flaky"}, nixgrpc::never, false, patient);
+        tst.check(failures.size() == 2, "publish retries a failing upload until it goes through");
+        tst.check(
+            !failures.empty() && failures.front().contains("server returned 500"), "each retry is told why the upload failed");
+        tst.check(cache.present({"dddd.narinfo"}).size() == 1, "the retried upload is in the cache");
+    }
+    {
+        nixgrpc::PublishRetry const brief{.budget = std::chrono::milliseconds(1500), .firstPause = quickPause};
+        std::string why;
+        try {
+            cache.publish({"/nix/store/eeee-fail"}, nixgrpc::never, false, brief);
+        } catch (nixgrpc::PublishFailing & err) {
+            why = err.what();
+        } catch (nix::Error & err) {
+            why = "wrong error: " + std::string(err.what());
+        }
+        tst.check(why.contains("cache upload failing"), "an upload that keeps failing gives up with a clear error");
+        tst.check(
+            tst.countLog([](const nlohmann::json & entry) -> bool {
+                return entry.value("ev", "") == "push" && entry.at("paths") == nlohmann::json{"/nix/store/eeee-fail"};
+            }) > 1,
+            "and was retried before giving up");
+    }
+    {
+        std::atomic<bool> stop = false;
+        std::thread canceller([&] -> void {
+            std::this_thread::sleep_for(settle);
+            stop = true;
+        });
+        nixgrpc::PublishRetry const slow{.budget = std::chrono::minutes(10), .firstPause = std::chrono::minutes(1)};
+        auto const started = std::chrono::steady_clock::now();
+        std::string got = "ok";
+        try {
+            cache.publish({"/nix/store/ffff-fail"}, [&] -> bool { return stop; }, false, slow);
+        } catch (nixgrpc::CancelledWait &) {
+            got = "cancelled";
+        } catch (nix::Error &) {
+            got = "error";
+        }
+        canceller.join();
+        constexpr std::chrono::seconds fewCancelPolls{5};
+        tst.check(
+            got == "cancelled" && std::chrono::steady_clock::now() - started < fewCancelPolls,
+            "a cancelled build stops waiting between retries");
+    }
+}
+
 void testCache(Suite & tst, const std::string & base, const std::string & mock)
 {
     nixgrpc::Cache off(nixgrpc::Niks3Config{});
@@ -170,6 +229,7 @@ void testCache(Suite & tst, const std::string & base, const std::string & mock)
     auto const have = cache.present({"aaaa.narinfo", "bbbb.narinfo", "cccc.narinfo"});
     tst.check(have.size() == 2 && have.contains("aaaa.narinfo") && !have.contains("cccc.narinfo"), "published paths are present");
     tst.check(cache.present({}).empty(), "empty query, no request");
+    testPublishRetry(tst, cache);
 }
 
 } // namespace

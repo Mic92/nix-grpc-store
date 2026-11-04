@@ -180,6 +180,10 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         return openLocalStore();
     }
 
+    // How long a finished build waits for the cache to take its outputs
+    // before it fails. Well under a drain's stop timeout.
+    static constexpr std::chrono::minutes publishRetryBudget{10};
+
     // Retryable on another worker or later: guarded() maps it to UNAVAILABLE.
     struct Unavailable : nix::Error
     {
@@ -191,11 +195,14 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         nix::Store & localStore,
         const std::vector<std::string> & paths,
         const nixgrpc::Cancelled & cancelled,
-        bool verify = false)
+        bool verify = false,
+        const nixgrpc::PublishRetry & retry = {})
     {
         try {
-            coord.cache.publish(localStore, paths, cancelled, verify);
+            coord.cache.publish(localStore, paths, cancelled, verify, retry);
         } catch (nixgrpc::CancelledWait &) {
+            throw;
+        } catch (nixgrpc::PublishFailing &) {
             throw;
         } catch (nix::Error & err) {
             throw Unavailable("publish failed: %s", err.what());
@@ -915,10 +922,33 @@ public:
                 outputs.emplace_back(built.back(), localStore.queryPathInfo(path)->narSize);
             }
             phase.next("publish");
-            // The client rebuilt this because the cache lost its NAR.
-            publish(localStore, built, cancelled, context.client_metadata().contains("x-nix-cache-lost"));
+            // The outputs stay rooted here, so retry the upload in place.
+            // Giving the build back would rebuild it, and fail the same way
+            // for as long as the cache is down.
+            nixgrpc::PublishRetry const retry{
+                .budget = publishRetryBudget,
+                .onRetry = [&](const std::string & error, std::chrono::milliseconds pause) -> void {
+                    metrics.event("publish_retry");
+                    auto const secs = std::to_string(std::chrono::duration_cast<std::chrono::seconds>(pause).count());
+                    nixgrpc::logLine(
+                        nixgrpc::LogLevel::info,
+                        {{"event", "publish_retry"},
+                         {"drv", std::string(drvPath.to_string())},
+                         {"pause_s", secs},
+                         {"error", error}});
+                    log({.text = workerName + ": cache upload failed, retrying in " + secs + "s: " + error});
+                }};
+            try {
+                // The client rebuilt this because the cache lost its NAR.
+                publish(localStore, built, cancelled, context.client_metadata().contains("x-nix-cache-lost"), retry);
+                outcome = nix::remote::Done::BUILT;
+            } catch (nixgrpc::PublishFailing & err) {
+                // A build failure, not the worker's: every worker uploads to the same cache.
+                metrics.event("publish_failed");
+                outputs.clear();
+                res = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, err.what());
+            }
             phase.done();
-            outcome = nix::remote::Done::BUILT;
         } else if (nixcompat::failureStatus(res) == nixcompat::FailureStatus::TransientFailure && nixcompat::isSandboxed(drv)) {
             // ENOSPC and the like: not the build's fault, let the scheduler place it again.
             // Nix reports every failed fixed-output build as transient too, which is the build's result.

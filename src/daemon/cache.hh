@@ -1,10 +1,14 @@
 #pragma once
 // Local store plus, if configured, a niks3 binary cache. Same calls in every topology.
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -23,6 +27,25 @@
 #include "niks3-client.hh"
 
 namespace nixgrpc {
+
+// How long a publish keeps retrying a failing upload. The default tries once.
+struct PublishRetry
+{
+    static constexpr std::chrono::seconds defaultFirstPause{1};
+    static constexpr std::chrono::seconds defaultMaxPause{30};
+
+    std::chrono::milliseconds budget{0};
+    std::chrono::milliseconds firstPause{defaultFirstPause};
+    std::chrono::milliseconds maxPause{defaultMaxPause};
+    // Told why the upload failed and how long until the next attempt.
+    std::function<void(const std::string & error, std::chrono::milliseconds pause)> onRetry;
+};
+
+// The upload kept failing for the whole PublishRetry budget.
+struct PublishFailing : nix::Error
+{
+    using nix::Error::Error;
+};
 
 class Cache
 {
@@ -95,21 +118,52 @@ public:
     // Make locally valid paths visible to other nodes. No-op without niks3.
     // With `verify`, niks3 checks the bucket instead of trusting its database,
     // at one S3 lookup per object in the closure.
-    auto publish(const std::vector<std::string> & paths, const Cancelled & cancelled = never, bool verify = false)
-        -> PushProcess::Signatures
+    // A failed upload is retried with backoff for `retry.budget`, then
+    // PublishFailing; the paths stay valid locally all along.
+    auto publish(
+        const std::vector<std::string> & paths,
+        const Cancelled & cancelled = never,
+        bool verify = false,
+        const PublishRetry & retry = {}) -> PushProcess::Signatures
     {
         if (!remote || paths.empty()) {
             return {};
         }
-        return (verify ? remote->verifyingPush : remote->push).pushWait(paths, cancelled);
+        auto & push = verify ? remote->verifyingPush : remote->push;
+        auto const deadline = std::chrono::steady_clock::now() + retry.budget;
+        auto pause = retry.firstPause;
+        while (true) {
+            try {
+                return push.pushWait(paths, cancelled);
+            } catch (CancelledWait &) {
+                throw;
+            } catch (nix::Error & err) {
+                if (retry.budget <= std::chrono::milliseconds::zero()) {
+                    throw;
+                }
+                if (std::chrono::steady_clock::now() + pause > deadline) {
+                    auto const secs = std::chrono::duration_cast<std::chrono::seconds>(retry.budget);
+                    throw PublishFailing("cache upload failing for %ds, giving up: %s", secs.count(), err.what());
+                }
+                if (retry.onRetry) {
+                    retry.onRetry(err.what(), pause);
+                }
+                sleepUnlessCancelled(pause, cancelled);
+                pause = std::min(pause * 2, retry.maxPause);
+            }
+        }
     }
 
     // Also puts the cache's signatures on the local paths: built here they are
     // only "ultimate", and a client checking signatures would refuse them.
     void publish(
-        nix::Store & store, const std::vector<std::string> & paths, const Cancelled & cancelled = never, bool verify = false)
+        nix::Store & store,
+        const std::vector<std::string> & paths,
+        const Cancelled & cancelled = never,
+        bool verify = false,
+        const PublishRetry & retry = {})
     {
-        for (const auto & [path, sigs] : publish(paths, cancelled, verify)) {
+        for (const auto & [path, sigs] : publish(paths, cancelled, verify, retry)) {
             nixcompat::addSignatures(store, store.parseStorePath(path), sigs);
         }
     }
@@ -132,6 +186,19 @@ public:
             if (ref != info.path) {
                 substitute(store, ref);
             }
+        }
+    }
+
+private:
+    static void sleepUnlessCancelled(std::chrono::milliseconds pause, const Cancelled & cancelled)
+    {
+        auto const until = std::chrono::steady_clock::now() + pause;
+        while (std::chrono::steady_clock::now() < until) {
+            if (cancelled()) {
+                throw CancelledWait("gave up retrying the upload");
+            }
+            std::this_thread::sleep_for(
+                std::min<std::chrono::steady_clock::duration>(cancelPoll, until - std::chrono::steady_clock::now()));
         }
     }
 };

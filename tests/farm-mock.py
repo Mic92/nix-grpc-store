@@ -5,7 +5,8 @@
 `farm-mock.py push --stdin --server-url URL ...` stands in for
 `niks3 push --stdin` and forwards each line to the server so state stays in
 one process. A path containing "fail", "hang" or "crash" makes the push fail,
-never ack, or kills the push process.
+never ack, or kills the push process. One containing "flaky" fails its first
+FLAKY_FAILURES pushes, like a bucket that is briefly out of space.
 """
 
 import json
@@ -18,12 +19,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 ACK_DELAY = float(os.environ.get("FARM_MOCK_HB", "0.2"))
+FLAKY_FAILURES = 2
 
 
 class State:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.pushed: set[str] = set()  # narinfo keys
+        self.flaky: dict[str, int] = {}  # failed pushes per flaky path
         self.log: list[dict[str, Any]] = []
 
     def record(self, **ev: Any) -> None:
@@ -92,7 +95,13 @@ def push_result(line: str) -> list[dict[str, Any]]:
     if any("hang" in p for p in paths):
         return []
     time.sleep(ACK_DELAY)
-    if any("fail" in p for p in paths):
+    with S.lock:
+        flaky = [p for p in paths if "flaky" in p and S.flaky.get(p, 0) < FLAKY_FAILURES]
+        for p in flaky:
+            S.flaky[p] = S.flaky.get(p, 0) + 1
+    if flaky:
+        status, msg = "error", "uploading NAR: server returned 500"
+    elif any("fail" in p for p in paths):
         status, msg = "error", "push failed"
     else:
         status, msg = "ok", ""
