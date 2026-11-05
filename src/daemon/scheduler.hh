@@ -655,12 +655,14 @@ public:
             workers, [&](const Worker & wkr) -> bool { return wkr.up && !wkr.draining && offers(wkr, ent); });
     }
 
-    // Features of the connected, non-draining workers that serve the system.
+    // Features of the connected, non-draining workers with slots that serve
+    // the system.
     [[nodiscard]] auto offeredFeatures(const std::string & system) const -> std::vector<std::string>
     {
         std::set<std::string> feats;
         for (const auto & wkr : workers) {
-            if (wkr.up && !wkr.draining && std::ranges::find(wkr.systems, system) != wkr.systems.end()) {
+            if (wkr.up && !wkr.draining && wkr.maxJobs > 0
+                && std::ranges::find(wkr.systems, system) != wkr.systems.end()) {
                 feats.insert(wkr.features.begin(), wkr.features.end());
             }
         }
@@ -908,9 +910,10 @@ private:
         return -(ent.cpHint + (cfg.faninWeight * extra) - (cfg.ageWeight * ent.enqMs));
     }
 
+    // A worker without slots runs nothing, as the membership says too.
     [[nodiscard]] static auto offers(const Worker & wkr, const Entry & ent) -> bool
     {
-        return std::ranges::find(wkr.systems, ent.system) != wkr.systems.end()
+        return wkr.maxJobs > 0 && std::ranges::find(wkr.systems, ent.system) != wkr.systems.end()
                && std::ranges::all_of(ent.features, [&](const std::string & feat) -> bool {
                       return std::ranges::find(wkr.features, feat) != wkr.features.end();
                   });
