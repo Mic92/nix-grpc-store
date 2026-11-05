@@ -162,6 +162,9 @@ spec:
             - {name: nix, mountPath: /nix, subPath: nix}
             - {name: build, mountPath: /build}
             - {name: nixconf, mountPath: /etc/nix/nix.conf.d}
+            {{- with $w.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           livenessProbe:
             exec:
               command: [nix, store, info, --store, daemon]
@@ -322,6 +325,9 @@ spec:
         - name: nixconf
           configMap:
             name: {{ $svc }}
+        {{- with $w.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
         - name: niks3-token
           {{- if $root.Values.niks3.auth.serviceAccountToken.enabled }}
           projected:

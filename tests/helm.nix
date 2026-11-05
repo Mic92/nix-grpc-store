@@ -98,6 +98,24 @@ let
     };
     workers.arm.hostPort = 50052;
   };
+  # A Secret mounted into the build container of every group.
+  valuesExtraVolumes = lib.recursiveUpdate values {
+    workerDefaults = {
+      extraVolumes = [
+        {
+          name = "nix-secrets";
+          secret.secretName = "nix-github";
+        }
+      ];
+      extraVolumeMounts = [
+        {
+          name = "nix-secrets";
+          mountPath = "/etc/nix/secrets";
+          readOnly = true;
+        }
+      ];
+    };
+  };
   # formats.yaml emits a %YAML directive that helm rejects. JSON is YAML.
   json = pkgs.formats.json { };
   valuesFile = json.generate "values.json" values;
@@ -109,6 +127,7 @@ let
       valuesPublicCertManager
       valuesPublicSecret
       valuesExternal
+      valuesExtraVolumes
     ]
     ++ extraValues
   );
@@ -277,6 +296,15 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
     # Without a map the node's InternalIP is the address.
     daemon arm '.args[]' | grep -x -- '--advertise=$(HOST_IP):50052' > /dev/null
     test "$(daemon arm '.command[0]')" = /bin/nix-grpc-daemon
+
+    # Extra volumes reach the pod and the nix-daemon container only, in every group.
+    helm template t chart -f ${json.generate "values.json" valuesExtraVolumes} --api-versions monitoring.coreos.com/v1/PodMonitor > extra.yaml
+    for g in x86 arm; do
+      test "$(pick Deployment t-nix-grpc-farm-worker-$g '.spec.template.spec.volumes[] | select(.name == "nix-secrets") | .secret.secretName' extra.yaml)" = nix-github
+      test "$(pick Deployment t-nix-grpc-farm-worker-$g '.spec.template.spec.containers[] | select(.name == "nix-daemon") | .volumeMounts[] | select(.name == "nix-secrets") | .mountPath' extra.yaml)" = /etc/nix/secrets
+      test -z "$(pick Deployment t-nix-grpc-farm-worker-$g '.spec.template.spec.containers[] | select(.name != "nix-daemon") | .volumeMounts[] | select(.name == "nix-secrets") | .name' extra.yaml)"
+    done
+    test -z "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.volumes[] | select(.name == "nix-secrets") | .name' out.yaml)"
 
     # The CA secret also holds the CA key under cert-manager: mount only ca.crt.
     for f in out.yaml cm.yaml; do

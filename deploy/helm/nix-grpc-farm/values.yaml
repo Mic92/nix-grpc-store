@@ -109,6 +109,10 @@ workerDefaults:
     medium: "" # "Memory" for tmpfs builds
     sizeLimit: null
   extraNixConf: ""
+  # Pod volumes and their mounts in the nix-daemon container, e.g. a Secret
+  # that extraNixConf `!include`s.
+  extraVolumes: []
+  extraVolumeMounts: []
   resources: {} # nix-daemon container, where builds run
   daemonResources: {} # nix-grpc-daemon container
   nodeSelector: {}

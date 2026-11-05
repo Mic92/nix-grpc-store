@@ -229,6 +229,36 @@ With the default sandbox (`hostUsers: false`), the build users map to
 unprivileged host UIDs. They can open `/dev/kvm` only if the device is
 world read-write (mode `0666`, which NixOS and most distributions use).
 
+### Give builds credentials
+
+`extraNixConf` is stored in a ConfigMap, so keep secrets out of it.
+Mount them from a Secret with `extraVolumes` and `extraVolumeMounts`
+and `!include` the file from `extraNixConf`.
+
+Example: let `fetchFromGitHub { private = true; }` fetch private
+repositories. Create a Secret `nix-github` with a key `github.conf`:
+
+```
+impure-env = NIX_GITHUB_PRIVATE_USERNAME=x-access-token NIX_GITHUB_PRIVATE_PASSWORD=<token>
+```
+
+and mount it:
+
+```yaml
+workerDefaults:
+  extraNixConf: |
+    extra-experimental-features = configurable-impure-env
+    !include /etc/nix/secrets/github.conf
+  extraVolumes:
+    - name: nix-secrets
+      secret: {secretName: nix-github, defaultMode: 0400}
+  extraVolumeMounts:
+    - {name: nix-secrets, mountPath: /etc/nix/secrets, readOnly: true}
+```
+
+Every build that lists these variables in `impureEnvVars` gets the
+token, so only use credentials every client of the farm may have.
+
 ### Certificates
 
 If cert-manager is installed, let the chart use it:
