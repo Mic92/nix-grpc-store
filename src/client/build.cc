@@ -373,6 +373,7 @@ struct GrpcStore::Run {
       auto noJobs = [](const StorePath &) -> bool { return false; };
       auto & job = jobs.emplace(drvPath, store.farmJob(evalStore, drvPath, full, noJobs)).first->second;
       job.cpHintMs = work.job->cpHintMs + 1; // ahead of the build waiting for it
+      job.mode = nixcompat::inputBuildMode(work.job->mode);
       job.cacheLost = true;
       addLocked(job, {});
     }
@@ -811,9 +812,7 @@ void GrpcStore::loadJobs(const std::vector<DerivedPath> & reqs, BuildMode buildM
     auto const full = evalStore.readDerivation(drvPath);
     auto const isJob = [&](const StorePath & input) -> bool { return missing.contains(input); };
     auto & job = jobs.emplace(drvPath, farmJob(evalStore, drvPath, full, isJob)).first->second;
-    // As in nix's DerivationResolutionGoal: --repair applies to inputs too,
-    // --check doesn't.
-    job.mode = buildMode == bmRepair ? bmRepair : bmNormal;
+    job.mode = nixcompat::inputBuildMode(buildMode);
     nixcompat::forInputDrvs(full, [&](const StorePath & input) -> void {
       if (!isJob(input)) {
         return;

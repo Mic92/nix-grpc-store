@@ -383,6 +383,13 @@ auto toBasicDrv(const nix::Derivation &drv, const OutputOf &outputOf)
   return basic;
 }
 
+// The mode nix builds the inputs of a derivation built in `mode`
+// (DerivationResolutionGoal): --repair repairs them too, --check only
+// checks the derivation itself.
+inline auto inputBuildMode(nix::BuildMode mode) -> nix::BuildMode {
+  return mode == nix::bmRepair ? nix::bmRepair : nix::bmNormal;
+}
+
 // Every input derivation path (static ones only, see toBasicDrv).
 template <typename F> void forInputDrvs(const nix::Derivation &drv, const F &visit) {
 #if NIX_COMPAT_TEMPLATED_DRV
