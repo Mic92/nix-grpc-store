@@ -126,6 +126,19 @@ pkgs.testers.runNixOSTest {
         }
       '';
 
+      # A build log far larger than the socket buffers and HTTP/2 windows
+      # between the daemon and a client, so one that stops reading leaves the
+      # daemon still sending it.
+      environment.etc."hugelog.nix".text = ''
+        derivation {
+          name = "hugelog-grpc";
+          system = builtins.currentSystem;
+          builder = "/bin/sh";
+          args = [ "-c" "head -c 48000000 /dev/urandom | base64 >&2; echo hugelog > $out" ];
+          PATH = builtins.storePath "${pkgs.coreutils}" + "/bin";
+        }
+      '';
+
       # Bench corpora as input-addressed outputs: CA paths from `nix store
       # add` are re-hashed on import (RewritingSink), skewing the benchmark.
       environment.etc."blob.nix".text = ''

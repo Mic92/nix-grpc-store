@@ -246,10 +246,9 @@ public:
     auto operator=(const GrpcStore &) -> GrpcStore & = delete;
     auto operator=(GrpcStore &&) -> GrpcStore & = delete;
 
-    auto getBuildLogExact(const StorePath & /*path*/)
-        -> std::optional<std::string> override {
-      unsupported("getBuildLogExact");
-    }
+    // The server's log of the derivation, as `nix log` reads it there. In a
+    // farm only the node that built it keeps one: address that node.
+    auto getBuildLogExact(const StorePath & path) -> std::optional<std::string> override;
 
     // A farm has no single store to collect. The tunnel would reach whichever
     // worker the balancer picked.

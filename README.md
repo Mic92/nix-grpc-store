@@ -207,7 +207,8 @@ is given.
         --allow '*=write' \
         --allow-anonymous read-only    # optional: cert-less clients
 
-  * `read-only` — path queries and NAR downloads (`nix copy --from`)
+  * `read-only` — path queries, NAR downloads (`nix copy --from`) and
+    every build log the daemon's store keeps (`nix log --store`)
   * `write` — additionally imports (signature checking is enforced
     regardless of `--no-check-sigs`) and server-side builds
     (`nix build --store 'grpc://…'`)
@@ -243,6 +244,7 @@ Role needed per use case:
 | Use case                                         | Role        |
 | ------------------------------------------------ | ----------- |
 | Substituter, `nix copy --from`                   | `read-only` |
+| `nix log --store 'grpc://…'`                     | `read-only` |
 | `nix copy --to` (signed paths)                   | `write`     |
 | `nix build --store 'grpc://…' --eval-store auto` | `write`     |
 | Remote builder (`nix.buildMachines`)             | `trusted`   |
@@ -332,6 +334,10 @@ TLS uses the system CA bundle and the client key pair from
 With access control enabled, remote builders need the `trusted` role.
 The builder protocol imports unsigned outputs built on the client,
 which also requires `trustClients` (see above).
+
+`nix log --store 'grpc://builder:50051' DRV` reads the whole log the
+builder's nix-daemon kept, which the client's own copy may lack. In a
+farm, name the node that ran the build.
 
 ## URI parameters
 

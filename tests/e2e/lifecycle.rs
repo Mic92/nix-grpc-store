@@ -173,3 +173,34 @@ fn default_client_cert_lookup() {
     succeed(&["rm", "-r", "/var/lib/nix-grpc-store"]);
     assert_eq!(out.code, 0, "{}", out.combined());
 }
+
+/// On SIGTERM the daemon waits for a build log it is sending, as for
+/// FetchNars. The log is a plain file, which it reads as it sends.
+#[test]
+fn drain_waits_for_a_build_log() {
+    use crate::transfer::{GET_BUILD_LOG, StopUnit, get_build_log_request, open_log_files};
+    write_file("/tmp/drain-log.nix", &drv_expr("drain-log-grpc", "echo never > $out"));
+    let drv = succeed(&["nix-instantiate", "/tmp/drain-log.nix"]);
+    let base = drv.trim().rsplit('/').next().unwrap();
+    let flat = format!("/nix/var/log/nix/drvs/{base}");
+    succeed(&["sh", "-c", r#"mkdir -p "${1%/*}" && head -c 48000000 /dev/urandom | base64 > "$1""#, "sh", &flat]);
+    let stop = StopUnit("drain-build-log");
+    let reader = format!("{GET_BUILD_LOG}\nget_build_log \"$1\" | {{ dd bs=1 count=1 of=/tmp/drain.first 2>/dev/null; sleep 600; }}");
+    let path = "--setenv=PATH=/run/current-system/sw/bin";
+    succeed(&["systemd-run", "--unit", stop.0, "--collect", path, "sh", "-c", &reader, "sh", &get_build_log_request(base)]);
+    wait_until_succeeds(&["test", "-s", "/tmp/drain.first"], 120);
+    let read = open_log_files("drain-log-grpc");
+    assert!(read.len() == 1 && read[0][0] < read[0][1], "the daemon's open log file (read, size): {read:?}");
+
+    let pid = succeed(&["systemctl", "show", "-p", "MainPID", "--value", "nix-grpc-daemon"]);
+    let events = || {
+        let journal = r#"journalctl -o cat _PID="$1" | grep -o 'event=[a-z_]*' | tr '\n' ' '"#;
+        succeed(&["sh", "-c", journal, "sh", pid.trim()])
+    };
+    succeed(&["kill", "-TERM", pid.trim()]);
+    sleep(3);
+    let early = events();
+    assert!(early.contains("event=draining") && !early.contains("event=signal_exit"), "3 s after SIGTERM: {early}");
+    drop(stop);
+    retry(30, "the daemon exits once the reader is gone", || events().contains("event=signal_exit"));
+}

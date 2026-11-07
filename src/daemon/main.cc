@@ -31,11 +31,15 @@
 #include <iterator>
 #include <set>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include <sys/socket.h>
+
+#include <bzlib.h>
+#include <unistd.h>
 
 #include <grpc/impl/channel_arg_names.h>
 #include <grpcpp/resource_quota.h>
@@ -49,6 +53,7 @@
 #include <nix/store/derivations.hh>
 #include <nix/store/derived-path.hh>
 #include <nix/store/globals.hh>
+#include <nix/store/local-fs-store.hh>
 #include <nix/store/path-info.hh>
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
@@ -99,6 +104,7 @@ using GrpcStream = grpc::ServerReaderWriter<nix::remote::Chunk, nix::remote::Chu
 using AddMultipleReader = grpc::ServerReader<nix::remote::AddMultipleChunk>;
 using NarFrameWriter = grpc::ServerWriter<nix::remote::NarFrame>;
 using BuildWriter = grpc::ServerWriter<nix::remote::BuildDerivationChunk>;
+using BuildLogWriter = grpc::ServerWriter<nix::remote::GetBuildLogChunk>;
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): signal handler.
 volatile std::sig_atomic_t nixgrpc::stopSignal = 0;
@@ -589,6 +595,154 @@ public:
         });
     }
 
+    // The log nix kept of the derivation's build here, for `nix log`, read
+    // from its file in chunks through zstd rather than whole: a call holds
+    // a few buffers, however big the log or slow the reader. Not through
+    // getBuildLogExact, which holds the whole log, nor makeDecompressionSink,
+    // which, fed in chunks, aborts (serialise.cc) when bytes follow the
+    // bzip2 stream.
+    auto GetBuildLog(
+        grpc::ServerContext * context,
+        const nix::remote::GetBuildLogRequest * request,
+        BuildLogWriter * writer) -> grpc::Status override
+    {
+        return guarded([&] -> grpc::Status {
+            auto const rpc = begin(*context, "GetBuildLog", nixgrpc::Role::readOnly);
+            nixgrpc::Metrics::Held const held(metrics, "GetBuildLog"); // the drain waits for it
+            std::optional<nix::StorePath> drvPath;
+            try {
+                drvPath.emplace(request->drv_path());
+            } catch (nix::BadStorePath & err) {
+                return {grpc::StatusCode::INVALID_ARGUMENT, err.what()};
+            }
+            auto const localStore = getStore();
+            auto * const fsStore = dynamic_cast<nix::LocalFSStore *>(&*localStore);
+            if (fsStore == nullptr) {
+                return {grpc::StatusCode::UNIMPLEMENTED, "the store behind this daemon keeps no build logs here"};
+            }
+            auto const baseName = std::string(drvPath->to_string());
+            // As LocalFSStore::getBuildLogExact looks (nix src/libstore/
+            // local-fs-store.cc, lines 116-139 in 2.34.9, 181-204 in 2.35.3):
+            // bucketed, then flat; each plain, else a .bz2 that decompresses.
+            for (auto const & rel : {nix::LocalFSStore::drvsLogDir / baseName.substr(0, 2) / baseName.substr(2),
+                                     nix::LocalFSStore::drvsLogDir / baseName}) {
+                for (bool const bz2 : {false, true}) {
+                    auto path = fsStore->config.logDir.get() / rel;
+                    if (bz2) {
+                        path += ".bz2";
+                    }
+                    if (auto const status = sendLogFile(path, bz2, *writer)) {
+                        if (status->ok()) {
+                            rpc.done({{"drv", baseName}});
+                        }
+                        return *status;
+                    }
+                }
+            }
+            return {grpc::StatusCode::NOT_FOUND, "no build log of " + baseName};
+        });
+    }
+
+    // None if nix's pathExists finds no such file or, as nix skips it, a
+    // .bz2 that cannot be read or decompressed before anything was sent.
+    static auto sendLogFile(const std::filesystem::path & path, bool bz2, BuildLogWriter & writer)
+        -> std::optional<grpc::Status>
+    {
+        auto const file = nix::openFileReadonly(path);
+        auto const err = errno;
+        if (!file && (bz2 || !nix::pathExists(path))) {
+            return std::nullopt;
+        }
+        if (!file) {
+            // Not a SysError: guarded() would take the ENOENT of a dangling
+            // symlink for a lost nix-daemon, and the client would retry.
+            throw nix::Error("opening '%s': %s", path.string(), std::system_category().message(err));
+        }
+
+        struct Counting
+        {
+            BuildLogWriter * writer = nullptr;
+            uint64_t writes = 0;
+
+            auto Write(const nix::remote::GetBuildLogChunk & chunk) -> bool
+            {
+                ++writes;
+                return writer->Write(chunk);
+            }
+        };
+
+        Counting counted{.writer = &writer};
+        nixgrpc::ZstdWriterSink<Counting, nix::remote::GetBuildLogChunk> sink(counted);
+        try {
+            if (!bz2) {
+                nix::FdSource(file.get()).drainInto(sink);
+            } else if (!bunzip2(file.get(), sink)) {
+                if (counted.writes == 0) {
+                    return std::nullopt;
+                }
+                return grpc::Status{grpc::StatusCode::DATA_LOSS, path.string() + " does not decompress"};
+            }
+            sink.finish();
+        } catch (nixgrpc::StreamClosed &) {
+            return grpc::Status{grpc::StatusCode::CANCELLED, "the client went away"};
+        }
+        return grpc::Status::OK;
+    }
+
+    // The bzip2 streams in `logFd`, one after another, into `out`, read 64
+    // KiB at a time; false if one does not decompress or the file cannot be
+    // read. As nix reads them, an empty file is an empty log (sourceToSink
+    // skips empty input), and, as libarchive does, bytes after a stream that
+    // do not start another are ignored: fewer than 14, or not "BZh1"-"BZh9"
+    // and a block or end magic (archive_read_support_filter_bzip2.c,
+    // bzip2_reader_bid). libbz2 fails on those within the first 10 bytes.
+    // Unlike libarchive, this does not decompress again a log that is
+    // itself bzip2, which nix does not write.
+    static auto bunzip2(int logFd, nix::Sink & out) -> bool
+    {
+        bz_stream strm{};
+        std::unique_ptr<bz_stream, decltype(&BZ2_bzDecompressEnd)> const end(&strm, &BZ2_bzDecompressEnd);
+        static constexpr size_t bufSize = 64 << 10;
+        std::string input(bufSize, '\0');
+        std::string output(bufSize, '\0');
+        bool empty = true;
+        bool ended = false; // a stream ended: what follows is another or is ignored
+        static constexpr unsigned checked = 14;
+        auto const ignored = [&] -> bool { return ended && strm.total_in_lo32 < checked; };
+        for (bool start = true;;) {
+            if (start && BZ2_bzDecompressInit(&strm, 0, 0) != BZ_OK) {
+                throw nix::Error("BZ2_bzDecompressInit failed");
+            }
+            start = false;
+            if (strm.avail_in == 0) {
+                auto const got = ::read(logFd, input.data(), input.size());
+                if (got < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (got < 0) {
+                    return false;
+                }
+                if (got == 0) {
+                    return empty || ignored();
+                }
+                empty = false;
+                strm.next_in = input.data();
+                strm.avail_in = static_cast<unsigned>(got);
+            }
+            strm.next_out = output.data();
+            strm.avail_out = static_cast<unsigned>(output.size());
+            auto const ret = BZ2_bzDecompress(&strm);
+            if (ret != BZ_OK && ret != BZ_STREAM_END) {
+                return ignored();
+            }
+            out({output.data(), output.size() - strm.avail_out});
+            if (ret == BZ_STREAM_END) {
+                ended = start = true;
+                BZ2_bzDecompressEnd(&strm);
+            }
+        }
+    }
+
     // Outputs built on another node live only in the cache. Clients read them back through us.
     void substituteIfRemote(nix::Store & store, const nix::StorePath & path) const
     {
@@ -1051,7 +1205,8 @@ namespace {
 auto drained(nixgrpc::Coordinator & coord, nixgrpc::Metrics & metrics) -> bool
 {
     return (!coord.builder || coord.builder->holding() == 0)
-           && metrics.inflightNow("BuildDerivation") + metrics.inflightNow("FetchNars") == 0;
+           && metrics.inflightNow("BuildDerivation") + metrics.inflightNow("FetchNars")
+                      + metrics.inflightNow("GetBuildLog") == 0;
 }
 
 // Returns on idle timeout or SIGTERM. A builder's first SIGTERM only stops

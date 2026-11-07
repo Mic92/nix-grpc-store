@@ -10,6 +10,7 @@
   openssl,
   prometheus-cpp,
   zstd,
+  bzip2,
   curl,
   nlohmann_json,
   jwt-cpp,
@@ -112,6 +113,7 @@ stdenv.mkDerivation {
     nlohmann_json
     jwt-cpp
     jemalloc
+    bzip2
   ];
 
   # Frame pointers for perf in the VM test. DWARF goes to the debug output,
