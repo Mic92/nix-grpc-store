@@ -170,7 +170,7 @@ void Dispatcher::membershipChangedLocked()
             continue;
         }
         for (const auto & system : wkr.systems) {
-            (*next)[system].push_back({.addr = wkr.addr, .draining = wkr.draining || wkr.maxJobs == 0});
+            (*next)[system].push_back({.addr = wkr.addr, .draining = !wkr.takesWork()});
         }
     }
     {

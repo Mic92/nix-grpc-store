@@ -307,6 +307,12 @@ struct Worker
     bool up = false;
     bool draining = false;
     std::vector<DrvId> running;
+
+    // A worker that says Hello with max_jobs 0 is up but runs nothing.
+    [[nodiscard]] auto takesWork() const -> bool
+    {
+        return up && !draining && maxJobs > 0;
+    }
 };
 
 class Core
@@ -648,19 +654,18 @@ public:
         }
     }
 
-    // Some connected, non-draining worker could ever run it.
+    // Some worker that takes work could ever run it.
     [[nodiscard]] auto placeable(const Entry & ent) const -> bool
     {
-        return std::ranges::any_of(
-            workers, [&](const Worker & wkr) -> bool { return wkr.up && !wkr.draining && offers(wkr, ent); });
+        return std::ranges::any_of(workers, [&](const Worker & wkr) -> bool { return wkr.takesWork() && offers(wkr, ent); });
     }
 
-    // Features of the connected, non-draining workers that serve the system.
+    // Features of the workers that take work and serve the system.
     [[nodiscard]] auto offeredFeatures(const std::string & system) const -> std::vector<std::string>
     {
         std::set<std::string> feats;
         for (const auto & wkr : workers) {
-            if (wkr.up && !wkr.draining && std::ranges::find(wkr.systems, system) != wkr.systems.end()) {
+            if (wkr.takesWork() && std::ranges::find(wkr.systems, system) != wkr.systems.end()) {
                 feats.insert(wkr.features.begin(), wkr.features.end());
             }
         }
@@ -717,7 +722,7 @@ public:
         size_t unplaceable = 0; // of those, no connected worker could ever run it
         // Keyed by what the worker offers (native system).
         size_t running = 0; // assigned, until the worker's Done
-        size_t slots = 0;   // maxJobs of up, non-draining workers
+        size_t slots = 0;   // maxJobs of workers that take work
         size_t free = 0;
     };
 
@@ -745,7 +750,7 @@ public:
             }
             auto & sst = out[{.system = wkr.systems.front(), .features = featureKey(wkr.features)}];
             sst.running += wkr.running.size();
-            if (!wkr.up || wkr.draining) {
+            if (!wkr.takesWork()) {
                 continue;
             }
             sst.slots += static_cast<size_t>(wkr.maxJobs);
@@ -896,7 +901,7 @@ private:
     {
         auto const & wkr = workers.at(wid);
         auto const running = static_cast<int32_t>(std::min<size_t>(wkr.running.size(), FreeIndex::maxSlots));
-        auto const val = (wkr.up && !wkr.draining) ? wkr.maxJobs - running : 0;
+        auto const val = wkr.takesWork() ? wkr.maxJobs - running : 0;
         for (const auto & name : wkr.systems) {
             sys(name).free.set(wid, val);
         }
@@ -945,7 +950,7 @@ private:
         bool others = false;
         for (WorkerId wid = 0; wid < workers.size(); wid++) {
             const auto & wkr = workers.at(wid);
-            if (wid == ent.avoid || !wkr.up || wkr.draining || !offers(wkr, ent)) {
+            if (wid == ent.avoid || !wkr.takesWork() || !offers(wkr, ent)) {
                 continue;
             }
             others = true;
