@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <stop_token>
 #include <string>
@@ -125,6 +126,30 @@ auto GrpcStore::queryPathInfosNative(const StorePathSet &paths) -> PathInfoMap {
     res.insert(nixgrpc::decodePathInfo(*this, entry));
   }
   return res;
+}
+
+auto GrpcStore::getBuildLogExact(const StorePath & path) -> std::optional<std::string> {
+  remote::GetBuildLogRequest request;
+  request.set_drv_path(std::string(path.to_string()));
+  StringSink log;
+  bool none = false;
+  retrying("GetBuildLog", [&] -> grpc::Status {
+    nixgrpc::Call call;
+    log.s.clear();
+    auto reader = stub->GetBuildLog(&call.ctx(), request);
+    nixgrpc::ZstdReaderSource<grpc::ClientReader<remote::GetBuildLogChunk>, remote::GetBuildLogChunk> source(
+        *reader, "");
+    source.drainInto(log);
+    auto const status = reader->Finish();
+    // UNIMPLEMENTED: the store keeps no logs, or the server predates GetBuildLog.
+    none = status.error_code() == grpc::StatusCode::NOT_FOUND
+           || status.error_code() == grpc::StatusCode::UNIMPLEMENTED;
+    return none ? grpc::Status::OK : status;
+  });
+  if (none) {
+    return std::nullopt;
+  }
+  return std::move(log.s);
 }
 
 #if NIX_COMPAT_AT_LEAST(2, 35)

@@ -53,6 +53,8 @@ if build_server
   # niks3 /present over HTTPS, niks3 push acks as JSON lines.
   curl_dep = dependency('libcurl')
   json_dep = dependency('nlohmann_json')
+  # GetBuildLog decompresses .bz2 build logs.
+  bz2_dep = cxx.find_library('bz2')
   # Header-only and ships only a cmake config. The include path finds it.
   cxx.check_header('jwt-cpp/traits/nlohmann-json/defaults.h', required: true)
 endif
@@ -210,7 +212,7 @@ if build_server
     cpp_pch : do_pch ? ['pch/daemon_pch.hh'] : [],
     cpp_args : nix_compat_args + ['-DNIX_GRPC_VERSION="' + meson.project_version() + '"'],
     # nix-store has the native QueryValidPaths / AddMultipleToStore handlers.
-    dependencies : common_deps + prometheus_dep + [dispatcher_dep, nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep, jemalloc_dep],
+    dependencies : common_deps + prometheus_dep + [dispatcher_dep, nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep, jemalloc_dep, bz2_dep],
     install : true,
   )
 
