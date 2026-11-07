@@ -122,6 +122,11 @@ let
         niks3 = {
           package = niks3Pkgs.niks3;
           url = niks3Url;
+          # Short, so the failed-upload test need not wait out the default.
+          pushFlags = [
+            "--retry-timeout"
+            "3s"
+          ];
           tokenFile = toString tokenFile;
           cacheUrl = niks3Url;
           publicKeys = [ signingPublicKey ];

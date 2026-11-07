@@ -524,6 +524,44 @@ in
     succeed(CLIENT, &["nix", "path-info", "--store", &envoy(), other.trim()]);
 }
 
+/// When niks3 can't take a build's outputs, the build fails with the upload
+/// error instead of being rebuilt on the other worker.
+#[test]
+fn a_failed_upload_fails_the_build_instead_of_rebuilding_it() {
+    farm_ready();
+    let built = || WORKERS.into_iter().map(|w| events(w, "built")).sum::<i64>();
+    let before = built();
+    // Fail worker uploads to garage once the inputs are in, niks3 keeps
+    // serving narinfos over lo. tcp-reset also breaks niks3 push's
+    // kept-alive connection, which a plain REJECT would leave hanging.
+    fn block(op: &str) {
+        for ipt in ["iptables", "ip6tables"] {
+            succeed(
+                LB,
+                &[ipt, op, "INPUT", "-i", "eth1", "-p", "tcp", "--dport", "9000", "-j", "REJECT", "--reject-with", "tcp-reset"],
+            );
+        }
+    }
+    struct Unblock;
+    impl Drop for Unblock {
+        fn drop(&mut self) {
+            block("-D");
+        }
+    }
+    spawn_build("pubdown", "pubdown");
+    wait_building();
+    block("-I");
+    let unblock = Unblock;
+    release_slow();
+    wait_unit_done("pubdown", 120);
+    drop(unblock);
+    retry(60, "scheduler settled", settled);
+    let log = journal(CLIENT, "pubdown");
+    assert_ne!(unit_result(CLIENT, "pubdown"), "success", "{log}");
+    assert!(log.contains("publish failed"), "{log}");
+    assert_eq!(built() - before, 1, "{log}");
+}
+
 #[test]
 fn a_niks3_restart_does_not_cost_the_leader_its_role() {
     farm_ready();

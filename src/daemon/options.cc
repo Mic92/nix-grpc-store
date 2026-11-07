@@ -98,6 +98,11 @@ void finishNiks3(Niks3Config & niks3, const std::string & tlsCert, const std::st
         argv = {"niks3", "push"};
     }
     argv.insert(argv.end(), {"--stdin", "--server-url", niks3.url});
+    // Ride out a cache outage here: a build whose upload fails is lost, and
+    // every worker uploads to the same cache.
+    if (std::ranges::find(argv, "--retry-timeout") == argv.end()) {
+        argv.insert(argv.end(), {"--retry-timeout", "10m"});
+    }
     if (!niks3.tokenFile.empty()) {
         argv.insert(argv.end(), {"--auth-token-path", niks3.tokenFile});
     }
