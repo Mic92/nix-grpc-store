@@ -207,7 +207,8 @@ is given.
         --allow '*=write' \
         --allow-anonymous read-only    # optional: cert-less clients
 
-  * `read-only` — path queries and NAR downloads (`nix copy --from`)
+  * `read-only` — path queries, NAR downloads (`nix copy --from`) and
+    every build log the daemon's store keeps (`nix log --store`)
   * `write` — additionally imports (signature checking is enforced
     regardless of `--no-check-sigs`) and server-side builds
     (`nix build --store 'grpc://…'`)
@@ -243,6 +244,7 @@ Role needed per use case:
 | Use case                                         | Role        |
 | ------------------------------------------------ | ----------- |
 | Substituter, `nix copy --from`                   | `read-only` |
+| `nix log --store 'grpc://…'`                     | `read-only` |
 | `nix copy --to` (signed paths)                   | `write`     |
 | `nix build --store 'grpc://…' --eval-store auto` | `write`     |
 | Remote builder (`nix.buildMachines`)             | `trusted`   |

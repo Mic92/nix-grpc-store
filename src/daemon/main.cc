@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <system_error>
 #include <chrono>
 #include <csignal>
 #include <signal.h> // NOLINT(modernize-deprecated-headers): sigaction is POSIX, not in <csignal>
@@ -37,6 +38,9 @@
 
 #include <sys/socket.h>
 
+#include <bzlib.h>
+#include <unistd.h>
+
 #include <grpc/impl/channel_arg_names.h>
 #include <grpcpp/resource_quota.h>
 #include <grpcpp/grpcpp.h>
@@ -49,6 +53,7 @@
 #include <nix/store/derivations.hh>
 #include <nix/store/derived-path.hh>
 #include <nix/store/globals.hh>
+#include <nix/store/local-fs-store.hh>
 #include <nix/store/path-info.hh>
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
@@ -99,6 +104,7 @@ using GrpcStream = grpc::ServerReaderWriter<nix::remote::Chunk, nix::remote::Chu
 using AddMultipleReader = grpc::ServerReader<nix::remote::AddMultipleChunk>;
 using NarFrameWriter = grpc::ServerWriter<nix::remote::NarFrame>;
 using BuildWriter = grpc::ServerWriter<nix::remote::BuildDerivationChunk>;
+using BuildLogWriter = grpc::ServerWriter<nix::remote::GetBuildLogChunk>;
 
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables): signal handler.
 volatile std::sig_atomic_t nixgrpc::stopSignal = 0;
@@ -594,6 +600,124 @@ public:
             reply->set_trusted(rpc.caller.role == nixgrpc::Role::trusted);
             return grpc::Status::OK;
         });
+    }
+
+    // Finds the log like LocalFSStore::getBuildLogExact, but streams it
+    // instead of loading it whole: a small .bz2 can expand to gigabytes.
+    auto GetBuildLog(
+        grpc::ServerContext * context,
+        const nix::remote::GetBuildLogRequest * request,
+        BuildLogWriter * writer) -> grpc::Status override
+    {
+        return guarded([&] -> grpc::Status {
+            auto const rpc = begin(*context, "GetBuildLog", nixgrpc::Role::readOnly);
+            std::optional<nix::StorePath> drvPath;
+            try {
+                drvPath.emplace(request->drv_path());
+            } catch (nix::BadStorePath & err) {
+                return {grpc::StatusCode::INVALID_ARGUMENT, err.what()};
+            }
+            auto const localStore = getStore();
+            auto * const fsStore = dynamic_cast<nix::LocalFSStore *>(&*localStore);
+            if (fsStore == nullptr) {
+                return {grpc::StatusCode::UNIMPLEMENTED, "the store behind this daemon keeps no build logs"};
+            }
+            auto const base = std::string(drvPath->to_string());
+            for (auto const & rel : {nix::LocalFSStore::drvsLogDir / base.substr(0, 2) / base.substr(2),
+                                     nix::LocalFSStore::drvsLogDir / base}) {
+                auto const plain = fsStore->config.logDir.get() / rel;
+                auto bz2 = plain;
+                bz2 += ".bz2";
+                bool const compressed = !nix::pathExists(plain);
+                auto const & path = compressed ? bz2 : plain;
+                auto const file = nix::openFileReadonly(path);
+                if (!file) {
+                    auto const err = errno;
+                    if (compressed && err == ENOENT) {
+                        continue;
+                    }
+                    // Not a SysError: guarded() would treat ENOENT as a lost nix-daemon.
+                    return {grpc::StatusCode::INTERNAL, "cannot open " + path.string() + ": " + std::system_category().message(err)};
+                }
+                try {
+                    nixgrpc::ZstdWriterSink<BuildLogWriter, nix::remote::GetBuildLogChunk> sink(*writer);
+                    if (!compressed) {
+                        nix::FdSource(file.get()).drainInto(sink);
+                    } else if (!bunzip2(file.get(), sink)) {
+                        // Part of the log may be sent already, so no fallback to the next file.
+                        return {grpc::StatusCode::DATA_LOSS, bz2.string() + " does not decompress"};
+                    }
+                    sink.finish();
+                } catch (nixgrpc::StreamClosed &) {
+                    return {grpc::StatusCode::CANCELLED, "the client went away"};
+                }
+                rpc.done({{"drv", request->drv_path()}});
+                return grpc::Status::OK;
+            }
+            return {grpc::StatusCode::NOT_FOUND, "no build log of " + request->drv_path()};
+        });
+    }
+
+    // Reads into `buf`, retrying on EINTR. 0 at end of file.
+    static auto readSome(int logFd, std::span<char> buf) -> size_t
+    {
+        for (;;) {
+            auto const got = ::read(logFd, buf.data(), buf.size());
+            if (got >= 0) {
+                return static_cast<size_t>(got);
+            }
+            if (errno != EINTR) {
+                // Not a SysError, see GetBuildLog.
+                throw nix::Error("reading build log: %s", std::system_category().message(errno));
+            }
+        }
+    }
+
+    // Decompresses the concatenated bzip2 streams in `logFd` into `out`.
+    // Returns false on corrupt data. Like libarchive in nix, an empty file is
+    // an empty log and trailing garbage is ignored.
+    static auto bunzip2(int logFd, nix::Sink & out) -> bool
+    {
+        static constexpr size_t bufSize = 64 << 10;
+        static constexpr unsigned bidBytes = 14; // libarchive's bzip2 bid
+        std::vector<char> input(bufSize);
+        std::vector<char> output(bufSize);
+        bz_stream strm{};
+        std::unique_ptr<bz_stream, decltype(&BZ2_bzDecompressEnd)> decoder(nullptr, &BZ2_bzDecompressEnd);
+        bool ended = false;
+        auto const trailingGarbage = [&] -> bool {
+            return ended && strm.total_in_hi32 == 0 && strm.total_in_lo32 < bidBytes;
+        };
+        for (;;) {
+            if (strm.avail_in == 0) {
+                auto const got = readSome(logFd, input);
+                if (got == 0) {
+                    return !decoder || trailingGarbage();
+                }
+                strm.next_in = input.data();
+                strm.avail_in = static_cast<unsigned>(got);
+            }
+            if (!decoder) {
+                if (auto const ret = BZ2_bzDecompressInit(&strm, 0, 0); ret != BZ_OK) {
+                    throw nix::Error("BZ2_bzDecompressInit failed: %d", ret);
+                }
+                decoder.reset(&strm);
+            }
+            strm.next_out = output.data();
+            strm.avail_out = static_cast<unsigned>(output.size());
+            auto const ret = BZ2_bzDecompress(&strm);
+            if (ret == BZ_DATA_ERROR || ret == BZ_DATA_ERROR_MAGIC) {
+                return trailingGarbage();
+            }
+            if (ret != BZ_OK && ret != BZ_STREAM_END) {
+                throw nix::Error("BZ2_bzDecompress failed: %d", ret);
+            }
+            out({output.data(), output.size() - strm.avail_out});
+            if (ret == BZ_STREAM_END) {
+                decoder.reset();
+                ended = true;
+            }
+        }
     }
 
     // Outputs built on another node live only in the cache. Clients read them back through us.

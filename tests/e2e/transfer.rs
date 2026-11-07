@@ -34,6 +34,142 @@ fn build_whose_log_is_not_utf8() {
     assert!(built.contains("rawlog-over-grpc"), "{built}");
 }
 
+/// `nix log --store grpc://…` reads the server's log, by derivation and by output.
+#[test]
+fn build_log_is_read_from_the_server() {
+    write_file(
+        "/tmp/logged.nix",
+        &drv_expr(
+            "logged-grpc",
+            "echo line-from-the-build >&2; echo logged > $out",
+        ),
+    );
+    let out = succeed(&[
+        "nix",
+        "build",
+        "--store",
+        STORE,
+        "--impure",
+        "-f",
+        "/tmp/logged.nix",
+        "--no-link",
+        "--print-out-paths",
+    ]);
+    let drv = succeed(&["nix-instantiate", "/tmp/logged.nix"]);
+    let drv = drv.trim();
+    for installable in [drv, out.trim()] {
+        let log = succeed(&["nix", "log", "--store", STORE, installable]);
+        assert!(log.contains("line-from-the-build"), "{installable}: {log}");
+    }
+    // read-only is enough, so anonymous callers get it too.
+    wait_for_unit("nix-grpc-daemon-mtls.service");
+    wait_for_open_port(50052);
+    let log = succeed(&["nix", "log", "--store", &anon_store(), drv]);
+    assert!(log.contains("line-from-the-build"), "anonymous: {log}");
+
+    // Missing, dangling, truncated .bz2, and .bz2 with trailing garbage.
+    write_file(
+        "/tmp/unbuilt.nix",
+        &drv_expr("unbuilt-grpc", "echo never > $out"),
+    );
+    let unbuilt = succeed(&["nix-instantiate", "/tmp/unbuilt.nix"]);
+    let unbuilt = unbuilt.trim();
+    let logs = |drv: &str| {
+        let base = drv.rsplit('/').next().unwrap().to_string();
+        (
+            format!("/nix/var/log/nix/drvs/{}/{}", &base[..2], &base[2..]),
+            base,
+        )
+    };
+    let (bucketed, base) = logs(unbuilt);
+    let err = fail(&["nix", "log", "--store", STORE, unbuilt]);
+    assert!(err.contains("is not available"), "no log: {err}");
+    succeed(&[
+        "sh",
+        "-c",
+        r#"mkdir -p "${1%/*}" && ln -sfn /nonexistent "$1""#,
+        "sh",
+        &bucketed,
+    ]);
+    let err = fail(&["nix", "log", "--store", STORE, unbuilt]);
+    assert!(
+        err.contains("cannot open") && !err.contains("connection lost"),
+        "dangling: {err}"
+    );
+    let script = r#"mv "$1" /tmp/dangling-log
+head -c 2000000 /dev/urandom | bzip2 | head -c 1500000 > "$1.bz2""#;
+    succeed(&["sh", "-c", script, "sh", &bucketed]);
+    let err = fail(&["nix", "log", "--store", STORE, unbuilt]);
+    assert!(err.contains("does not decompress"), "cut short: {err}");
+    let script = r#"{ cat "$2.bz2" "$2.bz2"; head -c 1000 /dev/urandom; } > "$1.bz2""#;
+    succeed(&["sh", "-c", script, "sh", &bucketed, &logs(drv).0]);
+    let log = succeed(&["nix", "log", "--store", STORE, unbuilt]);
+    assert!(
+        log.matches("line-from-the-build").count() == 2,
+        "two streams: {log}"
+    );
+    // A 256 MiB log must be streamed, not held in memory.
+    let script = format!(
+        r#"{GET_BUILD_LOG}
+head -c 256M /dev/zero | bzip2 > "$2.bz2"
+nix log --store "$3" "$4" > /dev/null
+pid=$(systemctl show -p MainPID --value nix-grpc-daemon)
+echo 5 > /proc/$pid/clear_refs
+get_build_log "$1" -D /tmp/bomb.hdr -o /dev/null
+grep -qi 'grpc-status: 0' /tmp/bomb.hdr
+test "$(systemctl show -p MainPID --value nix-grpc-daemon)" = "$pid"
+awk '/^VmHWM/ {{print $2}}' /proc/$pid/status"#
+    );
+    let peak = succeed(&[
+        "sh",
+        "-c",
+        &script,
+        "sh",
+        &get_build_log_request(&base),
+        &bucketed,
+        STORE,
+        drv,
+    ]);
+    let peak: u64 = peak.trim().parse().unwrap();
+    assert!(
+        peak < 160 * 1024,
+        "daemon peak RSS {peak} kB for a 256 MiB log"
+    );
+}
+
+/// GetBuildLog request as a `printf` format of the raw gRPC frame.
+pub(crate) fn get_build_log_request(drv_path: &str) -> String {
+    assert!(drv_path.len() < 126 && !drv_path.contains(['%', '\\']));
+    format!(
+        "\\000\\000\\000\\000\\{:03o}\\012\\{:03o}{drv_path}",
+        drv_path.len() + 2,
+        drv_path.len()
+    )
+}
+
+/// Shell function calling GetBuildLog via curl. Args: request format, then curl flags.
+pub(crate) const GET_BUILD_LOG: &str = r#"get_build_log() {
+  printf "$1" > "/tmp/req.$$"; shift
+  curl -sS --http2-prior-knowledge -H 'content-type: application/grpc' -H 'te: trailers' \
+    --data-binary "@/tmp/req.$$" "$@" http://127.0.0.1:50051/nix.remote.NixRemote/GetBuildLog
+}"#;
+
+#[test]
+fn build_log_of_a_bad_name_is_invalid_argument() {
+    let call = format!("{GET_BUILD_LOG}\nget_build_log \"$1\" -D - -o /dev/null");
+    let headers = succeed(&[
+        "sh",
+        "-c",
+        &call,
+        "sh",
+        &get_build_log_request("not-a-store-path"),
+    ]);
+    assert!(
+        headers.to_ascii_lowercase().contains("grpc-status: 3\r"),
+        "{headers}"
+    );
+}
+
 #[test]
 fn copy_to_a_local_scratch_store() {
     let p = hello_path();
