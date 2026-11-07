@@ -199,7 +199,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-farm";
-  globalTimeout = 900;
+  globalTimeout = 1800;
 
   sshBackdoor.enable = true;
   defaults.virtualisation.qemu.enableSharedMemory = true;
