@@ -43,6 +43,9 @@ struct Options
     std::string schedulerTokenFile; // bearer towards a remote scheduler, optional
     // How the balancer reaches this worker. Goes into Assigned.worker_addr.
     std::string advertise;
+    // Systems the local nix-daemon builds without them being in extra-platforms,
+    // e.g. through external-builders.
+    std::vector<std::string> extraSystems;
     unsigned maxJobs = 0; // 0 = take nix's max-jobs
     uint64_t minFree = 0;
     std::string storeDir;

@@ -62,6 +62,10 @@
   "--min-free"
   cfg.minFree
 ]
+++ lib.concatMap (s: [
+  "--extra-system"
+  s
+]) cfg.extraSystems
 ++ lib.optionals (cfg.maxJobs != null) [
   "--max-jobs"
   (toString cfg.maxJobs)

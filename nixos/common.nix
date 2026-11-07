@@ -281,6 +281,16 @@ in
         `workers`. Defaults to {option}`listen`.
       '';
     };
+    extraSystems = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "aarch64-linux" ];
+      description = ''
+        Systems to advertise to the scheduler besides `system` and
+        `extra-platforms`. For builds the local nix-daemon hands off
+        elsewhere, e.g. through `external-builders`.
+      '';
+    };
     maxJobs = lib.mkOption {
       type = lib.types.nullOr (lib.types.ints.between 1 63);
       default = null;
