@@ -430,6 +430,24 @@ void testStaleDoneAndUnknown()
     assert(threw);
 }
 
+// A build holds its worker's slot until its Done, followed or not: one known
+// only from the worker's Hello after a scheduler restart, or one whose last
+// client cancelled it.
+void testRunningFollowsTheWorker()
+{
+    Core shard;
+    auto const w0 = hello(shard, "w0", 1, {"orphan.drv"});
+    auto const stat = [&] -> Core::Stats { return shard.stats()[{.system = "x", .features = ""}]; };
+    assert(stat().slots == 1 && stat().free == 0 && stat().running == 1);
+    shard.done(w0, "orphan.drv", {});
+    assert(stat().free == 1 && stat().running == 0);
+    std::vector<Assign> out;
+    shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 1 && shard.cancel(1, "a.drv") == w0);
+    assert(stat().free == 0 && stat().running == 1);
+}
+
 } // namespace
 // NOLINTEND(*-magic-numbers, *-avoid-unchecked-container-access, bugprone-unchecked-optional-access, readability-identifier-length)
 
@@ -444,6 +462,7 @@ try {
     testHelloReconciles();
     testHelloSupersedes();
     testCancelAndClientGone();
+    testRunningFollowsTheWorker();
     testDraining();
     testFeatures();
     testSystems();
