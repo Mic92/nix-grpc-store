@@ -104,16 +104,6 @@ public:
         return (verify ? remote->verifyingPush : remote->push).pushWait(paths, cancelled);
     }
 
-    // Also puts the cache's signatures on the local paths: built here they are
-    // only "ultimate", and a client checking signatures would refuse them.
-    void publish(
-        nix::Store & store, const std::vector<std::string> & paths, const Cancelled & cancelled = never, bool verify = false)
-    {
-        for (const auto & [path, sigs] : publish(paths, cancelled, verify)) {
-            nixcompat::addSignatures(store, store.parseStorePath(path), sigs);
-        }
-    }
-
     // Path valid locally afterwards, or throws.
     static void substitute(nix::Store & store, const nix::StorePath & path)
     {

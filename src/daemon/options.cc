@@ -98,6 +98,16 @@ void finishNiks3(Niks3Config & niks3, const std::string & tlsCert, const std::st
         argv = {"niks3", "push"};
     }
     argv.insert(argv.end(), {"--stdin", "--server-url", niks3.url});
+    // Ride out a cache outage here: a build whose upload fails is lost, and
+    // every worker uploads to the same cache.
+    // Go's flag package takes -flag, --flag and either with =value.
+    auto const setsRetryTimeout = [](std::string_view arg) -> bool {
+        arg.remove_prefix(std::min(arg.find_first_not_of('-'), arg.size()));
+        return arg == "retry-timeout" || arg.starts_with("retry-timeout=");
+    };
+    if (std::ranges::none_of(argv, setsRetryTimeout)) {
+        argv.insert(argv.end(), {"--retry-timeout", "10m"});
+    }
     if (!niks3.tokenFile.empty()) {
         argv.insert(argv.end(), {"--auth-token-path", niks3.tokenFile});
     }
