@@ -193,12 +193,19 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         const nixgrpc::Cancelled & cancelled,
         bool verify = false)
     {
+        nixgrpc::PushProcess::Signatures signed_;
         try {
-            coord.cache.publish(localStore, paths, cancelled, verify);
+            signed_ = coord.cache.publish(paths, cancelled, verify);
         } catch (nixgrpc::CancelledWait &) {
             throw;
         } catch (nix::Error & err) {
             throw Unavailable("publish failed: %s", err.what());
+        }
+        // Built here the paths are only "ultimate", a client checking
+        // signatures would refuse them. Outside the catch: a local nix-daemon
+        // hiccup must stay retryable.
+        for (const auto & [path, sigs] : signed_) {
+            nixcompat::addSignatures(localStore, localStore.parseStorePath(path), sigs);
         }
     }
 
@@ -830,11 +837,6 @@ public:
                 return {grpc::StatusCode::ABORTED, "superseded, another worker was already building this"};
             }
             throw;
-        } catch (Unavailable &) {
-            outcome = nix::remote::Done::GIVEN_BACK;
-            reason = nix::remote::Done::PUBLISH_UNAVAILABLE;
-            report();
-            throw;
         } catch (...) {
             report();
             throw;
@@ -915,10 +917,18 @@ public:
                 outputs.emplace_back(built.back(), localStore.queryPathInfo(path)->narSize);
             }
             phase.next("publish");
-            // The client rebuilt this because the cache lost its NAR.
-            publish(localStore, built, cancelled, context.client_metadata().contains("x-nix-cache-lost"));
+            try {
+                // The client rebuilt this because the cache lost its NAR.
+                publish(localStore, built, cancelled, context.client_metadata().contains("x-nix-cache-lost"));
+                outcome = nix::remote::Done::BUILT;
+            } catch (Unavailable & err) {
+                // niks3 push already retried, and another worker would upload
+                // to the same cache: fail instead of rebuilding elsewhere.
+                metrics.event("publish_failed");
+                outputs.clear();
+                res = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, err.what());
+            }
             phase.done();
-            outcome = nix::remote::Done::BUILT;
         } else if (nixcompat::failureStatus(res) == nixcompat::FailureStatus::TransientFailure && nixcompat::isSandboxed(drv)) {
             // ENOSPC and the like: not the build's fault, let the scheduler place it again.
             // Nix reports every failed fixed-output build as transient too, which is the build's result.
