@@ -715,9 +715,9 @@ public:
         // Keyed by what the derivation requires.
         size_t queued = 0;      // wanted, not placed
         size_t unplaceable = 0; // of those, no connected worker could ever run it
-        size_t running = 0;
         // Keyed by what the worker offers (native system).
-        size_t slots = 0; // maxJobs of up, non-draining workers
+        size_t running = 0; // assigned, until the worker's Done
+        size_t slots = 0;   // maxJobs of up, non-draining workers
         size_t free = 0;
     };
 
@@ -740,25 +740,25 @@ public:
             out[{.system = name, .features = ""}];
         }
         for (const auto & wkr : workers) {
-            if (!wkr.up || wkr.draining || wkr.systems.empty()) {
+            if (wkr.systems.empty()) {
                 continue;
             }
             auto & sst = out[{.system = wkr.systems.front(), .features = featureKey(wkr.features)}];
+            sst.running += wkr.running.size();
+            if (!wkr.up || wkr.draining) {
+                continue;
+            }
             sst.slots += static_cast<size_t>(wkr.maxJobs);
             sst.free += static_cast<size_t>(std::max(0, wkr.maxJobs - static_cast<int32_t>(wkr.running.size())));
         }
         // placeable() is O(workers). Entries sharing system+features share the answer.
         std::map<StatsKey, bool> memo;
         for (const auto & slot : entries) {
-            if (!slot || slot->followers.empty()) {
+            if (!slot || slot->followers.empty() || slot->worker != noWorker) {
                 continue;
             }
             const StatsKey key{.system = slot->system, .features = featureKey(slot->features)};
             auto & sst = out[key];
-            if (slot->worker != noWorker) {
-                sst.running++;
-                continue;
-            }
             sst.queued++;
             auto [iter, fresh] = memo.try_emplace(key, false);
             if (fresh) {

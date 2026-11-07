@@ -296,9 +296,9 @@ of it from the scheduler, and it takes queued builds as soon as it has
 connected.
 
 **Autoscale builders.** `nix_grpc_sched_system` has one series per
-system and feature set. `queued`, `unplaceable` and `running` are
-labelled with what the derivations require (`features=""` for none,
-otherwise sorted and comma-joined like `features="big-parallel,kvm"`).
+system and feature set. `queued` and `unplaceable` are labelled with
+what the derivations require (`features=""` for none, otherwise sorted
+and comma-joined like `features="big-parallel,kvm"`). `running`,
 `slots` and `free` are labelled with what the builders offer, under
 their native system. So a plain x86_64 group scales on
 `{system="x86_64-linux",features=""}` and a kvm group on
