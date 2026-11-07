@@ -372,6 +372,7 @@ struct GrpcStore::Run {
       auto noJobs = [](const StorePath &) -> bool { return false; };
       auto & job = jobs.emplace(drvPath, store.farmJob(evalStore, drvPath, full, noJobs)).first->second;
       job.cpHintMs = work.job->cpHintMs + 1; // ahead of the build waiting for it
+      job.mode = work.job->mode == bmRepair ? bmRepair : bmNormal; // as loadJobs
       job.cacheLost = true;
       addLocked(job, {});
     }
