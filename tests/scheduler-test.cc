@@ -410,6 +410,27 @@ void testSystems()
     assert(out.size() == 1 && out[0].worker == both);
 }
 
+// A worker with max_jobs 0 runs nothing and offers no features. A drv given
+// back by the only other worker goes back there, and is unplaceable without it.
+void testNoSlotsRunsNothing()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 1, {}, {"kvm"});
+    hello(shard, "w1", 0, {}, {"f"});
+    assert((shard.offeredFeatures("x") == std::vector<std::string>{"kvm"}));
+    auto const res = shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    shard.giveBack(w0, "a.drv");
+    shard.dispatch(out);
+    assert(out.size() == 2 && out[1].worker == w0);
+    shard.workerGone(w0);
+    assert(!shard.placeable(res.drv));
+    std::vector<DrvId> changed;
+    shard.placeabilityChanges(changed);
+    assert(changed.size() == 1 && changed[0] == res.drv && shard.entry(res.drv)->unplaceable);
+}
+
 void testStaleDoneAndUnknown()
 {
     Core shard;
@@ -471,6 +492,7 @@ try {
     testGiveBack();
     testCrossSystemPriority();
     testPlaceabilityFlips();
+    testNoSlotsRunsNothing();
     testStaleDoneAndUnknown();
     return 0;
 } catch (std::exception & err) {
