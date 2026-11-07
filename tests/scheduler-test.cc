@@ -358,6 +358,204 @@ void testGiveBack()
     assert(out.empty() && shard.entry(res.drv)->worker == noWorker);
 }
 
+// Given back by w0, then by the worker it went to next, it goes to the
+// third, though w0 has more slots free and the input it needs.
+void testGiveBackPassesOverEveryWorkerThatGaveItBack()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 2);
+    auto const w1 = hello(shard, "w1", 1);
+    auto const w2 = hello(shard, "w2", 1);
+    shard.done(w0, "x.drv", {{"/nix/store/big", 1'000'000'000}});
+    shard.want(1, {.drvPath = "a.drv", .inputs = {"/nix/store/big"}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 1 && out[0].worker == w0);
+    shard.giveBack(w0, "a.drv");
+    shard.dispatch(out);
+    assert(out.size() == 2 && (out[1].worker == w1 || out[1].worker == w2));
+    auto const second = out[1].worker;
+    shard.giveBack(second, "a.drv");
+    shard.dispatch(out);
+    assert(out.size() == 3 && out[2].worker != w0 && out[2].worker != second);
+}
+
+// w0 (2 slots) and w1 each give it back as soon as they get it: they take
+// turns rather than w0 getting it every time after the second, and each is
+// remembered once, the latest last.
+void testRepeatGiveBacksTakeTurns()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 2);
+    auto const w1 = hello(shard, "w1", 1);
+    auto const res = shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    std::vector<WorkerId> placed;
+    for (int round = 0; round < 5; round++) {
+        assert(out.size() == placed.size() + 1);
+        placed.push_back(out.back().worker);
+        shard.giveBack(placed.back(), "a.drv");
+        shard.dispatch(out);
+    }
+    placed.push_back(out.back().worker);
+    assert((placed == std::vector<WorkerId>{w0, w1, w0, w1, w0, w1}));
+    assert((shard.entry(res.drv)->avoid == std::vector<WorkerId>{w1, w0}));
+}
+
+// w2 is busy: given back by w0 and then by w1, it waits for w2 rather than
+// going back to w0, and goes to w2 once w2 is free.
+void testGiveBackWaitsForAWorkerThatNeverHadIt()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w2 = hello(shard, "w2", 1);
+    shard.want(1, {.drvPath = "b.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    hello(shard, "w0", 1);
+    hello(shard, "w1", 1);
+    auto const res = shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    for (size_t round = 1; round <= 2; round++) {
+        shard.dispatch(out);
+        assert(out.size() == round + 1 && out[round].worker != w2);
+        shard.giveBack(out[round].worker, "a.drv");
+    }
+    shard.dispatch(out);
+    assert(out.size() == 3);
+    shard.done(w2, "b.drv", {});
+    shard.dispatch(out);
+    assert(out.size() == 4 && out[3].worker == w2 && out[3].drv == res.drv);
+}
+
+// Given back by w0 and then by w1, it went back to w0; once w0 is gone, w1
+// is the only one left that can run it.
+void testLastResortIsTheLastToGiveItBack()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 1);
+    auto const w1 = hello(shard, "w1", 1);
+    shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    for (size_t round = 0; round < 2; round++) {
+        shard.giveBack(out[round].worker, "a.drv");
+        shard.dispatch(out);
+    }
+    assert(out.size() == 3 && out[2].worker == out[0].worker);
+    shard.workerGone(out[0].worker);
+    shard.dispatch(out);
+    assert(out.size() == 4 && out[3].worker == (out[0].worker == w0 ? w1 : w0));
+}
+
+// Each worker gave it back, w1 first. Only the last to give it back is
+// passed over, so it goes back to w1, which built its input, rather than to
+// w0, which has more slots free.
+void testLastResortKeepsLocality()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 3);
+    auto const w1 = hello(shard, "w1", 1);
+    auto const w2 = hello(shard, "w2", 1);
+    shard.done(w1, "x.drv", {{"/nix/store/big", 1'000'000'000}});
+    shard.want(1, {.drvPath = "a.drv", .inputs = {"/nix/store/big"}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    for (auto const giver : std::vector<WorkerId>{w1, w0, w2}) {
+        shard.dispatch(out);
+        assert(out.back().worker == giver);
+        shard.giveBack(giver, "a.drv");
+    }
+    shard.dispatch(out);
+    assert(out.size() == 4 && out[3].worker == w1);
+}
+
+// Each worker gave it back, w1 last, and w1 built its input: w1 is passed
+// over for locality too, so it goes to w0.
+void testLastResortPassesOverTheLastForLocalityToo()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w1 = hello(shard, "w1", 1);
+    shard.want(2, {.drvPath = "b.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    auto const w0 = hello(shard, "w0", 3);
+    auto const w2 = hello(shard, "w2", 1);
+    shard.done(w1, "x.drv", {{"/nix/store/big", 1'000'000'000}});
+    shard.want(1, {.drvPath = "a.drv", .inputs = {"/nix/store/big"}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    for (auto const giver : std::vector<WorkerId>{w0, w2, w1}) {
+        shard.dispatch(out);
+        assert(out.back().worker == giver);
+        shard.giveBack(giver, "a.drv");
+        if (giver == w2) {
+            shard.done(w1, "b.drv", {});
+        }
+    }
+    shard.dispatch(out);
+    assert(out.size() == 5 && out[4].worker == w0);
+}
+
+// w2 has no slot, or is draining: given back by w0 and then by w1, it goes
+// back to the first of them rather than waiting for w2.
+void testGiveBackWaitsOnlyForAWorkerThatCanRunIt()
+{
+    for (bool const draining : {false, true}) {
+        Core shard;
+        std::vector<Assign> out;
+        hello(shard, "w0", 1);
+        hello(shard, "w1", 1);
+        auto const w2 = hello(shard, "w2", draining ? 1 : 0);
+        shard.setDraining(w2, draining);
+        shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+        for (size_t round = 0; round < 2; round++) {
+            shard.dispatch(out);
+            assert(out.size() == round + 1 && out[round].worker != w2);
+            shard.giveBack(out[round].worker, "a.drv");
+        }
+        shard.dispatch(out);
+        assert(out.size() == 3 && out[2].worker == out[0].worker);
+    }
+}
+
+// It needs f, which w1 lacks: given back by w0, it waits for w2 rather than
+// going to w1; given back by w2 too, it goes back to w0.
+void testGiveBackWaitsOnlyForAWorkerWithItsFeatures()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 1, {}, {"f"});
+    hello(shard, "w1", 4);
+    auto const w2 = hello(shard, "w2", 1, {"busy.drv"}, {"f"});
+    shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {"f"}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 1 && out[0].worker == w0);
+    shard.giveBack(w0, "a.drv");
+    shard.dispatch(out);
+    assert(out.size() == 1);
+    shard.done(w2, "busy.drv", {});
+    shard.dispatch(out);
+    assert(out.size() == 2 && out[1].worker == w2);
+    shard.giveBack(w2, "a.drv");
+    shard.dispatch(out);
+    assert(out.size() == 3 && out[2].worker == w0);
+}
+
+// A give-back from a worker that does not have it passes nobody over: given
+// back by w0 after that, it goes to w1, which has the most slots free.
+void testStaleGiveBackPassesNobodyOver()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 3);
+    auto const w1 = hello(shard, "w1", 2);
+    hello(shard, "w2", 1);
+    shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 1 && out[0].worker == w0);
+    shard.giveBack(w1, "a.drv");
+    shard.giveBack(w0, "a.drv");
+    shard.dispatch(out);
+    assert(out.size() == 2 && out[1].worker == w1);
+}
+
 // A worker serving two systems gives its slot to the more urgent drv.
 void testCrossSystemPriority()
 {
@@ -410,6 +608,28 @@ void testSystems()
     assert(out.size() == 1 && out[0].worker == both);
 }
 
+// A worker without slots runs nothing: given back by the only other
+// worker, a drv goes back there rather than waiting for it, and without
+// that worker it is unplaceable. The features it has are not offered.
+void testNoSlotsRunsNothing()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const w0 = hello(shard, "w0", 1, {}, {"kvm"});
+    hello(shard, "w1", 0, {}, {"f"});
+    assert((shard.offeredFeatures("x") == std::vector<std::string>{"kvm"}));
+    auto const res = shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    shard.giveBack(w0, "a.drv");
+    shard.dispatch(out);
+    assert(out.size() == 2 && out[1].worker == w0);
+    shard.workerGone(w0);
+    assert(!shard.placeable(res.drv));
+    std::vector<DrvId> changed;
+    shard.placeabilityChanges(changed);
+    assert(changed.size() == 1 && changed[0] == res.drv && shard.entry(res.drv)->unplaceable);
+}
+
 void testStaleDoneAndUnknown()
 {
     Core shard;
@@ -450,8 +670,18 @@ try {
     testUnofferedSystems();
     testHelloAdoptsQueued();
     testGiveBack();
+    testGiveBackPassesOverEveryWorkerThatGaveItBack();
+    testRepeatGiveBacksTakeTurns();
+    testGiveBackWaitsForAWorkerThatNeverHadIt();
+    testLastResortIsTheLastToGiveItBack();
+    testLastResortKeepsLocality();
+    testLastResortPassesOverTheLastForLocalityToo();
+    testGiveBackWaitsOnlyForAWorkerThatCanRunIt();
+    testGiveBackWaitsOnlyForAWorkerWithItsFeatures();
+    testStaleGiveBackPassesNobodyOver();
     testCrossSystemPriority();
     testPlaceabilityFlips();
+    testNoSlotsRunsNothing();
     testStaleDoneAndUnknown();
     return 0;
 } catch (std::exception & err) {
