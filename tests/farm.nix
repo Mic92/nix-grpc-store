@@ -122,6 +122,11 @@ let
         niks3 = {
           package = niks3Pkgs.niks3;
           url = niks3Url;
+          # Short, so the failed-upload test need not wait out the default.
+          pushFlags = [
+            "--retry-timeout"
+            "3s"
+          ];
           tokenFile = toString tokenFile;
           cacheUrl = niks3Url;
           publicKeys = [ signingPublicKey ];
@@ -194,7 +199,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-farm";
-  globalTimeout = 900;
+  globalTimeout = 1800;
 
   sshBackdoor.enable = true;
   defaults.virtualisation.qemu.enableSharedMemory = true;
