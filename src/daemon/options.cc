@@ -201,6 +201,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.schedulerTokenFile = next();
         } else if (arg == "--advertise") {
             options.advertise = next();
+        } else if (arg == "--extra-system") {
+            options.extraSystems.emplace_back(next());
         } else if (arg == "--max-jobs") {
             auto jobs = parseInt<unsigned>(next());
             if (!jobs || *jobs < 1 || *jobs > static_cast<unsigned>(sched::FreeIndex::maxSlots)) {

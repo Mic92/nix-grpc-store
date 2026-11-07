@@ -143,7 +143,9 @@ config. `nix.settings.system-features` decides which
 `requiredSystemFeatures` a builder accepts: a derivation that needs
 `kvm` only goes to builders that list it. A builder with
 `nix.settings.extra-platforms` (binfmt, Rosetta) takes those systems
-too. Add each of them to the balancer's `systems`. A
+too, and so do the systems in `extraSystems` (e.g. ones the
+nix-daemon hands to `external-builders`). Add each of them to the
+balancer's `systems`. A
 scheduler-only node is the same with `roles = [ "scheduler" ]` and no
 `scheduler`, `maxJobs` or `minFree`.
 
