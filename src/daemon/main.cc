@@ -664,6 +664,66 @@ public:
         return res;
     }
 
+    // A floating content-addressed output the GC took before we held it.
+    static auto collected(
+        const nix::Store & store, const nix::StorePath & drvPath, const nix::StorePath & path, std::string_view before)
+        -> grpc::Status
+    {
+        return {
+            grpc::StatusCode::UNAVAILABLE,
+            "output " + store.printStorePath(path) + " was garbage-collected before it was " + std::string(before)
+                + "; this builder's nix-daemon may keep its build trace of " + store.printStorePath(drvPath)
+                + " and refuse a rebuild here that makes other bytes"};
+    }
+
+    // nix-daemon does not root a floating content-addressed output, which has
+    // no path before the build. Rooted on `roots` once built, one still valid
+    // stays so until publish is done, and is held for the client's session
+    // before that root goes.
+    auto rootFloating(
+        const Rpc & rpc, nix::Store & localStore, const nix::StorePath & drvPath, nix::Store & roots,
+        const std::vector<nix::StorePath> & floating) -> grpc::Status
+    {
+        for (const auto & path : floating) {
+            roots.addTempRoot(path);
+            if (!localStore.isValidPath(path)) {
+                return collected(localStore, drvPath, path, "rooted");
+            }
+        }
+        if (!floating.empty()) {
+            holdForSession(rpc, floating);
+        }
+        return grpc::Status::OK;
+    }
+
+    // An attached caller learns floating outputs only once the owner is done,
+    // when only the owner's session holds them. Without a cache its client
+    // fetches them from here: hold them for its session, then check them. The
+    // build was reported done, so one the GC took only makes the client ask
+    // the scheduler again.
+    auto holdAttached(
+        const Rpc & rpc, nix::Store & localStore, const nix::StorePath & drvPath,
+        const std::map<std::string, nix::StorePath> & outPaths, const nix::remote::BuildDerivationDone & done)
+        -> grpc::Status
+    {
+        std::vector<nix::StorePath> floating;
+        for (const auto & output : done.outputs()) {
+            if (nix::StorePath path(output.path()); !std::ranges::contains(outPaths | std::views::values, path)) {
+                floating.push_back(std::move(path));
+            }
+        }
+        if (floating.empty()) {
+            return grpc::Status::OK;
+        }
+        holdForSession(rpc, floating);
+        for (const auto & path : floating) {
+            if (!coord.cache.hasRemote() && !localStore.isValidPath(path)) {
+                return collected(localStore, drvPath, path, "held");
+            }
+        }
+        return grpc::Status::OK;
+    }
+
     // Second caller for a drv that already builds here: wait for its result.
     static auto attach(grpc::ServerContext & context, nixgrpc::Expected::Shared & shared, const nixgrpc::BuildEventSink & log)
         -> std::optional<std::string>
@@ -753,6 +813,7 @@ public:
 
     // gRPC errors mean "ask the scheduler again", build outcomes travel as BuildResult.
     auto build(
+        const Rpc & rpc,
         grpc::ServerContext & context,
         nix::Store & localStore,
         const nix::StorePath & drvPath,
@@ -768,8 +829,12 @@ public:
         }
         auto & builder = *coord.builder;
         auto const outPaths = staticOutputs(localStore, drv);
-        if (outPaths.size() != drv.outputs.size()) {
-            return {grpc::StatusCode::UNIMPLEMENTED, "builds need statically known output paths"};
+        auto const type = nixcompat::drvType(drv);
+        // A floating content-addressed output's path comes with the result.
+        if (outPaths.size() != drv.outputs.size() && (!type.isCA() || type.isImpure())) {
+            return {
+                grpc::StatusCode::UNIMPLEMENTED,
+                "builds need statically known or floating content-addressed output paths"};
         }
         if (auto feature = missingFeature(localStore, drv)) {
             return {grpc::StatusCode::FAILED_PRECONDITION, "lacks system feature '" + *feature + "'"};
@@ -792,7 +857,8 @@ public:
         }
         std::array<uint64_t, 3> const settings{static_cast<uint64_t>(mode), limits.buildTimeout, limits.maxSilentTime};
         if (adm->attach) {
-            return attached(context, *adm->shared, log, settings, done);
+            auto status = attached(context, *adm->shared, log, settings, done);
+            return status.ok() ? holdAttached(rpc, localStore, drvPath, outPaths, done) : status;
         }
 
         // From here on we own the Expect and must report Done exactly once.
@@ -809,8 +875,8 @@ public:
         try {
             auto status =
                 buildExpected(
-                    context, *adm->shared, localStore, drvPath, drv, mode, limits, tee, inputs, outPaths, done, outcome,
-                    outputs);
+                    rpc, context, *adm->shared, localStore, drvPath, drv, mode, limits, tee, inputs, outPaths, done,
+                    outcome, outputs);
             // No result to share unless the build produced one: attachers of a
             // failed owner must retry, not return an empty Done as success.
             if (status.ok()) {
@@ -856,6 +922,7 @@ public:
     }
 
     auto buildExpected(
+        const Rpc & rpc,
         grpc::ServerContext & context,
         nixgrpc::Expected::Shared & shared,
         nix::Store & localStore,
@@ -909,9 +976,18 @@ public:
             metrics.buildFailure(nixcompat::failureStatusName(*status));
         }
         if (nixcompat::succeeded(res)) {
+            std::vector<nix::StorePath> paths;
+            nixcompat::forBuiltOutputs(res, [&](const nix::StorePath & path) -> void { paths.push_back(path); });
+            std::vector<nix::StorePath> floating;
+            std::ranges::copy_if(paths, std::back_inserter(floating), [&](const nix::StorePath & path) -> bool {
+                return !std::ranges::contains(outPaths | std::views::values, path);
+            });
+            if (auto status = rootFloating(rpc, localStore, drvPath, *roots, floating); !status.ok()) {
+                return status;
+            }
             std::vector<std::string> built;
-            built.reserve(outPaths.size());
-            for (const auto & [name, path] : outPaths) {
+            built.reserve(paths.size());
+            for (const auto & path : paths) {
                 built.push_back(localStore.printStorePath(path));
                 outputs.emplace_back(built.back(), localStore.queryPathInfo(path)->narSize);
             }
@@ -965,8 +1041,8 @@ public:
 
             nix::remote::BuildDerivationChunk chunk;
             nixgrpc::Metrics::Inputs inputs;
-            if (auto const status =
-                    build(*context, *localStore, drvPath, drv, mode, limits, sendLogLine, inputs, *chunk.mutable_done());
+            if (auto const status = build(
+                    rpc, *context, *localStore, drvPath, drv, mode, limits, sendLogLine, inputs, *chunk.mutable_done());
                 !status.ok()) {
                 return {status.error_code(), workerName + ": " + status.error_message()};
             }

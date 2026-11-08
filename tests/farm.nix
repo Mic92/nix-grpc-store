@@ -83,7 +83,7 @@ let
         module
       ];
       # The recovery test uploads a floating content-addressed derivation;
-      # farm::ca checks the features these add.
+      # farm::ca checks the features these add and builds dynamic ones.
       nix.settings.experimental-features = [
         "ca-derivations"
         "dynamic-derivations"
