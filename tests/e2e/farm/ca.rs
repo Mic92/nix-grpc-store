@@ -45,6 +45,21 @@ fn build_ca(attr: &str, tag: &str) -> Out {
     )
 }
 
+/// The farm builds the floating, text-hashed producer, the floating
+/// derivation it outputs, and the derivation that reads that one's output,
+/// each resolved by the client.
+#[test]
+fn a_dynamic_derivation_is_built_on_the_farm() {
+    farm_ready();
+    let o = build_ca("dynamic", "dyn");
+    assert_eq!(o.code, 0, "{}", o.combined());
+    let out = succeed(
+        CLIENT,
+        &["nix", "store", "cat", "--store", STORE, o.stdout.trim()],
+    );
+    assert_eq!(out.trim(), "dynamic-inner-dyn");
+}
+
 /// A builder offers its `system-features` and those its experimental
 /// features add: farm.nix's enable ca-derivations and dynamic-derivations.
 #[test]
