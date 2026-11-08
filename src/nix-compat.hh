@@ -191,12 +191,12 @@ inline void readDrv(nix::Source &source, const nix::StoreDirConfig &store,
 
 // Late 2.36 made the derivation type a free function, found by ADL.
 template<typename D>
-auto isSandboxed(const D & drv) -> bool
+auto drvType(const D & drv) -> auto
 {
     if constexpr (requires { drv.type(); }) {
-        return drv.type().isSandboxed();
+        return drv.type();
     } else {
-        return type(drv).isSandboxed();
+        return type(drv);
     }
 }
 

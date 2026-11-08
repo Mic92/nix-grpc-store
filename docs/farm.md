@@ -254,7 +254,8 @@ before the build, and which ones serve `builders-use-substitutes`
 downloads.
 
 The CI certificate needs the `trusted` role, since the hook uploads
-locally built, unsigned store paths.
+locally built, unsigned store paths. The farm does not build impure
+derivations: the hook refuses them.
 
 If `nix.firewall` restricts what `nix-daemon.service` may connect to,
 port 50051 is already allowed. For a balancer on another port set

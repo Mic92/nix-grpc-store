@@ -334,5 +334,8 @@ pkgs.testers.runNixOSTest {
 
     with subtest("scheduler and lifecycle"):
         run_e2e(nodes, env, "farm::serial::", "--test-threads=1")
+
+    with subtest("content-addressed derivations"):
+        run_e2e(nodes, env, "farm::ca::", "--test-threads=1")
   '';
 }
