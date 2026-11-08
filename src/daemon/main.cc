@@ -1015,7 +1015,7 @@ public:
                 res = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, err.what());
             }
             phase.done();
-        } else if (nixcompat::failureStatus(res) == nixcompat::FailureStatus::TransientFailure && nixcompat::isSandboxed(drv)) {
+        } else if (nixcompat::failureStatus(res) == nixcompat::FailureStatus::TransientFailure && nixcompat::drvType(drv).isSandboxed()) {
             // ENOSPC and the like: not the build's fault, let the scheduler place it again.
             // Nix reports every failed fixed-output build as transient too, which is the build's result.
             return {grpc::StatusCode::UNAVAILABLE, nixcompat::buildFailureMsg(res).value_or("transient failure")};
