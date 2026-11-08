@@ -810,8 +810,9 @@ public:
 
     static auto missingFeature(nix::Store & store, const nix::BasicDerivation & drv) -> std::optional<std::string>
     {
+        auto const offered = nix::StoreConfig::getDefaultSystemFeatures();
         for (const auto & feature : nixcompat::requiredSystemFeatures(store, drv)) {
-            if (!nix::settings.systemFeatures.get().contains(feature)) {
+            if (!offered.contains(feature)) {
                 return feature;
             }
         }
@@ -1413,7 +1414,7 @@ try {
         NIX_GRPC_VERSION,
         options.workerName,
         nix::settings.thisSystem.get(),
-        nix::concatStringsSep(",", nix::settings.systemFeatures.get()));
+        nix::concatStringsSep(",", nix::StoreConfig::getDefaultSystemFeatures()));
     nixgrpc::IdleTracker idle;
     if (options.storeUri.empty()) {
         options.storeUri = "unix://" + options.socketPath;
