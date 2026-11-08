@@ -39,6 +39,7 @@ rec {
   };
   # Inner sh, so pkill lets the build end at once.
   slow = ca "floating-slow-${tag}" "read x < ${dep}; /bin/sh -c 'read -t 90 ${tag} < /dev/zero'; echo slow-${tag} > $out";
+  nondet = ca "floating-nondet-${tag}" "read u < /proc/sys/kernel/random/uuid; echo $u > $out";
   impure = derivation {
     name = "ca-impure-${tag}";
     system = builtins.currentSystem;

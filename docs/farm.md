@@ -290,6 +290,9 @@ Two known limitations need fixes in Nix:
   the output too, a rebuild there that is not reproducible makes other
   bytes, which the builder's nix-daemon refuses: `Trying to register a
   realisation of '…^out', but we already have another one locally`.
+  The builder gives the build back, the scheduler places it on a
+  builder other than the last one that gave it back if one can run it,
+  and with none the CI host gives up after its `reschedule-retries`.
   `nix store build-trace delete '/nix/store/…drv^out'` (Nix master),
   run as root on the builder against the local store, clears the
   trace. The GC can also take an output between its build and the

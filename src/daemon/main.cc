@@ -65,6 +65,7 @@
 #include <nix/util/repair-flag.hh>
 #include <nix/util/serialise.hh>
 #include <nix/util/strings.hh>
+#include <nix/util/terminal.hh>
 #include <nix/util/unix-domain-socket.hh>
 #include <nix/util/util.hh>
 
@@ -960,9 +961,20 @@ public:
             nixgrpc::Metrics::Held const building(metrics, "build_slot");
             res = backends.storedBuild(cancelled, localStore, drvPath, mode, limits, log);
             phase.done();
-        } catch (nix::Error &) {
+        } catch (nix::Error & err) {
             if (cancelled()) {
                 throw nixgrpc::CancelledWait("build interrupted");
+            }
+            // nix-daemon refused a rebuild of drvPath that made other bytes
+            // than its build trace of an output the GC took; another builder
+            // has no such trace. Only nix-daemon's errors get here, never a log.
+            if (auto const plain = nix::filterANSIEscapes(err.what(), true);
+                plain.contains("Trying to register a realisation of '" + std::string(drvPath.to_string()) + "^")) {
+                return {
+                    grpc::StatusCode::UNAVAILABLE,
+                    "this builder's build trace of " + localStore.printStorePath(drvPath)
+                        + " names an output it no longer has, and its nix-daemon refuses the rebuild's other bytes: "
+                        + plain};
             }
             throw;
         }

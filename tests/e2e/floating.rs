@@ -1,7 +1,8 @@
 //! Floating content-addressed derivations through the build hook on a
 //! single node without a cache: the client fetches their outputs from the
 //! builder, which holds them for the client's session once it knows them.
-//! A GC on the node takes such an output in the gaps the builder leaves.
+//! A GC on the node takes such an output in the gaps the builder leaves,
+//! and a build trace the GC left behind meets a rebuild.
 
 use crate::fixtures::*;
 use crate::harness::{MACHINE, journal, unit_result};
@@ -308,4 +309,63 @@ fn a_floating_output_the_gc_took_before_an_attached_client_held_it_is_built_agai
         "floating-share-b",
         "was garbage-collected before it was held",
     );
+}
+
+/// The GC takes an output whose build is not reproducible, and keeps its
+/// build trace. A rebuild here makes other bytes, which a nix-daemon 2.35
+/// through current master refuses: the builder gives the build back, so
+/// that another builder may make it. Deleting the trace lets it through.
+#[test]
+fn a_rebuild_a_stale_build_trace_refuses_is_given_back() {
+    wait_for_unit(UNIT);
+    write_expr();
+    let first = succeed(&strs(&build_argv(CLIENT_STORE, "nondet", "stale", "")));
+    // Its session holds it: that session's connection goes first.
+    for pid in connections("stale", "-floating-nondet-stale.drv") {
+        succeed(&["kill", "-KILL", &pid]);
+    }
+    wait_until_succeeds(&["nix", "store", "delete", first.trim()], 120);
+    let before = given_back();
+    // A client without the realisation asks again. With one builder it
+    // gives up after asking once more.
+    let again = build_argv(
+        "/root/floating-client-stale",
+        "nondet",
+        "stale",
+        "&reschedule-retries=0",
+    );
+    let o = run_t(&strs(&again), 300);
+    assert_ne!(o.code, 0, "{}", o.combined());
+    assert!(
+        o.combined().contains("names an output it no longer has"),
+        "{}",
+        o.combined()
+    );
+    assert!(given_back() > before);
+    let drv = succeed(&[
+        "nix",
+        "eval",
+        "--raw",
+        "-f",
+        EXPR,
+        "nondet.drvPath",
+        "--argstr",
+        "tag",
+        "stale",
+    ]);
+    succeed(&[
+        "nix",
+        "store",
+        "build-trace",
+        "delete",
+        "--store",
+        "local",
+        &format!("{}^out", drv.trim()),
+    ]);
+    succeed(&strs(&build_argv(
+        "/root/floating-client-stale-2",
+        "nondet",
+        "stale",
+        "",
+    )));
 }
