@@ -246,6 +246,9 @@ pkgs.testers.runNixOSTest {
 
     with subtest("benchmarks"):
         run_e2e({"machine": machine}, env, "bench::", "--test-threads=1")
+
+    with subtest("floating content-addressed builds without a cache"):
+        run_e2e({"machine": machine}, env, "floating::", "--test-threads=1")
   '' + pkgs.lib.optionalString (phase == "upload") ''
     with subtest("concurrent uploads of one input"):
         run_e2e({"machine": machine}, env, "upload::", "--test-threads=1")

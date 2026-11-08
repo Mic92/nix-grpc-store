@@ -697,6 +697,10 @@ auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode b
 
 auto GrpcStore::buildOne(const StorePath & drvPath, const BasicDerivation & drv, BuildMode buildMode,
               Store * evalStore) -> BuildResult {
+  // Builders turn them down: they have no output paths to root or publish.
+  if (nixcompat::drvType(drv).isImpure()) {
+    throw Error("'%s' is impure, and the farm does not build impure derivations", printStorePath(drvPath));
+  }
   std::shared_ptr<Store> local;
   if (evalStore == nullptr || evalStore == this) {
     local = localEvalStore({drvPath});

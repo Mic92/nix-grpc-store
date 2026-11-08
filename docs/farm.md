@@ -141,7 +141,11 @@ services.nix-grpc-daemon = {
 Repeat for every node. Builders for different systems use the same
 config. `nix.settings.system-features` decides which
 `requiredSystemFeatures` a builder accepts: a derivation that needs
-`kvm` only goes to builders that list it. A builder with
+`kvm` only goes to builders that list it. As for nix-daemon, enabled
+experimental features add to them: `ca-derivations`, `recursive-nix`,
+and with Nix master `builder-rpc-v0` for `dynamic-derivations`. Run
+nix-daemon from the Nix that nix-grpc-daemon is built with, which
+decides these. A builder with
 `nix.settings.extra-platforms` (binfmt, Rosetta) takes those systems
 too, and so do the systems in `extraSystems` (e.g. ones the
 nix-daemon hands to `external-builders`). Add each of them to the
@@ -254,7 +258,49 @@ before the build, and which ones serve `builders-use-substitutes`
 downloads.
 
 The CI certificate needs the `trusted` role, since the hook uploads
-locally built, unsigned store paths.
+locally built, unsigned store paths. The farm does not build impure
+derivations: the hook refuses them.
+
+Floating content-addressed derivations, and dynamic derivations, build
+on the farm through the build hook only: `nix build --store grpc://…`
+(Step 4) turns them down. The CI host's nix-daemon and the builders
+need the `ca-derivations` experimental feature, and
+`dynamic-derivations` for dynamic derivations. Nix requires
+`ca-derivations` of these derivations, so list it in each
+`buildMachines` entry's `supportedFeatures`; impure derivations require
+it too, so leave it out on a CI host that builds impure derivations
+itself. The CI host resolves each derivation, hands it to the farm and
+records the realisations of what the farm built. The cache holds no
+realisations, so a CI host without one hands the derivation to the farm
+again. Without niks3 the CI host copies the outputs from the builder,
+which holds them for its session.
+
+Two known limitations need fixes in Nix:
+
+* **`--store daemon` cannot record what the farm built.** A trusted
+  user's `nix build --store daemon` makes the build hook record each
+  realisation through the nix-daemon, which since Nix 4ee62770a8 (in no
+  release yet) checks its signature even for a trusted client. The
+  build results the farm passes on (worker protocol 1.37) carry none,
+  so the build fails (`lacks a signature by a trusted key`) unless the
+  CI host has `require-sigs = false`. A plain `nix build` is not
+  affected. This is read from Nix's source, not tested.
+* **A builder's GC leaves the build trace of a floating output** (Nix
+  2.35 and later; 2.34 drops it with the output). Once the cache lost
+  the output too, a rebuild there that is not reproducible makes other
+  bytes, which the builder's nix-daemon refuses: `Trying to register a
+  realisation of '…^out', but we already have another one locally`.
+  The builder gives the build back, the scheduler places it on a
+  builder other than the last one that gave it back if one can run it,
+  and with none the CI host gives up after its `reschedule-retries`.
+  `nix store build-trace delete '/nix/store/…drv^out'` (Nix master),
+  run as root on the builder against the local store, clears the
+  trace. The GC can also take an output between its build and the
+  builder rooting it: the builder gives the build back (`was
+  garbage-collected before it was rooted`), leaving such a trace.
+  Without a cache, a CI host attached to another's build can find the
+  output gone before the builder holds it for its session (`before it
+  was held`), and asks the scheduler again.
 
 If `nix.firewall` restricts what `nix-daemon.service` may connect to,
 port 50051 is already allowed. For a balancer on another port set
@@ -304,7 +350,10 @@ and comma-joined like `features="big-parallel,kvm"`). `running`,
 `slots` and `free` are labelled with what the builders offer, under
 their native system. So a plain x86_64 group scales on
 `{system="x86_64-linux",features=""}` and a kvm group on
-`{system="x86_64-linux",features="kvm"}` independently. `unplaceable`
+`{system="x86_64-linux",features="kvm"}` independently. What builders
+offer includes the features their experimental features add (Step 1),
+here and in `nix_grpc_build_info`: a kvm group with `ca-derivations`
+enabled is `{features="ca-derivations,kvm"}`. `unplaceable`
 counts queued builds that no connected builder could take at all, so a
 group does not grow for builds it cannot run. The number to scale a
 group on is therefore `queued - unplaceable` for its label set.
