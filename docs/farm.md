@@ -141,7 +141,11 @@ services.nix-grpc-daemon = {
 Repeat for every node. Builders for different systems use the same
 config. `nix.settings.system-features` decides which
 `requiredSystemFeatures` a builder accepts: a derivation that needs
-`kvm` only goes to builders that list it. A builder with
+`kvm` only goes to builders that list it. As for nix-daemon, enabled
+experimental features add to them: `ca-derivations`, `recursive-nix`,
+and with Nix master `builder-rpc-v0` for `dynamic-derivations`. Run
+nix-daemon from the Nix that nix-grpc-daemon is built with, which
+decides these. A builder with
 `nix.settings.extra-platforms` (binfmt, Rosetta) takes those systems
 too, and so do the systems in `extraSystems` (e.g. ones the
 nix-daemon hands to `external-builders`). Add each of them to the
@@ -305,7 +309,10 @@ and comma-joined like `features="big-parallel,kvm"`). `running`,
 `slots` and `free` are labelled with what the builders offer, under
 their native system. So a plain x86_64 group scales on
 `{system="x86_64-linux",features=""}` and a kvm group on
-`{system="x86_64-linux",features="kvm"}` independently. `unplaceable`
+`{system="x86_64-linux",features="kvm"}` independently. What builders
+offer includes the features their experimental features add (Step 1),
+here and in `nix_grpc_build_info`: a kvm group with `ca-derivations`
+enabled is `{features="ca-derivations,kvm"}`. `unplaceable`
 counts queued builds that no connected builder could take at all, so a
 group does not grow for builds it cannot run. The number to scale a
 group on is therefore `queued - unplaceable` for its label set.

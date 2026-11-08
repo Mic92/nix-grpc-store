@@ -178,7 +178,7 @@ public:
     {
         prometheus::BuildGauge()
             .Name("nix_grpc_build_info")
-            .Help("Constant 1, labelled with daemon version, --worker-name, system and system-features")
+            .Help("Constant 1, labelled with daemon version, --worker-name, system and the features the builder offers")
             .Register(*registry)
             .Add({{"version", version}, {"worker", worker}, {"system", system}, {"features", features}})
             .Set(1);

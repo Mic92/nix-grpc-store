@@ -82,8 +82,12 @@ let
         common
         module
       ];
-      # The recovery test uploads a floating content-addressed derivation.
-      nix.settings.experimental-features = [ "ca-derivations" ];
+      # The recovery test uploads a floating content-addressed derivation;
+      # farm::ca checks the features these add.
+      nix.settings.experimental-features = [
+        "ca-derivations"
+        "dynamic-derivations"
+      ];
       services.nix-grpc-daemon = {
         enable = true;
         listen = "[::]:50051";

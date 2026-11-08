@@ -92,8 +92,10 @@ auth:
 workerDefaults:
   system: "" # nix `system` of the group's builders. Required: the balancer finds a group's builders by it.
   replicas: 1
-  # nix system-features. The scheduler only assigns drvs whose
-  # requiredSystemFeatures a worker has.
+  # nix system-features. A worker also offers those its nix
+  # experimental-features add, which the image's nix.conf does not
+  # enable. The scheduler only assigns drvs whose
+  # requiredSystemFeatures a worker offers.
   features: []
   # Concurrent builds per worker. "auto" is one per CPU of the node, which
   # nix counts without regard to the pod's CPU limit.

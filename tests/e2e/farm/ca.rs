@@ -45,6 +45,29 @@ fn build_ca(attr: &str, tag: &str) -> Out {
     )
 }
 
+/// A builder offers its `system-features` and those its experimental
+/// features add: farm.nix's enable ca-derivations and dynamic-derivations.
+#[test]
+fn build_info_shows_the_features_a_builder_offers() {
+    farm_ready();
+    for w in WORKERS {
+        let set = succeed(w, &["nix", "config", "show", "system-features"]);
+        let mut set = set.split_whitespace().collect::<Vec<_>>();
+        set.extend(["builder-rpc-v0", "ca-derivations"]);
+        set.sort_unstable();
+        set.dedup();
+        let label = format!(r#"features="{}""#, set.join(","));
+        let metrics = worker_metrics(w);
+        assert!(
+            metrics
+                .iter()
+                .any(|l| l.starts_with("nix_grpc_build_info{") && l.contains(&label)),
+            "{} lacks {label}: {metrics:?}",
+            w.0
+        );
+    }
+}
+
 /// nix requires ca-derivations of an impure derivation too, which the
 /// hook's machine supports. Builders would turn it down, so the hook
 /// refuses it.
