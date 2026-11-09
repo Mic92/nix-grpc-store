@@ -358,6 +358,37 @@ void testGiveBack()
     assert(out.empty() && shard.entry(res.drv)->worker == noWorker);
 }
 
+// A resting worker gets no new drvs, but they stay placeable. Its rests
+// double until it finishes a build.
+void testRestingWorker()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const want = [&](std::string_view drv) -> DrvId {
+        return shard.want(1, {.drvPath = std::string(drv), .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0).drv;
+    };
+    auto const w0 = hello(shard, "w0", 2);
+    auto const w1 = hello(shard, "w1", 1);
+    want("a.drv");
+    shard.dispatch(out);
+    assert(out.size() == 1 && out[0].worker == w0);
+    shard.rest(w0, 0);
+    shard.giveBack(w0, "a.drv");
+    shard.dispatch(out);
+    assert(out.size() == 2 && out[1].worker == w1);
+    auto const b = want("b.drv");
+    shard.dispatch(out);
+    assert(out.size() == 2 && shard.placeable(b) && !shard.wake(9'999));
+    assert(shard.wake(10'000));
+    shard.dispatch(out);
+    assert(out.size() == 3 && out[2].worker == w0 && out[2].drv == b);
+    shard.rest(w0, 10'000);
+    assert(!shard.wake(29'999) && shard.wake(30'000));
+    shard.done(w0, "b.drv", {});
+    shard.rest(w0, 30'000);
+    assert(!shard.wake(39'999) && shard.wake(40'000));
+}
+
 // A worker serving two systems gives its slot to the more urgent drv.
 void testCrossSystemPriority()
 {
@@ -490,6 +521,7 @@ try {
     testUnofferedSystems();
     testHelloAdoptsQueued();
     testGiveBack();
+    testRestingWorker();
     testCrossSystemPriority();
     testPlaceabilityFlips();
     testNoSlotsRunsNothing();
