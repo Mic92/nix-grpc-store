@@ -16,6 +16,8 @@
 
 namespace nixgrpc {
 
+class Metrics;
+
 struct Caller
 {
     enum class Kind : std::uint8_t { anonymous, named, badToken };
@@ -29,16 +31,16 @@ struct Auth
     Acl acl;
     xfcc::TrustedProxies proxies;
     std::optional<oidc::Verifier> * oidc = nullptr;
+    Metrics * metrics = nullptr;
 
     [[nodiscard]] auto identify(const grpc::ServerContextBase & context) const -> Caller;
     // Identity from the peer's own certificate, for calls the balancer makes
     // for itself. Client requests go through identify().
     [[nodiscard]] auto identifyDirect(const grpc::ServerContextBase & context) const -> Caller;
-    static auto authorize(const Caller & caller, std::string_view method, Role minRole) -> grpc::Status;
+    [[nodiscard]] auto authorize(const Caller & caller, std::string_view method, Role minRole) const -> grpc::Status;
     // Repair rewrites existing store paths.
-    static auto authorize(const Caller & caller, std::string_view method, Role minRole, uint32_t buildMode)
+    [[nodiscard]] auto authorize(const Caller & caller, std::string_view method, Role minRole, uint32_t buildMode) const
         -> grpc::Status;
-
 };
 
 } // namespace nixgrpc

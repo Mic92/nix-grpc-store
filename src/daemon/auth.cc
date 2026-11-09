@@ -14,6 +14,7 @@
 
 #include "acl.hh"
 #include "logfmt.hh"
+#include "metrics.hh"
 #include "oidc.hh"
 #include "xfcc.hh"
 
@@ -56,11 +57,34 @@ auto Auth::identifyDirect(const grpc::ServerContextBase & context) const -> Call
         .kind = cert ? Caller::Kind::named : Caller::Kind::anonymous};
 }
 
-auto Auth::authorize(const Caller & caller, std::string_view method, Role minRole) -> grpc::Status
+namespace {
+
+auto denialReason(const Caller & caller) -> std::string
+{
+    if (caller.role) {
+        return "role";
+    }
+    switch (caller.kind) {
+    case Caller::Kind::anonymous:
+        return "anonymous";
+    case Caller::Kind::badToken:
+        return "bad_token";
+    case Caller::Kind::named:
+        break;
+    }
+    return "no_rule";
+}
+
+} // namespace
+
+auto Auth::authorize(const Caller & caller, std::string_view method, Role minRole) const -> grpc::Status
 {
     auto const & role = caller.role;
     if (role && *role >= minRole) {
         return grpc::Status::OK;
+    }
+    if (metrics != nullptr) {
+        metrics->countDenied(std::string(method), denialReason(caller));
     }
     logLine(
         LogLevel::info,
@@ -84,7 +108,8 @@ auto Auth::authorize(const Caller & caller, std::string_view method, Role minRol
     return {grpc::StatusCode::PERMISSION_DENIED, "no access rule matches '" + caller.name + "'"};
 }
 
-auto Auth::authorize(const Caller & caller, std::string_view method, Role minRole, uint32_t buildMode) -> grpc::Status
+auto Auth::authorize(const Caller & caller, std::string_view method, Role minRole, uint32_t buildMode) const
+    -> grpc::Status
 {
     auto status = authorize(caller, method, minRole);
     if (status.ok() && buildMode == static_cast<uint32_t>(nix::bmRepair)) {

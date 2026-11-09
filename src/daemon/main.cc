@@ -277,7 +277,7 @@ private:
         -> Rpc
     {
         auto caller = auth.identify(context);
-        if (auto const status = nixgrpc::Auth::authorize(caller, method, minRole, buildMode); !status.ok()) {
+        if (auto const status = auth.authorize(caller, method, minRole, buildMode); !status.ok()) {
             throw Denied{status};
         }
         metrics.countRpc(std::string(method), caller.name);
@@ -1189,7 +1189,7 @@ try {
         }
         oidc.emplace(std::move(cfg));
     }
-    nixgrpc::Auth auth{.acl = options.acl, .proxies = options.proxies, .oidc = &oidc};
+    nixgrpc::Auth auth{.acl = options.acl, .proxies = options.proxies, .oidc = &oidc, .metrics = &metrics};
     nixgrpc::Coordinator coord(options, auth, metrics, idle);
     nixgrpc::logLine(
         nixgrpc::LogLevel::info,

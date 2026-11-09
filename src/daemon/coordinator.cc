@@ -306,7 +306,7 @@ auto SchedulerService::Schedule(grpc::CallbackServerContext * context)
         return new RejectReactor<ClientMsgs, SchedMsgs>(passive()); // NOLINT(cppcoreguidelines-owning-memory): deletes itself in OnDone
     }
     auto const caller = auth->identify(*context);
-    if (auto const status = Auth::authorize(caller, "Schedule", Role::write); !status.ok()) {
+    if (auto const status = auth->authorize(caller, "Schedule", Role::write); !status.ok()) {
         return new RejectReactor<ClientMsgs, SchedMsgs>(status); // NOLINT(cppcoreguidelines-owning-memory)
     }
     return new ScheduleReactor(context, *dispatcher, *idle); // NOLINT(cppcoreguidelines-owning-memory)
@@ -319,7 +319,7 @@ auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
         return new RejectReactor<WorkerMsgs, SchedCmds>(passive()); // NOLINT(cppcoreguidelines-owning-memory)
     }
     auto caller = auth->identify(*context);
-    if (auto const status = Auth::authorize(caller, "WorkerSession", Role::trusted); !status.ok()) {
+    if (auto const status = auth->authorize(caller, "WorkerSession", Role::trusted); !status.ok()) {
         return new RejectReactor<WorkerMsgs, SchedCmds>(status); // NOLINT(cppcoreguidelines-owning-memory)
     }
     logLine(LogLevel::info, {{"event", "worker_session_open"}, {"cn", caller.name}, {"peer", context->peer()}});

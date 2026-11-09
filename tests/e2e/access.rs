@@ -331,6 +331,13 @@ fn oidc_bearer_tokens() {
     let err = fail(&["nix", "path-info", "--store", &wrongaud, p]);
     assert!(err.contains("bearer token rejected"), "{err}");
     assert_journal(MTLS, "event=oidc_rejected.*audience");
+    let lines = metrics(MACHINE, 9464);
+    assert!(
+        lines.iter().any(|l| l.starts_with("nix_grpc_denied_total{")
+            && l.contains(r#"reason="bad_token""#)
+            && l.contains(r#"method="QueryMissing""#)),
+        "{lines:#?}"
+    );
     write_file(&format!("{dir}/garbage.jwt"), "garbage");
     let garbage = format!("grpc://localhost:50052?ca-cert={d}/ca.pem&token-file={dir}/garbage.jwt");
     fail(&["nix", "path-info", "--store", &garbage, p]);
