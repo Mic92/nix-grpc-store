@@ -238,7 +238,8 @@ message Done {
     // Expect expired without a BuildDerivation arriving. Older builders;
     // newer ones give it back as UNREACHABLE.
     NO_SHOW = 3;
-    // The worker can't run it: place it elsewhere, here only as a last resort.
+    // The worker can't run it: place it again, passing this worker over for
+    // as long as the reason says.
     GIVEN_BACK = 4;
   }
   enum Reason {
