@@ -421,7 +421,7 @@ auto EdsService::StreamEndpoints(grpc::CallbackServerContext * context)
         return new Reject({grpc::StatusCode::UNAVAILABLE, "scheduler passive, another node serves"}); // NOLINT(cppcoreguidelines-owning-memory)
     }
     auto const caller = auth->identifyDirect(*context);
-    if (auto const status = Auth::authorize(caller, "StreamEndpoints", Role::trusted); !status.ok()) {
+    if (auto const status = auth->authorize(caller, "StreamEndpoints", Role::trusted); !status.ok()) {
         return new Reject(status); // NOLINT(cppcoreguidelines-owning-memory)
     }
     if (!acquire()) {

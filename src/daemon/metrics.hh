@@ -26,6 +26,11 @@ class Metrics
              .Name("nix_grpc_rpcs_total")
              .Help("RPCs handled, by method and client certificate CN")
              .Register(*registry);
+    prometheus::Family<prometheus::Counter> * denied =
+        &prometheus::BuildCounter()
+             .Name("nix_grpc_denied_total")
+             .Help("RPCs refused by authorization, by method and reason: bad_token, anonymous, no_rule, role")
+             .Register(*registry);
     prometheus::Family<prometheus::Counter> * tunnelBytes =
         &prometheus::BuildCounter()
              .Name("nix_grpc_tunnel_bytes_total")
@@ -265,6 +270,11 @@ public:
     void countRpc(const std::string & method, const std::string & commonName)
     {
         rpcs->Add({{"method", method}, {"cn", commonName}}).Increment();
+    }
+
+    void countDenied(const std::string & method, const std::string & reason)
+    {
+        denied->Add({{"method", method}, {"reason", reason}}).Increment();
     }
 
     void countTunnelBytes(const std::string & commonName, uint64_t bytesIn, uint64_t bytesOut)
