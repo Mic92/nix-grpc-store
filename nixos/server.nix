@@ -31,6 +31,11 @@ in
     };
     users.groups.nix-grpc-daemon = { };
 
+    systemd.tmpfiles.settings.nix-grpc-daemon = lib.mkIf (builder && cfg.buildLogRetention != null) {
+      # mM: only the modification time counts, so reading a log does not keep it.
+      "/nix/var/log/nix/drvs".e.age = "mM:${cfg.buildLogRetention}";
+    };
+
     systemd.sockets.nix-grpc-daemon = lib.mkIf socketActivated {
       description = "Nix worker-protocol over gRPC";
       wantedBy = [ "sockets.target" ];
