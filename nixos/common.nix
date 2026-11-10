@@ -304,6 +304,18 @@ in
       '';
     };
 
+    buildLogRetention = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = "30d";
+      example = "7d";
+      description = ''
+        How long a NixOS builder keeps Nix's log of each build, as a systemd
+        time span. `systemd-tmpfiles-clean` deletes older logs daily, by
+        modification time, so reading a log does not keep it. `null` keeps
+        them forever, as Nix does.
+      '';
+    };
+
     niks3 = lib.mkOption {
       default = null;
       description = ''

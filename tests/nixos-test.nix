@@ -90,6 +90,7 @@ pkgs.testers.runNixOSTest {
         minFree = "0";
         # Reuse the client bundle so the test doesn't compile the project twice.
         package = config.programs.nix-grpc-store.package;
+        buildLogRetention = "1h";
       };
       # Bulk-upload subtest needs the daemon to be a trusted user so
       # nix copy --to can add unsigned paths.
@@ -243,6 +244,20 @@ pkgs.testers.runNixOSTest {
 
     with subtest("transfers, access control, logs and metrics"):
         run_e2e({"machine": machine}, env, "transfer::", "access::", "--test-threads=4")
+
+    with subtest("kept build logs expire"):
+        machine.succeed(
+            "mkdir -p /nix/var/log/nix/drvs/zy /nix/var/log/nix/drvs/zx",
+            "echo old > /nix/var/log/nix/drvs/zy/old-retention.drv.bz2",
+            "touch -m -d '1 day ago' /nix/var/log/nix/drvs/zy/old-retention.drv.bz2",
+            "echo fresh > /nix/var/log/nix/drvs/zx/fresh-retention.drv.bz2",
+            # A read and a chmod make atime and ctime fresh, which must not count.
+            "cat /nix/var/log/nix/drvs/zy/old-retention.drv.bz2 > /dev/null",
+            "chmod 0644 /nix/var/log/nix/drvs/zy/old-retention.drv.bz2",
+            "systemd-tmpfiles --clean",
+        )
+        machine.fail("test -e /nix/var/log/nix/drvs/zy/old-retention.drv.bz2")
+        machine.succeed("test -e /nix/var/log/nix/drvs/zx/fresh-retention.drv.bz2")
 
     with subtest("benchmarks"):
         run_e2e({"machine": machine}, env, "bench::", "--test-threads=1")
