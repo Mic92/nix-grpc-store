@@ -298,9 +298,12 @@ fetched on first use and cached for an hour, so the daemon starts while
 the issuer is down and refuses tokens until it comes back. A presented
 client certificate takes precedence over a token.
 Rules are alternatives: a token gets the highest role of all rules it
-matches, so each rule must bind the repository or owner on its own. Two
-providers may not share an issuer. A verified token that
-matches no rule is denied, it does not fall back to `--allow-anonymous`.
+matches, so each rule must bind the repository or owner on its own.
+Providers may share an issuer if their audiences differ. A token gets the
+highest role of the providers whose audience it carries, so a client that
+asks for its own audience, such as a read-only mirror, meets only its own
+provider's rules. A verified token that matches no rule is denied, it does
+not fall back to `--allow-anonymous`.
 In logs and metrics the caller shows as `oidc:<provider>:<sub>`.
 
 Clients pass the token with the `token-file` URI parameter or

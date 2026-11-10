@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -164,10 +165,12 @@ inline auto loadConfig(const std::string & path) -> Config
         cfg.allowInsecure = json.value("allow_insecure", false);
         for (const auto & [name, prov] : json.at("providers").items()) {
             auto provider = providerFrom(name, prov, cfg.allowInsecure);
-            // A token names one issuer, so it can only be checked against one provider.
+            // Providers for one issuer tell tokens apart by audience.
             for (const auto & other : cfg.providers) {
-                if (other.issuer == provider.issuer) {
-                    throw nix::Error("providers '%s' and '%s' share issuer %s", other.name, name, provider.issuer);
+                if (other.issuer == provider.issuer && other.audience == provider.audience) {
+                    throw nix::Error(
+                        "providers '%s' and '%s' share issuer %s and audience %s", other.name, name, provider.issuer,
+                        provider.audience);
                 }
             }
             cfg.providers.push_back(std::move(provider));
@@ -504,6 +507,8 @@ private:
         return res;
     }
 
+    // Against every provider for the token's issuer whose audience it
+    // carries. The highest role wins, as across one provider's rules.
     auto doVerify(const std::string & token, std::chrono::system_clock::time_point now) -> Result
     {
         auto parsed = parseToken(token);
@@ -511,36 +516,67 @@ private:
             return fail("malformed token");
         }
         auto const iss = parsed->has_issuer() ? parsed->get_issuer() : "";
+        auto const aud = parsed->has_audience() ? parsed->get_audience() : std::set<std::string>{};
+        bool issuerKnown = false;
+        std::optional<Result> best;
+        std::optional<Role> bestRole;
+        std::optional<Result> failed;
         for (size_t idx = 0; idx < config.providers.size(); ++idx) {
             const auto & provider = config.providers.at(idx);
             if (provider.issuer != iss) {
                 continue;
             }
-            if (!parsed->has_expires_at()) {
-                return fail("token has no exp");
+            issuerKnown = true;
+            if (!aud.contains(provider.audience)) {
+                continue;
             }
-            std::error_code err;
-            for (auto & verifier : candidates(provider, keys.at(idx), *parsed, now)) {
+            auto res = verifyWith(idx, *parsed, now);
+            if (!res.identity) {
+                failed = std::move(res);
+                continue;
+            }
+            if (auto const role = res.identity->role; !best || role > bestRole) {
+                bestRole = role;
+                best = std::move(res);
+            }
+        }
+        if (best || failed) {
+            return best ? std::move(*best) : std::move(*failed);
+        }
+        return fail(
+            issuerKnown ? "no provider for issuer '" + iss + "' has the token's audience" : "unknown issuer '" + iss + "'");
+    }
+
+    auto verifyWith(size_t idx, const Decoded & parsed, std::chrono::system_clock::time_point now) -> Result
+    {
+        const auto & provider = config.providers.at(idx);
+        if (!parsed.has_expires_at()) {
+            return fail("token has no exp");
+        }
+        std::error_code err;
+        try {
+            for (auto & verifier : candidates(provider, keys.at(idx), parsed, now)) {
                 err.clear();
-                verifier.verify(*parsed, err);
+                verifier.verify(parsed, err);
                 if (!err) {
                     break;
                 }
             }
-            if (err) {
-                return fail(provider.name + ": " + err.message());
-            }
-            auto const claims = Json::parse(parsed->get_payload());
-            auto const sub = claims.value("sub", "");
-            if (sub.empty() || sub.contains('\0')) {
-                return fail("token lacks sub");
-            }
-            auto const role = roleFor(provider, claims);
-            return {
-                .identity = Identity{.subject = "oidc:" + provider.name + ":" + sub, .role = role},
-                .error = role ? "" : "no rule matched"};
+        } catch (std::exception & exc) {
+            return fail(provider.name + ": " + exc.what()); // no keys: the next provider may have some
         }
-        return fail("unknown issuer '" + iss + "'");
+        if (err) {
+            return fail(provider.name + ": " + err.message());
+        }
+        auto const claims = Json::parse(parsed.get_payload());
+        auto const sub = claims.value("sub", "");
+        if (sub.empty() || sub.contains('\0')) {
+            return fail("token lacks sub");
+        }
+        auto const role = roleFor(provider, claims);
+        return {
+            .identity = Identity{.subject = "oidc:" + provider.name + ":" + sub, .role = role},
+            .error = role ? "" : "no rule matched"};
     }
 };
 

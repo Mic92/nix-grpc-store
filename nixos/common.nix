@@ -214,7 +214,9 @@ in
         Accept OIDC bearer tokens (`authorization: Bearer …`) besides client
         certificates. Same schema as niks3's `--oidc-config`, so one attrset
         can serve both. Scopes map to roles: `read` → read-only, `write` →
-        write, `admin` → trusted. A client certificate, when presented,
+        write, `admin` → trusted. Providers may share an issuer if their
+        audiences differ. A token then gets the highest role of the providers
+        whose audience it carries. A client certificate, when presented,
         takes precedence. Clients set `token-file` or `$NIX_GRPC_TOKEN_FILE`.
       '';
     };

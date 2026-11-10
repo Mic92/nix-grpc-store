@@ -232,6 +232,11 @@ auto writeConfig(const std::string & dir, const std::string & base) -> void
                   {{"bound_claims", {{"repository_owner", {"myorg"}}, {"ref", {"refs/heads/main"}}}},
                    {"scopes", {"admin"}}},
                   {{"bound_claims", {{"groups", {"readers"}}}}, {"scopes", {"read"}}}}}}},
+              // Same issuer, a read-only client's own audience.
+              {"mirror",
+               {{"issuer", base},
+                {"audience", "mirror"},
+                {"rules", {{{"bound_claims", {{"groups", {"mirrors"}}}}, {"scopes", {"read"}}}}}}},
               {"k8s",
                {{"audience", "grpc://cache"},
                 {"bearer_token_file", dir + "/sa-token"},
@@ -256,7 +261,7 @@ auto run(const std::string & dir, const std::string & base) -> int
 
     // Issuer serves nothing yet: config loads, verifier constructs, tokens are refused.
     auto const cfg = loadConfig(dir + "/oidc.json");
-    check(cfg.providers.size() == 2, "two providers");
+    check(cfg.providers.size() == 3, "three providers, two for one issuer");
     {
         auto twice = Json::parse(nix::readFile(dir + "/oidc.json"));
         auto & providers = twice.at("providers");
@@ -268,7 +273,7 @@ auto run(const std::string & dir, const std::string & base) -> int
         } catch (nix::Error &) {
             refused = true;
         }
-        check(refused, "two providers with one issuer are refused");
+        check(refused, "two providers with one issuer and audience are refused");
     }
     Verifier verifier(cfg, std::chrono::seconds(0));
 
@@ -323,6 +328,22 @@ auto run(const std::string & dir, const std::string & base) -> int
     {
         auto res = verifier.verify(edKey.sign(good));
         check(res.identity && res.identity->role == Role::write, "EdDSA");
+    }
+    {
+        // A token for the mirror's audience meets only the mirror's rules, so
+        // its subject gets read-only, not the write the build audience gives it.
+        auto const mirror = [&](const Json & aud, const Json & groups) -> Json {
+            return claims({{"sub", "repo:myorg/a:b"}, {"aud", aud}, {"groups", groups}});
+        };
+        auto res = verifier.verify(ecKey.sign(mirror("mirror", {"mirrors"})));
+        check(res.identity && res.identity->role == Role::readOnly, "own audience -> only its rules");
+        check(res.identity && res.identity->subject == "oidc:mirror:repo:myorg/a:b", "own audience names its provider");
+        res = verifier.verify(ecKey.sign(mirror("mirror", {"readers"})));
+        check(res.identity && !res.identity->role, "own audience, only a build rule matches -> no role");
+        // A token for both audiences gets the higher role, from the build provider.
+        res = verifier.verify(ecKey.sign(mirror({"mirror", "grpc://cache"}, {"mirrors"})));
+        check(res.identity && res.identity->role == Role::write, "both audiences -> highest role");
+        check(res.identity && res.identity->subject == "oidc:ci:repo:myorg/a:b", "named by the provider that granted it");
     }
     check(verifier.verify(ecKey.signWithoutKid(good)).identity.has_value(), "no kid: every ES256 key is tried");
     {
