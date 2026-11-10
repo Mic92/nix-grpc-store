@@ -48,8 +48,12 @@ in
 
     launchd.daemons.nix-grpc-daemon = {
       path = lib.optional (cfg.niks3 != null) config.nix.package;
+      # `command` rather than ProgramArguments: nix-darwin prefixes it with
+      # `/bin/wait4path /nix/store`. At boot launchd starts daemons before the
+      # Nix store volume is mounted, finds no executable, and gives up on the
+      # job for good (exit 78, despite KeepAlive).
+      command = lib.escapeShellArgs (map toString (import ./daemon-args.nix { inherit cfg lib pkgs; }));
       serviceConfig = {
-        ProgramArguments = map toString (import ./daemon-args.nix { inherit cfg lib pkgs; });
         UserName = "nix-grpc-daemon";
         GroupName = "nix-grpc-daemon";
         RunAtLoad = true;
