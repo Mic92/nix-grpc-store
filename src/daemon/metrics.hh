@@ -95,6 +95,16 @@ class Metrics
              .Name("nix_grpc_unavailable")
              .Help("1 while this worker takes no new builds for the reason, else 0")
              .Register(*registry);
+    prometheus::Family<prometheus::Counter> * buildLogUploads =
+        &prometheus::BuildCounter()
+             .Name("nix_grpc_build_log_uploads_total")
+             .Help("Build logs copied to the log store, by result: ok, failed, skipped (too large or none), dropped (queue full)")
+             .Register(*registry);
+    prometheus::Gauge * buildLogUploadQueueGauge = &prometheus::BuildGauge()
+                                                        .Name("nix_grpc_build_log_upload_queue")
+                                                        .Help("Build logs waiting for the log store, the one uploading included")
+                                                        .Register(*registry)
+                                                        .Add({});
     prometheus::Family<prometheus::Gauge> * sched =
         &prometheus::BuildGauge().Name("nix_grpc_sched").Help("Scheduler state on this node, by kind").Register(*registry);
     prometheus::Family<prometheus::Gauge> * schedSystemFam =
@@ -191,6 +201,14 @@ public:
     void buildFailure(std::string_view reason)
     {
         buildFailures->Add({{"reason", std::string(reason)}}).Increment();
+    }
+    void buildLogUpload(std::string_view result)
+    {
+        buildLogUploads->Add({{"result", std::string(result)}}).Increment();
+    }
+    void buildLogUploadQueue(size_t count) const
+    {
+        buildLogUploadQueueGauge->Set(static_cast<double>(count));
     }
     // For hot paths: resolve the label once, Increment() is then lock-free.
     auto eventCounter(const std::string & kind) -> prometheus::Counter &

@@ -196,6 +196,8 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             // The program plus extra flags, e.g. "niks3 push --max-concurrent-uploads 8".
             auto words = nix::shellSplitString(next());
             options.niks3.pushArgv = {words.begin(), words.end()};
+        } else if (arg == "--build-log-store") {
+            options.buildLogStore = next();
         } else if (arg == "--role") {
             options.builder = options.scheduler = false;
             for (auto & role : nix::tokenizeString<std::vector<std::string>>(next(), ",")) {

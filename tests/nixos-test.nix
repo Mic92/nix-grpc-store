@@ -45,6 +45,45 @@ let
   # nix.conf), so it cannot be generated at runtime like the TLS certs.
   signingSecretKey = "nix-grpc-test-1:1/icU6Hlts+rG2LxnM8NoIMcrLWAzdCgJEOLjewE8DxGQKUPC9+LF07Ci6sEjhQP2G50TfF9TkQFBwwVRW5FXw==";
   signingPublicKey = "nix-grpc-test-1:RkClDwvfixdOwourBI4UD9hudE3xfU5EBQcMFUVuRV8=";
+  # A binary cache store for build logs: serves and takes files under
+  # /srv/logstore. An upload below /slow is answered after 20 s.
+  logStoreServer = pkgs.writeText "log-store-server.py" ''
+    import http.server, os, time
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def file(self):
+            return os.path.join("/srv/logstore", self.path.split("?")[0].lstrip("/"))
+
+        def do_GET(self):
+            if not os.path.isfile(self.file()):
+                self.send_error(404)
+                return
+            with open(self.file(), "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_HEAD(self):
+            self.send_response(200 if os.path.isfile(self.file()) else 404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_PUT(self):
+            data = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            if self.path.startswith("/slow/"):
+                time.sleep(20)
+            os.makedirs(os.path.dirname(self.file()), exist_ok=True)
+            with open(self.file() + ".part", "wb") as out:
+                out.write(data)
+            os.rename(self.file() + ".part", self.file())
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    http.server.ThreadingHTTPServer(("127.0.0.1", 8090), Handler).serve_forever()
+  '';
 in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-store-${phase}";
@@ -87,6 +126,7 @@ pkgs.testers.runNixOSTest {
         logLevel = "debug";
         idleTimeout = 3;
         # Test VM disk is ~1 GiB.
+        buildLogStore = "http://127.0.0.1:8090";
         minFree = "0";
         # Reuse the client bundle so the test doesn't compile the project twice.
         package = config.programs.nix-grpc-store.package;
@@ -147,6 +187,18 @@ pkgs.testers.runNixOSTest {
       '';
       system.extraDependencies = [ pkgs.coreutils ];
 
+      # Log store tests: a derivation that runs a script with coreutils.
+      environment.etc."log-drv.nix".text = ''
+        { name, script }:
+        derivation {
+          inherit name;
+          system = builtins.currentSystem;
+          builder = "/bin/sh";
+          args = [ "-c" script ];
+          PATH = builtins.storePath "${pkgs.coreutils}" + "/bin";
+        }
+      '';
+
       # Self-signed CA plus server/client leaf certs for the mTLS subtest.
       systemd.services.nix-grpc-certs = {
         wantedBy = [ "multi-user.target" ];
@@ -180,6 +232,31 @@ pkgs.testers.runNixOSTest {
           openssl x509 -req -in expired.csr -not_before 20200101000000Z -not_after 20200102000000Z \
             -CA ca.pem -CAkey ca.key -set_serial 0x$RANDOM -out expired.pem
           chmod a+r ${certDir}/*
+        '';
+      };
+
+      systemd.services.log-store = {
+        wantedBy = [ "multi-user.target" ];
+        preStart = ''
+          mkdir -p /srv/logstore/slow
+          printf 'StoreDir: /nix/store\n' | tee /srv/logstore/nix-cache-info > /srv/logstore/slow/nix-cache-info
+        '';
+        serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 ${logStoreServer}";
+      };
+
+      # Copies build logs to the slow part of the log store.
+      systemd.services.nix-grpc-daemon-logstore = {
+        wantedBy = [ "multi-user.target" ];
+        after = [
+          "nix-daemon.socket"
+          "log-store.service"
+        ];
+        serviceConfig.ExecStart = ''
+          ${lib.getExe config.services.nix-grpc-daemon.package} --listen 127.0.0.1:50054 \
+            --proxy-socket /nix/var/nix/daemon-socket/socket \
+            --build-log-store http://127.0.0.1:8090/slow \
+            --trust-clients \
+            --metrics-listen 127.0.0.1:9465
         '';
       };
 

@@ -35,6 +35,8 @@ struct Options
     xfcc::TrustedProxies proxies;
     std::string oidcConfig;
     Niks3Config niks3;
+    // A Nix store URL builders copy each build's log to. Empty: none.
+    std::string buildLogStore;
 
     bool builder = true;
     bool scheduler = true;

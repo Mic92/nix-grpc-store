@@ -104,6 +104,10 @@
     cfg.niks3.clientKeyFile
   ]
 )
+++ lib.optionals (cfg.buildLogStore != null) [
+  "--build-log-store"
+  cfg.buildLogStore
+]
 ++ lib.optionals cfg.sandbox.enable (
   [ "--sandbox" ]
   ++ lib.concatMap (path: [

@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use crate::fixtures::*;
+use crate::harness::{MACHINE, metrics, retry};
 
 #[test]
 fn add_path_and_read_it_back_locally() {
@@ -302,4 +303,83 @@ fn add_path_through_envoy() {
     ]);
     succeed(&["test", "-e", p.trim()]);
     assert_journal("nix-grpc-daemon", "event=rpc method=Connect");
+}
+
+/// Writes /tmp/{name}.nix, a derivation that runs `script` with coreutils,
+/// and returns its .drv path.
+fn log_drv(name: &str, script: &str) -> String {
+    let file = format!("/tmp/{name}.nix");
+    write_file(
+        &file,
+        &format!(r#"import /etc/log-drv.nix {{ name = "{name}"; script = "{script}"; }}"#),
+    );
+    succeed(&["nix-instantiate", &file]).trim().to_string()
+}
+
+fn build_ok(store: &str, name: &str) -> bool {
+    let file = format!("/tmp/{name}.nix");
+    run_t(
+        &[
+            "nix",
+            "build",
+            "--store",
+            store,
+            "--impure",
+            "-f",
+            &file,
+            "--no-link",
+        ],
+        300,
+    )
+    .code
+        == 0
+}
+
+/// The daemon on 50051 copies build logs to a log store. A failed build's
+/// log gets there, and `nix log --store` reads it.
+#[test]
+fn failed_build_log_reaches_the_log_store() {
+    let drv = log_drv(
+        "stored-grpc",
+        "echo stored line one; echo stored line two; exit 1",
+    );
+    assert!(!build_ok(STORE, "stored-grpc"));
+    let base = drv.rsplit('/').next().unwrap();
+    wait_until_succeeds(&["test", "-s", &format!("/srv/logstore/log/{base}")], 60);
+    let log = succeed(&["nix", "log", "--store", "http://127.0.0.1:8090", &drv]);
+    assert!(log.contains("stored line two"), "{log}");
+}
+
+/// The daemon on 50054 uploads to a log store that takes 20 s per upload.
+/// A log over 64 MiB is skipped and counted. A SIGTERM right after a
+/// build's Done waits for its upload, which outlasts the 6 s the daemon
+/// gives itself to shut down.
+#[test]
+fn log_store_skips_large_logs_and_drains() {
+    const LOGSTORE: &str = "nix-grpc-daemon-logstore.service";
+    let store = "grpc://127.0.0.1:50054?insecure=1";
+    wait_for_unit(LOGSTORE);
+    wait_for_open_port(50054);
+
+    let big = log_drv(
+        "huge-grpc",
+        "head -c 70000000 /dev/zero | tr '\\\\0' x | fold -w 1000; echo > $out",
+    );
+    assert!(build_ok(store, "huge-grpc"));
+    retry(60, "the huge log is skipped", || {
+        metrics(MACHINE, 9465).iter().any(|line| {
+            line.strip_prefix(r#"nix_grpc_build_log_uploads_total{result="skipped"} "#)
+                .and_then(|value| value.parse::<f64>().ok())
+                == Some(1.0)
+        })
+    });
+    let big = big.rsplit('/').next().unwrap();
+    fail(&["test", "-e", &format!("/srv/logstore/slow/log/{big}")]);
+
+    let last = log_drv("last-grpc", "echo the last build; echo > $out");
+    assert!(build_ok(store, "last-grpc"));
+    succeed(&["systemctl", "kill", "-s", "TERM", LOGSTORE]);
+    retry(90, "the daemon exits", || unit_state(LOGSTORE) != "active");
+    let last = last.rsplit('/').next().unwrap();
+    succeed(&["test", "-s", &format!("/srv/logstore/slow/log/{last}")]);
 }

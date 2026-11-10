@@ -71,6 +71,9 @@ in
           reloadIfChanged = builder;
           # /tmp is a size-limited tmpfs.
           environment.TMPDIR = "/var/cache/nix-grpc-daemon";
+          # Nix opens a binary cache store with a SQLite cache in here. The
+          # sandbox lets the daemon write only below TMPDIR.
+          environment.XDG_CACHE_HOME = lib.mkIf (cfg.buildLogStore != null) "/var/cache/nix-grpc-daemon";
           serviceConfig = {
             CacheDirectory = "nix-grpc-daemon";
             LimitNOFILE = lib.mkDefault 65536;

@@ -34,6 +34,11 @@ in
         assertion = cfg.idleTimeout == null;
         message = "services.nix-grpc-daemon.idleTimeout needs socket activation, which launchd does not provide";
       }
+      {
+        # Nix opens the store with a SQLite cache under the user's home, which is /var/empty here.
+        assertion = cfg.buildLogStore == null;
+        message = "services.nix-grpc-daemon.buildLogStore is not supported on nix-darwin yet";
+      }
     ];
 
     users.knownGroups = [ "nix-grpc-daemon" ];

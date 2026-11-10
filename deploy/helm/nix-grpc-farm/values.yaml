@@ -101,6 +101,11 @@ workerDefaults:
   cores: 0
   # Below this the worker tells the scheduler to stop assigning to it.
   minFree: 20G
+  # A Nix store URL the builder copies each build's log to, such as
+  # "s3://farm-logs?region=eu-central-1&log-compression=zstd", so logs
+  # outlive the pod. The pod needs the store's credentials, for S3 through
+  # the usual AWS variables or a web identity.
+  buildLogStore: ""
   store:
     sizeLimit: null # emptyDir sizeLimit for /nix
   spool:
