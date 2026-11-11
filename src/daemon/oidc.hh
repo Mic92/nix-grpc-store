@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -164,10 +165,12 @@ inline auto loadConfig(const std::string & path) -> Config
         cfg.allowInsecure = json.value("allow_insecure", false);
         for (const auto & [name, prov] : json.at("providers").items()) {
             auto provider = providerFrom(name, prov, cfg.allowInsecure);
-            // A token names one issuer, so it can only be checked against one provider.
+            // Issuer and audience are what a token picks its providers by.
             for (const auto & other : cfg.providers) {
-                if (other.issuer == provider.issuer) {
-                    throw nix::Error("providers '%s' and '%s' share issuer %s", other.name, name, provider.issuer);
+                if (other.issuer == provider.issuer && other.audience == provider.audience) {
+                    throw nix::Error(
+                        "providers '%s' and '%s' share issuer %s and audience %s", other.name, name, provider.issuer,
+                        provider.audience);
                 }
             }
             cfg.providers.push_back(std::move(provider));
@@ -379,7 +382,7 @@ public:
     }
 
 private:
-    // Signing keys per provider. Fetched on first use, not at startup, so the
+    // Signing keys per provider, which may name its own JWKS URL. Fetched on first use, not at startup, so the
     // daemon comes up while the issuer is unreachable and recovers later.
     struct KeySet
     {
@@ -498,10 +501,39 @@ private:
             set.attempted = std::chrono::steady_clock::now();
             res = pick();
         }
-        if (res.empty()) {
-            throw nix::Error("no signing keys for provider %s and alg %s (issuer unreachable?)", provider.name, alg);
-        }
         return res;
+    }
+
+    // What `provider` makes of a token that names its issuer and audience.
+    auto verifyWith(size_t idx, const Decoded & token, std::chrono::system_clock::time_point now) -> Result
+    {
+        const auto & provider = config.providers.at(idx);
+        auto const verifiers = candidates(provider, keys.at(idx), token, now);
+        if (verifiers.empty()) {
+            return fail(
+                "no signing keys for provider " + provider.name + " and alg "
+                + (token.has_algorithm() ? token.get_algorithm() : "") + " (issuer unreachable?)");
+        }
+        std::error_code err;
+        for (const auto & verifier : verifiers) {
+            err.clear();
+            verifier.verify(token, err);
+            if (!err) {
+                break;
+            }
+        }
+        if (err) {
+            return fail(provider.name + ": " + err.message());
+        }
+        auto const claims = Json::parse(token.get_payload());
+        auto const sub = claims.value("sub", "");
+        if (sub.empty() || sub.contains('\0')) {
+            return fail("token lacks sub");
+        }
+        auto const role = roleFor(provider, claims);
+        return {
+            .identity = Identity{.subject = "oidc:" + provider.name + ":" + sub, .role = role},
+            .error = role ? "" : "no rule matched"};
     }
 
     auto doVerify(const std::string & token, std::chrono::system_clock::time_point now) -> Result
@@ -510,37 +542,35 @@ private:
         if (!parsed) {
             return fail("malformed token");
         }
+        if (!parsed->has_expires_at()) {
+            return fail("token has no exp");
+        }
         auto const iss = parsed->has_issuer() ? parsed->get_issuer() : "";
+        auto const aud = parsed->has_audience() ? parsed->get_audience() : std::set<std::string>{};
+        // Providers are alternatives as the rules of one are: the highest
+        // role wins, and a refusal only counts if nobody accepts.
+        bool issuerKnown = false;
+        std::optional<Result> best;
         for (size_t idx = 0; idx < config.providers.size(); ++idx) {
             const auto & provider = config.providers.at(idx);
             if (provider.issuer != iss) {
                 continue;
             }
-            if (!parsed->has_expires_at()) {
-                return fail("token has no exp");
+            issuerKnown = true;
+            if (!aud.contains(provider.audience)) {
+                continue;
             }
-            std::error_code err;
-            for (auto & verifier : candidates(provider, keys.at(idx), *parsed, now)) {
-                err.clear();
-                verifier.verify(*parsed, err);
-                if (!err) {
-                    break;
-                }
+            auto res = verifyWith(idx, *parsed, now);
+            auto const better = !best || (res.identity && (!best->identity || res.identity->role > best->identity->role));
+            if (better) {
+                best = std::move(res);
             }
-            if (err) {
-                return fail(provider.name + ": " + err.message());
-            }
-            auto const claims = Json::parse(parsed->get_payload());
-            auto const sub = claims.value("sub", "");
-            if (sub.empty() || sub.contains('\0')) {
-                return fail("token lacks sub");
-            }
-            auto const role = roleFor(provider, claims);
-            return {
-                .identity = Identity{.subject = "oidc:" + provider.name + ":" + sub, .role = role},
-                .error = role ? "" : "no rule matched"};
         }
-        return fail("unknown issuer '" + iss + "'");
+        if (best) {
+            return std::move(*best);
+        }
+        return fail(
+            issuerKnown ? "no provider of issuer '" + iss + "' takes the token's audience" : "unknown issuer '" + iss + "'");
     }
 };
 
