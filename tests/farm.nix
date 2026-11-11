@@ -245,7 +245,10 @@ pkgs.testers.runNixOSTest {
         services.nix-grpc-farm-lb = {
           accessLog = true;
           enable = true;
-          systems = [ system ];
+          systems = [
+            system
+            "s390x-linux" # no builder offers it
+          ];
           scheduler = [
             "${ip.worker1}:50051"
             "${ip.worker2}:50051"
