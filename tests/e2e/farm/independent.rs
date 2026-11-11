@@ -30,6 +30,14 @@ fn outputs_carry_the_cache_signature() {
     );
 }
 
+/// Queries and uploads do not need a builder of the client's system.
+#[test]
+fn a_system_without_builders_is_served_by_the_default_one() {
+    farm_ready();
+    let store = format!("{}&system=s390x-linux", envoy());
+    succeed(CLIENT, &["nix", "store", "info", "--store", &store]);
+}
+
 #[test]
 fn build_hook_through_nix_daemon() {
     farm_ready();

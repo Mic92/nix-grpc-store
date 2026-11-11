@@ -200,6 +200,27 @@ let
       };
     };
 
+  # A system whose builders are all gone, or that only has builders the
+  # balancer cannot reach, still takes queries and uploads: neither depends
+  # on the system of the node that answers.
+  withDefault = system: "${system}-or-default";
+  fallbackCluster = system: {
+    name = withDefault system;
+    inherit (http2) circuit_breakers;
+    connect_timeout = "5s";
+    lb_policy = "CLUSTER_PROVIDED";
+    cluster_type = {
+      name = "envoy.clusters.aggregate";
+      typed_config = {
+        "@type" = "type.googleapis.com/envoy.extensions.clusters.aggregate.v3.ClusterConfig";
+        clusters = [
+          system
+          cfg.defaultSystem
+        ];
+      };
+    };
+  };
+
   schedCluster =
     upstreamTls
     // http2
@@ -272,7 +293,7 @@ let
       }
       // systemMatch system;
       route = {
-        cluster = system;
+        cluster = if system == cfg.defaultSystem then system else withDefault system;
         timeout = "0s";
         retry_policy = retryDeadHost;
       };
@@ -307,7 +328,8 @@ in
       description = ''
         The systems the farm builds for. Each system has a worker cluster.
         Its members are the builders that are connected to the active
-        scheduler and offer that system.
+        scheduler and offer that system. While a system has none, its
+        requests go to the builders of `defaultSystem`.
 
         A builder's `services.nix-grpc-daemon.advertise` is its address in
         the cluster, so it has to be an `IP:port`.
@@ -505,7 +527,10 @@ in
               ];
             }
           ];
-          clusters = map workerCluster systems ++ [ schedCluster ];
+          clusters =
+            map workerCluster systems
+            ++ map fallbackCluster (lib.remove cfg.defaultSystem systems)
+            ++ [ schedCluster ];
         };
       };
     };

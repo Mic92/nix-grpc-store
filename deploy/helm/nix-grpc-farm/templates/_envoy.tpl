@@ -127,6 +127,23 @@ load_balancing_policy:
                     "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.least_request.v3.LeastRequest
 {{- end }}
 
+{{/*
+A group whose builders are all gone still takes queries and uploads: neither
+depends on the system of the node that answers.
+*/}}
+{{- define "farm.envoy.fallbackCluster" -}}
+name: {{ .name | quote }}
+connect_timeout: 5s
+circuit_breakers:
+  thresholds: [{max_connections: 1000000, max_pending_requests: 1000000, max_requests: 1000000}]
+lb_policy: CLUSTER_PROVIDED
+cluster_type:
+  name: envoy.clusters.aggregate
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.clusters.aggregate.v3.ClusterConfig
+    clusters: {{ .clusters | toJson }}
+{{- end }}
+
 {{- define "farm.envoy.route" -}}
 match:
   prefix: {{ .prefix }}
@@ -271,7 +288,12 @@ load_assignment:
 {{- $isDefault := eq $g $defaultGroup }}
 {{- if not $w.system }}{{ fail (printf "workers.%s.system is required, the scheduler names the endpoints of a group by system" $g) }}{{ end }}
 {{- $clusters = append $clusters (include "farm.envoy.workerCluster" (dict "root" $root "name" $g "edsSystem" $w.system) | fromYaml) }}
-{{- $routes = append $routes (include "farm.envoy.route" (dict "prefix" "/" "cluster" $g "system" $w.system "isDefault" $isDefault) | fromYaml) }}
+{{- $target := $g }}
+{{- if not $isDefault }}
+{{- $target = printf "%s-or-default" $g }}
+{{- $clusters = append $clusters (include "farm.envoy.fallbackCluster" (dict "name" $target "clusters" (list $g $defaultGroup)) | fromYaml) }}
+{{- end }}
+{{- $routes = append $routes (include "farm.envoy.route" (dict "prefix" "/" "cluster" $target "system" $w.system "isDefault" $isDefault) | fromYaml) }}
 {{- end }}
 {{- $clusters = append $clusters (include "farm.envoy.clusterCommon" (dict "root" $root "name" "sched" "service" (include "farm.schedulerNames" $root) "healthService" "nix.scheduler") | fromYaml) }}
 {{- $listener := include "farm.envoy.listener" (dict "Values" .Values "Chart" .Chart "Release" .Release "routes" $routes) | fromYaml }}
