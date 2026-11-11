@@ -38,6 +38,8 @@
 namespace nixgrpc {
 
 namespace {
+constexpr unsigned maxLookupThreads = 1024;
+
 auto parseLogLevel(std::string_view value) -> LogLevel
 {
     if (value == "debug") {
@@ -219,6 +221,12 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
                 throw nix::Error("--max-jobs expects an integer in 1..%d", sched::FreeIndex::maxSlots);
             }
             options.maxJobs = *jobs;
+        } else if (arg == "--lookup-threads") {
+            auto threads = parseInt<unsigned>(next());
+            if (!threads || *threads < 1 || *threads > maxLookupThreads) {
+                throw nix::Error("--lookup-threads expects an integer in 1..%d", maxLookupThreads);
+            }
+            options.lookupThreads = *threads;
         } else if (arg == "--sandbox") {
             options.sandbox = true;
         } else if (arg == "--sandbox-write") {

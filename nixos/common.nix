@@ -296,6 +296,15 @@ in
       default = null;
       description = "Concurrent builds. Defaults to `nix.settings.max-jobs`.";
     };
+    lookupThreads = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 1 1024);
+      default = null;
+      description = ''
+        Cache lookups a scheduler runs at once for incoming build requests,
+        32 by default. Raise it when requests wait on a slow cache while
+        the scheduler is idle.
+      '';
+    };
     minFree = lib.mkOption {
       type = lib.types.str;
       default = "10G";

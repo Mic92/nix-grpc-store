@@ -413,6 +413,8 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
             Dispatcher::Config{
                 .defaultSystem = nix::settings.thisSystem.get(),
                 .present = std::move(present),
+                .lookupThreads =
+                    options.lookupThreads != 0 ? options.lookupThreads : Dispatcher::Config::defaultLookupThreads,
                 .logLevel = options.logLevel},
             metrics);
         scheduler = std::make_unique<SchedulerService>(*dispatcher, auth, idle);

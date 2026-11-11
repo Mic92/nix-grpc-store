@@ -47,6 +47,7 @@ struct Options
     // e.g. through external-builders.
     std::vector<std::string> extraSystems;
     unsigned maxJobs = 0; // 0 = take nix's max-jobs
+    unsigned lookupThreads = 0; // scheduler: concurrent cache lookups for Wants, 0 = default
     uint64_t minFree = 0;
     std::string storeDir;
     bool sandbox = false;

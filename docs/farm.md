@@ -131,6 +131,7 @@ services.nix-grpc-daemon = {
 | `scheduler` | Where a builder finds the scheduler: that node's address, or the balancer's when several nodes have the role (see [failover](#managing-the-farm)). Unset on a node that is the only scheduler. |
 | `advertise` | The address the balancer reaches this node at. A builder's must be `IP:port`, since the scheduler passes it to envoy as an endpoint. It routes requests and grants no access: only peers with the `trusted` role can open a session. A scheduler node's must match its entry in the balancer's `scheduler`. |
 | `maxJobs` | Concurrent builds. Defaults to the local nix-daemon's `max-jobs`. |
+| `lookupThreads` | Cache lookups a scheduler runs at once for incoming build requests, 32 by default. Raise it when requests wait on a slow cache while the scheduler is idle. |
 | `minFree` | Below this much free disk the node takes no new builds until space returns. |
 | `buildLogRetention` | How long a builder keeps Nix's build logs, `"30d"` by default. `null` keeps them forever, as Nix does. |
 | `trustedProxies` | Peers with a matching client cert are balancers. The node takes the real client identity from the `x-forwarded-client-cert` header they set. Other peers can't set it. |
