@@ -77,6 +77,7 @@ stdenv.mkDerivation {
         ../../tests/retry-test.cc
         ../../tests/scheduler-test.cc
         ../../tests/dispatcher-test.cc
+        ../../tests/http-test.cc
         ../../tests/dispatcher-bench.cc
         ../../tests/scheduler-grpc-bench.cc
       ]

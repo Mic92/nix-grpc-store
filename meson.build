@@ -256,6 +256,13 @@ if build_server
   )
   test('oidc', find_program('tests/oidc-test.sh'), args : [oidc_test], timeout : 60)
 
+  test('http', executable('http-test',
+    sources : ['tests/http-test.cc'],
+    include_directories : [src_inc],
+    dependencies : [nix_util_dep, curl_dep, json_dep, threads_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
+
   test('scheduler', executable('scheduler-test',
     sources : ['tests/scheduler-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],

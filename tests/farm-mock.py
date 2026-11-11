@@ -67,10 +67,11 @@ class Http(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         auth = self.headers.get("Authorization", "")
+        # Before any reply: the client sends its next request on this connection.
+        body = self.raw_body()
         if self.path.startswith("/api/") and auth != "Bearer testtoken":
             self.reply(401, {"error": "bad token"})
             return
-        body = self.raw_body()
         if self.path == "/_mock/push":
             self.reply(200, push_result(body.decode()))
             return

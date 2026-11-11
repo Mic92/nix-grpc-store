@@ -62,6 +62,34 @@ class Call
         }
     };
 
+    // What a thread's calls share: connections, so a request to a host this
+    // thread already talked to needs no TCP or TLS handshake, and the DNS and
+    // TLS session caches for when it does. One per thread, so curl needs no
+    // locks for it.
+    static auto shared() -> CURLSH *
+    {
+        struct Deleter
+        {
+            void operator()(CURLSH * share) const noexcept
+            {
+                curl_share_cleanup(share);
+            }
+        };
+        thread_local const std::unique_ptr<CURLSH, Deleter> share = [] -> auto {
+            std::unique_ptr<CURLSH, Deleter> made(curl_share_init());
+            if (!made) {
+                throw nix::Error("curl_share_init failed");
+            }
+            for (auto const what : {CURL_LOCK_DATA_CONNECT, CURL_LOCK_DATA_DNS, CURL_LOCK_DATA_SSL_SESSION}) {
+                if (curl_share_setopt(made.get(), CURLSHOPT_SHARE, what) != CURLSHE_OK) {
+                    throw nix::Error("curl_share_setopt failed");
+                }
+            }
+            return made;
+        }();
+        return share.get();
+    }
+
     std::unique_ptr<CURL, CurlDeleter> curl;
     std::unique_ptr<curl_slist, SlistDeleter> headers;
     std::string url;
@@ -119,6 +147,9 @@ public:
         }
         opt(CURLOPT_URL, url.c_str());
         opt(CURLOPT_HTTPHEADER, headers.get());
+        opt(CURLOPT_SHARE, shared());
+        // Finds a peer that went away between two calls.
+        opt(CURLOPT_TCP_KEEPALIVE, 1L);
         opt(CURLOPT_NOSIGNAL, 1L);
         opt(CURLOPT_TIMEOUT, timeoutSecs);
         opt(CURLOPT_WRITEFUNCTION, &Call::collect);
