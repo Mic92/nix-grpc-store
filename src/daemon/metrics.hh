@@ -57,6 +57,11 @@ class Metrics
              .Name("nix_grpc_lookup_seconds")
              .Help("Wall time of a batch of Wants before it is queued: waiting for a lookup thread, then asking the cache")
              .Register(*registry);
+    prometheus::Family<prometheus::Histogram> * lookupKeys =
+        &prometheus::BuildHistogram()
+             .Name("nix_grpc_lookup_keys")
+             .Help("Outputs one cache lookup of a batch of Wants asked about, and how many of them the cache has")
+             .Register(*registry);
     prometheus::Family<prometheus::Counter> * inputsCtr =
         &prometheus::BuildCounter()
              .Name("nix_grpc_build_inputs_total")
@@ -223,6 +228,14 @@ public:
     void lookupStage(const char * stage, double seconds)
     {
         lookupSeconds->Add({{"stage", stage}}, buckets).Observe(seconds);
+    }
+
+    // How long a lookup takes depends on how much it asks about.
+    void lookupSize(size_t asked, size_t present)
+    {
+        static const prometheus::Histogram::BucketBoundaries counts{1, 3, 10, 30, 100, 300, 1000, 3000, 10000};
+        lookupKeys->Add({{"result", "asked"}}, counts).Observe(static_cast<double>(asked));
+        lookupKeys->Add({{"result", "present"}}, counts).Observe(static_cast<double>(present));
     }
 
     // What one build fetched before it started.
