@@ -52,6 +52,11 @@ class Metrics
              .Name("nix_grpc_queue_seconds")
              .Help("Wall time a derivation waited for a worker, by system")
              .Register(*registry);
+    prometheus::Family<prometheus::Histogram> * lookupSeconds =
+        &prometheus::BuildHistogram()
+             .Name("nix_grpc_lookup_seconds")
+             .Help("Wall time of a batch of Wants before it is queued: waiting for a lookup thread, then asking the cache")
+             .Register(*registry);
     prometheus::Family<prometheus::Counter> * inputsCtr =
         &prometheus::BuildCounter()
              .Name("nix_grpc_build_inputs_total")
@@ -212,6 +217,12 @@ public:
     void queueWait(std::string_view system, double seconds)
     {
         queueSeconds->Add({{"system", std::string(system)}}, buckets).Observe(seconds);
+    }
+
+    // Not part of queueWait: a derivation is queued only after its lookup.
+    void lookupStage(const char * stage, double seconds)
+    {
+        lookupSeconds->Add({{"stage", stage}}, buckets).Observe(seconds);
     }
 
     // What one build fetched before it started.
