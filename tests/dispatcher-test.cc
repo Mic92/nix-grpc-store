@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdint>
 #include <exception>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -96,10 +97,39 @@ void dropPlacesItsWorkElsewhere()
     farm.disp.workerGone(other.conn);
 }
 
+// A worker in the scheduler's own process answers from inside the delivery
+// of a command, here by giving an Expect back as a draining builder does.
+void loopbackWorkerMayAnswerACommand()
+{
+    Farm farm;
+    std::vector<std::string> expected;
+    std::shared_ptr<Dispatcher::Worker> worker;
+    worker = farm.disp.loopbackWorker([&](const nix::remote::SchedCmd & cmd) -> void {
+        if (!cmd.has_expect()) {
+            return;
+        }
+        expected.push_back(cmd.expect().drv_path());
+        if (expected.size() == 1) {
+            nix::remote::WorkerMsgs msgs;
+            auto * done = msgs.add_msgs()->mutable_done();
+            done->set_drv_path(cmd.expect().drv_path());
+            done->set_assign_id(cmd.expect().assign_id());
+            done->set_outcome(nix::remote::Done::GIVEN_BACK);
+            farm.disp.workerMsgs(*worker, msgs);
+        }
+    });
+    farm.hello(*worker, "w:1");
+    farm.want("a.drv");
+    // Given back once, then placed again on the only worker there is.
+    assert((expected == std::vector<std::string>{"a.drv", "a.drv"}));
+    farm.disp.workerGone(*worker);
+}
+
 } // namespace
 
 auto main() -> int
 try {
+    loopbackWorkerMayAnswerACommand();
     endOfADroppedSessionKeepsTheNewOne();
     dropPlacesItsWorkElsewhere();
     return 0;

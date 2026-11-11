@@ -86,6 +86,9 @@ public:
         std::optional<sched::WorkerId> id; // under Dispatcher::mutex; set while `workers` has it
     };
 
+    // A worker in this process. `deliver` gets each command.
+    auto loopbackWorker(std::function<void(const nix::remote::SchedCmd &)> deliver) -> std::shared_ptr<Worker>;
+
     // Throws on protocol violations; the caller closes the stream.
     void workerMsgs(Worker & worker, const nix::remote::WorkerMsgs & msgs);
     void workerGone(Worker & worker);
