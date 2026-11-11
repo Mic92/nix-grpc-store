@@ -306,6 +306,11 @@ struct Worker
     int32_t maxJobs = 0;
     bool up = false;
     bool draining = false;
+    // Gave a drv back for a transient failure (full disk, lost nix-daemon).
+    // Unlike draining, its drvs stay placeable.
+    bool resting = false;
+    double restUntilMs = 0;
+    uint32_t restStreak = 0; // rests since its last finished build
     std::vector<DrvId> running;
 
     // A worker that says Hello with max_jobs 0 is up but runs nothing.
@@ -525,6 +530,7 @@ public:
         wkr.up = true;
         workersUp_++;
         wkr.draining = false;
+        wkr.resting = false;
         wkr.systems = info.systems;
         for (const auto & name : wkr.systems) {
             sys(name).free.push(wid);
@@ -568,11 +574,41 @@ public:
             return;
         }
         std::erase(wkr.running, *found);
+        if (!wkr.resting) {
+            wkr.restStreak = 0;
+        }
         refreshFree(wid);
         auto & slot = entries.at(*found);
         if (slot && slot->worker == wid) {
             retire(*found);
         }
+    }
+
+    // No new drvs for the worker for a while. Each rest without a finished
+    // build in between doubles, so a broken worker can't fail every drv it gets.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): worker, then time.
+    void rest(WorkerId wid, double nowMs)
+    {
+        auto & wkr = workers.at(wid);
+        auto const doublings = std::min(wkr.restStreak++, restMaxDoublings);
+        wkr.restUntilMs = nowMs + (restBaseMs * static_cast<double>(1U << doublings));
+        wkr.resting = true;
+        refreshFree(wid);
+    }
+
+    // Ends the rests that are over. True if any did.
+    auto wake(double nowMs) -> bool
+    {
+        bool woke = false;
+        for (WorkerId wid = 0; wid < workers.size(); wid++) {
+            auto & wkr = workers.at(wid);
+            if (wkr.resting && wkr.restUntilMs <= nowMs) {
+                wkr.resting = false;
+                refreshFree(wid);
+                woke = true;
+            }
+        }
+        return woke;
     }
 
     // The worker can't run it after all: place it elsewhere.
@@ -789,6 +825,8 @@ public:
 
     // Bounds on soft state; inputs come from the network.
     static constexpr size_t maxUnofferedSystems = 16;
+    static constexpr double restBaseMs = 10'000;
+    static constexpr uint32_t restMaxDoublings = 5; // 320 s
     static constexpr size_t maxEntries = 1U << 22U;
     static constexpr size_t maxLastBuilder = 1U << 18U;
     static constexpr size_t initialEntries = 1U << 16U;
@@ -901,7 +939,7 @@ private:
     {
         auto const & wkr = workers.at(wid);
         auto const running = static_cast<int32_t>(std::min<size_t>(wkr.running.size(), FreeIndex::maxSlots));
-        auto const val = wkr.takesWork() ? wkr.maxJobs - running : 0;
+        auto const val = wkr.takesWork() && !wkr.resting ? wkr.maxJobs - running : 0;
         for (const auto & name : wkr.systems) {
             sys(name).free.set(wid, val);
         }

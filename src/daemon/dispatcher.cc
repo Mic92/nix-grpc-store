@@ -80,6 +80,9 @@ void Dispatcher::statsLoop()
             return;
         }
         revokeOrphans();
+        if (core.wake(nowMs())) {
+            dispatchLocked();
+        }
         if (statsPending) {
             exportStats(true);
         }
@@ -652,6 +655,15 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
 {
     metrics.event("done_" + nix::remote::Done::Outcome_Name(done.outcome()));
     if (done.outcome() == nix::remote::Done::GIVEN_BACK || done.outcome() == nix::remote::Done::NO_SHOW) {
+        if (done.reason() == nix::remote::Done::TRANSIENT_FAILURE) {
+            core.rest(wid, nowMs());
+            metrics.event("worker_rest");
+            logLine(
+                LogLevel::info,
+                {{"event", "worker_rest"},
+                 {"addr", core.worker(wid).addr},
+                 {"seconds", std::to_string(static_cast<int>((core.worker(wid).restUntilMs - nowMs()) / msPerSecond))}});
+        }
         core.giveBack(wid, done.drv_path());
         metrics.event("given_back_" + nix::remote::Done::Reason_Name(done.reason()));
         placeabilityChangedLocked(); // its followers may have no worker left
