@@ -290,6 +290,7 @@ auto Dispatcher::lookup(const nix::remote::ClientMsgs & msgs) const -> std::vect
     }
     try {
         auto have = config.present(keys);
+        metrics.lookupSize(keys.size(), have.size());
         for (int i = 0; i < msgs.msgs_size(); i++) {
             const auto & msg = msgs.msgs(i);
             cached.at(static_cast<size_t>(i)) =
