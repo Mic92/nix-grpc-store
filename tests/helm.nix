@@ -118,19 +118,53 @@ let
   };
   # formats.yaml emits a %YAML directive that helm rejects. JSON is YAML.
   json = pkgs.formats.json { };
-  valuesFile = json.generate "values.json" values;
-  allValuesFiles = map (json.generate "values.json") (
-    [
-      values
-      valuesInCluster
-      valuesCertManager
-      valuesPublicCertManager
-      valuesPublicSecret
-      valuesExternal
-      valuesExtraVolumes
-    ]
-    ++ extraValues
+  # What tests/helm_test.py reads, by name.
+  renders = {
+    default = { inherit values; };
+    runtime-class = {
+      inherit values;
+      set = "sandbox.runtimeClassName=cgroup-writable";
+    };
+    other-upstream-cache = {
+      inherit values;
+      set = "upstreamCaches.urls={https://other}";
+    };
+    in-cluster.values = valuesInCluster;
+    cert-manager.values = valuesCertManager;
+    public-cert-manager.values = valuesPublicCertManager;
+    public-secret.values = valuesPublicSecret;
+    external.values = valuesExternal;
+    extra-volumes.values = valuesExtraVolumes;
+  }
+  // lib.listToAttrs (
+    lib.imap0 (idx: extra: {
+      name = "extra-${toString idx}";
+      value.values = extra;
+    }) extraValues
   );
+  render =
+    name:
+    {
+      values,
+      set ? null,
+    }:
+    let
+      args = lib.escapeShellArgs (
+        [
+          "chart"
+          "-f"
+          (json.generate "values.json" values)
+        ]
+        ++ lib.optionals (set != null) [
+          "--set"
+          set
+        ]
+      );
+    in
+    ''
+      helm lint --strict ${args}
+      helm template t ${args} --api-versions monitoring.coreos.com/v1/PodMonitor > renders/${name}.yaml
+    '';
 
   # Same topology through the NixOS module.
   nixosEnvoy =
@@ -178,162 +212,23 @@ let
     { inherit (nixosEnvoy) static_resources; }
   );
 
-  # Cluster and system names differ by design (chart keys groups, the module
-  # keys systems) and endpoints are hostnames vs. a headless Service.
-  normalize = pkgs.writeText "normalize.jq" ''
-    def names: {"x86_64-linux": "x86", "aarch64-linux": "arm"};
-    def ren: . as $n | (names[$n] // $n);
-    # SDS resource files: a ConfigMap path in the chart, a store path in NixOS.
-    def sds: walk(if type == "object" and has("path_config_source") then .path_config_source.path = "X" else . end);
-    # The chart's admin stays on loopback behind a stats listener.
-    .static_resources | sds
-    | .listeners |= map(select(.name != "stats"))
-    | .clusters |= (map(select(.name != "admin")) | map(.name |= ren
-                        | if has("load_assignment") then
-                            .load_assignment.cluster_name |= ren
-                            | .load_assignment.endpoints[0].lb_endpoints |= map(.endpoint.address.socket_address.address = "X" | .endpoint.address.socket_address |= del(.ipv4_compat))
-                          else . end
-                        | del(.dns_lookup_family))
-                    | sort_by(.name))
-    | .listeners[0].address.socket_address |= (del(.ipv4_compat) | .address = "X")
-    | .listeners[0].filter_chains[0].filters[0].typed_config.route_config.virtual_hosts[0].routes |= map(if has("route") then .route.cluster |= ren else . end)
-  '';
 in
 pkgs.runCommand "nix-grpc-farm-helm-check"
   {
     nativeBuildInputs = [
       pkgs.kubernetes-helm
-      pkgs.yq-go
-      pkgs.jq
+      (pkgs.python3.withPackages (ps: [
+        ps.pytest
+        ps.pyyaml
+      ]))
     ];
+    HELM_RENDERS = "renders";
   }
   ''
     cp -r ${chart} chart && chmod -R u+w chart
-    for v in ${toString allValuesFiles}; do
-      helm lint --strict chart -f "$v"
-      helm template t chart -f "$v" --api-versions monitoring.coreos.com/v1/PodMonitor | yq -e '.kind' > /dev/null
-    done
-    helm template t chart -f ${valuesFile} --api-versions monitoring.coreos.com/v1/PodMonitor > out.yaml
-
-    yq -r 'select(.kind == "ConfigMap" and .metadata.name == "t-nix-grpc-farm-lb") | .data."envoy.json"' out.yaml \
-      | jq -S -f ${normalize} > chart.json
-    jq -S -f ${normalize} < ${nixosJson} > nixos.json
-    if ! diff -u nixos.json chart.json; then
-      echo "envoy config from the chart drifted from nixos/lb.nix" >&2
-      exit 1
-    fi
-    jq -e '[.clusters[] | select(.name == "sched") | .common_lb_config.healthy_panic_threshold.value] == [0]' chart.json
-
-    # Default placement: workers spread, scheduler replicas on distinct nodes.
-    pick() { yq "select(.kind == \"$1\" and .metadata.name == \"$2\") | $3" "$4"; }
-    # Not `| grep -q`: grep exits at its first match, and yq, if still
-    # writing, dies of SIGPIPE, which fails the pipeline (pipefail).
-    test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.topologySpreadConstraints[0].topologyKey' out.yaml)" = kubernetes.io/hostname
-    test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.topologySpreadConstraints[0].whenUnsatisfiable' out.yaml)" = ScheduleAnyway
-    test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.topologySpreadConstraints[0].nodeTaintsPolicy' out.yaml)" = Honor
-    test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.topologySpreadConstraints[0].matchLabelKeys[0]' out.yaml)" = pod-template-hash
-    test "$(pick Deployment t-nix-grpc-farm-worker-arm '.spec.template.spec.topologySpreadConstraints[0].whenUnsatisfiable' out.yaml)" = DoNotSchedule
-    test "$(pick Deployment t-nix-grpc-farm-scheduler-0 '.spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].topologyKey' out.yaml)" = kubernetes.io/hostname
-
-    test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.runtimeClassName' out.yaml)" = null
-    helm template t chart -f ${valuesFile} --set sandbox.runtimeClassName=cgroup-writable --api-versions monitoring.coreos.com/v1/PodMonitor > rc.yaml
-    test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.runtimeClassName' rc.yaml)" = cgroup-writable
-
-    # cert-manager mode: chart-named Secrets everywhere, worker cert covers every scheduler Service.
-    helm template t chart -f ${json.generate "values.json" valuesCertManager} > cm.yaml
-    helm template t chart -f ${json.generate "values.json" valuesInCluster} --api-versions monitoring.coreos.com/v1/PodMonitor > in-cluster.yaml
-    # The worker must not remain Ready after its separate nix-daemon container dies.
-    for f in out.yaml cm.yaml in-cluster.yaml; do
-      test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.containers[] | select(.name == "nix-grpc-daemon") | .readinessProbe.exec.command | join(" ")' "$f")" = 'nix store info --store daemon'
-    done
-    for n in t-nix-grpc-farm-scheduler-0.default.svc t-nix-grpc-farm-scheduler-1.default.svc t-nix-grpc-farm.default.svc; do
-      pick Certificate t-nix-grpc-farm-worker '.spec.dnsNames[]' cm.yaml | grep -x "$n" > /dev/null
-    done
-    test "$(pick Certificate t-nix-grpc-farm-lb '.spec.commonName' cm.yaml)" = lb
-    test "$(pick Service t-nix-grpc-farm '.spec.ports[0].appProtocol' cm.yaml)" = kubernetes.io/h2c
-    test "$(pick Service t-nix-grpc-farm '.spec.ports[0].appProtocol' out.yaml)" = null
-    test "$(pick Deployment t-nix-grpc-farm-scheduler-0 '.spec.template.spec.volumes[] | select(.name == "tls") | .secret.secretName' cm.yaml)" = t-nix-grpc-farm-worker-tls
-    grep -q "kind: VMPodScrape" cm.yaml
-    ! grep -q "kind: PodMonitor" cm.yaml
-
-    # A public certificate faces clients, the farm-CA one still faces the nodes.
-    envoyCerts() { yq -r 'select(.kind == "ConfigMap" and .metadata.name == "t-nix-grpc-farm-lb") | .data."envoy.json"' "$1" \
-      | jq -c '[.static_resources.listeners[0].filter_chains[-1].transport_socket.typed_config.common_tls_context.tls_certificate_sds_secret_configs[0].name, ([.static_resources.clusters[] | select(.name != "admin") | .transport_socket.typed_config.common_tls_context.tls_certificate_sds_secret_configs[0].name] | unique)]'; }
-    test "$(envoyCerts out.yaml)" = '["lb",["lb"]]'
-    ! grep -q "name: t-nix-grpc-farm-public" cm.yaml
-    helm template t chart -f ${json.generate "values.json" valuesPublicCertManager} > public-cm.yaml
-    test "$(envoyCerts public-cm.yaml)" = '["public",["lb"]]'
-    test "$(pick Certificate t-nix-grpc-farm-public '.spec.issuerRef.name' public-cm.yaml)" = letsencrypt
-    test "$(pick Certificate t-nix-grpc-farm-public '.spec.dnsNames[0]' public-cm.yaml)" = farm.example.com
-    test "$(pick Deployment t-nix-grpc-farm-lb '.spec.template.spec.volumes[] | select(.name == "tls-public") | .secret.secretName' public-cm.yaml)" = t-nix-grpc-farm-public-tls
-    helm template t chart -f ${json.generate "values.json" valuesPublicSecret} --api-versions monitoring.coreos.com/v1/PodMonitor > public-secret.yaml
-    test "$(envoyCerts public-secret.yaml)" = '["public",["lb"]]'
-    test "$(pick Deployment t-nix-grpc-farm-lb '.spec.template.spec.volumes[] | select(.name == "tls-public") | .secret.secretName' public-secret.yaml)" = public
-
-    # External scheduler: no scheduler or balancer of our own, workers on a node port.
-    helm template t chart -f ${json.generate "values.json" valuesExternal} --api-versions monitoring.coreos.com/v1/PodMonitor > ext.yaml
-    test "$(yq ea '[select(.kind == "Deployment") | .metadata.name] | sort | join(" ")' ext.yaml)" = 't-nix-grpc-farm-worker-arm t-nix-grpc-farm-worker-x86'
-    ! grep -q 't-nix-grpc-farm-lb' ext.yaml
-    daemon() { pick Deployment "t-nix-grpc-farm-worker-$1" ".spec.template.spec.containers[] | select(.name == \"nix-grpc-daemon\") | $2" ext.yaml; }
-    daemon x86 '.args[]' | grep -x -- --scheduler=farm.example.com:50051 > /dev/null
-    test "$(daemon x86 '.ports[] | select(.name == "grpc") | .hostPort')" = 50052
-    test "$(daemon x86 '.command[0]')" = /bin/sh
-    test "$(daemon x86 '.ports[] | select(.name == "metrics") | .hostPort')" = 9465
-    test "$(daemon arm '.ports[] | select(.name == "metrics") | .hostPort')" = null
-    # The case script must pick each node's address and refuse unknown nodes.
-    script=$(daemon x86 '.command[2]')
-    for n in n1:10.0.0.1 n2:10.0.0.2 n3:; do
-      got=$(NODE_NAME=''${n%%:*} sh -c "''${script/exec \/bin\/nix-grpc-daemon/echo}" sh 2>&1 || true)
-      if [ -n "''${n#*:}" ]; then
-        test "$got" = "--advertise=''${n#*:}:50052"
-      else
-        echo "$got" | grep -q 'no advertise address'
-      fi
-    done
-    test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values | join(",")' ext.yaml)" = n1,n2
-    # A second pod cannot take the port on the same node, so no surge.
-    test "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.strategy.rollingUpdate.maxSurge' ext.yaml)" = 0
-    # Without a map the node's InternalIP is the address.
-    daemon arm '.args[]' | grep -x -- '--advertise=$(HOST_IP):50052' > /dev/null
-    test "$(daemon arm '.command[0]')" = /bin/nix-grpc-daemon
-
-    # Extra volumes reach the pod and the nix-daemon container only, in every group.
-    helm template t chart -f ${json.generate "values.json" valuesExtraVolumes} --api-versions monitoring.coreos.com/v1/PodMonitor > extra.yaml
-    for g in x86 arm; do
-      test "$(pick Deployment t-nix-grpc-farm-worker-$g '.spec.template.spec.volumes[] | select(.name == "nix-secrets") | .secret.secretName' extra.yaml)" = nix-github
-      test "$(pick Deployment t-nix-grpc-farm-worker-$g '.spec.template.spec.containers[] | select(.name == "nix-daemon") | .volumeMounts[] | select(.name == "nix-secrets") | .mountPath' extra.yaml)" = /etc/nix/secrets
-      test -z "$(pick Deployment t-nix-grpc-farm-worker-$g '.spec.template.spec.containers[] | select(.name != "nix-daemon") | .volumeMounts[] | select(.name == "nix-secrets") | .name' extra.yaml)"
-    done
-    test -z "$(pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.spec.volumes[] | select(.name == "nix-secrets") | .name' out.yaml)"
-
-    # The CA secret also holds the CA key under cert-manager: mount only ca.crt.
-    for f in out.yaml cm.yaml; do
-      for d in t-nix-grpc-farm-worker-x86 t-nix-grpc-farm-scheduler-0 t-nix-grpc-farm-lb; do
-        test "$(pick Deployment $d '.spec.template.spec.volumes[] | select(.secret.secretName == "ca" or .secret.secretName == "t-nix-grpc-farm-ca") | .secret.items | to_json(0)' "$f")" = '[{"key":"ca.crt","path":"ca.crt"}]'
-      done
-    done
-
-    # Admin on loopback, only /ready and /stats/prometheus reachable.
-    envoy() { yq -r 'select(.kind == "ConfigMap" and .metadata.name == "t-nix-grpc-farm-lb") | .data."envoy.json"' "$1"; }
-    envoy out.yaml | jq -e '.admin.address.socket_address.address == "127.0.0.1"'
-    envoy out.yaml | jq -e '[.static_resources.listeners[] | select(.name == "stats") | .. | .path? // empty] == ["/ready", "/stats/prometheus"]'
-
-    # Upstream names are verified, and long streams are not capped at 1024.
-    envoy out.yaml | jq -e '[.static_resources.clusters[] | select(.name != "admin") | .transport_socket.typed_config.common_tls_context.combined_validation_context.default_validation_context.match_typed_subject_alt_names[0].matcher.exact] | unique == ["worker"]'
-    envoy out.yaml | jq -e '[.static_resources.clusters[] | select(.name != "admin") | .circuit_breakers.thresholds[0].max_requests] | unique == [1000000]'
-
-    # A rollout's surge pod gets Ready while the old one leads, and may share its node.
-    test "$(pick Deployment t-nix-grpc-farm-scheduler-0 '.spec.template.spec.containers[0].readinessProbe.grpc.service' in-cluster.yaml)" = null
-    test "$(pick Deployment t-nix-grpc-farm-scheduler-1 '.spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].labelSelector.matchExpressions[0].values[0]' out.yaml)" = 1
-
-    # Builders dial the .svc name, which the public certificate lacks.
-    envoy public-cm.yaml | jq -e '.static_resources.listeners[0].filter_chains[0] | (.filter_chain_match.server_names | index("t-nix-grpc-farm.default.svc")) and .transport_socket.typed_config.common_tls_context.tls_certificate_sds_secret_configs[0].name == "lb"'
-
-    # Worker settings that must reach nix-daemon, and a changed cache must roll workers.
-    pick ConfigMap t-nix-grpc-farm-worker-x86 '.data."farm.conf"' out.yaml | grep -x 'build-dir = /build' > /dev/null
-    helm template t chart -f ${valuesFile} --set 'upstreamCaches.urls={https://other}' --api-versions monitoring.coreos.com/v1/PodMonitor > caches.yaml
-    sum() { pick Deployment t-nix-grpc-farm-worker-x86 '.spec.template.metadata.annotations."checksum/config"' "$1"; }
-    test "$(sum out.yaml)" != "$(sum caches.yaml)"
-
+    mkdir renders
+    ${lib.concatStrings (lib.mapAttrsToList render renders)}
+    cp ${nixosJson} renders/envoy-nixos.json
+    pytest -vv -p no:cacheprovider ${./helm_test.py}
     touch $out
   ''
