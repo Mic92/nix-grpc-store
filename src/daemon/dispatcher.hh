@@ -82,8 +82,8 @@ public:
     struct Worker
     {
         WorkerSend send;
-        std::function<void()> abort; // ends the stream when a newer session replaces it
-        std::optional<sched::WorkerId> id; // under Dispatcher::mutex; reset when replaced
+        std::function<void()> abort; // ends the stream once the dispatcher dropped the session
+        std::optional<sched::WorkerId> id; // under Dispatcher::mutex; set while `workers` has it
     };
 
     // Throws on protocol violations; the caller closes the stream.
@@ -189,6 +189,8 @@ private:
     void statsLoop();
     // Run dispatch and deliver Expect (first) and Assigned.
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void dispatchLocked();
+    // True if it dropped a worker, whose derivations are then queued again.
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto dispatchOnceLocked() -> bool;
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void membershipChangedLocked();
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void wakeWatchersLocked();
     // Per-system gauges. O(entries), so at most once a second unless forced.
@@ -201,6 +203,7 @@ private:
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto unplaceableMsg(const sched::Entry & ent) const -> nix::remote::SchedMsg;
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void supersede(sched::DrvId drv, sched::WorkerId loser);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onDone(sched::WorkerId wid, const nix::remote::Done & done);
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void untrackLocked(sched::WorkerId wid);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onHello(Worker & worker, const nix::remote::Hello & hel);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onWant(Client & client, const nix::remote::Want & want, bool cached);

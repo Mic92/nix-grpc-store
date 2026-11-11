@@ -244,6 +244,16 @@ auto Dispatcher::lookup(const nix::remote::ClientMsgs & msgs) const -> std::vect
 
 void Dispatcher::dispatchLocked()
 {
+    // A dropped worker's derivations are queued again, so go round once more.
+    // Each round with a drop has one worker fewer.
+    while (dispatchOnceLocked()) {
+    }
+    exportStats(false);
+}
+
+auto Dispatcher::dispatchOnceLocked() -> bool
+{
+    bool dropped = false;
     std::vector<sched::Assign> out;
     core.dispatch(out);
     for (auto const & asg : out) {
@@ -257,10 +267,11 @@ void Dispatcher::dispatchLocked()
         cmd.mutable_expect()->set_assign_id(asg.assignId);
         auto const wit = workers.find(asg.worker);
         if (wit == workers.end() || !wit->second->send(cmd)) {
-            // Worker stream died under us; requeue and let the next event retry.
+            // Worker stream died under us.
+            dropped = true;
             core.workerGone(asg.worker);
             membershipChangedLocked();
-            workers.erase(asg.worker);
+            untrackLocked(asg.worker);
             metrics.event("expect_undeliverable");
             placeabilityChangedLocked();
             continue;
@@ -274,7 +285,7 @@ void Dispatcher::dispatchLocked()
              {"worker", wkr.addr},
              {"clients", std::to_string(asg.clients.size())}});
     }
-    exportStats(false);
+    return dropped;
 }
 
 void Dispatcher::exportStats(bool force)
@@ -619,11 +630,7 @@ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
     }
     auto const wid = core.workerId(hel.addr());
     if (auto const old = workers.find(wid); old != workers.end() && old->second != &worker) {
-        // A half-open older session must not take the new one down when it finally closes.
-        old->second->id.reset();
-        if (old->second->abort) {
-            afterUnlock(old->second->abort);
-        }
+        untrackLocked(wid);
     }
     std::vector<sched::Core::Superseded> superseded;
     worker.id = core.hello(
@@ -646,6 +653,22 @@ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
          {"systems", nix::concatStringsSep(",", core.worker(*worker.id).systems)},
          {"max_jobs", std::to_string(hel.max_jobs())},
          {"running", std::to_string(hel.running_size())}});
+}
+
+// `workers` and Worker::id name each other, so they change together. A
+// session left without an id must not take a newer one down when it closes,
+// and is ended so its worker reconnects.
+void Dispatcher::untrackLocked(sched::WorkerId wid)
+{
+    auto const iter = workers.find(wid);
+    if (iter == workers.end()) {
+        return;
+    }
+    iter->second->id.reset();
+    if (iter->second->abort) {
+        afterUnlock(iter->second->abort);
+    }
+    workers.erase(iter);
 }
 
 void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
