@@ -263,6 +263,13 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
+  test('dispatcher', executable('dispatcher-test',
+    sources : ['tests/dispatcher-test.cc'],
+    include_directories : [include_directories('src/client')],
+    dependencies : [dispatcher_dep, jemalloc_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
+
   test('sbpl', executable('sbpl-test',
     sources : ['tests/sbpl-test.cc', 'src/daemon/sbpl.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
