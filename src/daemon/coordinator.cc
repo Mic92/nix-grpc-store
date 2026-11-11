@@ -397,6 +397,7 @@ void Coordinator::restarting()
 Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics, IdleTracker & idle)
     : cache(options.niks3)
     , options(options)
+    , metrics(metrics)
 {
     if (options.builder) {
         builder.emplace(options, metrics);
@@ -462,7 +463,14 @@ void Coordinator::start(grpc::Server & server)
         const bool elect = options.niks3.enabled() && (!builder || !options.schedulerAddr.empty());
         setSchedulerActive(!elect);
         if (elect) {
-            elector.emplace(*cache.client(), [this](bool lead) -> void { setSchedulerActive(lead); });
+            // The leader gauge is sampled, so a lead that moves and moves back
+            // between two scrapes would leave no trace.
+            metrics.declareEvent("scheduler_take_over");
+            metrics.declareEvent("scheduler_yield");
+            elector.emplace(*cache.client(), [this](bool lead) -> void {
+                metrics.event(lead ? "scheduler_take_over" : "scheduler_yield");
+                setSchedulerActive(lead);
+            });
         }
     }
     if (!builder) {

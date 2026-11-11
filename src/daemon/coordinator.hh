@@ -212,6 +212,7 @@ public:
 
 private:
     const Options & options;
+    Metrics & metrics;
     std::jthread sessionThread; // remote WorkerSession client
     std::optional<Elector> elector;
     grpc::HealthCheckServiceInterface * health = nullptr;

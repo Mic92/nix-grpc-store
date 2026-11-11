@@ -167,6 +167,11 @@ public:
     {
         events->Add({{"kind", kind}}).Increment();
     }
+    // Exports the series at 0, so increase() sees its first event.
+    void declareEvent(const std::string & kind)
+    {
+        events->Add({{"kind", kind}});
+    }
     void buildFailure(std::string_view reason)
     {
         buildFailures->Add({{"reason", std::string(reason)}}).Increment();
