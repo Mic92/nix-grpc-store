@@ -105,7 +105,11 @@ void Dispatcher::lookupLoop()
         }
         // Inline, the reactor closes the stream on a throw. Here only this client fails.
         try {
-            applyClientMsgs(*job.client, job.msgs, lookup(job.msgs));
+            auto const startMs = nowMs();
+            metrics.lookupStage("queued", (startMs - job.sinceMs) / msPerSecond);
+            auto const cached = lookup(job.msgs);
+            metrics.lookupStage("cache", (nowMs() - startMs) / msPerSecond);
+            applyClientMsgs(*job.client, job.msgs, cached);
         } catch (std::exception & err) {
             logLine(LogLevel::info, {{"event", "client_failed"}, {"client", std::to_string(job.client->id)}, {"error", err.what()}});
                     const Lock lock(*this);
@@ -537,7 +541,7 @@ void Dispatcher::clientMsgs(const ClientPtr & client, const nix::remote::ClientM
         });
     if (needs && !lookupThreads.empty()) {
         const absl::MutexLock lock(lookupMutex);
-        lookupQueue.push_back({.client = client, .msgs = msgs});
+        lookupQueue.push_back({.client = client, .msgs = msgs, .sinceMs = nowMs()});
         return;
     }
     applyClientMsgs(*client, msgs, lookup(msgs));

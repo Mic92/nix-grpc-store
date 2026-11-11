@@ -168,6 +168,7 @@ private:
     {
         ClientPtr client;
         nix::remote::ClientMsgs msgs;
+        double sinceMs = 0;
     };
 
     absl::Mutex lookupMutex ABSL_ACQUIRED_AFTER(mutex);
