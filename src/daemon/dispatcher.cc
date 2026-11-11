@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -139,6 +140,62 @@ Dispatcher::Lock::~Lock()
 void Dispatcher::afterUnlock(std::function<void()> func)
 {
     deferred.push_back(std::move(func));
+}
+
+auto Dispatcher::loopbackWorker(std::function<void(const nix::remote::SchedCmd &)> deliver) -> std::shared_ptr<Worker>
+{
+    // Commands are queued under the dispatcher mutex, which fixes their
+    // order, and delivered outside it, since what the worker answers takes it
+    // again. Several threads may come to deliver; one at a time does.
+    struct Inbox
+    {
+        std::function<void(const nix::remote::SchedCmd &)> deliver;
+        absl::Mutex mutex;
+        std::deque<nix::remote::SchedCmd> queue ABSL_GUARDED_BY(mutex);
+        bool delivering ABSL_GUARDED_BY(mutex) = false;
+
+        void drain()
+        {
+            {
+                const absl::MutexLock lock(mutex);
+                if (delivering) {
+                    return;
+                }
+                delivering = true;
+            }
+            for (;;) {
+                nix::remote::SchedCmd cmd;
+                {
+                    const absl::MutexLock lock(mutex);
+                    if (queue.empty()) {
+                        delivering = false;
+                        return;
+                    }
+                    cmd = std::move(queue.front());
+                    queue.pop_front();
+                }
+                try {
+                    deliver(cmd);
+                } catch (...) {
+                    const absl::MutexLock lock(mutex);
+                    delivering = false;
+                    throw;
+                }
+            }
+        }
+    };
+    auto const inbox = std::make_shared<Inbox>(std::move(deliver));
+    return std::make_shared<Worker>(Worker{
+        .send = [this, inbox](const nix::remote::SchedCmd & cmd) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) -> bool {
+            {
+                const absl::MutexLock lock(inbox->mutex);
+                inbox->queue.push_back(cmd);
+            }
+            afterUnlock([inbox] -> void { inbox->drain(); });
+            return true;
+        },
+        .abort = {},
+        .id = {}});
 }
 
 auto Dispatcher::membership() const -> std::shared_ptr<const Membership>

@@ -419,18 +419,13 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
         eds = std::make_unique<EdsService>(*dispatcher, auth, idle);
     }
     if (builder && dispatcher && options.schedulerAddr.empty()) {
-        // In-process worker: the Dispatcher calls straight into the Builder.
-        auto const worker =
-            std::make_shared<Dispatcher::Worker>(Dispatcher::Worker{.send = [this](const SchedCmd & cmd) -> bool {
-                // Called under the dispatcher mutex; Builder takes only its own lock.
-                if (cmd.has_expect()) {
-                    builder->onExpect(cmd.expect());
-                } else if (cmd.has_revoke()) {
-                    // Revoke answers with Done, which re-enters the dispatcher: defer.
-                    std::thread([this, rev = cmd.revoke()] -> void { builder->onRevoke(rev); }).detach();
-                }
-                return true;
-            }});
+        auto const worker = dispatcher->loopbackWorker([this](const SchedCmd & cmd) -> void {
+            if (cmd.has_expect()) {
+                builder->onExpect(cmd.expect());
+            } else if (cmd.has_revoke()) {
+                builder->onRevoke(cmd.revoke());
+            }
+        });
         builder->setSend([this, worker](const WorkerMsg & msg) -> bool {
             WorkerMsgs one;
             *one.add_msgs() = msg;
