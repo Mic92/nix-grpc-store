@@ -70,6 +70,10 @@
   "--max-jobs"
   (toString cfg.maxJobs)
 ]
+++ lib.optionals (cfg.lookupThreads != null) [
+  "--lookup-threads"
+  (toString cfg.lookupThreads)
+]
 ++ lib.optionals (cfg.scheduler != null) [
   "--scheduler"
   cfg.scheduler
