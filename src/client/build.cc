@@ -502,6 +502,7 @@ struct GrpcStore::Run {
         break;
       }
       case Outcome::unplaceable:
+      case Outcome::gaveUp:
         // nix reports only the top-level result. Say why a leaf failed.
         printError("%s: %s", job.drvPath.to_string(), done->message);
         [[fallthrough]];
