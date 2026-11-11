@@ -1,4 +1,5 @@
-// Acl::roleFor over every way the daemon can be configured.
+// Acl::roleFor over every way the daemon can be configured, and rules on
+// the CN and the SPIFFE ID.
 
 #include <array>
 #include <cassert>
@@ -6,12 +7,15 @@
 #include <iostream>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "acl.hh"
+#include "peer.hh"
 
 namespace {
 
 using nixgrpc::Acl;
+using nixgrpc::Peer;
 using nixgrpc::Role;
 
 struct Config
@@ -47,7 +51,7 @@ struct Row
     std::optional<Role> role;
 };
 
-void run()
+void configurations()
 {
     auto const rows = std::to_array<Row>({
     // No authentication configured: everyone is one anonymous caller.
@@ -65,7 +69,47 @@ void run()
     {.cfg = {.authenticates = true, .rule = "*=read-only"}, .cn = std::nullopt, .role = std::nullopt},
     });
     for (const auto & row : rows) {
-        assert(acl(row.cfg).roleFor(row.cn) == row.role);
+        assert(acl(row.cfg).roleFor(Peer{.commonName = row.cn}) == row.role);
+    }
+}
+
+auto svid(std::string spiffeId) -> Peer
+{
+    return {.commonName = "", .spiffeId = std::move(spiffeId)};
+}
+
+void spiffeRules()
+{
+    Acl acl;
+    assert(acl.roleFor(Peer{}) == Role::write);
+    acl.addRule("spiffe://nt.example/farm/client/*=trusted");
+    acl.addRule("spiffe://nt.example/mirror=read-only");
+    acl.addRule("ci-*=write");
+
+    assert(acl.roleFor(Peer{}) == std::nullopt);
+    assert(acl.roleFor(Peer{.commonName = "ci-1"}) == Role::write);
+    assert(acl.roleFor(svid("spiffe://nt.example/farm/client/bld1")) == Role::trusted);
+    assert(acl.roleFor(svid("spiffe://nt.example/mirror")) == Role::readOnly);
+    // '*' is one path segment: neither deeper nor another trust domain.
+    assert(acl.roleFor(svid("spiffe://nt.example/farm/client/a/b")) == std::nullopt);
+    assert(acl.roleFor(svid("spiffe://other.example/farm/client/bld1")) == std::nullopt);
+    assert(acl.roleFor(svid("spiffe://nt.example.evil.example/farm/client/bld1")) == std::nullopt);
+    // Each kind of rule reads its own field only.
+    assert(acl.roleFor(Peer{.commonName = "spiffe://nt.example/farm/client/bld1"}) == std::nullopt);
+    assert(acl.roleFor(Peer{.commonName = "x", .spiffeId = "ci-1"}) == std::nullopt);
+    assert(acl.roleFor(svid(std::string("spiffe://nt.example/mirror") + '\0' + "x")) == std::nullopt);
+
+    // The log name is the field the rule read.
+    auto const both = Peer{.commonName = "ci-1", .spiffeId = "spiffe://nt.example/farm/client/bld1"};
+    assert(acl.accessFor(both).name == "spiffe://nt.example/farm/client/bld1");
+    assert(acl.accessFor(Peer{.commonName = "ci-1", .spiffeId = "spiffe://nt.example/x"}).name == "ci-1");
+    assert(acl.accessFor(svid("spiffe://nt.example/x")).name == "spiffe://nt.example/x");
+
+    {
+        Acl domain;
+        domain.addRule("spiffe://*/farm=write");
+        assert(domain.roleFor(svid("spiffe://a.example/farm")) == Role::write);
+        assert(domain.roleFor(svid("spiffe://a.example/x/farm")) == std::nullopt);
     }
 }
 
@@ -74,7 +118,8 @@ void run()
 auto main() -> int
 {
     try {
-        run();
+        configurations();
+        spiffeRules();
     } catch (std::exception & err) {
         std::cerr << "error: " << err.what() << "\n";
         return 1;
