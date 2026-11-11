@@ -39,6 +39,26 @@ constexpr double msPerSecond = 1000;
 // A client whose stream broke reconnects within its backoff and Wants its
 // assigned drvs again. Until then their builds keep running.
 constexpr double orphanGraceMs = 10'000;
+
+// What a give-back says about its worker, for this drv.
+auto passOver(const nix::remote::Done & done) -> sched::PassOver
+{
+    using nix::remote::Done;
+    if (done.outcome() == Done::NO_SHOW) {
+        return sched::PassOver::untilNextGiveBack;
+    }
+    switch (done.reason()) {
+    case Done::DRAINING: // the worker's state: its next Load or Hello says
+        return sched::PassOver::untilLoad;
+    case Done::UNREACHABLE: // no client came
+        return sched::PassOver::untilNextGiveBack;
+    case Done::INPUT_UNAVAILABLE:   // the client repairs the cache
+    case Done::PUBLISH_UNAVAILABLE: // built, the giver republishes
+        return sched::PassOver::never;
+    default: // TRANSIENT_FAILURE (disk full) or unknown
+        return sched::PassOver::always;
+    }
+}
 } // namespace
 
 Dispatcher::Dispatcher(Config config_, Metrics & metrics)
@@ -652,7 +672,7 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
 {
     metrics.event("done_" + nix::remote::Done::Outcome_Name(done.outcome()));
     if (done.outcome() == nix::remote::Done::GIVEN_BACK || done.outcome() == nix::remote::Done::NO_SHOW) {
-        core.giveBack(wid, done.drv_path());
+        core.giveBack(wid, done.drv_path(), passOver(done));
         metrics.event("given_back_" + nix::remote::Done::Reason_Name(done.reason()));
         placeabilityChangedLocked(); // its followers may have no worker left
         return;

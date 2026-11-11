@@ -15,6 +15,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -283,6 +284,9 @@ struct Assign
     std::vector<ClientId> clients;
 };
 
+// How long a give-back passes its worker over for the drv.
+enum class PassOver : std::uint8_t { never, untilNextGiveBack, untilLoad, always };
+
 struct Entry
 {
     std::string drvPath;
@@ -295,7 +299,9 @@ struct Entry
     double enqMs = 0;
     double cpHint = 0;
     bool unplaceable = false; // as last told to the followers
-    WorkerId avoid = noWorker; // gave it back; used only if no other worker can run it
+    std::vector<WorkerId> avoid;         // passed over for it, latest giver last; see passedOver()
+    PassOver lastFor = PassOver::always; // for avoid.back(); never: the last giver is not in avoid
+    uint32_t lastEpoch = 0;              // its worker's epoch, for PassOver::untilLoad
 };
 
 struct Worker
@@ -306,6 +312,7 @@ struct Worker
     int32_t maxJobs = 0;
     bool up = false;
     bool draining = false;
+    uint32_t epoch = 0; // counts its Loads and Hellos
     std::vector<DrvId> running;
 
     // A worker that says Hello with max_jobs 0 is up but runs nothing.
@@ -523,6 +530,7 @@ public:
         }
         auto & wkr = workers.at(wid);
         wkr.up = true;
+        wkr.epoch++;
         workersUp_++;
         wkr.draining = false;
         wkr.systems = info.systems;
@@ -575,8 +583,9 @@ public:
         }
     }
 
-    // The worker can't run it after all: place it elsewhere.
-    void giveBack(WorkerId wid, std::string_view drvPath)
+    // The worker can't run it after all: place it elsewhere, passing the
+    // worker over as long as `pass` says.
+    void giveBack(WorkerId wid, std::string_view drvPath, PassOver pass = PassOver::always)
     {
         auto found = findDrv(drvPath);
         if (!found) {
@@ -589,7 +598,17 @@ public:
             return;
         }
         slot->worker = noWorker;
-        slot->avoid = wid;
+        if (slot->lastFor == PassOver::untilNextGiveBack || slot->lastFor == PassOver::untilLoad) {
+            slot->avoid.pop_back();
+        }
+        // An earlier give-back for the drv itself still holds.
+        bool const known = std::ranges::contains(slot->avoid, wid);
+        if (known || pass != PassOver::never) {
+            std::erase(slot->avoid, wid);
+            slot->avoid.push_back(wid);
+        }
+        slot->lastFor = known ? PassOver::always : pass;
+        slot->lastEpoch = workers.at(wid).epoch;
         if (slot->followers.empty()) {
             retire(*found);
         } else {
@@ -600,6 +619,7 @@ public:
     void setDraining(WorkerId wid, bool draining)
     {
         workers.at(wid).draining = draining;
+        workers.at(wid).epoch++;
         refreshFree(wid);
     }
 
@@ -921,55 +941,64 @@ private:
                   });
     }
 
-    // Most free among workers offering system and features. O(1) without
-    // features, O(workers) with.
-    [[nodiscard]] auto emptiestFor(const Entry & ent) const -> std::optional<WorkerId>
+    // Every worker its give-backs still pass over, while one they do not can
+    // run it now; else the last giver, if still passed over, while another
+    // worker could; else nobody.
+    [[nodiscard]] auto passedOver(const Entry & ent) const -> std::span<const WorkerId>
+    {
+        std::span<const WorkerId> passed = ent.avoid;
+        bool last = !passed.empty() && ent.lastFor != PassOver::never;
+        if (last && ent.lastFor == PassOver::untilLoad && workers.at(passed.back()).epoch != ent.lastEpoch) {
+            passed = passed.first(passed.size() - 1); // it said Load or Hello since
+            last = false;
+        }
+        auto const another = [&](bool now) -> bool {
+            for (WorkerId wid = 0; wid < workers.size(); wid++) {
+                bool const can = now ? freeOf(wid) > 0 : workers.at(wid).takesWork();
+                if (can && offers(workers.at(wid), ent) && !std::ranges::contains(passed, wid)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (passed.empty() || another(true)) {
+            return passed;
+        }
+        passed = passed.last(last ? 1 : 0);
+        return another(false) ? passed : passed.first(0);
+    }
+
+    // A free slot means it takes work (refreshFree).
+    [[nodiscard]] auto runsNow(const Entry & ent, std::span<const WorkerId> passed, WorkerId wid) const -> bool
+    {
+        return wid < workers.size() && freeOf(wid) > 0 && offers(workers.at(wid), ent) && !std::ranges::contains(passed, wid);
+    }
+
+    // Most free that runs it now. O(1) without features or anyone passed
+    // over, O(workers) with.
+    [[nodiscard]] auto emptiestFor(const Entry & ent, std::span<const WorkerId> passed) const
+        -> std::optional<WorkerId>
     {
         auto const iter = systems.find(ent.system);
         if (iter == systems.end()) {
             return std::nullopt;
         }
-        const auto & fidx = iter->second.free;
-        if (ent.features.empty()) {
-            return fidx.emptiest();
+        if (ent.features.empty() && passed.empty()) {
+            return iter->second.free.emptiest();
         }
         std::optional<WorkerId> best;
         for (WorkerId wid = 0; wid < workers.size(); wid++) {
-            if (workers.at(wid).up && fidx.get(wid) > 0 && offers(workers.at(wid), ent)
-                && (!best || fidx.get(wid) > fidx.get(*best))) {
+            if (runsNow(ent, passed, wid) && (!best || freeOf(wid) > freeOf(*best))) {
                 best = wid;
             }
         }
         return best;
     }
 
-    // The worker it was given back by, if nobody else can run it.
-    [[nodiscard]] auto avoiding(const Entry & ent) const -> std::optional<WorkerId>
-    {
-        std::optional<WorkerId> best;
-        bool others = false;
-        for (WorkerId wid = 0; wid < workers.size(); wid++) {
-            const auto & wkr = workers.at(wid);
-            if (wid == ent.avoid || !wkr.takesWork() || !offers(wkr, ent)) {
-                continue;
-            }
-            others = true;
-            if (freeOf(wid) > 0 && (!best || freeOf(wid) > freeOf(*best))) {
-                best = wid;
-            }
-        }
-        if (best || others) {
-            return best;
-        }
-        return ent.avoid;
-    }
-
     [[nodiscard]] auto pick(const Entry & ent) const -> std::optional<WorkerId>
     {
-        auto best = emptiestFor(ent);
-        if (best && *best == ent.avoid) {
-            best = avoiding(ent);
-        }
+        auto const passed = passedOver(ent);
+        auto const best = emptiestFor(ent, passed);
         if (!best) {
             return std::nullopt;
         }
@@ -984,8 +1013,7 @@ private:
                 continue;
             }
             auto [wid, size] = iter->second;
-            if (wid >= workers.size() || wid == ent.avoid || !workers.at(wid).up || freeOf(wid) <= 0
-                || !offers(workers.at(wid), ent)) {
+            if (!runsNow(ent, passed, wid)) {
                 continue;
             }
             auto const cand = std::ranges::find_if(cands, [&](auto & cnd) -> bool { return cnd.first == wid; });
