@@ -30,14 +30,15 @@ namespace nixgrpc {
 // cancelled for nothing.
 class Call
 {
-  grpc::ClientContext context;
-  // After context: destroyed first, so the callback never sees a dead context.
+  // Shared with the callback: Nix calls it from a copy, outside its lock,
+  // so it can still run after this Call unregistered it.
+  std::shared_ptr<grpc::ClientContext> context = std::make_shared<grpc::ClientContext>();
   std::unique_ptr<nix::InterruptCallback> onInterrupt;
 
 public:
   // Registers before checking: a signal between the two would be lost.
   Call()
-    : onInterrupt(nix::createInterruptCallback([this] -> void { context.TryCancel(); }))
+    : onInterrupt(nix::createInterruptCallback([context = context] -> void { context->TryCancel(); }))
   {
     nix::checkInterrupt();
   }
@@ -48,7 +49,7 @@ public:
   auto operator=(Call &&) -> Call & = delete;
   ~Call() = default;
 
-  [[nodiscard]] auto ctx() -> grpc::ClientContext & { return context; }
+  [[nodiscard]] auto ctx() -> grpc::ClientContext & { return *context; }
 };
 
 // The server rejects an expired client cert during the TLS handshake, which
