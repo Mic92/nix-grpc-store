@@ -1,8 +1,10 @@
 // nixgrpc::Call against an in-process server.
 
+#include <atomic>
 #include <cassert>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/security/credentials.h>
@@ -93,12 +95,37 @@ void startingAfterInterruptThrows()
     assert(threw);
 }
 
+// Nix copies an interrupt callback under its lock and calls it outside, so
+// it can run after its Call unregistered it. Only a sanitizer sees the
+// difference.
+void interruptRacingTheEndOfACallIsHarmless()
+{
+    std::atomic<bool> stop = false;
+    std::thread interrupter([&stop] -> void {
+        while (!stop) {
+            nix::unix::triggerInterrupt();
+        }
+    });
+    constexpr int calls = 20'000;
+    for (int i = 0; i < calls; i++) {
+        try {
+            nixgrpc::Call const call;
+        } catch (nix::Interrupted &) {
+            nix::setInterrupted(false);
+        }
+    }
+    stop = true;
+    interrupter.join();
+    nix::setInterrupted(false);
+}
+
 } // namespace
 
 auto main() -> int
 try {
     interruptDuringSetupCancelsTheCall();
     startingAfterInterruptThrows();
+    interruptRacingTheEndOfACallIsHarmless();
     return 0;
 } catch (...) {
     return 1;
