@@ -232,6 +232,11 @@ auto writeConfig(const std::string & dir, const std::string & base) -> void
                   {{"bound_claims", {{"repository_owner", {"myorg"}}, {"ref", {"refs/heads/main"}}}},
                    {"scopes", {"admin"}}},
                   {{"bound_claims", {{"groups", {"readers"}}}}, {"scopes", {"read"}}}}}}},
+              // The same issuer, for clients that ask for another audience.
+              {"mirror",
+               {{"issuer", base},
+                {"audience", "mirror"},
+                {"rules", {{{"bound_subject", {"repo:myorg/*"}}, {"scopes", {"read"}}}}}}},
               {"k8s",
                {{"audience", "grpc://cache"},
                 {"bearer_token_file", dir + "/sa-token"},
@@ -256,7 +261,7 @@ auto run(const std::string & dir, const std::string & base) -> int
 
     // Issuer serves nothing yet: config loads, verifier constructs, tokens are refused.
     auto const cfg = loadConfig(dir + "/oidc.json");
-    check(cfg.providers.size() == 2, "two providers");
+    check(cfg.providers.size() == 3, "three providers, two of one issuer");
     {
         auto twice = Json::parse(nix::readFile(dir + "/oidc.json"));
         auto & providers = twice.at("providers");
@@ -268,7 +273,7 @@ auto run(const std::string & dir, const std::string & base) -> int
         } catch (nix::Error &) {
             refused = true;
         }
-        check(refused, "two providers with one issuer are refused");
+        check(refused, "two providers with one issuer and audience are refused");
     }
     Verifier verifier(cfg, std::chrono::seconds(0));
 
@@ -323,6 +328,14 @@ auto run(const std::string & dir, const std::string & base) -> int
     {
         auto res = verifier.verify(edKey.sign(good));
         check(res.identity && res.identity->role == Role::write, "EdDSA");
+    }
+    {
+        // The subject that may write with the build audience.
+        auto res = verifier.verify(ecKey.sign(claims({{"sub", "repo:myorg/a:b"}, {"aud", "mirror"}})));
+        check(res.identity && res.identity->role == Role::readOnly, "a token meets the rules of its audience only");
+        check(res.identity && res.identity->subject == "oidc:mirror:repo:myorg/a:b", "named after that provider");
+        res = verifier.verify(ecKey.sign(claims({{"sub", "repo:myorg/a:b"}, {"aud", {"mirror", "grpc://cache"}}})));
+        check(res.identity && res.identity->role == Role::write, "two audiences -> the higher role");
     }
     check(verifier.verify(ecKey.signWithoutKid(good)).identity.has_value(), "no kid: every ES256 key is tried");
     {
