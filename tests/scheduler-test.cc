@@ -259,6 +259,61 @@ void testFeatures()
     assert(out.size() == 4 && shard.entry(out[3].drv)->drvPath == "gpu.drv");
 }
 
+// A pass stops asking for a feature set once it found no worker for it.
+// That must not hide work behind it, nor a sibling of an entry that failed
+// only because it avoids the one free worker.
+void testStuckFeatureSet()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const plain = hello(shard, "plain", 1);
+    auto const kvmA = hello(shard, "kvmA", 1, {}, {"kvm"});
+    auto const kvmB = hello(shard, "kvmB", 1, {}, {"kvm"});
+    auto const wantKvm = [&](std::string_view drv, double hint) -> void {
+        shard.want(1, {.drvPath = drv, .inputs = {}, .system = "x", .features = {"kvm"}, .cpHintMs = hint}, 0);
+    };
+    wantKvm("vm1.drv", 9e9);
+    wantKvm("vm2.drv", 8e9);
+    shard.dispatch(out);
+    assert(out.size() == 2);
+    auto const holder = [&](std::string_view drv) -> WorkerId { return shard.entry(*shard.findDrv(drv))->worker; };
+
+    // Both kvm workers busy, plain free: the plain drv behind two stuck ones is placed.
+    wantKvm("vm3.drv", 7e9);
+    wantKvm("vm4.drv", 6e9);
+    shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 3 && out[2].worker == plain);
+    assert(shard.queued() == 2);
+
+    // vm1's worker gives it back, so only the giver is free: vm1 avoids it while the other kvm worker exists, vm3 behind it takes the slot.
+    auto const giver = holder("vm1.drv");
+    shard.giveBack(giver, "vm1.drv");
+    shard.dispatch(out);
+    assert(out.size() == 4);
+    assert(shard.entry(out[3].drv)->drvPath == "vm3.drv" && out[3].worker == giver);
+    assert(giver == kvmA || giver == kvmB);
+    assert(shard.queued() == 2);
+
+    // Order within the set survives the early end of those passes.
+    shard.done(holder("vm2.drv"), "vm2.drv", {});
+    shard.dispatch(out);
+    assert(out.size() == 5 && shard.entry(out[4].drv)->drvPath == "vm1.drv");
+}
+
+// Feature names come from the network: a comma in one must not make its
+// set look like another.
+void testFeatureSetsWithCommas()
+{
+    Core shard;
+    std::vector<Assign> out;
+    hello(shard, "w", 1, {}, {"a", "b"});
+    shard.want(1, {.drvPath = "odd.drv", .inputs = {}, .system = "x", .features = {"a,b"}, .cpHintMs = 9e9}, 0);
+    shard.want(1, {.drvPath = "ok.drv", .inputs = {}, .system = "x", .features = {"a", "b"}, .cpHintMs = 0}, 0);
+    shard.dispatch(out);
+    assert(out.size() == 1 && shard.entry(out[0].drv)->drvPath == "ok.drv");
+}
+
 // Stats of the testSystems fixture after its first dispatch.
 void checkStats(Core & shard)
 {
@@ -486,6 +541,8 @@ try {
     testRunningFollowsTheWorker();
     testDraining();
     testFeatures();
+    testStuckFeatureSet();
+    testFeatureSetsWithCommas();
     testSystems();
     testUnofferedSystems();
     testHelloAdoptsQueued();

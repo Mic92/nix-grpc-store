@@ -176,6 +176,56 @@ public:
     }
 };
 
+// The wait queue of one system. Counts its entries by required feature set,
+// so a dispatch pass can tell when everything left is of a set it already
+// found no worker for.
+class WaitQueue
+{
+    IndexedHeap heap;
+    absl::flat_hash_map<std::string, uint32_t> perFeatures;
+
+public:
+    [[nodiscard]] auto size() const -> size_t
+    {
+        return heap.size();
+    }
+
+    [[nodiscard]] auto top() const -> std::optional<DrvId>
+    {
+        return heap.top();
+    }
+
+    [[nodiscard]] auto topKey() const -> std::optional<double>
+    {
+        return heap.topKey();
+    }
+
+    [[nodiscard]] auto count(const std::string & features) const -> size_t
+    {
+        auto const iter = perFeatures.find(features);
+        return iter == perFeatures.end() ? 0 : iter->second;
+    }
+
+    void set(DrvId drv, double key, const std::string & features)
+    {
+        if (!heap.contains(drv)) {
+            perFeatures.try_emplace(features).first->second++;
+        }
+        heap.set(drv, key);
+    }
+
+    void erase(DrvId drv, const std::string & features)
+    {
+        if (!heap.contains(drv)) {
+            return;
+        }
+        heap.erase(drv);
+        if (auto const iter = perFeatures.find(features); iter != perFeatures.end() && --iter->second == 0) {
+            perFeatures.erase(iter);
+        }
+    }
+};
+
 // Workers bucketed by free slot count: O(1) "most free" and O(1) update.
 class FreeIndex
 {
@@ -289,6 +339,7 @@ struct Entry
     std::vector<PathKey> inputs;       // for locality only
     std::string system;
     std::vector<std::string> features; // required
+    std::string featureKey;            // featureSetKey(features); fixed while queued
     std::vector<ClientId> followers;
     WorkerId worker = noWorker;
     uint64_t assignId = 0;
@@ -422,6 +473,7 @@ public:
                 .system = std::string(info.system),
                 .features = std::move(info.features),
                 .enqMs = nowMs};
+            slot->featureKey = featureSetKey(slot->features);
             slot->inputs.reserve(info.inputs.size());
             for (auto const input : info.inputs) {
                 slot->inputs.emplace_back(input);
@@ -430,6 +482,7 @@ public:
             // Known only from a worker's Hello so far.
             slot->system = std::string(info.system);
             slot->features = std::move(info.features);
+            slot->featureKey = featureSetKey(slot->features);
         }
         // Followers of an assigned drv are told again if its worker vanishes.
         if (std::ranges::find(slot->followers, client) == slot->followers.end()) {
@@ -440,7 +493,7 @@ public:
         if (slot->worker != noWorker) {
             return {.drv = drv, .assigned = std::pair(slot->worker, slot->assignId)};
         }
-        sys(slot->system).queue.set(drv, prio(*slot));
+        enqueue(drv);
         return {.drv = drv};
     }
 
@@ -468,7 +521,7 @@ public:
         }
         if (!slot->followers.empty()) {
             if (slot->worker == noWorker) {
-                sys(slot->system).queue.set(drv, prio(*slot));
+                enqueue(drv);
             }
             return std::nullopt;
         }
@@ -547,7 +600,7 @@ public:
             }
             slot->worker = wid;
             slot->assignId = assignId;
-            sys(slot->system).queue.erase(drv);
+            sys(slot->system).queue.erase(drv, slot->featureKey);
             if (std::ranges::find(wkr.running, drv) == wkr.running.end()) {
                 wkr.running.push_back(drv);
             }
@@ -593,7 +646,7 @@ public:
         if (slot->followers.empty()) {
             retire(*found);
         } else {
-            sys(slot->system).queue.set(*found, prio(*slot));
+            enqueue(*found);
         }
     }
 
@@ -625,7 +678,7 @@ public:
             if (slot->followers.empty()) {
                 retire(drv);
             } else {
-                sys(slot->system).queue.set(drv, prio(*slot));
+                enqueue(drv);
             }
         }
     }
@@ -633,13 +686,14 @@ public:
     // Across systems, so the most urgent drv wins.
     void dispatch(std::vector<Assign> & out)
     {
-        std::vector<Skipped> skipped;
+        Pass pass;
         for (;;) {
             std::string const * best = nullptr;
             double bestKey = 0;
             for (const auto & [name, state] : systems) {
                 auto const key = state.queue.topKey();
-                if (key && state.free.maxFree() > 0 && (best == nullptr || *key < bestKey)) {
+                if (key && state.free.maxFree() > 0 && !pass.exhausted(name, state.queue)
+                    && (best == nullptr || *key < bestKey)) {
                     best = &name;
                     bestKey = *key;
                 }
@@ -647,10 +701,10 @@ public:
             if (best == nullptr) {
                 break;
             }
-            dispatchHead(std::string(*best), out, skipped);
+            dispatchHead(std::string(*best), out, pass);
         }
-        for (const auto & skip : skipped) {
-            sys(skip.system).queue.set(skip.drv, skip.key);
+        for (auto const drv : pass.skipped) {
+            enqueue(drv);
         }
     }
 
@@ -725,6 +779,18 @@ public:
         size_t slots = 0;   // maxJobs of workers that take work
         size_t free = 0;
     };
+
+    // Identifies a set of features. Unlike featureKey(), which is a label,
+    // no two sets share one: names come from the network and may hold a comma.
+    [[nodiscard]] static auto featureSetKey(std::vector<std::string> feats) -> std::string
+    {
+        std::ranges::sort(feats);
+        std::string key;
+        for (const auto & feat : feats) {
+            key += std::to_string(feat.size()) + ":" + feat;
+        }
+        return key;
+    }
 
     [[nodiscard]] static auto featureKey(std::vector<std::string> feats) -> std::string
     {
@@ -803,7 +869,7 @@ private:
     size_t workersUp_ = 0;
     struct SystemState
     {
-        IndexedHeap queue;
+        WaitQueue queue;
         FreeIndex free; // a worker sits in each of its systems' index with the same count
     };
     std::unordered_map<std::string, SystemState> systems;
@@ -822,7 +888,7 @@ private:
         }
         auto const iter = systems.find(slot->system);
         if (iter != systems.end()) {
-            iter->second.queue.erase(drv);
+            iter->second.queue.erase(drv, slot->featureKey);
             if (iter->second.queue.size() == 0 && !offered(iter->first)) {
                 systems.erase(iter);
             }
@@ -856,28 +922,60 @@ private:
         return systems.try_emplace(name).first->second;
     }
 
-    struct Skipped
+    void enqueue(DrvId drv)
     {
-        std::string system;
-        DrvId drv;
-        double key;
+        if (const auto & slot = entries.at(drv)) {
+            sys(slot->system).queue.set(drv, prio(*slot), slot->featureKey);
+        }
+    }
+
+    // What one dispatch pass found it cannot place. Slots only fill during a
+    // pass, so a feature set without a worker stays without one.
+    struct Pass
+    {
+        std::vector<DrvId> skipped; // off the queue until the pass ends
+        std::unordered_map<std::string, std::vector<std::string>> stuck; // system -> feature keys
+
+        [[nodiscard]] auto isStuck(const Entry & ent) const -> bool
+        {
+            auto const iter = stuck.find(ent.system);
+            return iter != stuck.end() && std::ranges::find(iter->second, ent.featureKey) != iter->second.end();
+        }
+
+        // Everything still queued is of a stuck feature set.
+        [[nodiscard]] auto exhausted(const std::string & system, const WaitQueue & queue) const -> bool
+        {
+            auto const iter = stuck.find(system);
+            if (iter == stuck.end()) {
+                return false;
+            }
+            size_t left = queue.size();
+            for (const auto & key : iter->second) {
+                left -= queue.count(key);
+            }
+            return left == 0;
+        }
     };
 
-    void dispatchHead(const std::string & system, std::vector<Assign> & out, std::vector<Skipped> & skipped)
+    void dispatchHead(const std::string & system, std::vector<Assign> & out, Pass & pass)
     {
         auto & queue = sys(system).queue;
         auto const drv = queue.top().value_or(0);
-        queue.erase(drv);
         auto & slot = entries.at(drv);
+        queue.erase(drv, slot ? slot->featureKey : std::string());
         if (!slot || slot->followers.empty() || slot->worker != noWorker) {
             if (slot && slot->followers.empty() && slot->worker == noWorker) {
                 retire(drv); // stale
             }
             return;
         }
-        auto wid = pick(*slot);
+        auto const wid = pass.isStuck(*slot) ? std::nullopt : pick(*slot);
         if (!wid) {
-            skipped.push_back({.system = system, .drv = drv, .key = prio(*slot)});
+            pass.skipped.push_back(drv);
+            // With `avoid` set, pick() can fail where the rest of the set would not.
+            if (slot->avoid == noWorker && !pass.isStuck(*slot)) {
+                pass.stuck[system].push_back(slot->featureKey);
+            }
             return;
         }
         slot->worker = *wid;
