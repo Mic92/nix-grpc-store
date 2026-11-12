@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <functional>
 #include <future>
 #include <filesystem>
 #include <map>
@@ -742,15 +743,24 @@ public:
         return res;
     }
 
-    // Second caller for a drv that already builds here: wait for its result.
-    static auto attach(grpc::ServerContext & context, nixgrpc::Expected::Shared & shared, const nixgrpc::BuildEventSink & log)
-        -> std::optional<std::string>
+    // Who a build runs for. It does not have to be an RPC.
+    struct Caller
     {
+        std::function<bool()> gone; // it no longer waits for the result
+        nixgrpc::BuildEventSink log;
+        bool cacheLost = false;   // it builds again because the cache lost the NAR
+        std::string missingInput; // out: the input that could not be fetched
+    };
+
+    // Second caller for a drv that already builds here: wait for its result.
+    static auto attach(const Caller & caller, nixgrpc::Expected::Shared & shared) -> std::optional<std::string>
+    {
+        const auto & log = caller.log;
         log({.text = "attached to the build already running on this worker"});
         shared.attached++;
         auto const completed = nixgrpc::followSpill(
             shared.spill, shared.mutex, shared.cv, shared.finished, nixgrpc::cancelPoll,
-            [&] -> bool { return context.IsCancelled() || stopSignal >= nixgrpc::kCancelBuilds; },
+            [&] -> bool { return caller.gone() || stopSignal >= nixgrpc::kCancelBuilds; },
             [&](nixgrpc::SpillKind kind, std::string_view text) -> void {
                 log({.kind = static_cast<nixgrpc::BuildEvent::Kind>(kind), .text = std::string(text)});
             });
@@ -763,14 +773,13 @@ public:
     }
 
     auto attached(
-        grpc::ServerContext & context,
+        const Caller & caller,
         nixgrpc::Expected::Shared & shared,
-        const nixgrpc::BuildEventSink & log,
         const std::array<uint64_t, 3> & settings,
         nix::remote::BuildDerivationDone & done) -> grpc::Status
     {
         metrics.event("attached");
-        auto wire = attach(context, shared, log);
+        auto wire = attach(caller, shared);
         if (shared.revoked) {
             return {grpc::StatusCode::ABORTED, "superseded, another worker was already building this"};
         }
@@ -795,12 +804,12 @@ public:
     class OwnerRelay
     {
     public:
-        OwnerRelay(grpc::ServerContext & context, nixgrpc::Expected::Shared & shared, const nixgrpc::BuildEventSink & log)
+        OwnerRelay(const Caller & caller, nixgrpc::Expected::Shared & shared)
             : shared_(shared)
-            , thread_([&context, &shared, &log] -> void {
+            , thread_([&caller, &shared, &log = caller.log] -> void {
                 (void) nixgrpc::followSpill(
                     shared.spill, shared.mutex, shared.cv, shared.finished, nixgrpc::cancelPoll,
-                    [&] -> bool { return context.IsCancelled() || stopSignal >= nixgrpc::kCancelBuilds; },
+                    [&] -> bool { return caller.gone() || stopSignal >= nixgrpc::kCancelBuilds; },
                     [&](nixgrpc::SpillKind kind, std::string_view text) -> void {
                         log({.kind = static_cast<nixgrpc::BuildEvent::Kind>(kind), .text = std::string(text)});
                     });
@@ -831,14 +840,13 @@ public:
 
     // gRPC errors mean "ask the scheduler again", build outcomes travel as BuildResult.
     auto build(
-        grpc::ServerContext & context,
+        Caller & caller,
         nix::Store & localStore,
         const nix::StorePath & drvPath,
         const nix::BasicDerivation & drv,
         uint64_t assignId,
         nix::BuildMode mode,
         nixgrpc::Backends::Limits limits,
-        const nixgrpc::BuildEventSink & log,
         nixgrpc::Metrics::Inputs & inputs,
         nix::remote::BuildDerivationDone & done) -> grpc::Status
     {
@@ -875,7 +883,7 @@ public:
         }
         std::array<uint64_t, 3> const settings{static_cast<uint64_t>(mode), limits.buildTimeout, limits.maxSilentTime};
         if (adm->attach) {
-            return attached(context, *adm->shared, log, settings, done);
+            return attached(caller, *adm->shared, settings, done);
         }
 
         // From here on we own the Expect and must report Done exactly once.
@@ -888,11 +896,11 @@ public:
         auto const tee = [&](const nixgrpc::BuildEvent & event) -> void {
             adm->shared->logged(static_cast<nixgrpc::SpillKind>(event.kind), event.text);
         };
-        OwnerRelay const relay(context, *adm->shared, log);
+        OwnerRelay const relay(caller, *adm->shared);
         try {
             auto status =
                 buildExpected(
-                    context, *adm->shared, localStore, drvPath, drv, mode, limits, tee, inputs, outPaths, done, outcome,
+                    caller, *adm->shared, localStore, drvPath, drv, mode, limits, tee, inputs, outPaths, done, outcome,
                     outputs);
             // No result to share unless the build produced one: attachers of a
             // failed owner must retry, not return an empty Done as success.
@@ -934,7 +942,7 @@ public:
     }
 
     auto buildExpected(
-        grpc::ServerContext & context,
+        Caller & caller,
         nixgrpc::Expected::Shared & shared,
         nix::Store & localStore,
         const nix::StorePath & drvPath,
@@ -949,16 +957,14 @@ public:
         std::vector<std::pair<std::string, uint64_t>> & outputs) -> grpc::Status
     {
         auto const cancelled = [&] -> bool {
-            return (context.IsCancelled() && shared.attached == 0) || shared.revoked || stopSignal >= nixgrpc::kCancelBuilds;
+            return (caller.gone() && shared.attached == 0) || shared.revoked || stopSignal >= nixgrpc::kCancelBuilds;
         };
         nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "substitute");
         // Roots inputs and outputs until publish is done.
         auto const roots = local.scoped();
         std::string missing;
         if (auto status = gatherInputs(localStore, drv, *roots, inputs, missing); !status.ok()) {
-            if (!missing.empty()) {
-                context.AddTrailingMetadata("x-nix-missing-input", missing);
-            }
+            caller.missingInput = std::move(missing);
             return status;
         }
         for (const auto & [name, path] : outPaths) {
@@ -996,7 +1002,7 @@ public:
             phase.next("publish");
             try {
                 // The client rebuilt this because the cache lost its NAR.
-                publish(localStore, built, cancelled, context.client_metadata().contains("x-nix-cache-lost"));
+                publish(localStore, built, cancelled, caller.cacheLost);
                 outcome = nix::remote::Done::BUILT;
             } catch (Unavailable & err) {
                 // niks3 push already retried, and another worker would upload
@@ -1051,11 +1057,17 @@ public:
 
             nix::remote::BuildDerivationChunk chunk;
             nixgrpc::Metrics::Inputs inputs;
+            Caller caller{
+                .gone = [context] -> bool { return context->IsCancelled(); },
+                .log = sendLogLine,
+                .cacheLost = context->client_metadata().contains("x-nix-cache-lost"),
+            };
             if (auto const status =
-                    build(
-                        *context, *localStore, drvPath, drv, request->assign_id(), mode, limits, sendLogLine, inputs,
-                        *chunk.mutable_done());
+                    build(caller, *localStore, drvPath, drv, request->assign_id(), mode, limits, inputs, *chunk.mutable_done());
                 !status.ok()) {
+                if (!caller.missingInput.empty()) {
+                    context->AddTrailingMetadata("x-nix-missing-input", caller.missingInput);
+                }
                 return {status.error_code(), workerName + ": " + status.error_message()};
             }
             writer->Write(chunk);
