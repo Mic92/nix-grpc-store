@@ -835,6 +835,7 @@ public:
         nix::Store & localStore,
         const nix::StorePath & drvPath,
         const nix::BasicDerivation & drv,
+        uint64_t assignId,
         nix::BuildMode mode,
         nixgrpc::Backends::Limits limits,
         const nixgrpc::BuildEventSink & log,
@@ -855,7 +856,7 @@ public:
         auto const drvName = std::string(drvPath.to_string());
         // The client is here: the lease holds through its upload. NOT_FOUND
         // makes it upload the closure and retry, so admit comes after.
-        builder.claim(drvName);
+        builder.claim(drvName, assignId);
         if (!localStore.isValidPath(drvPath)) {
             try {
                 nixcompat::ensurePath(localStore, drvPath);
@@ -1047,7 +1048,9 @@ public:
             nix::remote::BuildDerivationChunk chunk;
             nixgrpc::Metrics::Inputs inputs;
             if (auto const status =
-                    build(*context, *localStore, drvPath, drv, mode, limits, sendLogLine, inputs, *chunk.mutable_done());
+                    build(
+                        *context, *localStore, drvPath, drv, request->assign_id(), mode, limits, sendLogLine, inputs,
+                        *chunk.mutable_done());
                 !status.ok()) {
                 return {status.error_code(), workerName + ": " + status.error_message()};
             }

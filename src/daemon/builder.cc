@@ -1,6 +1,8 @@
 #include "builder.hh"
 
+#include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -33,11 +35,17 @@ void Builder::onExpect(const nix::remote::Expect & exp)
     if (exp.drv_path().empty()) {
         return;
     }
+    auto const arrived = [&](State & sta) -> void {
+        sta.newestExpect = std::max(sta.newestExpect, exp.assign_id());
+        expectArrived.notify_all();
+    };
     if (draining()) {
+        arrived(*state.lock());
         giveBack({{exp.drv_path(), exp.assign_id()}}, nix::remote::Done::DRAINING);
         return;
     }
     auto lck = state.lock();
+    arrived(*lck);
     auto & ent = lck->expected[exp.drv_path()];
     if (ent.claimed) {
         return; // re-announced across a scheduler restart, keep the live one
@@ -47,11 +55,23 @@ void Builder::onExpect(const nix::remote::Expect & exp)
     metrics.event("expect");
 }
 
-void Builder::claim(const std::string & drvPath)
+auto Builder::claim(const std::string & drvPath, uint64_t assignId) -> bool
 {
+    auto const deadline = Clock::now() + expectLag;
     auto lck = state.lock();
-    if (auto const found = lck->expected.find(drvPath); found != lck->expected.end()) {
-        found->second.claimed = true;
+    for (bool waited = false;; waited = true) {
+        if (auto const found = lck->expected.find(drvPath); found != lck->expected.end()) {
+            found->second.claimed = true;
+            if (waited) {
+                metrics.event("expect_late");
+            }
+            return true;
+        }
+        // The scheduler numbers its assignments in the order it sends them,
+        // so only a newer one than the last we read can still arrive.
+        if (assignId <= lck->newestExpect || lck.wait_until(expectArrived, deadline) == std::cv_status::timeout) {
+            return false;
+        }
     }
 }
 
@@ -167,6 +187,7 @@ auto Builder::hello() -> WorkerMsg
     }
     hel->set_max_jobs(config.maxJobs);
     auto lck = state.lock();
+    lck->newestExpect = 0; // a new session, maybe of a new scheduler, counts anew
     // A slot nobody claimed is dropped, not reported: the scheduler would
     // take it for a build and revoke the one its client started elsewhere.
     std::erase_if(lck->expected, [](const auto & item) -> bool { return !item.second.claimed; });
