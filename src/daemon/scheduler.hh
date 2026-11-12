@@ -346,8 +346,12 @@ struct Entry
     double enqMs = 0;
     double cpHint = 0;
     bool unplaceable = false; // as last told to the followers
-    WorkerId avoid = noWorker; // gave it back; used only if no other worker can run it
+    std::vector<WorkerId> givers; // could not run it, latest last
 };
+
+// What a give-back says: the worker takes no builds at all right now, or it
+// could not run this drv.
+enum class GaveBack : uint8_t { worker, drv };
 
 struct Worker
 {
@@ -629,8 +633,9 @@ public:
     }
 
     // The worker can't run it after all: place it elsewhere.
-    void giveBack(Lease lease)
+    void giveBack(Lease lease, GaveBack why)
     {
+
         auto const found = release(lease);
         if (!found) {
             return;
@@ -640,7 +645,10 @@ public:
             return;
         }
         slot->worker = noWorker;
-        slot->avoid = lease.worker;
+        if (why == GaveBack::drv) {
+            std::erase(slot->givers, lease.worker);
+            slot->givers.push_back(lease.worker);
+        }
         if (slot->followers.empty()) {
             retire(*found);
         } else {
@@ -986,8 +994,8 @@ private:
         auto const wid = pass.isStuck(*slot) ? std::nullopt : pick(*slot);
         if (!wid) {
             pass.skipped.push_back(drv);
-            // With `avoid` set, pick() can fail where the rest of the set would not.
-            if (slot->avoid == noWorker && !pass.isStuck(*slot)) {
+            // With givers, pick() can fail where the rest of the set would not.
+            if (slot->givers.empty() && !pass.isStuck(*slot)) {
                 pass.stuck[system].push_back(slot->featureKey);
             }
             return;
@@ -1055,32 +1063,44 @@ private:
         return best;
     }
 
-    // The worker it was given back by, if nobody else can run it.
-    [[nodiscard]] auto avoiding(const Entry & ent) const -> std::optional<WorkerId>
+    static auto gave(const Entry & ent, WorkerId wid) -> bool
     {
-        std::optional<WorkerId> best;
+        return std::ranges::find(ent.givers, wid) != ent.givers.end();
+    }
+
+    // Givers are passed over while another worker can run the drv now. If
+    // none can, only the latest giver is, as long as someone else offers it.
+    [[nodiscard]] auto sparing(const Entry & ent) const -> std::optional<WorkerId>
+    {
+        auto const latest = ent.givers.back();
+        std::optional<WorkerId> fresh;
+        std::optional<WorkerId> giver;
         bool others = false;
         for (WorkerId wid = 0; wid < workers.size(); wid++) {
             const auto & wkr = workers.at(wid);
-            if (wid == ent.avoid || !wkr.takesWork() || !offers(wkr, ent)) {
+            if (wid == latest || !wkr.takesWork() || !offers(wkr, ent)) {
                 continue;
             }
             others = true;
+            auto & best = gave(ent, wid) ? giver : fresh;
             if (freeOf(wid) > 0 && (!best || freeOf(wid) > freeOf(*best))) {
                 best = wid;
             }
         }
-        if (best || others) {
-            return best;
+        if (fresh || giver) {
+            return fresh ? fresh : giver;
         }
-        return ent.avoid;
+        if (others || freeOf(latest) <= 0) {
+            return std::nullopt;
+        }
+        return latest;
     }
 
     [[nodiscard]] auto pick(const Entry & ent) const -> std::optional<WorkerId>
     {
         auto best = emptiestFor(ent);
-        if (best && *best == ent.avoid) {
-            best = avoiding(ent);
+        if (best && gave(ent, *best)) {
+            best = sparing(ent);
         }
         if (!best) {
             return std::nullopt;
@@ -1096,7 +1116,7 @@ private:
                 continue;
             }
             auto [wid, size] = iter->second;
-            if (wid >= workers.size() || wid == ent.avoid || !workers.at(wid).up || freeOf(wid) <= 0
+            if (wid >= workers.size() || gave(ent, wid) || !workers.at(wid).up || freeOf(wid) <= 0
                 || !offers(workers.at(wid), ent)) {
                 continue;
             }
