@@ -24,12 +24,14 @@
 #include <nix/store/globals.hh>
 #include <nix/store/path.hh>
 #include <nix/util/error.hh>
+#include <nix/util/serialise.hh>
 #include <nix/util/terminal.hh>
 
 #include "client-stream.hh"
 #include "local-store.hh"
 #include "nix_remote.pb.h"
 #include "pump.hh"
+#include "upload-spool.hh"
 
 namespace {
 
@@ -87,6 +89,24 @@ auto endedUploadIsLost() -> bool
     return false;
 }
 
+// nix parses the NAR it stores; one that goes on after its declared size
+// makes it read past what was spooled.
+auto longNarIsLost() -> bool
+{
+    nixgrpc::NarSpool spool;
+    std::string const declared = "nar";
+    nix::StringSource upload(declared);
+    auto reader = spool.reader(spool.add(upload, declared.size()));
+    try {
+        std::array<char, 2> bytes{};
+        while (true) {
+            reader.read(bytes.data(), bytes.size());
+        }
+    } catch (const std::exception & err) {
+        return LocalStore::lost(err);
+    }
+}
+
 auto run() -> int
 {
     nix::initLibStore();
@@ -137,6 +157,11 @@ auto run() -> int
 
     if (endedUploadIsLost()) {
         std::println("FAIL an upload that ends early counts as a lost nix-daemon");
+        status = EXIT_FAILURE;
+    }
+
+    if (longNarIsLost()) {
+        std::println("FAIL a NAR longer than its declared size counts as a lost nix-daemon");
         status = EXIT_FAILURE;
     }
 

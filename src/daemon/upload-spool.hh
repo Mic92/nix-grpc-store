@@ -24,6 +24,13 @@ struct SpoolRange
     std::uint64_t size = 0;
 };
 
+// nix parses the NAR it stores, so one that goes on after the size its
+// client declared reads past its range.
+struct NarTooLong : nix::Error
+{
+    using nix::Error::Error;
+};
+
 // pread keeps the offset the spool appends at.
 class RangeSource : public nix::Source
 {
@@ -33,7 +40,7 @@ public:
     auto read(char * data, std::size_t len) -> std::size_t override
     {
         if (pos_ == end_) {
-            throw nix::EndOfFile("end of spooled NAR");
+            throw NarTooLong("an uploaded NAR is longer than its declared size");
         }
         auto const want = static_cast<std::size_t>(std::min<std::uint64_t>(len, end_ - pos_));
         ssize_t got = ::pread(descriptor_, data, want, static_cast<off_t>(pos_));
@@ -44,7 +51,7 @@ public:
             throw nix::SysError("reading a spooled NAR");
         }
         if (got == 0) {
-            throw nix::EndOfFile("spool file is shorter than expected");
+            throw nix::Error("spool file is shorter than expected");
         }
         pos_ += static_cast<std::uint64_t>(got);
         return static_cast<std::size_t>(got);
