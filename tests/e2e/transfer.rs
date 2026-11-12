@@ -230,9 +230,7 @@ fn many_small_paths_round_trip() {
     let dir = workdir("small");
     succeed(&["mkdir", "-p", &format!("{dir}/files")]);
     let files: Vec<String> = (0..200).map(|i| format!("{dir}/files/f{i}")).collect();
-    for f in &files {
-        random_file(f, 4096);
-    }
+    random_files(&files, 4096);
     let mut add = vec!["nix-store", "--store", "", "--add"];
     let src = format!("{dir}/src");
     add[2] = &src;
