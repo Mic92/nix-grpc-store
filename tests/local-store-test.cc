@@ -3,7 +3,6 @@
 // missing, refuse, or hang up, so a nix that words them differently fails
 // here.
 
-#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdlib>
@@ -18,7 +17,7 @@
 
 #include <signal.h> // NOLINT(modernize-deprecated-headers): SIGPIPE is POSIX, not in <csignal>.
 #include <sys/socket.h>
-#include <sys/un.h>
+#include <sys/stat.h> // NOLINT(misc-include-cleaner): which header has S_IRWXU differs per platform.
 #include <unistd.h>
 
 #include <nix/store/globals.hh>
@@ -26,6 +25,7 @@
 #include <nix/util/error.hh>
 #include <nix/util/serialise.hh>
 #include <nix/util/terminal.hh>
+#include <nix/util/unix-domain-socket.hh>
 
 #include "client-stream.hh"
 #include "local-store.hh"
@@ -36,21 +36,6 @@
 namespace {
 
 using nixgrpc::LocalStore;
-
-auto listenAt(const std::filesystem::path & path) -> int
-{
-    int const sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    auto const name = path.string();
-    std::ranges::copy(name, std::begin(addr.sun_path));
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): the sockets API
-    if (sock < 0 || ::bind(sock, reinterpret_cast<const sockaddr *>(&addr), sizeof addr) != 0 || ::listen(sock, SOMAXCONN) != 0) {
-        std::println("cannot listen at {}", name);
-        std::exit(EXIT_FAILURE); // NOLINT(concurrency-mt-unsafe)
-    }
-    return sock;
-}
 
 // The errors of two calls in a row: a store that failed to connect answers
 // the second one differently.
@@ -116,9 +101,11 @@ auto run() -> int
     std::filesystem::create_directory(dir);
 
     // Bound and closed: the file is there, nobody listens.
-    ::close(listenAt(dir / "refused"));
-    int const hangup = listenAt(dir / "hangup");
-    std::thread closer([hangup] -> void {
+    // NOLINTNEXTLINE(misc-include-cleaner): which header has S_IRWXU differs per platform.
+    nix::createUnixDomainSocket(dir / "refused", S_IRWXU).close();
+    // NOLINTNEXTLINE(misc-include-cleaner)
+    auto listener = nix::createUnixDomainSocket(dir / "hangup", S_IRWXU);
+    std::thread closer([hangup = listener.get()] -> void {
         for (;;) {
             int const conn = ::accept(hangup, nullptr, nullptr);
             if (conn < 0) {
@@ -165,8 +152,9 @@ auto run() -> int
         status = EXIT_FAILURE;
     }
 
-    ::shutdown(hangup, SHUT_RDWR);
-    ::close(hangup);
+    // Linux wakes the accept on shutdown, macOS on close.
+    ::shutdown(listener.get(), SHUT_RDWR);
+    listener.close();
     closer.join();
     std::filesystem::remove_all(dir);
     return status;
