@@ -23,6 +23,9 @@ Builder::Builder(Config config, Metrics & metrics)
     : config(std::move(config))
     , metrics(metrics)
 {
+    for (auto const why : {Unavailable::stopping, Unavailable::lowDisk, Unavailable::localDaemonDown}) {
+        metrics.unavailable(name(why), false);
+    }
 }
 
 void Builder::onExpect(const nix::remote::Expect & exp)
@@ -200,6 +203,7 @@ void Builder::setUnavailable(Unavailable why, bool holds)
     } else {
         unavailable_ &= static_cast<uint8_t>(~bit);
     }
+    metrics.unavailable(name(why), holds);
     bool const draining = this->draining();
     if (was == draining || !greeted_) {
         return;

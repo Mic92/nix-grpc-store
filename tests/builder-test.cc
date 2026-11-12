@@ -1,5 +1,6 @@
 // A worker can have more than one reason to take no builds. It tells the
-// scheduler it takes builds again only when the last one is gone.
+// scheduler it takes builds again only when the last one is gone, and its
+// metric shows which ones hold.
 
 #include <cstdlib>
 #include <print>
@@ -50,6 +51,11 @@ auto run() -> int
     builder.setUnavailable(Builder::Unavailable::lowDisk, false);
     if (told != std::vector<bool>{true}) {
         std::println("FAIL a stopping worker takes builds again once its disk has room");
+        return EXIT_FAILURE;
+    }
+    if (metrics.unavailableNow("low_disk") != 0 || metrics.unavailableNow("stopping") != 1
+        || metrics.unavailableNow("local_daemon") != 0) {
+        std::println("FAIL the metric does not show stopping as the only reason");
         return EXIT_FAILURE;
     }
     builder.setUnavailable(Builder::Unavailable::stopping, false);

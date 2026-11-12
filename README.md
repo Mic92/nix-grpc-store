@@ -414,6 +414,7 @@ With `--metrics-listen 127.0.0.1:9464` (NixOS:
 | `nix_grpc_build_info` | version, worker, system, features | constant 1, for joins and version skew |
 | `nix_grpc_sched` | kind = queued, workers, clients, leader | scheduler state |
 | `nix_grpc_sched_system` | system, features, kind = queued, unplaceable, running, slots, free | queue (by required features) and capacity (by offered features), for autoscaling |
+| `nix_grpc_unavailable` | reason = stopping, low_disk, local_daemon | 1 while a worker takes no new builds for that reason |
 | `nix_grpc_events_total` | kind | assigned, cached, attached, give_back, given_back_<reason>, unexpected_build, scheduler_take_over, scheduler_yield, … |
 | `nix_grpc_lookup_seconds` | stage = queued, cache | scheduler: time a batch of build requests waits for a lookup thread, then for the cache's answer. Not part of the queue wait |
 | `nix_grpc_lookup_keys` | result = asked, present | scheduler: outputs one such lookup asks the cache about, and how many of them it has |

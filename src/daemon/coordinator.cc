@@ -354,7 +354,7 @@ void Coordinator::askLocalDaemon(Builder & bld)
     logLine(
         LogLevel::info,
         {{"event", answers ? "healthy" : "unhealthy"},
-         {"reason", "local_daemon"}});
+         {"reason", std::string(Builder::name(Builder::Unavailable::localDaemonDown))}});
     bld.setUnavailable(Builder::Unavailable::localDaemonDown, !answers);
 }
 
@@ -381,7 +381,7 @@ void Coordinator::tick()
     }
     const bool healthy = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize >= options.minFree;
     if (lastHealthy.exchange(healthy) != healthy) {
-        logLine(LogLevel::info, {{"event", healthy ? "healthy" : "unhealthy"}, {"reason", "min_free"}});
+        logLine(LogLevel::info, {{"event", healthy ? "healthy" : "unhealthy"}, {"reason", std::string(Builder::name(Builder::Unavailable::lowDisk))}});
         builder->setUnavailable(Builder::Unavailable::lowDisk, !healthy);
     }
 }
