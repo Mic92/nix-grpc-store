@@ -30,7 +30,7 @@ void Builder::onExpect(const nix::remote::Expect & exp)
     if (exp.drv_path().empty()) {
         return;
     }
-    if (draining_) {
+    if (draining()) {
         giveBack({{exp.drv_path(), exp.assign_id()}}, nix::remote::Done::DRAINING);
         return;
     }
@@ -177,10 +177,12 @@ auto Builder::hello() -> WorkerMsg
 
 auto Builder::greet() -> bool
 {
+    std::scoped_lock const lock(unavailableMutex);
     if (!send(hello())) {
         return false;
     }
-    if (draining_) {
+    greeted_ = true;
+    if (draining()) {
         WorkerMsg msg;
         msg.mutable_load()->set_draining(true);
         return send(msg);
@@ -188,9 +190,18 @@ auto Builder::greet() -> bool
     return true;
 }
 
-void Builder::setDraining(bool draining)
+void Builder::setUnavailable(Unavailable why, bool holds)
 {
-    if (draining_.exchange(draining) == draining) {
+    std::scoped_lock const lock(unavailableMutex);
+    auto const bit = std::to_underlying(why);
+    bool const was = draining();
+    if (holds) {
+        unavailable_ |= bit;
+    } else {
+        unavailable_ &= static_cast<uint8_t>(~bit);
+    }
+    bool const draining = this->draining();
+    if (was == draining || !greeted_) {
         return;
     }
     WorkerMsg msg;
@@ -219,6 +230,8 @@ auto Builder::takeUnclaimed(const std::function<bool(const Expected &)> & pred)
 
 void Builder::setSend(SendFn send)
 {
+    std::scoped_lock const lock(unavailableMutex);
+    greeted_ = false;
     *sendFn.lock() = std::move(send);
 }
 
@@ -231,8 +244,8 @@ auto Builder::send(const WorkerMsg & msg) const -> bool
 void Builder::tick()
 {
     const auto now = config.now();
-    // While draining, also what an Expect racing setDraining() left behind.
-    bool const draining = draining_;
+    // While draining, also what an Expect racing setUnavailable() left behind.
+    bool const draining = this->draining();
     giveBack(
         takeUnclaimed([&](const Expected & ent) -> bool { return draining || now - ent.since > expectTimeout; }),
         draining ? nix::remote::Done::DRAINING : nix::remote::Done::UNREACHABLE);
