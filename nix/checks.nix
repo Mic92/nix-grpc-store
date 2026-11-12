@@ -67,11 +67,12 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     quint typecheck scheduler.qnt
     quint typecheck push.qnt
     quint run scheduler.qnt --main schedFixed --invariant=safety --max-steps=30 --max-samples=30000
-    ! quint run scheduler.qnt --main schedNoRevoke --invariant=safety --max-steps=30 --max-samples=30000
-    ! quint run scheduler.qnt --main schedNoFence --invariant=safety --max-steps=30 --max-samples=30000
     ! quint run scheduler.qnt --main schedNoPush --invariant=safety --max-steps=30 --max-samples=30000
-    ! quint run scheduler.qnt --main schedNoReport --invariant=safety --max-steps=30 --max-samples=30000
     ! quint run scheduler.qnt --main schedTerminal --invariant=safety --max-steps=30 --max-samples=30000
+    # The scripted traces state what each of these variants breaks.
+    for variant in schedFixed schedNoRevoke schedNoFence schedNoReport schedHelloSteal; do
+      quint test scheduler.qnt --main "$variant" --max-samples=100
+    done
     quint run push.qnt --main pushFixed --invariant=safety --max-steps=12 --max-samples=20000
     touch $out
   '';
