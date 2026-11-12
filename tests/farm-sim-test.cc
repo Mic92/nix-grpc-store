@@ -71,6 +71,7 @@ struct SimWorker
     std::deque<nix::remote::WorkerMsg> up;
     std::set<std::string> building; // a client's call runs the build
     std::set<std::string> stopping; // of those, the ones a Revoke reached
+    bool full = false;              // low on disk: takes no builds
 
     SimWorker(std::string addr, nixgrpc::Metrics & metrics, const double & nowMs)
         : addr(addr)
@@ -399,6 +400,18 @@ private:
                 add(steps, wkr.addr + " reads", [this, idx] -> void { workerReads(idx); });
             }
         }
+        if (wkr.full) {
+            add(steps, wkr.addr + " has room again", [&wkr] -> void {
+                                 wkr.full = false;
+                                 wkr.builder.setUnavailable(Builder::Unavailable::lowDisk, false);
+                             });
+        } else if (faults < faultsPerSeed) {
+            add(steps, wkr.addr + " runs out of disk", [this, &wkr] -> void {
+                                 faults++;
+                                 wkr.full = true;
+                                 wkr.builder.setUnavailable(Builder::Unavailable::lowDisk, true);
+                             }, true);
+        }
         for (const auto & drv : wkr.building) {
             add(steps, wkr.addr + " ends " + drv, [this, idx, name = std::string_view(drv)] -> void { buildEnds(idx, std::string(name)); });
         }
@@ -427,12 +440,22 @@ private:
         if (!wkr.building.contains(drv)) {
             return;
         }
+        // A build that ended still runs for the scheduler until it read the Done.
         bool const twice = std::ranges::any_of(workers, [&](const auto & other) -> bool {
-            return other.get() != &wkr && other->building.contains(drv);
+            return other.get() != &wkr
+                   && (other->building.contains(drv)
+                       || std::ranges::any_of(other->up, [&](const nix::remote::WorkerMsg & msg) -> bool {
+                              return msg.has_done() && msg.done().drv_path() == drv
+                                     && msg.done().outcome() == nix::remote::Done::BUILT;
+                          }));
         });
         bool const awaited = std::ranges::any_of(clients, [&](const auto & cli) -> bool {
             auto const job = cli->jobs.find(drv);
-            return cli->stream && job != cli->jobs.end() && job->second.state == Follow::building
+            // A client that came back follows again once its Want is read.
+            bool const heard = std::ranges::none_of(cli->up, [&](const nix::remote::ClientMsg & msg) -> bool {
+                return msg.has_want() && msg.want().drv_path() == drv;
+            });
+            return cli->stream && heard && job != cli->jobs.end() && job->second.state == Follow::building
                    && workers.at(job->second.worker).get() == &wkr;
         });
         if (!twice && awaited) {
