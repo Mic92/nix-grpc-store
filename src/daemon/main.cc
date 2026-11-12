@@ -57,8 +57,6 @@
 #include <nix/store/path-info.hh>
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
-#include <nix/store/store-open.hh>
-#include <nix/util/types.hh>
 #include <nix/store/worker-protocol.hh>
 // Generic definitions for the std::vector serialiser wrappers used by
 // BuildPaths, which libnixstore does not instantiate explicitly.
@@ -86,6 +84,7 @@
 #include "import-paths.hh"
 #include "log-spill.hh"
 #include "keepalive.hh"
+#include "local-store.hh"
 #include "logfmt.hh"
 #include "oidc.hh"
 #include "path-info-wire.hh"
@@ -118,7 +117,6 @@ static_assert(static_cast<int>(nixgrpc::SpillKind::phase) == static_cast<int>(ni
 
 class NixRemoteService final : public nix::remote::NixRemote::Service
 {
-    std::string storeUri;
     std::string workerName;
     nixgrpc::Metrics & metrics;
     nixgrpc::IdleTracker & idle;
@@ -127,65 +125,9 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     nixgrpc::Backends backends;
     nixgrpc::Coordinator & coord;
 
-    std::mutex storeMutex;
-    std::shared_ptr<nix::Store> store;
+    nixgrpc::LocalStore local;
     nixgrpc::UploadClaims uploads;
-    nixgrpc::SessionRoots sessions{[this] -> nix::ref<nix::Store> { return openScopedStore(); }};
-
-    // Without the path info cache a path deleted behind our back (gc) is
-    // invalid here too, instead of failing later when its NAR is read.
-    [[nodiscard]] auto openLocalStore(nix::StringMap params = {}) const -> nix::ref<nix::Store>
-    {
-        params.emplace("path-info-cache-size", "0");
-        return nix::openStore(storeUri, params);
-    }
-
-    // Aged-out connections release their temp roots. Not sooner: a fresh
-    // nix-daemon probes every substituter again.
-    static constexpr auto sharedConnections = "16";
-    static constexpr auto sharedConnectionAge = "600";
-
-    // The Store connects lazily and pools connections, but opening it can
-    // still throw (e.g. daemon socket missing), so defer to first use.
-    auto getStore() -> nix::ref<nix::Store>
-    {
-        std::scoped_lock const lock(storeMutex);
-        if (!store) {
-            store = openLocalStore({{"max-connections", sharedConnections}, {"max-connection-age", sharedConnectionAge}})
-                        .get_ptr();
-        }
-        return nix::ref<nix::Store>(store);
-    }
-
-    // A restarted nix-daemon leaves the pool full of dead connections that
-    // only fail on the next write. Drop them all so the retry gets fresh ones.
-    // A failed reconnect while the daemon is down is latched by the store and
-    // reported as "previously failed", so that drops the store too.
-    static auto backendGone(const std::exception & err) -> bool
-    {
-        const auto * sys = dynamic_cast<const nix::SysError *>(&err);
-        return dynamic_cast<const nix::EndOfFile *>(&err) != nullptr
-               || (sys != nullptr
-                   && (sys->errNo == EPIPE || sys->errNo == ECONNRESET || sys->errNo == ECONNREFUSED
-                       || sys->errNo == ENOENT))
-               || std::string_view(err.what()).contains("previously failed");
-    }
-
-    auto localDaemonGone(const std::exception & err) -> bool
-    {
-        bool const gone = backendGone(err);
-        if (gone) {
-            std::scoped_lock const lock(storeMutex);
-            store.reset();
-        }
-        return gone;
-    }
-
-    // For writes (temp roots end with the RPC) and anything long.
-    auto openScopedStore() -> nix::ref<nix::Store>
-    {
-        return openLocalStore();
-    }
+    nixgrpc::SessionRoots sessions{[this] -> nix::ref<nix::Store> { return local.scoped(); }};
 
     // Retryable on another worker or later: guarded() maps it to UNAVAILABLE.
     struct Unavailable : nix::Error
@@ -246,7 +188,7 @@ private:
             if (stopSignal != 0) {
                 return {grpc::StatusCode::UNAVAILABLE, std::string("worker shutting down: ") + err.what()};
             }
-            if (localDaemonGone(err)) {
+            if (local.dropIfLost(err)) {
                 return {grpc::StatusCode::UNAVAILABLE, std::string("local nix-daemon connection lost: ") + err.what()};
             }
             nixgrpc::logLine(
@@ -326,14 +268,14 @@ public:
         nixgrpc::LogLevel logLevel,
         nixgrpc::Auth & auth,
         nixgrpc::Coordinator & coord)
-        : storeUri(std::move(storeUri))
-        , workerName(std::move(workerName))
+        : workerName(std::move(workerName))
         , metrics(metrics)
         , idle(idle)
         , logLevel(logLevel)
         , auth(auth)
         , backends{.socketPath = std::move(socketPath)}
         , coord(coord)
+        , local(std::move(storeUri))
     {
     }
 
@@ -389,7 +331,7 @@ public:
         return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "QueryValidPaths", nixgrpc::Role::readOnly);
             nixgrpc::Metrics::Held const held(metrics, "QueryValidPaths");
-            auto const localStore = getStore();
+            auto const localStore = local.shared();
             nix::StorePathSet paths;
             for (const auto & path : request->paths()) {
                 paths.insert(nix::StorePath(path));
@@ -498,7 +440,7 @@ public:
     {
         return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "AddMultipleToStore", nixgrpc::Role::write);
-            auto localStore = openScopedStore();
+            auto localStore = local.scoped();
 
             nix::remote::AddMultipleChunk first;
             if (!reader->Read(&first)) {
@@ -544,7 +486,7 @@ public:
     {
         return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "QueryPathInfos", nixgrpc::Role::readOnly);
-            auto const localStore = getStore();
+            auto const localStore = local.shared();
             for (const auto & name : request->paths()) {
                 nix::StorePath const path(name);
                 std::shared_ptr<const nix::ValidPathInfo> info;
@@ -552,7 +494,7 @@ public:
                     substituteIfRemote(*localStore, path);
                     info = localStore->queryPathInfo(path).get_ptr();
                 } catch (nix::Error & err) {
-                    if (backendGone(err)) {
+                    if (nixgrpc::LocalStore::lost(err)) {
                         throw;
                     }
                     // invalid here and not substitutable: omitted from the reply
@@ -573,7 +515,7 @@ public:
     {
         return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "QueryMissing", nixgrpc::Role::readOnly);
-            auto const localStore = getStore();
+            auto const localStore = local.shared();
             auto const missing = localStore->queryMissing(parseTargets(*localStore, request->targets()));
             for (const auto & path : missing.willBuild) {
                 reply->add_will_build(std::string(path.to_string()));
@@ -618,7 +560,7 @@ public:
             } catch (nix::BadStorePath & err) {
                 return {grpc::StatusCode::INVALID_ARGUMENT, err.what()};
             }
-            auto const localStore = getStore();
+            auto const localStore = local.shared();
             auto * const fsStore = dynamic_cast<nix::LocalFSStore *>(&*localStore);
             if (fsStore == nullptr) {
                 return {grpc::StatusCode::UNIMPLEMENTED, "the store behind this daemon keeps no build logs"};
@@ -637,7 +579,6 @@ public:
                     if (compressed && err == ENOENT) {
                         continue;
                     }
-                    // Not a SysError: guarded() would treat ENOENT as a lost nix-daemon.
                     return {grpc::StatusCode::INTERNAL, "cannot open " + path.string() + ": " + std::system_category().message(err)};
                 }
                 try {
@@ -1001,7 +942,7 @@ public:
         };
         nixgrpc::Metrics::Phase phase(metrics, "BuildDerivation", "substitute");
         // Roots inputs and outputs until publish is done.
-        auto const roots = openScopedStore();
+        auto const roots = local.scoped();
         std::string missing;
         if (auto status = gatherInputs(localStore, drv, *roots, inputs, missing); !status.ok()) {
             if (!missing.empty()) {
@@ -1077,7 +1018,7 @@ public:
                 return {grpc::StatusCode::INVALID_ARGUMENT, "unsupported build protocol or mode"};
             }
             // No drain check: the scheduler stops sending new work, and what it already sent runs.
-            auto const localStore = getStore();
+            auto const localStore = local.shared();
             auto const sendLogLine = [&](nixgrpc::BuildEvent event) -> void {
                 writer->Write(nixgrpc::toChunk<nix::remote::BuildDerivationChunk>(std::move(event)));
             };
@@ -1125,7 +1066,7 @@ public:
         return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "FetchNars", nixgrpc::Role::readOnly);
             nixgrpc::Metrics::Held const held(metrics, "FetchNars"); // the drain waits for it
-            auto const localStore = openScopedStore();
+            auto const localStore = local.scoped();
 
             class TaggingWriter
             {
