@@ -90,6 +90,11 @@ class Metrics
              .Name("nix_grpc_build_failures_total")
              .Help("Failed builds, by Nix BuildResult failure status")
              .Register(*registry);
+    prometheus::Family<prometheus::Gauge> * unavailableFam =
+        &prometheus::BuildGauge()
+             .Name("nix_grpc_unavailable")
+             .Help("1 while this worker takes no new builds for the reason, else 0")
+             .Register(*registry);
     prometheus::Family<prometheus::Gauge> * sched =
         &prometheus::BuildGauge().Name("nix_grpc_sched").Help("Scheduler state on this node, by kind").Register(*registry);
     prometheus::Family<prometheus::Gauge> * schedSystemFam =
@@ -212,6 +217,15 @@ public:
             .Register(*registry)
             .Add({})
             .Set(count);
+    }
+
+    void unavailable(std::string_view reason, bool holds) const
+    {
+        unavailableFam->Add({{"reason", std::string(reason)}}).Set(holds ? 1 : 0);
+    }
+    [[nodiscard]] auto unavailableNow(std::string_view reason) const -> double
+    {
+        return unavailableFam->Add({{"reason", std::string(reason)}}).Value();
     }
 
     void schedQueued(size_t count) const

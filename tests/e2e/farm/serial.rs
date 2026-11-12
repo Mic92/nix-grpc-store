@@ -837,8 +837,8 @@ fn low_disk_drains_a_worker_and_builds_go_to_the_other() {
     farm_ready();
     let count = |p: &str| journal_count(WORKER1, UNIT, p);
     let (down, up) = (
-        "event=unhealthy reason=min_free",
-        "event=healthy reason=min_free",
+        "event=unhealthy reason=low_disk",
+        "event=healthy reason=low_disk",
     );
     let (down0, up0) = (count(down), count(up));
     let avail = succeed(WORKER1, &["df", "--output=avail", "-B1", "/nix/store"]);

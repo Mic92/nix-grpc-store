@@ -120,6 +120,19 @@ public:
         localDaemonDown = 1U << 2U,
     };
     void setUnavailable(Unavailable why, bool holds);
+    // The `reason` label of nix_grpc_unavailable.
+    [[nodiscard]] static constexpr auto name(Unavailable why) -> std::string_view
+    {
+        switch (why) {
+        case Unavailable::stopping:
+            return "stopping";
+        case Unavailable::lowDisk:
+            return "low_disk";
+        case Unavailable::localDaemonDown:
+            return "local_daemon";
+        }
+        return "";
+    }
 
     [[nodiscard]] auto draining() const -> bool
     {
