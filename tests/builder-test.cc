@@ -2,8 +2,12 @@
 // scheduler it takes builds again only when the last one is gone, and its
 // metric shows which ones hold.
 
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
+#include <future>
 #include <print>
+#include <thread>
 #include <vector>
 
 #include "builder.hh"
@@ -29,8 +33,50 @@ auto greetsFirst() -> bool
     return hellos == std::vector<bool>{true, false};
 }
 
+constexpr std::chrono::seconds hung{20};
+constexpr std::chrono::seconds atOnce{2}; // well below the wait for a late assignment
+constexpr std::chrono::milliseconds headStart{100};
+
+auto expectOf(uint64_t assignId) -> nix::remote::Expect
+{
+    nix::remote::Expect exp;
+    exp.set_drv_path("a.drv");
+    exp.set_assign_id(assignId);
+    return exp;
+}
+
+// The scheduler tells the worker and the client at the same time, on two
+// streams. The client's call may be the first to arrive.
+auto earlyCallWaits() -> bool
+{
+    nixgrpc::Metrics metrics{""};
+    Builder builder({.advertise = "w:0", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1}, metrics);
+    auto call = std::async(std::launch::async, [&] -> bool { return builder.claim("a.drv", 2); });
+    std::this_thread::sleep_for(headStart);
+    builder.onExpect(expectOf(2));
+    return call.wait_for(hung) == std::future_status::ready && call.get();
+}
+
+// The worker read a later assignment already, so this one is not on its way.
+auto staleCallIsRefusedAtOnce() -> bool
+{
+    nixgrpc::Metrics metrics{""};
+    Builder builder({.advertise = "w:0", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1}, metrics);
+    builder.onExpect(expectOf(2));
+    auto call = std::async(std::launch::async, [&] -> bool { return builder.claim("b.drv", 1); });
+    return call.wait_for(atOnce) == std::future_status::ready && !call.get();
+}
+
 auto run() -> int
 {
+    if (!earlyCallWaits()) {
+        std::println("FAIL a call that arrives before its assignment is not served once the assignment arrives");
+        return EXIT_FAILURE;
+    }
+    if (!staleCallIsRefusedAtOnce()) {
+        std::println("FAIL a call for an assignment that is over waits for it");
+        return EXIT_FAILURE;
+    }
     if (!greetsFirst()) {
         std::println("FAIL a worker that takes no builds from the start says so before its Hello");
         return EXIT_FAILURE;

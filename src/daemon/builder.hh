@@ -98,7 +98,10 @@ public:
     };
 
     // Any BuildDerivation for the drv, also one answered NOT_FOUND.
-    void claim(const std::string & drvPath);
+    // False if the worker does not expect the drv. `assignId` names the
+    // caller's assignment, 0 if it does not say. Waits a short while for an
+    // assignment that is still on its way.
+    auto claim(const std::string & drvPath, uint64_t assignId = 0) -> bool;
     auto admit(const std::string & drvPath) -> std::optional<Admission>;
     void finished(
         const std::string & drvPath,
@@ -153,6 +156,7 @@ private:
     struct State
     {
         std::unordered_map<std::string, Expected> expected;
+        uint64_t newestExpect = 0; // highest assign_id read in this session
     };
 
     mutable nix::Sync<State> state;
@@ -163,6 +167,10 @@ private:
     std::mutex unavailableMutex;
     bool greeted_ = false;
     static constexpr std::chrono::seconds expectTimeout{60};
+    // How long a call waits for an Expect the scheduler has sent but this
+    // worker has not read yet.
+    static constexpr std::chrono::seconds expectLag{5};
+    std::condition_variable expectArrived;
 
     void sendDone(
         const std::string & drvPath,
