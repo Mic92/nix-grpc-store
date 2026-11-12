@@ -387,7 +387,9 @@ isn't in `accessRules`.
 
 **`no connected, non-draining worker for system … offers features {…}`** —
 no builder for that system (with those `system-features`) is connected
-to the scheduler, or all of them are low on disk or stopping. The client
+to the scheduler, or all of them are low on disk, stopping, or have a
+local nix-daemon that does not answer (`event=unhealthy
+reason=local_daemon` in the builder's journal). The client
 prints this as a warning and waits two minutes before giving up, because
 right after a scheduler restart the builders may still be reconnecting.
 Look for `event=scheduler_disconnected` in the builders' journal.

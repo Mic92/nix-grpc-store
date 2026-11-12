@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <initializer_list>
 #include <memory>
@@ -41,6 +42,7 @@
 #include "builder.hh"
 #include "cache.hh"
 #include "client/channel.hh"
+#include "daemon-probe.hh"
 #include "keepalive.hh"
 #include "logfmt.hh"
 #include "metrics.hh"
@@ -222,6 +224,10 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
 Coordinator::~Coordinator()
 {
     elector.reset();
+    if (probeThread.joinable()) {
+        probeThread.request_stop();
+        probeThread.join();
+    }
     if (sessionThread.joinable()) {
         sessionThread.request_stop();
         sessionThread.join();
@@ -255,11 +261,14 @@ void Coordinator::start(grpc::Server & server)
     if (!builder) {
         return;
     }
+    // The first answer comes before the worker offers itself to a scheduler.
+    auto & bld = *builder;
+    askLocalDaemon(bld);
+    probeThread = std::jthread([this, &bld](const std::stop_token & stop) -> void { watchLocalDaemon(bld, stop); });
     if (options.schedulerAddr.empty()) {
-        builder->greet();
+        bld.greet();
     } else {
-        sessionThread = std::jthread(
-            [this, &bld = *builder](const std::stop_token & stop) -> void { runRemoteSession(bld, stop); });
+        sessionThread = std::jthread([this, &bld](const std::stop_token & stop) -> void { runRemoteSession(bld, stop); });
     }
 }
 
@@ -329,6 +338,34 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
         }
         std::this_thread::sleep_for(backoff);
         backoff = std::min(backoff * 2, maxBackoff);
+    }
+}
+
+// A nix-daemon that stops answering blocks every call that reaches it, and
+// no error tells the scheduler. So ask it, and take no builds meanwhile.
+void Coordinator::askLocalDaemon(Builder & bld)
+{
+    constexpr std::chrono::seconds patience{5};
+    bool const answers = nixDaemonAnswers(options.socketPath, patience);
+    if (answers == daemonAnswered) {
+        return;
+    }
+    daemonAnswered = answers;
+    logLine(
+        LogLevel::info,
+        {{"event", answers ? "healthy" : "unhealthy"},
+         {"reason", "local_daemon"}});
+    bld.setUnavailable(Builder::Unavailable::localDaemonDown, !answers);
+}
+
+void Coordinator::watchLocalDaemon(Builder & bld, const std::stop_token & stop)
+{
+    constexpr std::chrono::seconds every{10};
+    std::mutex mutex;
+    std::condition_variable_any wake;
+    std::unique_lock lock(mutex);
+    while (!wake.wait_for(lock, stop, every, [&] -> bool { return stop.stop_requested(); })) {
+        askLocalDaemon(bld);
     }
 }
 

@@ -341,6 +341,13 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
+  test('daemon-probe', executable('daemon-probe-test',
+    sources : ['tests/daemon-probe-test.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    dependencies : [nix_util_dep, threads_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
+
   test('upload-spool', executable('upload-spool-test',
     sources : ['tests/upload-spool-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
