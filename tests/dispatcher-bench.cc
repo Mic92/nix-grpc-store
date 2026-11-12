@@ -361,13 +361,14 @@ struct Sim
         }
         const auto * sp = byDrv.at(cmd.expect().drv_path());
         ws.running++;
-        at(now + sp->duration, [this, &ws, sp] {
+        at(now + sp->duration, [this, &ws, sp, assignId = cmd.expect().assign_id()] {
             ws.running--;
             built.insert(sp->outPath);
             builds++;
             WorkerMsgs msg;
             auto * done = msg.add_msgs()->mutable_done();
             done->set_drv_path(sp->drvPath);
+            done->set_assign_id(assignId);
             done->set_outcome(nix::remote::Done::BUILT);
             auto * out = done->add_outputs();
             out->set_path(sp->outPath);

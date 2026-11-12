@@ -84,6 +84,13 @@ auto hello(Core & shard, std::string_view addr, uint32_t jobs, const std::vector
     return shard.hello({.addr = addr, .systems = {"x"}, .features = std::move(features), .maxJobs = jobs, .running = std::move(runs)}, superseded != nullptr ? *superseded : ignored);
 }
 
+// The drv's current assignment on `wid`.
+auto lease(const Core & shard, WorkerId wid, std::string_view path) -> Core::Lease
+{
+    auto const drv = shard.findDrv(path);
+    return {.worker = wid, .drvPath = path, .assignId = drv ? shard.entry(*drv)->assignId : 0};
+}
+
 void testAssignAndDedup()
 {
     Core shard;
@@ -98,7 +105,7 @@ void testAssignAndDedup()
     // third client after assignment: immediate
     auto res = shard.want(3, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
     assert(res.assigned && res.assigned->first == w0 && res.assigned->second == out[0].assignId);
-    shard.done(w0, "a.drv", {{"/nix/store/a-out", 100}});
+    shard.done(lease(shard, w0, "a.drv"), {{"/nix/store/a-out", 100}});
     assert(!shard.entry(out[0].drv));
 }
 
@@ -109,7 +116,7 @@ void testMostFreeAndLocality()
     auto const w0 = hello(shard, "w0", 4);
     auto const w1 = hello(shard, "w1", 4);
     // w1 produced a big input
-    shard.done(w1, "x.drv", {{"/nix/store/big", 1'000'000'000}});
+    shard.done(lease(shard, w1, "x.drv"), {{"/nix/store/big", 1'000'000'000}});
     shard.want(1, {.drvPath = "b.drv", .inputs = {"/nix/store/big"}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
     shard.dispatch(out);
     assert(out.size() == 1 && out[0].worker == w1);
@@ -133,7 +140,7 @@ void testPriority()
     hello(shard, "w", 1);
     shard.dispatch(out);
     assert(out.size() == 1 && shard.entry(out[0].drv)->drvPath == "fan.drv");
-    shard.done(0, "fan.drv", {});
+    shard.done(lease(shard, 0, "fan.drv"), {});
     shard.dispatch(out);
     assert(out.size() == 2 && shard.entry(out[1].drv)->drvPath == "high.drv");
 }
@@ -165,7 +172,7 @@ void testHelloReconciles()
     shard.want(1, {.drvPath = "c.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
     shard.dispatch(out);
     assert(out.size() == 1); // only one slot left
-    shard.done(w0, "a.drv", {});
+    shard.done(lease(shard, w0, "a.drv"), {});
     shard.dispatch(out);
     assert(out.size() == 2);
 }
@@ -250,7 +257,7 @@ void testFeatures()
     assert(shard.entry(out[0].drv)->drvPath == "vm.drv" && out[0].worker == kvm);
     assert(shard.entry(out[1].drv)->drvPath == "a.drv" && out[1].worker == plain);
     assert(shard.queued() == 2);
-    shard.done(kvm, "vm.drv", {});
+    shard.done(lease(shard, kvm, "vm.drv"), {});
     shard.dispatch(out);
     assert(out.size() == 3 && out[2].worker == kvm);
     hello(shard, "gpu", 1, {}, {"cuda", "kvm"});
@@ -288,7 +295,7 @@ void testStuckFeatureSet()
 
     // vm1's worker gives it back, so only the giver is free: vm1 avoids it while the other kvm worker exists, vm3 behind it takes the slot.
     auto const giver = holder("vm1.drv");
-    shard.giveBack(giver, "vm1.drv");
+    shard.giveBack(lease(shard, giver, "vm1.drv"));
     shard.dispatch(out);
     assert(out.size() == 4);
     assert(shard.entry(out[3].drv)->drvPath == "vm3.drv" && out[3].worker == giver);
@@ -296,7 +303,7 @@ void testStuckFeatureSet()
     assert(shard.queued() == 2);
 
     // Order within the set survives the early end of those passes.
-    shard.done(holder("vm2.drv"), "vm2.drv", {});
+    shard.done(lease(shard, holder("vm2.drv"), "vm2.drv"), {});
     shard.dispatch(out);
     assert(out.size() == 5 && shard.entry(out[4].drv)->drvPath == "vm1.drv");
 }
@@ -394,12 +401,12 @@ void testGiveBack()
     shard.dispatch(out);
     assert(out.size() == 1 && out.at(0).worker == first);
     out.clear();
-    shard.giveBack(first, "g.drv");
+    shard.giveBack(lease(shard, first, "g.drv"));
     shard.dispatch(out);
     assert(out.size() == 1 && out.at(0).worker == first); // sole worker
     out.clear();
     auto const second = shard.hello({.addr = "b", .systems = {"x86_64"}, .features = {}, .maxJobs = 1, .running = {}}, sup);
-    shard.giveBack(first, "g.drv");
+    shard.giveBack(lease(shard, first, "g.drv"));
     shard.dispatch(out);
     assert(out.size() == 1 && out.at(0).worker == second);
     out.clear();
@@ -408,7 +415,7 @@ void testGiveBack()
     assert(out.size() == 1 && out.at(0).worker == first);
     out.clear();
     // Another worker can run it, just not now: it waits rather than going back.
-    shard.giveBack(second, "g.drv");
+    shard.giveBack(lease(shard, second, "g.drv"));
     shard.dispatch(out);
     assert(out.empty() && shard.entry(res.drv)->worker == noWorker);
 }
@@ -459,7 +466,7 @@ void testSystems()
     assert(shard.queued() == 2);
     checkStats(shard);
     // Slot on `both` frees: the other x86-ish drv goes there.
-    shard.done(both, shard.entry(out[0].worker == both ? out[0].drv : out[1].drv)->drvPath, {});
+    shard.done(lease(shard, both, shard.entry(out[0].worker == both ? out[0].drv : out[1].drv)->drvPath), {});
     out.clear();
     shard.dispatch(out);
     assert(out.size() == 1 && out[0].worker == both);
@@ -476,7 +483,7 @@ void testNoSlotsRunsNothing()
     assert((shard.offeredFeatures("x") == std::vector<std::string>{"kvm"}));
     auto const res = shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
     shard.dispatch(out);
-    shard.giveBack(w0, "a.drv");
+    shard.giveBack(lease(shard, w0, "a.drv"));
     shard.dispatch(out);
     assert(out.size() == 2 && out[1].worker == w0);
     shard.workerGone(w0);
@@ -490,8 +497,8 @@ void testStaleDoneAndUnknown()
 {
     Core shard;
     auto const w0 = hello(shard, "w0", 1);
-    shard.done(w0, "never.drv", {});
-    shard.done(w0, "never.drv", {});
+    shard.done(lease(shard, w0, "never.drv"), {});
+    shard.done(lease(shard, w0, "never.drv"), {});
     shard.workerGone(w0);
     shard.workerGone(w0);
     hello(shard, "w0", 1);
@@ -515,7 +522,7 @@ void testRunningFollowsTheWorker()
     auto const w0 = hello(shard, "w0", 1, {"orphan.drv"});
     auto const stat = [&] -> Core::Stats { return shard.stats()[{.system = "x", .features = ""}]; };
     assert(stat().slots == 1 && stat().free == 0 && stat().running == 1);
-    shard.done(w0, "orphan.drv", {});
+    shard.done(lease(shard, w0, "orphan.drv"), {});
     assert(stat().free == 1 && stat().running == 0);
     std::vector<Assign> out;
     shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);

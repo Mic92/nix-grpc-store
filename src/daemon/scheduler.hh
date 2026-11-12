@@ -609,40 +609,38 @@ public:
         return wid;
     }
 
-    void
-    done(WorkerId wid, std::string_view drvPath, const std::vector<std::pair<std::string_view, uint64_t>> & outputs)
+    // An assignment is named by the worker, the drv and the id it was
+    // placed with. A worker's word about one that is over changes nothing.
+    struct Lease
     {
-        auto & wkr = workers.at(wid);
+        WorkerId worker;
+        std::string_view drvPath;
+        uint64_t assignId;
+    };
+
+    void done(Lease lease, const std::vector<std::pair<std::string_view, uint64_t>> & outputs)
+    {
         for (auto [path, size] : outputs) {
-            rememberBuilder(path, wid, size);
+            rememberBuilder(path, lease.worker, size);
         }
-        auto found = findDrv(drvPath);
-        if (!found) {
-            return;
-        }
-        std::erase(wkr.running, *found);
-        refreshFree(wid);
-        auto & slot = entries.at(*found);
-        if (slot && slot->worker == wid) {
-            retire(*found);
+        if (auto const drv = release(lease)) {
+            retire(*drv);
         }
     }
 
     // The worker can't run it after all: place it elsewhere.
-    void giveBack(WorkerId wid, std::string_view drvPath)
+    void giveBack(Lease lease)
     {
-        auto found = findDrv(drvPath);
+        auto const found = release(lease);
         if (!found) {
             return;
         }
-        std::erase(workers.at(wid).running, *found);
-        refreshFree(wid);
         auto & slot = entries.at(*found);
-        if (!slot || slot->worker != wid) {
+        if (!slot) {
             return;
         }
         slot->worker = noWorker;
-        slot->avoid = wid;
+        slot->avoid = lease.worker;
         if (slot->followers.empty()) {
             retire(*found);
         } else {
@@ -880,6 +878,22 @@ private:
     uint64_t lastAssignId = 0;
 
     // Entry is finished or abandoned: free the slot and its id for reuse.
+    // Frees the worker's slot if the lease is the drv's current assignment.
+    auto release(Lease lease) -> std::optional<DrvId>
+    {
+        auto const found = findDrv(lease.drvPath);
+        if (!found) {
+            return std::nullopt;
+        }
+        const auto & slot = entries.at(*found);
+        if (!slot || slot->worker != lease.worker || slot->assignId != lease.assignId) {
+            return std::nullopt;
+        }
+        std::erase(workers.at(lease.worker).running, *found);
+        refreshFree(lease.worker);
+        return found;
+    }
+
     void retire(DrvId drv)
     {
         auto & slot = entries.at(drv);
