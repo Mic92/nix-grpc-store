@@ -1164,7 +1164,7 @@ void serve(
                 draining = true;
                 nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "draining"}});
                 if (coord.builder) {
-                    coord.builder->setDraining(true);
+                    coord.builder->setUnavailable(nixgrpc::Builder::Unavailable::stopping, true);
                 }
                 server.GetHealthCheckService()->SetServingStatus("", false);
             }

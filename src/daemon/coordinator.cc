@@ -38,7 +38,6 @@
 
 #include "acl.hh"
 #include "auth.hh"
-#include "backend.hh"
 #include "builder.hh"
 #include "cache.hh"
 #include "client/channel.hh"
@@ -346,9 +345,7 @@ void Coordinator::tick()
     const bool healthy = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize >= options.minFree;
     if (lastHealthy.exchange(healthy) != healthy) {
         logLine(LogLevel::info, {{"event", healthy ? "healthy" : "unhealthy"}, {"reason", "min_free"}});
-        if (stopSignal == 0) {
-            builder->setDraining(!healthy);
-        }
+        builder->setUnavailable(Builder::Unavailable::lowDisk, !healthy);
     }
 }
 

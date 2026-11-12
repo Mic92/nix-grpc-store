@@ -113,11 +113,16 @@ public:
     auto hello() -> nix::remote::WorkerMsg;
     // False if the session is gone.
     auto greet() -> bool;
-    void setDraining(bool draining);
+    // Why this worker takes no new builds. It takes none while any holds.
+    enum class Unavailable : uint8_t {
+        stopping = 1U << 0U,
+        lowDisk = 1U << 1U,
+    };
+    void setUnavailable(Unavailable why, bool holds);
 
     [[nodiscard]] auto draining() const -> bool
     {
-        return draining_;
+        return unavailable_ != 0;
     }
 
     // Give back unclaimed Expects nobody came for. Called from the serve loop.
@@ -138,7 +143,11 @@ private:
 
     mutable nix::Sync<State> state;
     mutable nix::Sync<SendFn> sendFn;
-    std::atomic<bool> draining_{false};
+    std::atomic<uint8_t> unavailable_{0};
+    // Orders the Load messages of concurrent setUnavailable() calls, and
+    // keeps them behind the Hello of their session.
+    std::mutex unavailableMutex;
+    bool greeted_ = false;
     static constexpr std::chrono::seconds expectTimeout{60};
 
     void sendDone(
