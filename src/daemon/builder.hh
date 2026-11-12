@@ -79,6 +79,7 @@ public:
         std::vector<std::string> systems; // first is the native one
         std::vector<std::string> features;
         uint32_t maxJobs = 0;
+        std::function<Clock::time_point()> now = Clock::now;
     };
 
     Builder(Config config, Metrics & metrics);
