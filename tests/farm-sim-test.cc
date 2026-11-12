@@ -410,7 +410,7 @@ struct Row
 
 constexpr auto rows = std::to_array<Row>({
     {.rule = Rule::slots, .name = "no worker holds more builds than it has slots", .broken = false},
-    {.rule = Rule::noSteal, .name = "a build a client started is not revoked for a reserved slot", .broken = true},
+    {.rule = Rule::noSteal, .name = "a build a client started is not revoked for a reserved slot", .broken = false},
 });
 
 auto run(std::span<char *> args) -> int

@@ -151,7 +151,7 @@ void Builder::sendDone(
     }
 }
 
-auto Builder::hello() const -> WorkerMsg
+auto Builder::hello() -> WorkerMsg
 {
     WorkerMsg msg;
     auto * hel = msg.mutable_hello();
@@ -164,6 +164,9 @@ auto Builder::hello() const -> WorkerMsg
     }
     hel->set_max_jobs(config.maxJobs);
     auto lck = state.lock();
+    // A slot nobody claimed is dropped, not reported: the scheduler would
+    // take it for a build and revoke the one its client started elsewhere.
+    std::erase_if(lck->expected, [](const auto & item) -> bool { return !item.second.claimed; });
     for (const auto & [drv, ent] : lck->expected) {
         auto * run = hel->add_running();
         run->set_drv_path(drv);
@@ -172,7 +175,7 @@ auto Builder::hello() const -> WorkerMsg
     return msg;
 }
 
-auto Builder::greet() const -> bool
+auto Builder::greet() -> bool
 {
     if (!send(hello())) {
         return false;
