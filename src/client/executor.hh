@@ -96,7 +96,7 @@ public:
     {
         auto const jid = static_cast<JobId>(jobs.size());
         jobs.push_back(
-            {.state = state::Blocked{.waiting = 0}, .prio = prio, .dependants = {}, .failedInput = {}, .bounced = 0, .followed = false});
+            {.state = state::Blocked{.waiting = 0}, .prio = prio, .dependants = {}, .failedInput = {}, .bounced = 0, .refused = 0, .followed = false});
         remaining++;
         size_t waiting = 0;
         for (auto const input : inputs) {
@@ -180,6 +180,7 @@ public:
         stream = false;
         for (auto & job : jobs) {
             job.followed = false;
+            job.refused = 0; // another scheduler numbers its own
         }
     }
 
@@ -322,7 +323,8 @@ public:
         }
     }
 
-        void bounced(JobId jid)
+    // `refused`: the worker did not start on it, so going back there is no use.
+    void bounced(JobId jid, bool refused = false)
     {
         auto & job = jobs.at(jid);
         auto * run = std::get_if<state::Running>(&job.state);
@@ -343,9 +345,12 @@ public:
                  .message = "gave up after " + std::to_string(job.bounced) + " reschedules"});
             return;
         }
+        job.refused = refused ? run->at.assignId : 0;
         to(jid, state::Blocked{.waiting = 0});
         release(jid);
     }
+
+    [[nodiscard]] auto refused(JobId jid) const -> uint64_t { return jobs.at(jid).refused; }
 
     // No scheduler any more. Placed jobs still build; everything else, now
     // or released later, fails as lost.
@@ -368,6 +373,7 @@ private:
         std::vector<JobId> dependants;
         std::optional<JobId> failedInput;
         unsigned bounced;
+        uint64_t refused; // assignment to name in the next Want
         // We sent a Want and no Cancel since. While set, the scheduler may
         // keep the job queued or placed for us.
         bool followed;

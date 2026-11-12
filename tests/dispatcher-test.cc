@@ -19,7 +19,15 @@ struct Farm
 {
     nixgrpc::Metrics metrics{""};
     Dispatcher disp{Dispatcher::Config{.defaultSystem = "x", .present = {}, .lookupThreads = 0}, metrics};
-    Dispatcher::ClientPtr client = disp.connectClient([](const nix::remote::SchedMsg &) -> bool { return true; }, {});
+    std::vector<std::string> sentTo;
+    Dispatcher::ClientPtr client = disp.connectClient(
+        [this](const nix::remote::SchedMsg & msg) -> bool {
+            if (msg.has_assigned()) {
+                sentTo.push_back(msg.assigned().worker_addr());
+            }
+            return true;
+        },
+        {});
 
     void hello(Dispatcher::Worker & session, const std::string & addr, uint32_t slots = 2)
     {
@@ -31,12 +39,13 @@ struct Farm
         disp.workerMsgs(session, msgs);
     }
 
-    void want(const std::string & drv)
+    void want(const std::string & drv, uint64_t refused = 0)
     {
         nix::remote::ClientMsgs msgs;
         auto * wnt = msgs.add_msgs()->mutable_want();
         wnt->set_drv_path(drv);
         wnt->set_system("x");
+        wnt->set_refused(refused);
         disp.clientMsgs(client, msgs);
     }
 };
@@ -47,9 +56,13 @@ struct Session
     bool alive = true;
     bool ended = false;
     std::vector<std::string> expected;
+    std::vector<std::string> revoked;
     uint64_t lastAssignId = 0;
     Dispatcher::Worker conn{
         .send = [this](const nix::remote::SchedCmd & cmd) -> bool {
+            if (alive && cmd.has_revoke()) {
+                revoked.push_back(cmd.revoke().drv_path());
+            }
             if (alive && cmd.has_expect()) {
                 expected.push_back(cmd.expect().drv_path());
                 lastAssignId = cmd.expect().assign_id();
@@ -155,10 +168,31 @@ void aWorkerThatRestedGetsItsDerivationBack()
     farm.disp.workerGone(busy.conn);
 }
 
+// A client that cannot reach the worker it was sent to is sent to another.
+void aClientThatCannotReachItsWorkerIsSentElsewhere()
+{
+    Farm farm;
+    Session unreachable;
+    Session other;
+    constexpr uint32_t more = 4; // so it is picked first
+    farm.hello(unreachable.conn, "w:1", more);
+    farm.hello(other.conn, "w:2");
+    farm.want("a.drv");
+    assert(farm.sentTo == std::vector<std::string>{"w:1"});
+
+    farm.want("a.drv", unreachable.lastAssignId);
+    assert((farm.sentTo == std::vector<std::string>{"w:1", "w:2"}));
+    assert(unreachable.revoked == std::vector<std::string>{"a.drv"});
+    assert(other.expected == std::vector<std::string>{"a.drv"});
+    farm.disp.workerGone(unreachable.conn);
+    farm.disp.workerGone(other.conn);
+}
+
 } // namespace
 
 auto main() -> int
 try {
+    aClientThatCannotReachItsWorkerIsSentElsewhere();
     aWorkerThatRestedGetsItsDerivationBack();
     loopbackWorkerMayAnswerACommand();
     endOfADroppedSessionKeepsTheNewOne();

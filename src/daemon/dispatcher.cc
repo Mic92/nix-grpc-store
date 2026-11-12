@@ -624,6 +624,10 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
         client.send(reply);
         return;
     }
+    if (auto const wid = core.refuse(client.id, want.drv_path(), want.refused())) {
+        revokeOn(*wid, want.drv_path());
+        metrics.event("refused");
+    }
     auto res = core.want(
         client.id,
         {.drvPath = want.drv_path(),

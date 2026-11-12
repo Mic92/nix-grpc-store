@@ -169,7 +169,7 @@ auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & 
     if (status.error_code() != grpc::StatusCode::ABORTED) {
       printError("%s: %s, asking the scheduler again", job.drvPath.to_string(), firstLine(status.error_message()));
     }
-    return Bounced{};
+    return Bounced{.refused = status.error_code() == grpc::StatusCode::UNAVAILABLE};
   default:
     checkStatus(status, "BuildDerivation");
   }
@@ -302,6 +302,7 @@ struct GrpcStore::Run {
     for (auto const jid : wants) {
       auto * msg = batch.add_msgs();
       fillWant(msg->mutable_want(), *byId.at(jid));
+      msg->mutable_want()->set_refused(exe.refused(jid));
       bytes += msg->ByteSizeLong();
       sent.push_back(jid);
       if (bytes >= maxBatchBytes) {
@@ -340,8 +341,8 @@ struct GrpcStore::Run {
         bool const succeeded = nixcompat::succeeded(*result);
         work->job->result = std::move(*result);
         exe.finished(work->jid, succeeded);
-      } else if (std::holds_alternative<Bounced>(res)) {
-        exe.bounced(work->jid);
+      } else if (const auto * bounce = std::get_if<Bounced>(&res)) {
+        exe.bounced(work->jid, bounce->refused);
       }
             flushLocked();
     }
