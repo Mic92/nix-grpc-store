@@ -107,10 +107,11 @@ public:
         nix::remote::Done::Reason reason = nix::remote::Done::REASON_UNSPECIFIED);
     [[nodiscard]] auto holding() const -> size_t;
 
-    // Hello reflecting current state. Sent on every (re)connect.
-    auto hello() const -> nix::remote::WorkerMsg;
+    // Sent on every (re)connect. Reports the builds a client came for and
+    // forgets the Expects nobody claimed.
+    auto hello() -> nix::remote::WorkerMsg;
     // False if the session is gone.
-    auto greet() const -> bool;
+    auto greet() -> bool;
     void setDraining(bool draining);
 
     [[nodiscard]] auto draining() const -> bool
