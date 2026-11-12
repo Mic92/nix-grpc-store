@@ -1,12 +1,14 @@
 // The scheduler (Dispatcher) and the workers' side of its protocol (Builder),
 // as the daemon runs them, joined by queues instead of gRPC streams. A seed
 // picks the order in which messages arrive, clients call workers, builds end,
-// sessions break and the scheduler restarts. After every step the rules below
-// are checked.
+// sessions break, the scheduler restarts and time passes. The rules below are
+// checked after every step, the last one once the faults have stopped.
 //
 // Usage: farm-sim-test [first-seed [seeds]]
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -20,6 +22,7 @@
 #include <optional>
 #include <print>
 #include <random>
+#include <ratio>
 #include <set>
 #include <span>
 #include <string>
@@ -45,8 +48,14 @@ constexpr size_t clientCount = 2;
 constexpr unsigned stepsPerSeed = 120;
 constexpr unsigned faultsPerSeed = 2;
 constexpr uint64_t defaultSeeds = 3000;
+// Enough steps for any run to end once the faults have stopped.
+constexpr unsigned settleSteps = 2000;
+// Longer than the scheduler waits for a client that left.
+constexpr double shortWaitMs = 11'000;
+// Longer than a worker keeps a slot nobody came for.
+constexpr double longWaitMs = 61'000;
 
-enum class Rule : uint8_t { slots, noSteal };
+enum class Rule : uint8_t { slots, noSteal, answered };
 
 struct Violation
 {
@@ -64,9 +73,18 @@ struct SimWorker
     std::set<std::string> building; // a client's call runs the build
     std::set<std::string> stopping; // of those, the ones a Revoke reached
 
-    SimWorker(std::string addr, nixgrpc::Metrics & metrics)
+    SimWorker(std::string addr, nixgrpc::Metrics & metrics, const double & nowMs)
         : addr(addr)
-        , builder({.advertise = std::move(addr), .systems = {"x"}, .features = {}, .maxJobs = slots}, metrics)
+        , builder(
+              {.advertise = std::move(addr),
+               .systems = {"x"},
+               .features = {},
+               .maxJobs = slots,
+               .now = [&nowMs] -> nixgrpc::Clock::time_point {
+                   return nixgrpc::Clock::time_point(
+                       std::chrono::duration_cast<nixgrpc::Clock::duration>(std::chrono::duration<double, std::milli>(nowMs)));
+               }},
+              metrics)
     {
     }
 };
@@ -92,11 +110,12 @@ struct Step
 {
     std::string name;
     std::function<void()> run;
+    bool wild = false; // not taken while the run settles
 };
 
-void add(std::vector<Step> & steps, std::string name, std::function<void()> run)
+void add(std::vector<Step> & steps, std::string name, std::function<void()> run, bool wild = false)
 {
-    steps.push_back({.name = std::move(name), .run = std::move(run)});
+    steps.push_back({.name = std::move(name), .run = std::move(run), .wild = wild});
 }
 
 class Sim
@@ -105,7 +124,7 @@ public:
     Sim()
     {
         for (size_t idx = 0; idx < workerCount; idx++) {
-            workers.push_back(std::make_unique<SimWorker>("w:" + std::to_string(idx), metrics));
+            workers.push_back(std::make_unique<SimWorker>("w:" + std::to_string(idx), metrics, nowMs));
         }
         for (size_t idx = 0; idx < clientCount; idx++) {
             clients.push_back(std::make_unique<SimClient>());
@@ -124,9 +143,34 @@ public:
             workerSteps(steps, idx);
         }
         if (faults < faultsPerSeed) {
-            add(steps, "scheduler restarts", [this] -> void { restartScheduler(); });
+            add(steps, "scheduler restarts", [this] -> void { restartScheduler(); }, true);
         }
+        add(steps, "a short time passes", [this] -> void { wait(shortWaitMs); }, true);
         return steps;
+    }
+
+    // With no more faults, runs until nothing but time can move.
+    auto settle(std::string & trace) -> std::optional<Violation>
+    {
+        faults = faultsPerSeed;
+        for (unsigned step = 0; step < settleSteps; step++) {
+            auto steps = enabled();
+            std::erase_if(steps, [](const Step & one) -> bool { return one.wild; });
+            if (steps.empty()) {
+                if (answered()) {
+                    return std::nullopt;
+                }
+                trace += "  a long time passes\n";
+                wait(longWaitMs);
+            } else {
+                trace += "  " + steps.front().name + "\n";
+                steps.front().run();
+            }
+            if (auto bad = check()) {
+                return bad;
+            }
+        }
+        return Violation{.rule = Rule::answered, .what = "a client still waits for its build"};
     }
 
     [[nodiscard]] auto check() const -> std::optional<Violation>
@@ -148,12 +192,36 @@ private:
     std::vector<std::unique_ptr<SimWorker>> workers;
     std::vector<std::unique_ptr<SimClient>> clients;
     unsigned faults = 0;
+    double nowMs = 0;
     std::optional<Violation> violation;
+
+    void wait(double forMs)
+    {
+        nowMs += forMs;
+        disp->tick();
+        for (auto & wkr : workers) {
+            wkr->builder.tick();
+        }
+    }
+
+    [[nodiscard]] auto answered() const -> bool
+    {
+        for (const auto & cli : clients) {
+            for (const auto & [drv, job] : cli->jobs) {
+                if (job.state != Follow::finished) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
 
     void startScheduler()
     {
         disp = std::make_unique<Dispatcher>(
-            Dispatcher::Config{.defaultSystem = "x", .present = {}, .lookupThreads = 0}, metrics);
+            Dispatcher::Config{
+                .defaultSystem = "x", .present = {}, .lookupThreads = 0, .nowMs = [this] -> double { return nowMs; }},
+            metrics);
     }
 
     void restartScheduler()
@@ -178,10 +246,13 @@ private:
         wkr.up.clear();
     }
 
-    static void connect(SimWorker & wkr)
+    void connect(SimWorker & wkr)
     {
         wkr.session = std::make_unique<Dispatcher::Worker>(Dispatcher::Worker{
-            .send = [&wkr](const nix::remote::SchedCmd & cmd) -> bool {
+            .send = [this, &wkr](const nix::remote::SchedCmd & cmd) -> bool {
+                if (cmd.has_revoke()) {
+                    revokeSent(wkr, cmd.revoke().drv_path());
+                }
                 wkr.down.push_back(cmd);
                 return true;
             },
@@ -224,6 +295,19 @@ private:
             add(steps, who + " connects", [this, &cli] -> void { connect(cli); });
             return;
         }
+        if (faults < faultsPerSeed) {
+            add(
+                steps,
+                who + " loses its stream",
+                [this, &cli] -> void {
+                    faults++;
+                    disp->clientGone(cli.stream);
+                    cli.stream.reset();
+                    cli.down.clear();
+                    cli.up.clear();
+                },
+                true);
+        }
         for (const std::string drv : {"a.drv", "b.drv"}) {
             if (!cli.jobs.contains(drv)) {
                 add(steps, std::format("{} wants {}", who, drv), [&cli, drv] -> void {
@@ -259,7 +343,7 @@ private:
             return;
         }
         auto const job = cli.jobs.find(msg.assigned().drv_path());
-        if (job == cli.jobs.end() || job->second.state != Follow::wanted) {
+        if (job == cli.jobs.end() || job->second.state == Follow::building || job->second.state == Follow::finished) {
             return;
         }
         for (size_t idx = 0; idx < workers.size(); idx++) {
@@ -292,14 +376,14 @@ private:
     {
         auto & wkr = *workers.at(idx);
         if (!wkr.session) {
-            add(steps, wkr.addr + " connects", [&wkr] -> void { connect(wkr); });
+            add(steps, wkr.addr + " connects", [this, &wkr] -> void { connect(wkr); });
         } else {
             if (faults < faultsPerSeed) {
                 add(steps, wkr.addr + " loses its session", [this, &wkr] -> void {
                                      faults++;
                                      disp->workerGone(*wkr.session);
                                      dropSession(wkr);
-                                 });
+                                 }, true);
             }
             if (!wkr.up.empty()) {
                 add(steps, "scheduler reads from " + wkr.addr, [this, &wkr] -> void {
@@ -329,24 +413,31 @@ private:
             auto const & drv = cmd.revoke().drv_path();
             if (wkr.building.contains(drv)) {
                 wkr.stopping.insert(drv);
-                if (!builtElsewhere(idx, drv)) {
-                    violation = Violation{
-                        .rule = Rule::noSteal,
-                        .what = "the build of " + drv + " on " + wkr.addr + " is revoked and no other worker builds it"};
-                }
             }
             wkr.builder.onRevoke(cmd.revoke());
         }
     }
 
-    [[nodiscard]] auto builtElsewhere(size_t idx, const std::string & drv) const -> bool
+    // The scheduler may stop a build nobody waits for, or one of two. It
+    // must not stop the only build of a client it can talk to.
+    void revokeSent(const SimWorker & wkr, const std::string & drv)
     {
-        for (size_t other = 0; other < workers.size(); other++) {
-            if (other != idx && workers.at(other)->building.contains(drv)) {
-                return true;
-            }
+        if (!wkr.building.contains(drv)) {
+            return;
         }
-        return false;
+        bool const twice = std::ranges::any_of(workers, [&](const auto & other) -> bool {
+            return other.get() != &wkr && other->building.contains(drv);
+        });
+        bool const awaited = std::ranges::any_of(clients, [&](const auto & cli) -> bool {
+            auto const job = cli->jobs.find(drv);
+            return cli->stream && job != cli->jobs.end() && job->second.state == Follow::building
+                   && workers.at(job->second.worker).get() == &wkr;
+        });
+        if (!twice && awaited) {
+            violation = Violation{
+                .rule = Rule::noSteal,
+                .what = "the scheduler revokes the only build of " + drv + ", on " + wkr.addr + ", while a client waits for it"};
+        }
     }
 
     // A revoked build ends cancelled and its callers ask again.
@@ -373,30 +464,37 @@ private:
     }
 };
 
-// The seed whose run breaks `rule`, with the steps that led there.
-auto firstViolation(Rule rule, uint64_t first, uint64_t seeds) -> std::optional<std::pair<uint64_t, std::string>>
+struct Found
 {
+    uint64_t seed;
+    std::string trace;
+};
+
+// For each rule some run breaks, the first such seed and its steps.
+auto violations(uint64_t first, uint64_t seeds) -> std::map<Rule, Found>
+{
+    std::map<Rule, Found> found;
     for (uint64_t seed = first; seed < first + seeds; seed++) {
         std::mt19937_64 rng(seed);
         Sim sim;
         std::string trace;
-        for (unsigned step = 0; step < stepsPerSeed; step++) {
+        std::optional<Violation> bad;
+        for (unsigned step = 0; step < stepsPerSeed && !bad; step++) {
             auto steps = sim.enabled();
-            if (steps.empty()) {
-                break;
-            }
             auto const & pick = steps.at(rng() % steps.size());
             trace += "  " + pick.name + "\n";
             pick.run();
-            if (auto const bad = sim.check(); bad && bad->rule == rule) {
-                return std::pair{seed, trace + "  => " + bad->what + "\n"};
-            }
-            if (sim.check()) {
-                break; // another rule broke; this run says nothing more about ours
-            }
+            bad = sim.check();
+        }
+        if (!bad) {
+            trace += "  (no more faults)\n";
+            bad = sim.settle(trace);
+        }
+        if (bad) {
+            found.try_emplace(bad->rule, Found{.seed = seed, .trace = trace + "  => " + bad->what + "\n"});
         }
     }
-    return std::nullopt;
+    return found;
 }
 
 struct Row
@@ -410,7 +508,8 @@ struct Row
 
 constexpr auto rows = std::to_array<Row>({
     {.rule = Rule::slots, .name = "no worker holds more builds than it has slots", .broken = false},
-    {.rule = Rule::noSteal, .name = "a build a client started is not revoked for a reserved slot", .broken = false},
+    {.rule = Rule::noSteal, .name = "the only build a client waits for is not revoked", .broken = false},
+    {.rule = Rule::answered, .name = "every client gets its build once the faults stop", .broken = false},
 });
 
 auto run(std::span<char *> args) -> int
@@ -425,16 +524,18 @@ auto run(std::span<char *> args) -> int
     uint64_t const first = args.size() > 1 ? std::stoull(args.subspan(1).front()) : 1;
     uint64_t const seeds = args.size() > 2 ? std::stoull(args.subspan(2).front()) : defaultSeeds;
     int status = EXIT_SUCCESS;
+    auto const all = violations(first, seeds);
     for (const auto & row : rows) {
-        auto const found = firstViolation(row.rule, first, seeds);
-        if (found && !row.broken) {
-            std::print("FAIL {}\nseed {}:\n{}", row.name, found->first, found->second);
+        auto const iter = all.find(row.rule);
+        auto const * const found = iter == all.end() ? nullptr : &iter->second;
+        if (found != nullptr && !row.broken) {
+            std::print("FAIL {}\nseed {}:\n{}", row.name, found->seed, found->trace);
             status = EXIT_FAILURE;
-        } else if (!found && row.broken) {
+        } else if (found == nullptr && row.broken) {
             std::println("FAIL {}\nis listed as broken, but no seed breaks it", row.name);
             status = EXIT_FAILURE;
-        } else if (found) {
-            std::println("known broken (seed {}): {}", found->first, row.name);
+        } else if (found != nullptr) {
+            std::println("known broken (seed {}): {}", found->seed, row.name);
         } else {
             std::println("ok: {}", row.name);
         }
