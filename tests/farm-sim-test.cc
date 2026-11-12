@@ -27,6 +27,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -496,7 +497,7 @@ struct Found
 };
 
 // For each rule some run breaks, the first such seed and its steps.
-auto violations(uint64_t first, uint64_t seeds) -> std::map<Rule, Found>
+auto violationsIn(uint64_t first, uint64_t seeds) -> std::map<Rule, Found>
 {
     std::map<Rule, Found> found;
     for (uint64_t seed = first; seed < first + seeds; seed++) {
@@ -518,6 +519,29 @@ auto violations(uint64_t first, uint64_t seeds) -> std::map<Rule, Found>
         if (bad) {
             found.try_emplace(bad->rule, Found{.seed = seed, .trace = trace + "  => " + bad->what + "\n"});
         }
+    }
+    return found;
+}
+
+// Seeds are independent, so each thread takes a slice of them.
+auto violations(uint64_t first, uint64_t seeds) -> std::map<Rule, Found>
+{
+    auto const threads = std::clamp<uint64_t>(std::thread::hardware_concurrency(), 1, std::max<uint64_t>(seeds, 1));
+    auto const slice = (seeds + threads - 1) / threads;
+    std::vector<std::map<Rule, Found>> parts(threads);
+    {
+        std::vector<std::jthread> pool;
+        for (uint64_t idx = 0; idx < threads; idx++) {
+            auto const from = std::min(idx * slice, seeds);
+            pool.emplace_back([&part = parts.at(idx), start = first + from, count = std::min(slice, seeds - from)] -> void {
+                part = violationsIn(start, count);
+            });
+        }
+    }
+    // Slices are in seed order, so the first hit of a rule is its lowest seed.
+    std::map<Rule, Found> found;
+    for (auto & part : parts) {
+        found.merge(part);
     }
     return found;
 }
