@@ -105,6 +105,7 @@ class Metrics
     // Touched on every scheduler message; Family::Add hashes the label map each time.
     prometheus::Gauge * schedQueuedGauge = &sched->Add({{"kind", "queued"}});
     prometheus::Gauge * schedWorkersGauge = &sched->Add({{"kind", "workers"}});
+    prometheus::Gauge * schedRestedGauge = &sched->Add({{"kind", "rested"}});
     prometheus::Gauge * schedLeaderGauge = &sched->Add({{"kind", "leader"}});
 
     // NOLINTNEXTLINE(*-magic-numbers)
@@ -275,6 +276,10 @@ public:
     void schedWorkers(size_t count) const
     {
         schedWorkersGauge->Set(static_cast<double>(count));
+    }
+    void schedRested(size_t count) const
+    {
+        schedRestedGauge->Set(static_cast<double>(count));
     }
     [[nodiscard]] auto schedWorkersNow() const -> double
     {

@@ -97,6 +97,11 @@ void Dispatcher::tick()
 void Dispatcher::tickLocked()
 {
     revokeOrphans();
+    if (core.wake(nowMs())) {
+        membershipChangedLocked();
+        dispatchLocked();
+        metrics.schedRested(core.resting());
+    }
     if (statsPending) {
         exportStats(true);
     }
@@ -692,6 +697,7 @@ void Dispatcher::workerMsgs(Worker & worker, const nix::remote::WorkerMsgs & msg
     }
     dispatchLocked();
     metrics.schedWorkers(core.workersUp());
+    metrics.schedRested(core.resting());
     exportStats(false);
 }
 
@@ -760,7 +766,19 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
     sched::Core::Lease const lease{.worker = wid, .drvPath = done.drv_path(), .assignId = done.assign_id()};
     metrics.event("done_" + nix::remote::Done::Outcome_Name(done.outcome()));
     if (done.outcome() == nix::remote::Done::GIVEN_BACK || done.outcome() == nix::remote::Done::NO_SHOW) {
-        core.giveBack(lease, done.reason() == nix::remote::Done::DRAINING ? sched::GaveBack::worker : sched::GaveBack::drv);
+        bool const held = core.giveBack(
+            lease, done.reason() == nix::remote::Done::DRAINING ? sched::GaveBack::worker : sched::GaveBack::drv);
+        if (held && done.reason() == nix::remote::Done::TRANSIENT_FAILURE) {
+            if (auto const rest = core.failed(wid, nowMs())) {
+                logLine(
+                    LogLevel::info,
+                    {{"event", "rested"},
+                     {"addr", core.worker(wid).addr},
+                     {"reason", "failing"},
+                     {"seconds", std::to_string(static_cast<uint64_t>(*rest / msPerSecond))}});
+                membershipChangedLocked();
+            }
+        }
         metrics.event("given_back_" + nix::remote::Done::Reason_Name(done.reason()));
         placeabilityChangedLocked(); // its followers may have no worker left
         return;
@@ -802,6 +820,7 @@ void Dispatcher::workerGone(Worker & worker)
     dispatchLocked();
     placeabilityChangedLocked();
     metrics.schedWorkers(core.workersUp());
+    metrics.schedRested(core.resting());
     exportStats(false);
     worker.id.reset();
 }
