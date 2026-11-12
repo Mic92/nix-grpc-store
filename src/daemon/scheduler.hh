@@ -501,6 +501,24 @@ public:
         return {.drv = drv};
     }
 
+    // The drv's only client could not use its assignment: the drv is placed
+    // again as if its worker had given it back. Returns the worker to Revoke on.
+    auto refuse(ClientId client, std::string_view drvPath, uint64_t assignId) -> std::optional<WorkerId>
+    {
+        auto const found = findDrv(drvPath);
+        if (!found) {
+            return std::nullopt;
+        }
+        const auto & slot = entries.at(*found);
+        if (!slot || slot->worker == noWorker || slot->assignId != assignId
+            || slot->followers != std::vector<ClientId>{client}) {
+            return std::nullopt;
+        }
+        auto const wid = slot->worker;
+        giveBack({.worker = wid, .drvPath = drvPath, .assignId = assignId}, GaveBack::drv);
+        return wid;
+    }
+
     // Worker to Revoke on, if the last follower left an assigned drv.
     auto cancel(ClientId client, std::string_view drvPath) -> std::optional<WorkerId>
     {

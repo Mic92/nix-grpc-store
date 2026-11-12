@@ -170,6 +170,9 @@ message Want {
   repeated string required_features = 6;
   // drv.platform; empty means the scheduler's own system.
   string system = 7;
+  // The assignment this client got for the drv and whose worker would not
+  // serve it. The scheduler places the drv on another worker.
+  uint64 refused = 11;
 }
 
 message Cancel {

@@ -500,7 +500,9 @@ public:
     };
     struct Run;
 
-        struct Bounced {};
+        struct Bounced {
+      bool refused = false; // the worker answered that it cannot serve builds now, or was not reachable
+    };
         struct MissingInput {
       StorePath path;
     };

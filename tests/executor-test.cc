@@ -83,6 +83,25 @@ void bounces()
     assert(outcome(exe, job) == Outcome::gaveUp);
 }
 
+// A worker that would not serve a job is named in the next Want, so the
+// scheduler sends the job elsewhere. A stream that broke later is not.
+void refusedPlacementIsNamedOnce()
+{
+    Executor exe({.threads = 1, .rescheduleRetries = Executor::defaultRescheduleRetries, .keepGoing = true});
+    auto const job = exe.add(0, {});
+    exe.connected();
+    exe.takeWants();
+    exe.onAssigned(job, place("a"));
+    exe.next();
+    exe.bounced(job, true);
+    assert(exe.refused(job) == place("a").assignId);
+    exe.takeWants();
+    exe.onAssigned(job, place("b"));
+    exe.next();
+    exe.bounced(job);
+    assert(exe.refused(job) == 0);
+}
+
 // Without keep-going the first failure cancels what has not started, and
 // the scheduler hears it.
 void stopsWithoutKeepGoing()
@@ -200,6 +219,7 @@ auto main() -> int
         wantsFollowThreads();
         dependantsWait();
         bounces();
+    refusedPlacementIsNamedOnce();
         stopsWithoutKeepGoing();
         unplaceableGrace();
         reconnectAndAbandon();
