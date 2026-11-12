@@ -295,7 +295,7 @@ void testStuckFeatureSet()
 
     // vm1's worker gives it back, so only the giver is free: vm1 avoids it while the other kvm worker exists, vm3 behind it takes the slot.
     auto const giver = holder("vm1.drv");
-    shard.giveBack(lease(shard, giver, "vm1.drv"));
+    shard.giveBack(lease(shard, giver, "vm1.drv"), GaveBack::drv);
     shard.dispatch(out);
     assert(out.size() == 4);
     assert(shard.entry(out[3].drv)->drvPath == "vm3.drv" && out[3].worker == giver);
@@ -401,12 +401,12 @@ void testGiveBack()
     shard.dispatch(out);
     assert(out.size() == 1 && out.at(0).worker == first);
     out.clear();
-    shard.giveBack(lease(shard, first, "g.drv"));
+    shard.giveBack(lease(shard, first, "g.drv"), GaveBack::drv);
     shard.dispatch(out);
     assert(out.size() == 1 && out.at(0).worker == first); // sole worker
     out.clear();
     auto const second = shard.hello({.addr = "b", .systems = {"x86_64"}, .features = {}, .maxJobs = 1, .running = {}}, sup);
-    shard.giveBack(lease(shard, first, "g.drv"));
+    shard.giveBack(lease(shard, first, "g.drv"), GaveBack::drv);
     shard.dispatch(out);
     assert(out.size() == 1 && out.at(0).worker == second);
     out.clear();
@@ -415,9 +415,28 @@ void testGiveBack()
     assert(out.size() == 1 && out.at(0).worker == first);
     out.clear();
     // Another worker can run it, just not now: it waits rather than going back.
-    shard.giveBack(lease(shard, second, "g.drv"));
+    shard.giveBack(lease(shard, second, "g.drv"), GaveBack::drv);
     shard.dispatch(out);
     assert(out.empty() && shard.entry(res.drv)->worker == noWorker);
+}
+
+// Every worker that gave a drv back is passed over, not just the last one.
+void testGiveBackRemembersEveryGiver()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const big = hello(shard, "big", 3);
+    auto const mid = hello(shard, "mid", 2);
+    auto const small = hello(shard, "small", 1);
+    shard.want(1, {.drvPath = "g.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    for (auto const giver : {big, mid}) {
+        shard.dispatch(out);
+        assert(out.size() == 1 && out.at(0).worker == giver);
+        out.clear();
+        shard.giveBack(lease(shard, giver, "g.drv"), GaveBack::drv);
+    }
+    shard.dispatch(out);
+    assert(out.size() == 1 && out.at(0).worker == small);
 }
 
 // A worker serving two systems gives its slot to the more urgent drv.
@@ -483,7 +502,7 @@ void testNoSlotsRunsNothing()
     assert((shard.offeredFeatures("x") == std::vector<std::string>{"kvm"}));
     auto const res = shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
     shard.dispatch(out);
-    shard.giveBack(lease(shard, w0, "a.drv"));
+    shard.giveBack(lease(shard, w0, "a.drv"), GaveBack::drv);
     shard.dispatch(out);
     assert(out.size() == 2 && out[1].worker == w0);
     shard.workerGone(w0);
@@ -554,6 +573,7 @@ try {
     testUnofferedSystems();
     testHelloAdoptsQueued();
     testGiveBack();
+    testGiveBackRemembersEveryGiver();
     testCrossSystemPriority();
     testPlaceabilityFlips();
     testNoSlotsRunsNothing();

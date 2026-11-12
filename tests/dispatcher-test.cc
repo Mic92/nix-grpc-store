@@ -47,10 +47,12 @@ struct Session
     bool alive = true;
     bool ended = false;
     std::vector<std::string> expected;
+    uint64_t lastAssignId = 0;
     Dispatcher::Worker conn{
         .send = [this](const nix::remote::SchedCmd & cmd) -> bool {
             if (alive && cmd.has_expect()) {
                 expected.push_back(cmd.expect().drv_path());
+                lastAssignId = cmd.expect().assign_id();
             }
             return alive;
         },
@@ -125,10 +127,39 @@ void loopbackWorkerMayAnswerACommand()
     farm.disp.workerGone(*worker);
 }
 
+// A worker that stops taking builds gives back what it was told to expect.
+// That says nothing about the derivation, which may return there.
+void aWorkerThatRestedGetsItsDerivationBack()
+{
+    Farm farm;
+    Session rested;
+    Session busy;
+    farm.hello(rested.conn, "w:1", 1);
+    farm.want("a.drv");
+    farm.hello(busy.conn, "w:2", 1);
+    farm.want("b.drv");
+    assert(busy.expected == std::vector<std::string>{"b.drv"});
+
+    nix::remote::WorkerMsgs msgs;
+    msgs.add_msgs()->mutable_load()->set_draining(true);
+    auto * done = msgs.add_msgs()->mutable_done();
+    done->set_drv_path("a.drv");
+    done->set_assign_id(rested.lastAssignId);
+    done->set_outcome(nix::remote::Done::GIVEN_BACK);
+    done->set_reason(nix::remote::Done::DRAINING);
+    msgs.add_msgs()->mutable_load()->set_draining(false);
+    farm.disp.workerMsgs(rested.conn, msgs);
+
+    assert((rested.expected == std::vector<std::string>{"a.drv", "a.drv"}));
+    farm.disp.workerGone(rested.conn);
+    farm.disp.workerGone(busy.conn);
+}
+
 } // namespace
 
 auto main() -> int
 try {
+    aWorkerThatRestedGetsItsDerivationBack();
     loopbackWorkerMayAnswerACommand();
     endOfADroppedSessionKeepsTheNewOne();
     dropPlacesItsWorkElsewhere();

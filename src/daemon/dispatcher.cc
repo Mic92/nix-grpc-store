@@ -756,7 +756,7 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
     sched::Core::Lease const lease{.worker = wid, .drvPath = done.drv_path(), .assignId = done.assign_id()};
     metrics.event("done_" + nix::remote::Done::Outcome_Name(done.outcome()));
     if (done.outcome() == nix::remote::Done::GIVEN_BACK || done.outcome() == nix::remote::Done::NO_SHOW) {
-        core.giveBack(lease);
+        core.giveBack(lease, done.reason() == nix::remote::Done::DRAINING ? sched::GaveBack::worker : sched::GaveBack::drv);
         metrics.event("given_back_" + nix::remote::Done::Reason_Name(done.reason()));
         placeabilityChangedLocked(); // its followers may have no worker left
         return;
