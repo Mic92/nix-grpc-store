@@ -328,6 +328,13 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
+  test('local-store', executable('local-store-test',
+    sources : ['tests/local-store-test.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    dependencies : [nix_store_dep, nix_util_dep, threads_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
+
   test('upload-spool', executable('upload-spool-test',
     sources : ['tests/upload-spool-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],

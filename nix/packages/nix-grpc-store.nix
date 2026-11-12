@@ -68,6 +68,7 @@ stdenv.mkDerivation {
         ../../tests/sbpl-test.cc
         ../../tests/sandbox-test.cc
         ../../tests/log-spill-test.cc
+        ../../tests/local-store-test.cc
         ../../tests/plugin-loader-test.cc
         ../../tests/upload-claims-test.cc
         ../../tests/top-down-test.cc
