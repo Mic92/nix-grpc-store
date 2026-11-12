@@ -344,7 +344,7 @@ assignment.
 
 **Metrics.** Set `services.nix-grpc-daemon.metricsListen` on workers and
 scrape envoy's admin port (`/stats/prometheus`). The scheduler adds
-`nix_grpc_sched{kind="queued|workers|clients|leader"}` and, per system
+`nix_grpc_sched{kind="queued|workers|rested|clients|leader"}` and, per system
 and feature set,
 `nix_grpc_sched_system{system,features,kind="queued|unplaceable|running|slots|free"}`.
 Only the node holding the lock has `leader` 1 and non-zero values, so
@@ -394,6 +394,15 @@ its journal (`event=unhealthy`). The client
 prints this as a warning and waits two minutes before giving up, because
 right after a scheduler restart the builders may still be reconnecting.
 Look for `event=scheduler_disconnected` in the builders' journal.
+
+**Builds wait although a builder has free slots** — a builder that gives
+back three builds in a row for a failure of its own (for example a full
+build directory) gets no builds for 30 seconds, then twice as long after
+each further failure, up to ten minutes. It gets builds again by itself;
+finishing one or restarting it clears the count. The scheduler's journal
+names it (`event=rested reason=failing addr=…`) and
+`nix_grpc_sched{kind="rested"}` counts such builders. The cause is in
+that builder's journal.
 
 **`asking the scheduler again` keeps repeating** — the client reaches a
 different worker than the scheduler picked. A worker's `advertise` is not

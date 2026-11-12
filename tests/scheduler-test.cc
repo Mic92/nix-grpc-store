@@ -439,6 +439,39 @@ void testGiveBackRemembersEveryGiver()
     assert(out.size() == 1 && out.at(0).worker == small);
 }
 
+// A worker that keeps failing for a reason of its own gets no work for a
+// while, longer each time, until it finishes a build.
+void testFailingWorkerRests()
+{
+    constexpr double firstRest = 30e3;
+    Core shard;
+    std::vector<Assign> out;
+    auto const sick = hello(shard, "sick", 1);
+    shard.want(1, {.drvPath = "r.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    auto const fail = [&](double now) -> bool {
+        shard.dispatch(out);
+        assert(out.size() == 1);
+        out.clear();
+        shard.giveBack(lease(shard, sick, "r.drv"), GaveBack::drv);
+        return shard.failed(sick, now).has_value();
+    };
+    assert(!fail(0) && !fail(0) && fail(0));
+    assert(!shard.failed(sick, 0)); // one more from before the rest
+    shard.dispatch(out);
+    assert(out.empty() && shard.placeable(*shard.findDrv("r.drv")));
+    assert(!shard.wake(firstRest - 1) && shard.wake(firstRest));
+
+    assert(fail(firstRest));
+    assert(!shard.wake(2 * firstRest) && shard.wake(3 * firstRest));
+
+    shard.dispatch(out);
+    assert(out.size() == 1);
+    out.clear();
+    shard.done(lease(shard, sick, "r.drv"), {});
+    shard.want(1, {.drvPath = "r.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    assert(!fail(0));
+}
+
 // A worker serving two systems gives its slot to the more urgent drv.
 void testCrossSystemPriority()
 {
@@ -574,6 +607,7 @@ try {
     testHelloAdoptsQueued();
     testGiveBack();
     testGiveBackRemembersEveryGiver();
+    testFailingWorkerRests();
     testCrossSystemPriority();
     testPlaceabilityFlips();
     testNoSlotsRunsNothing();

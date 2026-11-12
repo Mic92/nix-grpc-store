@@ -1,6 +1,7 @@
 // The Dispatcher driven through the calls its transports make, without gRPC.
 
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -18,13 +19,19 @@ using nixgrpc::Dispatcher;
 struct Farm
 {
     nixgrpc::Metrics metrics{""};
-    Dispatcher disp{Dispatcher::Config{.defaultSystem = "x", .present = {}, .lookupThreads = 0}, metrics};
+    double nowMs = 0;
+    Dispatcher disp{
+        Dispatcher::Config{
+            .defaultSystem = "x", .present = {}, .lookupThreads = 0, .nowMs = [this] -> double { return nowMs; }},
+        metrics};
     std::vector<std::string> sentTo;
+    bool unplaceable = false;
     Dispatcher::ClientPtr client = disp.connectClient(
         [this](const nix::remote::SchedMsg & msg) -> bool {
             if (msg.has_assigned()) {
                 sentTo.push_back(msg.assigned().worker_addr());
             }
+            unplaceable = unplaceable || msg.has_unplaceable();
             return true;
         },
         {});
@@ -168,6 +175,32 @@ void aWorkerThatRestedGetsItsDerivationBack()
     farm.disp.workerGone(busy.conn);
 }
 
+// A worker that gives back build after build for a failure of its own gets
+// none for a while. Its client waits and is not told the build has no worker.
+void aFailingWorkerIsRested()
+{
+    constexpr double rest = 30e3;
+    Farm farm;
+    Session sick;
+    farm.hello(sick.conn, "w:1", 1);
+    farm.want("a.drv");
+    for (std::size_t round = 1; round <= 3; round++) {
+        assert(sick.expected.size() == round);
+        nix::remote::WorkerMsgs msgs;
+        auto * done = msgs.add_msgs()->mutable_done();
+        done->set_drv_path("a.drv");
+        done->set_assign_id(sick.lastAssignId);
+        done->set_outcome(nix::remote::Done::GIVEN_BACK);
+        done->set_reason(nix::remote::Done::TRANSIENT_FAILURE);
+        farm.disp.workerMsgs(sick.conn, msgs);
+    }
+    assert(sick.expected.size() == 3 && !farm.unplaceable);
+    farm.nowMs = rest;
+    farm.disp.tick();
+    assert(sick.expected.size() == 4);
+    farm.disp.workerGone(sick.conn);
+}
+
 // A client that cannot reach the worker it was sent to is sent to another.
 void aClientThatCannotReachItsWorkerIsSentElsewhere()
 {
@@ -194,6 +227,7 @@ auto main() -> int
 try {
     aClientThatCannotReachItsWorkerIsSentElsewhere();
     aWorkerThatRestedGetsItsDerivationBack();
+    aFailingWorkerIsRested();
     loopbackWorkerMayAnswerACommand();
     endOfADroppedSessionKeepsTheNewOne();
     dropPlacesItsWorkElsewhere();

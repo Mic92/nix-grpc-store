@@ -361,12 +361,20 @@ struct Worker
     int32_t maxJobs = 0;
     bool up = false;
     bool draining = false;
+    // Give-backs for a failure of its own since it last finished a build.
+    uint32_t failures = 0;
+    std::optional<double> restsUntilMs;
     std::vector<DrvId> running;
 
     // A worker that says Hello with max_jobs 0 is up but runs nothing.
-    [[nodiscard]] auto takesWork() const -> bool
+    [[nodiscard]] auto serves() const -> bool
     {
         return up && !draining && maxJobs > 0;
+    }
+    // A resting worker serves again soon: what it offers stays placeable.
+    [[nodiscard]] auto takesWork() const -> bool
+    {
+        return serves() && !restsUntilMs;
     }
 };
 
@@ -646,21 +654,22 @@ public:
             rememberBuilder(path, lease.worker, size);
         }
         if (auto const drv = release(lease)) {
+            workers.at(lease.worker).failures = 0;
             retire(*drv);
         }
     }
 
-    // The worker can't run it after all: place it elsewhere.
-    void giveBack(Lease lease, GaveBack why)
+    // The worker can't run it after all: place it elsewhere. False if the
+    // lease is over.
+    auto giveBack(Lease lease, GaveBack why) -> bool
     {
-
         auto const found = release(lease);
         if (!found) {
-            return;
+            return false;
         }
         auto & slot = entries.at(*found);
         if (!slot) {
-            return;
+            return true;
         }
         slot->worker = noWorker;
         if (why == GaveBack::drv) {
@@ -672,6 +681,52 @@ public:
         } else {
             enqueue(*found);
         }
+        return true;
+    }
+
+    // The worker gave a drv back for a failure of its own. One that keeps
+    // doing so would get every new drv once, so it rests, longer each time.
+    // Returns the length of a rest that starts.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): who, then when.
+    auto failed(WorkerId wid, double nowMs) -> std::optional<double>
+    {
+        constexpr uint32_t tolerated = 2;
+        constexpr double firstRestMs = 30e3;
+        constexpr double longestRestMs = 600e3;
+        constexpr uint32_t maxDoublings = 5;
+        auto & wkr = workers.at(wid);
+        // Builds it gave back while resting were assigned before the rest.
+        if (!wkr.up || wkr.restsUntilMs || ++wkr.failures <= tolerated) {
+            return std::nullopt;
+        }
+        auto const doublings = std::min(wkr.failures - tolerated - 1, maxDoublings);
+        auto const rest = std::min(firstRestMs * static_cast<double>(1U << doublings), longestRestMs);
+        resting_++;
+        wkr.restsUntilMs = nowMs + rest;
+        refreshFree(wid);
+        return rest;
+    }
+
+    // True if a worker's rest ended.
+    auto wake(double nowMs) -> bool
+    {
+        if (resting_ == 0) {
+            return false;
+        }
+        bool woke = false;
+        for (WorkerId wid = 0; wid < workers.size(); wid++) {
+            auto & wkr = workers.at(wid);
+            if (wkr.restsUntilMs && *wkr.restsUntilMs <= nowMs) {
+                unrest(wid);
+                woke = true;
+            }
+        }
+        return woke;
+    }
+
+    [[nodiscard]] auto resting() const -> size_t
+    {
+        return resting_;
     }
 
     void setDraining(WorkerId wid, bool draining)
@@ -689,7 +744,8 @@ public:
             workersUp_--;
         }
         wkr.up = false;
-        refreshFree(wid);
+        wkr.failures = 0;
+        unrest(wid);
         for (auto const drv : std::exchange(wkr.running, {})) {
             if (drv >= entries.size()) {
                 continue;
@@ -735,7 +791,7 @@ public:
     // Some worker that takes work could ever run it.
     [[nodiscard]] auto placeable(const Entry & ent) const -> bool
     {
-        return std::ranges::any_of(workers, [&](const Worker & wkr) -> bool { return wkr.takesWork() && offers(wkr, ent); });
+        return std::ranges::any_of(workers, [&](const Worker & wkr) -> bool { return wkr.serves() && offers(wkr, ent); });
     }
 
     // Features of the workers that take work and serve the system.
@@ -743,7 +799,7 @@ public:
     {
         std::set<std::string> feats;
         for (const auto & wkr : workers) {
-            if (wkr.takesWork() && std::ranges::find(wkr.systems, system) != wkr.systems.end()) {
+            if (wkr.serves() && std::ranges::find(wkr.systems, system) != wkr.systems.end()) {
                 feats.insert(wkr.features.begin(), wkr.features.end());
             }
         }
@@ -891,6 +947,7 @@ private:
     std::vector<std::optional<Entry>> entries;
     std::vector<Worker> workers;
     size_t workersUp_ = 0;
+    size_t resting_ = 0;
     struct SystemState
     {
         WaitQueue queue;
@@ -1033,6 +1090,15 @@ private:
         }
         auto const iter = systems.find(wkr.systems.front());
         return iter == systems.end() ? 0 : iter->second.free.get(wid);
+    }
+
+    void unrest(WorkerId wid)
+    {
+        if (workers.at(wid).restsUntilMs) {
+            workers.at(wid).restsUntilMs.reset();
+            resting_--;
+        }
+        refreshFree(wid);
     }
 
     void refreshFree(WorkerId wid)
