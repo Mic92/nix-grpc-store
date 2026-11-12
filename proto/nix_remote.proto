@@ -238,8 +238,8 @@ message Hello {
   repeated string systems = 2; // native first, then extra-platforms
   repeated string features = 3;
   uint32 max_jobs = 4;
-  // Builds in progress and Expects not yet claimed, so a restarted scheduler
-  // neither double-assigns them nor counts their slots as free.
+  // Builds a client came for, so a restarted scheduler neither double-assigns
+  // them nor counts their slots as free.
   repeated RunningBuild running = 5;
 }
 
