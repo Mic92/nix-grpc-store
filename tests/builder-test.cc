@@ -34,6 +34,7 @@ auto greetsFirst() -> bool
 }
 
 constexpr std::chrono::seconds hung{20};
+constexpr std::chrono::seconds atOnce{2}; // well below the wait for a late assignment
 constexpr std::chrono::milliseconds headStart{100};
 
 auto expectOf(uint64_t assignId) -> nix::remote::Expect
@@ -63,7 +64,7 @@ auto staleCallIsRefusedAtOnce() -> bool
     Builder builder({.advertise = "w:0", .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1}, metrics);
     builder.onExpect(expectOf(2));
     auto call = std::async(std::launch::async, [&] -> bool { return builder.claim("b.drv", 1); });
-    return call.wait_for(hung) == std::future_status::ready && !call.get();
+    return call.wait_for(atOnce) == std::future_status::ready && !call.get();
 }
 
 auto run() -> int
