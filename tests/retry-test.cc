@@ -22,6 +22,16 @@ void classifiesFarmErrors()
                                          "receiving SETTINGS frame")));
     assert(!nixgrpc::goneAway(unavailable("failed to connect to all addresses; last error: UNKNOWN: "
                                           "ipv4:65.21.215.17:50051: Ssl handshake failed: certificate verify failed")));
+    // The peer took the connection and closed it before it spoke TLS.
+    assert(nixgrpc::goneAway(unavailable("failed to connect to all addresses; last error: UNAVAILABLE: "
+                                         "ipv4:127.0.0.1:41288: Handshake read failed (Socket closed)")));
+    // The peer does not speak TLS, or refuses us with a TLS alert.
+    assert(!nixgrpc::goneAway(unavailable("failed to connect to all addresses; last error: UNKNOWN: "
+                                          "ipv4:127.0.0.1:41916: Ssl handshake failed (TSI_PROTOCOL_FAILURE): "
+                                          "SSL_ERROR_SSL: error:0A00010B:SSL routines::wrong version number")));
+    assert(!nixgrpc::goneAway(unavailable("failed to connect to all addresses; last error: UNKNOWN: "
+                                          "ipv4:127.0.0.1:42678: Ssl handshake failed (TSI_PROTOCOL_FAILURE): "
+                                          "SSL_ERROR_SSL: error:0A000410:SSL routines::ssl/tls alert handshake failure")));
     assert(!nixgrpc::goneAway({grpc::StatusCode::PERMISSION_DENIED, "Connection reset"}));
     // Whatever the daemon says with UNAVAILABLE is worth a retry.
     assert(nixgrpc::goneAway(unavailable("publish failed: niks3 push exited with 1")));

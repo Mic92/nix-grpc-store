@@ -29,6 +29,15 @@ inline auto transportError(std::string_view msg) -> bool
     return std::ranges::any_of(needles, [&](std::string_view needle) -> bool { return msg.contains(needle); });
 }
 
+// TLS said no: a certificate was refused or the peer does not speak TLS.
+// A peer that closes during the handshake without saying so ("Handshake
+// read failed") is restarting, and not listed.
+inline auto tlsRejected(std::string_view msg) -> bool
+{
+    static constexpr auto needles = std::to_array<std::string_view>({"andshake failed", "certificate"});
+    return std::ranges::any_of(needles, [&](std::string_view needle) -> bool { return msg.contains(needle); });
+}
+
 // A worker or the balancer restarting under us, or not reachable right now.
 // The daemon sends UNAVAILABLE only for that; TLS setup failures are config errors.
 inline auto goneAway(const grpc::Status & status) -> bool
@@ -36,7 +45,7 @@ inline auto goneAway(const grpc::Status & status) -> bool
     auto const & msg = status.error_message();
     switch (status.error_code()) {
     case grpc::StatusCode::UNAVAILABLE:
-        return transportError(msg) || (!msg.contains("andshake") && !msg.contains("certificate"));
+        return transportError(msg) || !tlsRejected(msg);
     case grpc::StatusCode::CANCELLED:
         // Empty: the daemon shut down before a handler took the call.
         return msg.empty() || msg.contains("Cancelling all calls");
