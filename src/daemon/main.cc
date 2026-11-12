@@ -856,7 +856,11 @@ public:
         auto const drvName = std::string(drvPath.to_string());
         // The client is here: the lease holds through its upload. NOT_FOUND
         // makes it upload the closure and retry, so admit comes after.
-        builder.claim(drvName, assignId);
+        // A client that names no assignment may be ahead of its Expect.
+        if (!builder.claim(drvName, assignId) && assignId != 0) {
+            metrics.event("unexpected_build");
+            return {grpc::StatusCode::FAILED_PRECONDITION, "not scheduled here: " + drvName};
+        }
         if (!localStore.isValidPath(drvPath)) {
             try {
                 nixcompat::ensurePath(localStore, drvPath);
