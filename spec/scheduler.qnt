@@ -21,6 +21,10 @@ module scheduler {
   // placed elsewhere: true = keep the reporter and Revoke the other (kills
   // its build), false = leave both running (old behaviour).
   const REVOKE_DUP: bool
+  // A reconnecting worker reports a slot it only reserved, and the scheduler
+  // treats it like a running build (old behaviour). false: it reports only
+  // builds a client has claimed and drops its reservations.
+  const HELLO_STEAL: bool
 
   type CPhase = CIdle | CQueued | CAssigned(str) | CSent(str) | CDone | CFailed
   type Entry = { worker: str, followers: Set[str], leased: bool }
@@ -41,6 +45,7 @@ module scheduler {
   var mRetry: Set[str]                // -> client: UNAVAILABLE
   var mRevoke: Set[str]               // scheduler -> worker: stop building
   var crashes: int
+  var stolen: bool                    // a claimed build was revoked for a reservation
 
   pure def w0: WState = { up: true, running: false, expecting: false, attached: Set(), built: false, session: true }
 
@@ -53,7 +58,7 @@ module scheduler {
     publishedBy' = Set(),
     mSchedule' = Set(), mAssigned' = Set(), mExpect' = Set(), mBuild' = Set(),
     mResult' = Set(), mDone' = Set(), mRetry' = Set(), mRevoke' = Set(),
-    crashes' = 0,
+    crashes' = 0, stolen' = false,
   }
 
   action keepMsgs = all {
@@ -70,7 +75,7 @@ module scheduler {
     cl' = cl.set(c, CQueued),
     mSchedule' = mSchedule.union(Set(c)),
     mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRetry' = mRetry, mRevoke' = mRevoke,
-    keepSched, keepCache, ws' = ws, crashes' = crashes,
+    keepSched, keepCache, ws' = ws, crashes' = crashes, stolen' = stolen,
   }
 
   action recvAssigned(c: str, w: str): bool = all {
@@ -80,7 +85,7 @@ module scheduler {
     mAssigned' = mAssigned.exclude(Set((c, w))),
     mBuild' = mBuild.union(Set((c, w))),
     mSchedule' = mSchedule, mExpect' = mExpect, mResult' = mResult, mDone' = mDone, mRetry' = mRetry, mRevoke' = mRevoke,
-    keepSched, keepCache, ws' = ws, crashes' = crashes,
+    keepSched, keepCache, ws' = ws, crashes' = crashes, stolen' = stolen,
   }
 
   action recvResult(c: str): bool = all {
@@ -88,7 +93,7 @@ module scheduler {
     cl' = cl.set(c, CDone),
     mResult' = mResult.exclude(Set(c)),
     mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mDone' = mDone, mRetry' = mRetry, mRevoke' = mRevoke,
-    keepSched, keepCache, ws' = ws, crashes' = crashes,
+    keepSched, keepCache, ws' = ws, crashes' = crashes, stolen' = stolen,
   }
 
   action recvRetry(c: str): bool = all {
@@ -99,7 +104,7 @@ module scheduler {
     mSchedule' = mSchedule.union(Set(c)),
     mAssigned' = mAssigned.filter(p => p._1 != c),
     mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRevoke' = mRevoke,
-    keepSched, keepCache, ws' = ws, crashes' = crashes,
+    keepSched, keepCache, ws' = ws, crashes' = crashes, stolen' = stolen,
   }
 
   // ---- scheduler ----
@@ -134,7 +139,7 @@ module scheduler {
       }
     },
     mBuild' = mBuild, mDone' = mDone, mRetry' = mRetry, mRevoke' = mRevoke,
-    keepCache, ws' = ws, cl' = cl, crashes' = crashes,
+    keepCache, ws' = ws, cl' = cl, crashes' = crashes, stolen' = stolen,
   }
 
   // Old behaviour: nobody connected can take it => tell the client no and forget it.
@@ -145,7 +150,7 @@ module scheduler {
     mSchedule' = mSchedule.exclude(Set(c)),
     cl' = cl.set(c, CFailed),
     mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRetry' = mRetry, mRevoke' = mRevoke,
-    keepSched, keepCache, ws' = ws, crashes' = crashes,
+    keepSched, keepCache, ws' = ws, crashes' = crashes, stolen' = stolen,
   }
 
   action recvDone(w: str): bool = all {
@@ -154,7 +159,7 @@ module scheduler {
     free' = if (entry.length() == 1 and entry[0].worker == w) free.set(w, free.get(w) + 1) else free,
     entry' = if (entry.length() == 1 and entry[0].worker == w) [] else entry,
     mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mRetry' = mRetry, mRevoke' = mRevoke,
-    keepCache, ws' = ws, cl' = cl, crashes' = crashes,
+    keepCache, ws' = ws, cl' = cl, crashes' = crashes, stolen' = stolen,
   }
 
   action sessionLost(w: str): bool = all {
@@ -164,7 +169,7 @@ module scheduler {
     free' = free.set(w, SLOTS),
     mRetry' = mRetry.union(entry[0].followers),
     mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRevoke' = mRevoke,
-    keepCache, ws' = ws, cl' = cl, crashes' = crashes,
+    keepCache, ws' = ws, cl' = cl, crashes' = crashes, stolen' = stolen,
   }
 
   // Scheduler restarts empty. Worker sessions drop and come back in
@@ -177,28 +182,30 @@ module scheduler {
     mAssigned' = Set(), mExpect' = Set(), mDone' = Set(),
     mRetry' = mRetry.union(CLIENTS.filter(c => cl.get(c) == CQueued)),
     mSchedule' = Set(), mBuild' = mBuild, mResult' = mResult, mRevoke' = Set(),
-    keepCache, ws' = WORKERS.mapBy(k => { ...ws.get(k), session: false }), cl' = cl,
+    keepCache, ws' = WORKERS.mapBy(k => { ...ws.get(k), session: false }), cl' = cl, stolen' = stolen,
   }
 
   // One worker re-opens its session and reports what it runs. If the
   // scheduler placed the drv elsewhere in the meantime, the reporter keeps
   // it and the other one is revoked: its clients are retried and attach to
   // the reporter.
-  action sessionBack(w: str): bool = all {
-    ws.get(w).up and not(ws.get(w).session),
-    ws' = ws.set(w, { ...ws.get(w), session: true }),
-    val runs = REPORT_ON_RECONNECT and (ws.get(w).running or ws.get(w).expecting)
+  action sessionBack(w: str): bool = {
+    val s = ws.get(w)
+    val runs = REPORT_ON_RECONNECT and (s.running or (HELLO_STEAL and s.expecting))
     val other = entry.length() == 1 and entry[0].worker != w
     all {
+      s.up and not(s.session),
+      ws' = ws.set(w, { ...s, session: true, expecting: s.expecting and HELLO_STEAL }),
       entry' = if (runs and (entry.length() == 0 or (other and REVOKE_DUP)))
-                 [{ worker: w, followers: ws.get(w).attached.union(if (other) entry[0].followers else Set()), leased: true }]
+                 [{ worker: w, followers: s.attached.union(if (other) entry[0].followers else Set()), leased: true }]
                else entry,
       free' = free.set(w, if (runs) SLOTS - 1 else SLOTS),
       mRevoke' = if (runs and other and REVOKE_DUP) mRevoke.union(Set(entry[0].worker)) else mRevoke,
       mAssigned' = if (runs and other and REVOKE_DUP) mAssigned.union(entry[0].followers.map(c => (c, w))) else mAssigned,
-    },
-    mSchedule' = mSchedule, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRetry' = mRetry,
-    keepCache, cl' = cl, crashes' = crashes,
+      stolen' = (stolen or (runs and other and REVOKE_DUP and not(s.running) and ws.get(entry[0].worker).running)),
+      mSchedule' = mSchedule, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRetry' = mRetry,
+      keepCache, cl' = cl, crashes' = crashes,
+    }
   }
 
   // Kills the build. Attached clients get UNAVAILABLE and re-ask. The worker
@@ -211,19 +218,19 @@ module scheduler {
     free' = if (entry.length() == 1 and entry[0].worker == w) free else free.set(w, SLOTS),
     entry' = entry,
     mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone,
-    keepCache, cl' = cl, crashes' = crashes,
+    keepCache, cl' = cl, crashes' = crashes, stolen' = stolen,
   }
 
   // ---- worker ----
 
-  def startOn(w: str, who: Set[str]): WState = { ...ws.get(w), running: true, attached: ws.get(w).attached.union(who) }
+  def startOn(w: str, who: Set[str]): WState = { ...ws.get(w), running: true, expecting: false, attached: ws.get(w).attached.union(who) }
 
   action recvExpect(w: str): bool = all {
     mExpect.contains(w),
     mExpect' = mExpect.exclude(Set(w)),
-    ws' = ws.set(w, if (ws.get(w).up and not(ws.get(w).built)) { ...startOn(w, Set()), expecting: true } else ws.get(w)),
+    ws' = ws.set(w, if (ws.get(w).up and not(ws.get(w).built) and not(ws.get(w).running)) { ...ws.get(w), expecting: true } else ws.get(w)),
     mSchedule' = mSchedule, mAssigned' = mAssigned, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRetry' = mRetry, mRevoke' = mRevoke,
-    keepSched, keepCache, cl' = cl, crashes' = crashes,
+    keepSched, keepCache, cl' = cl, crashes' = crashes, stolen' = stolen,
   }
 
   action recvBuild(c: str, w: str): bool = all {
@@ -235,13 +242,22 @@ module scheduler {
     } else if (s.built or cached) all {
       ws' = ws, mResult' = mResult.union(Set(c)), mRetry' = mRetry,
     } else if (s.running or s.expecting or not(PUSH)) all {
-      ws' = ws.set(w, { ...startOn(w, Set(c)), expecting: true }),
+      ws' = ws.set(w, startOn(w, Set(c))),
       mResult' = mResult, mRetry' = mRetry,
     } else all {
       ws' = ws, mResult' = mResult, mRetry' = mRetry.union(Set(c)),
     },
     mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mDone' = mDone, mRevoke' = mRevoke,
-    keepSched, keepCache, cl' = cl, crashes' = crashes,
+    keepSched, keepCache, cl' = cl, crashes' = crashes, stolen' = stolen,
+  }
+
+  // Nobody claimed the reserved slot in time: the worker gives it back.
+  action expectTimeout(w: str): bool = all {
+    ws.get(w).up, ws.get(w).expecting,
+    ws' = ws.set(w, { ...ws.get(w), expecting: false }),
+    mDone' = if (ws.get(w).session) mDone.union(Set(w)) else mDone,
+    mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mRetry' = mRetry, mRevoke' = mRevoke,
+    keepSched, keepCache, cl' = cl, crashes' = crashes, stolen' = stolen,
   }
 
   action finish(w: str): bool = all {
@@ -255,7 +271,7 @@ module scheduler {
       mDone' = if (ws.get(w).session) mDone.union(Set(w)) else mDone,
     },
     mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mRetry' = mRetry, mRevoke' = mRevoke,
-    keepSched, cl' = cl, crashes' = crashes,
+    keepSched, cl' = cl, crashes' = crashes, stolen' = stolen,
   }
 
   action workerCrash(w: str): bool = all {
@@ -264,8 +280,10 @@ module scheduler {
     ws' = ws.set(w, { ...ws.get(w), up: false, running: false, expecting: false, attached: Set(), session: false }),
     mRetry' = mRetry.union(ws.get(w).attached),
     mExpect' = mExpect.exclude(Set(w)),
-    mSchedule' = mSchedule, mAssigned' = mAssigned, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRevoke' = mRevoke.exclude(Set(w)),
-    keepSched, keepCache, cl' = cl,
+    mSchedule' = mSchedule, mAssigned' = mAssigned, mBuild' = mBuild, mResult' = mResult,
+    // the session stream dies with the worker
+    mDone' = mDone.exclude(Set(w)), mRevoke' = mRevoke.exclude(Set(w)),
+    keepSched, keepCache, cl' = cl, stolen' = stolen,
   }
 
   action workerBack(w: str): bool = all {
@@ -278,7 +296,7 @@ module scheduler {
       mRetry' = if (stale) mRetry.union(entry[0].followers) else mRetry,
     },
     mSchedule' = mSchedule, mAssigned' = mAssigned, mExpect' = mExpect, mBuild' = mBuild, mResult' = mResult, mDone' = mDone, mRevoke' = mRevoke,
-    keepCache, cl' = cl, crashes' = crashes,
+    keepCache, cl' = cl, crashes' = crashes, stolen' = stolen,
   }
 
   action step = {
@@ -287,7 +305,7 @@ module scheduler {
     any {
       schedule(c), recvAssigned(c, w), recvResult(c), recvRetry(c),
       recvSchedule(c), rejectUnplaceable(c), recvDone(w), sessionLost(w), schedCrash, sessionBack(w),
-      recvRevoke(w), recvExpect(w), recvBuild(c, w), finish(w), workerCrash(w), workerBack(w),
+      recvRevoke(w), recvExpect(w), recvBuild(c, w), expectTimeout(w), finish(w), workerCrash(w), workerBack(w),
     }
   }
 
@@ -299,6 +317,43 @@ module scheduler {
       recvSchedule(c), recvDone(w), recvExpect(w), recvBuild(c, w), finish(w),
     }
   }
+
+  // ---- scripted traces ----
+  // Random walks rarely get a second build claimed, so the traces that need
+  // one are spelled out. Each step has one enabled choice.
+
+  action expectAny = { nondet w = mExpect.oneOf() recvExpect(w) }
+  action assignedAny(c: str): bool = { nondet p = mAssigned.filter(p => p._1 == c).oneOf() recvAssigned(c, p._2) }
+  action buildAny(c: str): bool = { nondet p = mBuild.filter(p => p._1 == c).oneOf() recvBuild(c, p._2) }
+  def busy(w: str): bool = ws.get(w).running or ws.get(w).expecting
+  action backIdle = { nondet w = WORKERS.filter(w => not(ws.get(w).session) and not(busy(w))).oneOf() sessionBack(w) }
+  action backBusy = { nondet w = WORKERS.filter(w => not(ws.get(w).session) and busy(w)).oneOf() sessionBack(w) }
+  action finishAny = { nondet w = WORKERS.filter(w => ws.get(w).running).oneOf() finish(w) }
+
+  // The scheduler restarts while a build runs and places the drv again
+  // before the first worker has reported back.
+  run dupBuildTest =
+    init
+      .then(schedule("c1")).then(recvSchedule("c1")).then(expectAny)
+      .then(assignedAny("c1")).then(buildAny("c1"))
+      .then(schedCrash).then(backIdle)
+      .then(schedule("c2")).then(recvSchedule("c2")).then(expectAny)
+      .then(assignedAny("c2")).then(buildAny("c2"))
+      .then(backBusy)
+      .expect(oneBuilder == (REPORT_ON_RECONNECT and REVOKE_DUP))
+      .then(finishAny).then(finishAny)
+      .expect(oneResult == FENCED_PUBLISH)
+
+  // The scheduler restarts after it reserved a slot nobody claimed yet. The
+  // client asks again and builds elsewhere, then the first worker reports.
+  run helloStealTest =
+    init
+      .then(schedule("c1")).then(recvSchedule("c1")).then(expectAny)
+      .then(schedCrash).then(backIdle)
+      .then(recvRetry("c1")).then(recvSchedule("c1")).then(expectAny)
+      .then(assignedAny("c1")).then(buildAny("c1"))
+      .then(backBusy)
+      .expect(stolen == (REPORT_ON_RECONNECT and HELLO_STEAL))
 
   // ---- properties ----
 
@@ -340,16 +395,20 @@ module scheduler {
   // scheduler before its workers had reconnected.
   val noSpuriousFail = CLIENTS.forall(c => cl.get(c) != CFailed)
 
-  val safety = all { doneImpliesPublished, slotsSane, singlePublish, noStrandedClient, noOversubscribe, entryLive, noSpuriousFail, oneBuilder, oneResult }
+  val noSteal = not(stolen)
+
+  val safety = all { noSteal, doneImpliesPublished, slotsSane, singlePublish, noStrandedClient, noOversubscribe, entryLive, noSpuriousFail, oneBuilder, oneResult }
 }
 
-module schedFixed    { import scheduler(PUSH = true,  FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false, REVOKE_DUP = true).* }
+module schedFixed    { import scheduler(PUSH = true,  FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false, REVOKE_DUP = true, HELLO_STEAL = false).* }
 // each drops one mechanism; `safety` must find the hole
-module schedNoPush   { import scheduler(PUSH = false, FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false, REVOKE_DUP = true).* }
-module schedNoReport { import scheduler(PUSH = true,  FENCED_PUBLISH = false, REPORT_ON_RECONNECT = false, UNPLACEABLE_TERMINAL = false, REVOKE_DUP = true).* }
+module schedNoPush   { import scheduler(PUSH = false, FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false, REVOKE_DUP = true, HELLO_STEAL = false).* }
+module schedNoReport { import scheduler(PUSH = true,  FENCED_PUBLISH = false, REPORT_ON_RECONNECT = false, UNPLACEABLE_TERMINAL = false, REVOKE_DUP = true, HELLO_STEAL = false).* }
 // without fencing the duplicate build after a scheduler restart publishes twice
-module schedNoFence  { import scheduler(PUSH = true,  FENCED_PUBLISH = false, REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false, REVOKE_DUP = true).* }
+module schedNoFence  { import scheduler(PUSH = true,  FENCED_PUBLISH = false, REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false, REVOKE_DUP = true, HELLO_STEAL = false).* }
 // scheduler answers "no worker" right after a restart and drops the Want
-module schedTerminal { import scheduler(PUSH = true,  FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = true, REVOKE_DUP = true).* }
+module schedTerminal { import scheduler(PUSH = true,  FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = true, REVOKE_DUP = true, HELLO_STEAL = false).* }
 // reconnect reports a duplicate and the scheduler lets both run
-module schedNoRevoke { import scheduler(PUSH = true,  FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false, REVOKE_DUP = false).* }
+module schedNoRevoke { import scheduler(PUSH = true,  FENCED_PUBLISH = true,  REPORT_ON_RECONNECT = true,  UNPLACEABLE_TERMINAL = false, REVOKE_DUP = false, HELLO_STEAL = false).* }
+// a reservation nobody claimed takes the drv from a worker that builds it
+module schedHelloSteal { import scheduler(PUSH = true, FENCED_PUBLISH = true, REPORT_ON_RECONNECT = true, UNPLACEABLE_TERMINAL = false, REVOKE_DUP = true, HELLO_STEAL = true).* }
