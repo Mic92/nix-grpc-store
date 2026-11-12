@@ -278,6 +278,12 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
+  test('farm-sim', executable('farm-sim-test',
+    sources : ['tests/farm-sim-test.cc'],
+    dependencies : [dispatcher_dep, jemalloc_dep],
+    cpp_args : ['-UNDEBUG'],
+  ), timeout : 120)
+
   test('sbpl', executable('sbpl-test',
     sources : ['tests/sbpl-test.cc', 'src/daemon/sbpl.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
