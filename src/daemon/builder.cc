@@ -40,7 +40,7 @@ void Builder::onExpect(const nix::remote::Expect & exp)
         return; // re-announced across a scheduler restart, keep the live one
     }
     ent.assignId = exp.assign_id();
-    ent.since = Clock::now();
+    ent.since = config.now();
     metrics.event("expect");
 }
 
@@ -230,7 +230,7 @@ auto Builder::send(const WorkerMsg & msg) const -> bool
 
 void Builder::tick()
 {
-    const auto now = Clock::now();
+    const auto now = config.now();
     // While draining, also what an Expect racing setDraining() left behind.
     bool const draining = draining_;
     giveBack(

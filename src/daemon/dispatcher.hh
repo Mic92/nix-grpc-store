@@ -53,6 +53,9 @@ public:
         static constexpr unsigned defaultLookupThreads = 32;
         unsigned lookupThreads = defaultLookupThreads;
         LogLevel logLevel = LogLevel::info;
+        // Unset: the steady clock, and the dispatcher calls tick() itself
+        // every second. Set: the caller owns time and calls tick().
+        std::function<double()> nowMs;
     };
 
     Dispatcher(Config config, Metrics & metrics);
@@ -102,6 +105,9 @@ public:
     {
         return mutex;
     }
+
+    // What is due by now: revokes builds whose last client stayed away.
+    void tick();
 
     // Tell every connected peer the streams are about to close on purpose.
     void restarting();
@@ -201,6 +207,7 @@ private:
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void exportStats(bool force);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOn(sched::WorkerId wid, const std::string & drvPath);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOrphans();
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void tickLocked();
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void placeabilityChangedLocked();
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void sendToFollowers(sched::DrvId drv, const nix::remote::SchedMsg & msg);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto assignedMsg(sched::DrvId drv) const -> nix::remote::SchedMsg;
