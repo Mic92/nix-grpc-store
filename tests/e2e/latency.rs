@@ -58,9 +58,7 @@ fn copy_and_remote_build_hide_the_round_trip() {
 
     succeed(&["mkdir", "-p", "/root/small"]);
     let files: Vec<String> = (0..N_PATHS).map(|i| format!("/root/small/f{i}")).collect();
-    for f in &files {
-        random_file(f, 4096);
-    }
+    random_files(&files, 4096);
     let mut add = vec!["nix-store", "--store", "/root/src", "--add"];
     add.extend(files.iter().map(String::as_str));
     let added = succeed(&add);

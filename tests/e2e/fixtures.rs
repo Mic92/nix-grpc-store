@@ -59,6 +59,20 @@ pub fn random_file(path: &str, bytes: usize) {
     ]);
 }
 
+/// One command for all of them: a slow machine takes seconds per command.
+pub fn random_files(paths: &[String], bytes: usize) {
+    let mut cmd = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        r#"n=$1; shift; for f; do head -c "$n" /dev/urandom | base64 > "$f"; done"#.to_string(),
+        "sh".to_string(),
+        bytes.to_string(),
+    ];
+    cmd.extend(paths.iter().cloned());
+    let cmd: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    succeed(&cmd);
+}
+
 pub fn deny_file(dir: &str) -> String {
     let path = format!("{dir}/denyfile");
     random_file(&path, 64);
