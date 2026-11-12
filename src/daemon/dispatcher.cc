@@ -52,7 +52,9 @@ Dispatcher::Dispatcher(Config config_, Metrics & metrics)
             lookupThreads.emplace_back([this] -> void { lookupLoop(); });
         }
     }
-    statsThread = std::thread([this] -> void { statsLoop(); });
+    if (!config.nowMs) {
+        statsThread = std::thread([this] -> void { statsLoop(); });
+    }
 }
 
 Dispatcher::~Dispatcher()
@@ -68,7 +70,9 @@ Dispatcher::~Dispatcher()
         const absl::MutexLock lock(mutex);
         statsStop = true;
     }
-    statsThread.join();
+    if (statsThread.joinable()) {
+        statsThread.join();
+    }
 }
 
 void Dispatcher::statsLoop()
@@ -80,10 +84,21 @@ void Dispatcher::statsLoop()
         if (statsStop) {
             return;
         }
-        revokeOrphans();
-        if (statsPending) {
-            exportStats(true);
-        }
+        tickLocked();
+    }
+}
+
+void Dispatcher::tick()
+{
+    const Lock lock(*this);
+    tickLocked();
+}
+
+void Dispatcher::tickLocked()
+{
+    revokeOrphans();
+    if (statsPending) {
+        exportStats(true);
     }
 }
 
@@ -250,6 +265,9 @@ void Dispatcher::wakeWatchersLocked()
 
 auto Dispatcher::nowMs() const -> double
 {
+    if (config.nowMs) {
+        return config.nowMs();
+    }
     return std::chrono::duration<double, std::milli>(Clock::now() - epoch).count();
 }
 
