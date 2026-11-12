@@ -117,6 +117,7 @@ public:
     enum class Unavailable : uint8_t {
         stopping = 1U << 0U,
         lowDisk = 1U << 1U,
+        localDaemonDown = 1U << 2U,
     };
     void setUnavailable(Unavailable why, bool holds);
 

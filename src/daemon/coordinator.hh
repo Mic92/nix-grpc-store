@@ -88,11 +88,16 @@ private:
     const Options & options;
     Metrics & metrics;
     std::jthread sessionThread; // remote WorkerSession client
+    std::jthread probeThread;
+    // Read and written by start() and then by the probe thread only.
+    bool daemonAnswered = true;
     std::optional<Elector> elector;
     grpc::HealthCheckServiceInterface * health = nullptr;
     std::atomic<bool> lastHealthy{true};
     void setSchedulerActive(bool active);
     void runRemoteSession(Builder & bld, const std::stop_token & stop);
+    void askLocalDaemon(Builder & bld);
+    void watchLocalDaemon(Builder & bld, const std::stop_token & stop);
 };
 
 } // namespace nixgrpc
