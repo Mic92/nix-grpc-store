@@ -26,7 +26,10 @@
 #include <nix/util/error.hh>
 #include <nix/util/terminal.hh>
 
+#include "client-stream.hh"
 #include "local-store.hh"
+#include "nix_remote.pb.h"
+#include "pump.hh"
 
 namespace {
 
@@ -62,6 +65,26 @@ auto errorsOf(const std::filesystem::path & socket) -> std::vector<std::string>
         }
     }
     return seen;
+}
+
+// A client's stream that has ended, as the upload handler sees it.
+struct EndedStream
+{
+    static auto Read(nix::remote::AddMultipleChunk * /*msg*/) -> bool { return false; }
+};
+
+auto endedUploadIsLost() -> bool
+{
+    EndedStream ended;
+    nixgrpc::ClientStream stream(ended);
+    nixgrpc::ZstdReaderSource<nixgrpc::ClientStream<EndedStream>, nix::remote::AddMultipleChunk> source(stream, "");
+    try {
+        std::array<char, 1> byte{};
+        source.read(byte.data(), byte.size());
+    } catch (const std::exception & err) {
+        return LocalStore::lost(err);
+    }
+    return false;
 }
 
 auto run() -> int
@@ -109,6 +132,11 @@ auto run() -> int
     }
     if (LocalStore::lost(nix::SysError(ENOENT, "opening file '/nix/var/log/nix/drvs/x'"))) {
         std::println("FAIL a missing file counts as a lost nix-daemon");
+        status = EXIT_FAILURE;
+    }
+
+    if (endedUploadIsLost()) {
+        std::println("FAIL an upload that ends early counts as a lost nix-daemon");
         status = EXIT_FAILURE;
     }
 

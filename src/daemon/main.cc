@@ -83,6 +83,7 @@
 #include "idle.hh"
 #include "import-paths.hh"
 #include "log-spill.hh"
+#include "client-stream.hh"
 #include "keepalive.hh"
 #include "local-store.hh"
 #include "logfmt.hh"
@@ -187,6 +188,9 @@ private:
         } catch (std::exception & err) {
             if (stopSignal != 0) {
                 return {grpc::StatusCode::UNAVAILABLE, std::string("worker shutting down: ") + err.what()};
+            }
+            if (dynamic_cast<const nixgrpc::ClientGone *>(&err) != nullptr) {
+                return {grpc::StatusCode::INVALID_ARGUMENT, err.what()};
             }
             if (local.dropIfLost(err)) {
                 return {grpc::StatusCode::UNAVAILABLE, std::string("local nix-daemon connection lost: ") + err.what()};
@@ -457,8 +461,9 @@ public:
                 checkSigs = nix::CheckSigs;
             }
 
-            nixgrpc::ZstdReaderSource<AddMultipleReader, nix::remote::AddMultipleChunk> source(
-                *reader, std::move(*first.mutable_data()));
+            nixgrpc::ClientStream upload(*reader);
+            nixgrpc::ZstdReaderSource<nixgrpc::ClientStream<AddMultipleReader>, nix::remote::AddMultipleChunk> source(
+                upload, std::move(*first.mutable_data()));
 
             nixgrpc::Metrics::Held const held(metrics, "AddMultipleToStore");
             nixgrpc::Metrics::Phase phase(metrics, "AddMultipleToStore", "recv");
