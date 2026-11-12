@@ -162,8 +162,10 @@ public:
                 trace += "  a long time passes\n";
                 wait(longWaitMs);
             } else {
-                trace += "  " + steps.front().name + "\n";
-                steps.front().run();
+                // In turn, so no peer is starved.
+                auto const & pick = steps.at(step % steps.size());
+                trace += "  " + pick.name + "\n";
+                pick.run();
             }
             if (auto bad = check()) {
                 return bad;
@@ -497,6 +499,76 @@ auto violations(uint64_t first, uint64_t seeds) -> std::map<Rule, Found>
     return found;
 }
 
+struct Script
+{
+    const char * name;
+    std::vector<std::string_view> steps;
+};
+
+// Orderings the random runs do not reach. Each must keep every rule.
+auto scripts() -> std::vector<Script>
+{
+    return {
+        {.name = "a Done for an assignment that is over arrives after the next one",
+         .steps =
+             {
+                 "w:0 connects",
+                 "scheduler reads from w:0",
+                 "client 0 connects",
+                 "client 0 wants a.drv",
+                 "scheduler reads from client 0",
+                 "w:0 reads",
+                 "client 0 reads",
+                 "client 0 calls w:0 for a.drv",
+                 "w:0 loses its session",
+                 "w:1 connects",
+                 "scheduler reads from w:1",
+                 "w:1 reads",
+                 "w:0 connects",
+                 // w:0 still builds a.drv, so w:1 is told to stop. Its Done stays unread.
+                 "scheduler reads from w:0",
+                 "w:1 reads",
+                 "w:0 ends a.drv",
+                 "scheduler reads from w:0",
+                 "w:0 loses its session",
+                 "client 1 connects",
+                 "client 1 wants a.drv",
+                 "scheduler reads from client 1",
+                 "scheduler reads from w:1",
+                 "client 1 wants b.drv",
+                 "scheduler reads from client 1",
+             }},
+    };
+}
+
+// What the script breaks, with the steps up to there.
+auto play(const Script & script) -> std::optional<std::string>
+{
+    Sim sim;
+    std::string trace;
+    std::optional<Violation> bad;
+    for (auto const name : script.steps) {
+        auto steps = sim.enabled();
+        auto const pick = std::ranges::find(steps, name, &Step::name);
+        trace += std::format("  {}\n", name);
+        if (pick == steps.end()) {
+            return trace + "  => this step cannot happen here\n";
+        }
+        pick->run();
+        bad = sim.check();
+        if (bad) {
+            break;
+        }
+    }
+    if (!bad) {
+        bad = sim.settle(trace);
+    }
+    if (bad) {
+        return trace + "  => " + bad->what + "\n";
+    }
+    return std::nullopt;
+}
+
 struct Row
 {
     Rule rule;
@@ -536,6 +608,14 @@ auto run(std::span<char *> args) -> int
             std::println("known broken (seed {}): {}", found->seed, row.name);
         } else {
             std::println("ok: {}", row.name);
+        }
+    }
+    for (const auto & script : scripts()) {
+        if (auto const bad = play(script)) {
+            std::print("FAIL {}\n{}", script.name, *bad);
+            status = EXIT_FAILURE;
+        } else {
+            std::println("ok: {}", script.name);
         }
     }
     return status;
