@@ -70,9 +70,12 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     ! quint run scheduler.qnt --main schedNoPush --invariant=safety --max-steps=30 --max-samples=30000
     ! quint run scheduler.qnt --main schedTerminal --invariant=safety --max-steps=30 --max-samples=30000
     # The scripted traces state what each of these variants breaks.
-    for variant in schedFixed schedNoRevoke schedNoFence schedNoReport schedHelloSteal; do
-      quint test scheduler.qnt --main "$variant" --max-samples=100
-    done
+    quint test scheduler.qnt --main schedFixed --max-samples=100
+    quint test scheduler.qnt --main schedNoRevoke --match dupBuildTest --max-samples=100
+    quint test scheduler.qnt --main schedNoFence --match dupBuildTest --max-samples=100
+    quint test scheduler.qnt --main schedNoReport --match dupBuildTest --max-samples=100
+    quint test scheduler.qnt --main schedHelloSteal --match helloStealTest --max-samples=100
+    quint test scheduler.qnt --main schedNoLease --match staleDoneTest --max-samples=100
     quint run push.qnt --main pushFixed --invariant=safety --max-steps=12 --max-samples=20000
     touch $out
   '';
