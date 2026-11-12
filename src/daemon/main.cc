@@ -189,7 +189,8 @@ private:
             if (stopSignal != 0) {
                 return {grpc::StatusCode::UNAVAILABLE, std::string("worker shutting down: ") + err.what()};
             }
-            if (dynamic_cast<const nixgrpc::ClientGone *>(&err) != nullptr) {
+            if (dynamic_cast<const nixgrpc::ClientGone *>(&err) != nullptr
+                || dynamic_cast<const nixgrpc::NarTooLong *>(&err) != nullptr) {
                 return {grpc::StatusCode::INVALID_ARGUMENT, err.what()};
             }
             if (local.dropIfLost(err)) {

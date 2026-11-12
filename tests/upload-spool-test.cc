@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -10,6 +11,13 @@
 namespace {
 
 constexpr rlim_t kDescriptorLimit = 32;
+
+auto readBack(nix::Source & reader, std::size_t size) -> std::string
+{
+    std::string content(size, '\0');
+    reader(content.data(), content.size());
+    return content;
+}
 
 void manyNarsNeedOneDescriptor()
 {
@@ -29,7 +37,7 @@ void manyNarsNeedOneDescriptor()
     for (int i = kNars - 1; i >= 0; i--) {
         std::string const content = "nar-" + std::to_string(i) + std::string(i, 'x');
         auto reader = spool.reader(nars.at(i));
-        assert(reader.drain() == content);
+        assert(readBack(reader, content.size()) == content);
     }
 }
 
@@ -44,7 +52,7 @@ void discardedBytesAreNotKept()
     std::string const kept = "kept";
     nix::StringSource source(kept);
     auto reader = spool.reader(spool.add(source, kept.size()));
-    assert(reader.drain() == kept);
+    assert(readBack(reader, kept.size()) == kept);
 }
 
 } // namespace
