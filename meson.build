@@ -181,9 +181,10 @@ shared_module('nix-grpc-store-loader',
 
 if build_server
 
-  # The scheduler without gRPC. The daemon and dispatcher-bench share it.
+  # The scheduler and the worker's side of its protocol, without gRPC. The
+  # daemon, the tests and dispatcher-bench share it.
   dispatcher_lib = static_library('nix-grpc-dispatcher',
-    sources : ['src/daemon/dispatcher.cc', gen[0], gen[1]],
+    sources : ['src/daemon/dispatcher.cc', 'src/daemon/builder.cc', gen[0], gen[1]],
     include_directories : [gen_inc, src_inc],
     dependencies : [protobuf_dep, nix_util_dep] + prometheus_dep + absl_dep,
   )
