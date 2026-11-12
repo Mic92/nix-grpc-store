@@ -77,6 +77,7 @@
 #include "acl.hh"
 #include "auth.hh"
 #include "backend.hh"
+#include "builder.hh"
 #include "cache.hh"
 #include "coordinator.hh"
 #include "options.hh"
