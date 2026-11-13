@@ -321,6 +321,21 @@ another worker. A second SIGTERM cancels right away. `nixos-rebuild
 switch` only signals the worker and the next connection starts the new
 generation.
 
+**Keep build logs.** A retired cloud builder takes its kept build logs
+with it, and niks3 uploads the logs of built outputs only. A log store
+keeps every log, failed ones included:
+
+```nix
+services.nix-grpc-daemon.buildLogStore = "s3://farm-logs?region=eu-central-1&log-compression=zstd";
+```
+
+Builders copy each build's log there as `log/<drv>`, and
+`nix log --store 's3://farm-logs?region=eu-central-1' /nix/store/…drv`
+reads it back. Use a bucket of its own, since niks3's garbage collection
+deletes the `log/` keys in its bucket. Builders need write access to it,
+through the usual AWS variables or an instance role. Retention is a
+lifecycle rule on `log/`. On Kubernetes, set `workers[].buildLogStore`.
+
 **Restart the scheduler.** Safe at any time, see [How it works](#how-it-works).
 New builds wait until it is back, or until another scheduler node has
 taken over.

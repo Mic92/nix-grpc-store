@@ -380,6 +380,19 @@ in
         }
       );
     };
+
+    buildLogStore = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "s3://farm-logs?region=eu-central-1&log-compression=zstd";
+      description = ''
+        Nix store URL a builder copies each build's log to, failed builds
+        included, so the logs outlive the builder. Read them with
+        `nix log --store <URL>`. Use a bucket of its own, since niks3's
+        garbage collection deletes the same keys in its bucket. A drain
+        waits up to a minute for the last uploads.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {

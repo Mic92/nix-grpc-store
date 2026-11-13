@@ -210,6 +210,9 @@ spec:
             - --niks3-push=niks3 push {{ join " " . }}
             {{- end }}
             - --min-free={{ $w.minFree }}
+            {{- with $w.buildLogStore }}
+            - --build-log-store={{ . }}
+            {{- end }}
             {{- if (include "farm.tlsSecret" (list $root "worker")) }}
             - --tls-cert=/secrets/tls/tls.crt
             - --tls-key=/secrets/tls/tls.key
@@ -242,6 +245,10 @@ spec:
             - name: HOST_IP
               valueFrom: {fieldRef: {fieldPath: status.hostIP}}
             - {name: TMPDIR, value: /spool}
+            {{- if $w.buildLogStore }}
+            # Nix opens the log store with a SQLite cache in here.
+            - {name: XDG_CACHE_HOME, value: /spool}
+            {{- end }}
           securityContext:
             runAsUser: 990
             runAsGroup: 990

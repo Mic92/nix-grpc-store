@@ -71,6 +71,7 @@ stdenv.mkDerivation {
         ../../tests/daemon-probe-test.cc
         ../../tests/builder-test.cc
         ../../tests/local-store-test.cc
+        ../../tests/log-uploader-test.cc
         ../../tests/plugin-loader-test.cc
         ../../tests/upload-claims-test.cc
         ../../tests/top-down-test.cc

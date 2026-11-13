@@ -377,6 +377,7 @@ which also requires `trustClients` (see above).
   * `--role builder,scheduler`, `--scheduler ADDR`, `--scheduler-token-file FILE`, `--advertise IP:PORT`, `--extra-system SYSTEM`, `--max-jobs N`, `--min-free SIZE` — see [docs/farm.md](docs/farm.md). The defaults make a single node schedule onto itself
   * `--lookup-threads N` — how many cache lookups a scheduler runs at once for incoming Wants, default 32. Raise it when Wants wait on a slow cache while the scheduler is idle
   * `--niks3 URL [--niks3-token-file FILE] [--niks3-client-cert FILE --niks3-client-key FILE] [--niks3-push CMD]` — publish build outputs and uploads to a niks3 cache; authenticate with a bearer token, a client certificate (defaults to `--tls-cert/--tls-key`), or both
+  * `--build-log-store URL` — copy each build's log to this Nix store, see [docs/farm.md](docs/farm.md#managing-the-farm)
   * `--log-level info|debug` — access log verbosity, default `info`
 
 ## Monitoring
@@ -419,6 +420,8 @@ With `--metrics-listen 127.0.0.1:9464` (NixOS:
 | `nix_grpc_lookup_seconds` | stage = queued, cache | scheduler: time a batch of build requests waits for a lookup thread, then for the cache's answer. Not part of the queue wait |
 | `nix_grpc_lookup_keys` | result = asked, present | scheduler: outputs one such lookup asks the cache about, and how many of them it has |
 | `nix_grpc_build_failures_total` | reason | failed builds, by Nix failure status: PermanentFailure, TimedOut, TransientFailure, … |
+| `nix_grpc_build_log_uploads_total` | result = ok, failed, skipped, dropped | build logs copied to `--build-log-store`. Skipped means over 64 MiB or none kept, dropped means the queue was full |
+| `nix_grpc_build_log_upload_queue` | | build logs waiting for the log store |
 
 Only CA-issued CNs appear as labels, so cardinality stays bounded.
 

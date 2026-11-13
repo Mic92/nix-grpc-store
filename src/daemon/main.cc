@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <expected>
 #include <future>
 #include <filesystem>
 #include <map>
@@ -54,9 +55,11 @@
 #include <nix/store/derived-path.hh>
 #include <nix/store/globals.hh>
 #include <nix/store/local-fs-store.hh>
+#include <nix/store/log-store.hh>
 #include <nix/store/path-info.hh>
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
+#include <nix/store/store-open.hh>
 #include <nix/store/worker-protocol.hh>
 // Generic definitions for the std::vector serialiser wrappers used by
 // BuildPaths, which libnixstore does not instantiate explicitly.
@@ -84,6 +87,7 @@
 #include "import-paths.hh"
 #include "log-spill.hh"
 #include "client-stream.hh"
+#include "log-uploader.hh"
 #include "keepalive.hh"
 #include "local-store.hh"
 #include "logfmt.hh"
@@ -129,6 +133,11 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     nixgrpc::LocalStore local;
     nixgrpc::UploadClaims uploads;
     nixgrpc::SessionRoots sessions{[this] -> nix::ref<nix::Store> { return local.scoped(); }};
+    // --build-log-store, opened by the uploader's thread on first use.
+    std::string logStoreUrl;
+    std::shared_ptr<nix::Store> logStore;
+    // Last: its thread uses the members above.
+    std::unique_ptr<nixgrpc::LogUploader> uploader;
 
     // Retryable on another worker or later: guarded() maps it to UNAVAILABLE.
     struct Unavailable : nix::Error
@@ -272,7 +281,8 @@ public:
         nixgrpc::IdleTracker & idle,
         nixgrpc::LogLevel logLevel,
         nixgrpc::Auth & auth,
-        nixgrpc::Coordinator & coord)
+        nixgrpc::Coordinator & coord,
+        std::string buildLogStore)
         : workerName(std::move(workerName))
         , metrics(metrics)
         , idle(idle)
@@ -281,7 +291,22 @@ public:
         , backends{.socketPath = std::move(socketPath)}
         , coord(coord)
         , local(std::move(storeUri))
+        , logStoreUrl(std::move(buildLogStore))
     {
+        if (!logStoreUrl.empty() && coord.builder) {
+            uploader = std::make_unique<nixgrpc::LogUploader>(
+                [this](const std::string & drv, uint64_t limit) -> std::optional<std::string> {
+                    return readKeptLog(nix::StorePath(drv), limit);
+                },
+                [this](const std::string & drv, std::string_view log) -> void { addToLogStore(drv, log); },
+                metrics);
+        }
+    }
+
+    // A drain waits for queued log uploads.
+    [[nodiscard]] auto uploadsDone() const -> bool
+    {
+        return !uploader || uploader->idle();
     }
 
     auto Connect(grpc::ServerContext * context, GrpcStream * stream) -> grpc::Status override
@@ -571,39 +596,118 @@ public:
             if (fsStore == nullptr) {
                 return {grpc::StatusCode::UNIMPLEMENTED, "the store behind this daemon keeps no build logs"};
             }
-            auto const base = std::string(drvPath->to_string());
-            for (auto const & rel : {nix::LocalFSStore::drvsLogDir / base.substr(0, 2) / base.substr(2),
-                                     nix::LocalFSStore::drvsLogDir / base}) {
-                auto const plain = fsStore->config.logDir.get() / rel;
-                auto bz2 = plain;
-                bz2 += ".bz2";
-                bool const compressed = !nix::pathExists(plain);
-                auto const & path = compressed ? bz2 : plain;
-                auto const file = nix::openFileReadonly(path);
-                if (!file) {
-                    auto const err = errno;
-                    if (compressed && err == ENOENT) {
-                        continue;
-                    }
-                    return {grpc::StatusCode::INTERNAL, "cannot open " + path.string() + ": " + std::system_category().message(err)};
-                }
-                try {
-                    nixgrpc::ZstdWriterSink<BuildLogWriter, nix::remote::GetBuildLogChunk> sink(*writer);
-                    if (!compressed) {
-                        nix::FdSource(file.get()).drainInto(sink);
-                    } else if (!bunzip2(file.get(), sink)) {
-                        // Part of the log may be sent already, so no fallback to the next file.
-                        return {grpc::StatusCode::DATA_LOSS, bz2.string() + " does not decompress"};
-                    }
-                    sink.finish();
-                } catch (nixgrpc::StreamClosed &) {
-                    return {grpc::StatusCode::CANCELLED, "the client went away"};
-                }
-                rpc.done({{"drv", request->drv_path()}});
-                return grpc::Status::OK;
+            auto const kept = openKeptLog(*fsStore, *drvPath);
+            if (!kept) {
+                // Not a SysError: guarded() would treat ENOENT as a lost nix-daemon.
+                return {grpc::StatusCode::INTERNAL, kept.error()};
             }
-            return {grpc::StatusCode::NOT_FOUND, "no build log of " + request->drv_path()};
+            auto const & found = *kept;
+            if (!found) {
+                return {grpc::StatusCode::NOT_FOUND, "no build log of " + request->drv_path()};
+            }
+            auto const & log = *found;
+            try {
+                nixgrpc::ZstdWriterSink<BuildLogWriter, nix::remote::GetBuildLogChunk> sink(*writer);
+                if (!log.compressed) {
+                    nix::FdSource(log.file.get()).drainInto(sink);
+                } else if (!bunzip2(log.file.get(), sink)) {
+                    // Part of the log may be sent already, so no fallback to the next file.
+                    return {grpc::StatusCode::DATA_LOSS, log.path.string() + " does not decompress"};
+                }
+                sink.finish();
+            } catch (nixgrpc::StreamClosed &) {
+                return {grpc::StatusCode::CANCELLED, "the client went away"};
+            }
+            rpc.done({{"drv", request->drv_path()}});
+            return grpc::Status::OK;
         });
+    }
+
+    struct KeptLog
+    {
+        nix::AutoCloseFD file;
+        std::filesystem::path path;
+        bool compressed = false;
+    };
+
+    // The file Nix kept the log of `drvPath` in, found like
+    // LocalFSStore::getBuildLogExact, and opened. nullopt: there is none. The
+    // error names a file that exists but cannot be opened.
+    static auto openKeptLog(const nix::LocalFSStore & fsStore, const nix::StorePath & drvPath)
+        -> std::expected<std::optional<KeptLog>, std::string>
+    {
+        auto const base = std::string(drvPath.to_string());
+        for (auto const & rel : {nix::LocalFSStore::drvsLogDir / base.substr(0, 2) / base.substr(2),
+                                 nix::LocalFSStore::drvsLogDir / base}) {
+            auto const plain = fsStore.config.logDir.get() / rel;
+            auto bz2 = plain;
+            bz2 += ".bz2";
+            bool const compressed = !nix::pathExists(plain);
+            auto path = compressed ? bz2 : plain;
+            auto file = nix::openFileReadonly(path);
+            if (!file) {
+                auto const err = errno;
+                if (compressed && err == ENOENT) {
+                    continue;
+                }
+                return std::unexpected("cannot open " + path.string() + ": " + std::system_category().message(err));
+            }
+            return KeptLog{.file = std::move(file), .path = std::move(path), .compressed = compressed};
+        }
+        return std::nullopt;
+    }
+
+    // The log Nix kept for `drvPath`, decoded, cut after `limit` bytes and
+    // one more, so the uploader can tell a larger log. nullopt: there is none.
+    auto readKeptLog(const nix::StorePath & drvPath, uint64_t limit) -> std::optional<std::string>
+    {
+        auto const localStore = local.shared();
+        auto const * const fsStore = dynamic_cast<const nix::LocalFSStore *>(&*localStore);
+        if (fsStore == nullptr) {
+            return std::nullopt;
+        }
+        auto const kept = openKeptLog(*fsStore, drvPath);
+        if (!kept) {
+            throw nix::Error("%s", kept.error());
+        }
+        auto const & found = *kept;
+        if (!found) {
+            return std::nullopt;
+        }
+        auto const & log = *found;
+        struct Full : std::exception
+        {
+        };
+        std::string text;
+        nix::LambdaSink sink([&](std::string_view data) -> void {
+            text.append(data.substr(0, static_cast<size_t>(std::min<uint64_t>(data.size(), limit + 1 - text.size()))));
+            if (text.size() > limit) {
+                throw Full();
+            }
+        });
+        try {
+            if (!log.compressed) {
+                nix::FdSource(log.file.get()).drainInto(sink);
+            } else if (!bunzip2(log.file.get(), sink)) {
+                throw nix::Error("%s does not decompress", log.path.string());
+            }
+        } catch (Full &) {
+            return text; // too large, and the caller can tell
+        }
+        return text;
+    }
+
+    // Called on the uploader's thread only.
+    void addToLogStore(const std::string & drv, std::string_view log)
+    {
+        if (!logStore) {
+            logStore = nix::openStore(logStoreUrl).get_ptr();
+        }
+        auto * const logs = dynamic_cast<nix::LogStore *>(logStore.get());
+        if (logs == nullptr) {
+            throw nix::Error("--build-log-store '%s' keeps no build logs", logStoreUrl);
+        }
+        logs->addBuildLog(nix::StorePath(drv), log);
     }
 
     // Reads into `buf`, retrying on EINTR. 0 at end of file.
@@ -884,7 +988,13 @@ public:
         auto reason = nix::remote::Done::REASON_UNSPECIFIED;
         std::vector<std::pair<std::string, uint64_t>> outputs;
         std::string wire;
-        auto const report = [&] -> void { builder.finished(drvName, outcome, outputs, wire, reason); };
+        auto const report = [&] -> void {
+            builder.finished(drvName, outcome, outputs, wire, reason);
+            // A result comes from the nix-daemon, which keeps the log of each build it runs.
+            if (uploader && !wire.empty()) {
+                uploader->enqueue(drvName);
+            }
+        };
         auto const tee = [&](const nixgrpc::BuildEvent & event) -> void {
             adm->shared->logged(static_cast<nixgrpc::SpillKind>(event.kind), event.text);
         };
@@ -1136,11 +1246,16 @@ public:
 } // namespace
 
 namespace {
-// Claimed leases count too: their clients may still be uploading.
-auto drained(nixgrpc::Coordinator & coord, nixgrpc::Metrics & metrics) -> bool
+// Claimed leases count too: their clients may still be uploading. Build
+// logs still queued for the log store delay the drain by at most a minute.
+constexpr std::chrono::seconds uploadGrace{60};
+auto drained(
+    nixgrpc::Coordinator & coord, nixgrpc::Metrics & metrics, const NixRemoteService & service,
+    std::chrono::steady_clock::time_point since) -> bool
 {
     return (!coord.builder || coord.builder->holding() == 0)
-           && metrics.inflightNow("BuildDerivation") + metrics.inflightNow("FetchNars") == 0;
+           && metrics.inflightNow("BuildDerivation") + metrics.inflightNow("FetchNars") == 0
+           && (service.uploadsDone() || std::chrono::steady_clock::now() - since > uploadGrace);
 }
 
 // Returns on idle timeout or SIGTERM. A builder's first SIGTERM only stops
@@ -1159,9 +1274,10 @@ void serve(
         watchdog.count() != 0 ? std::min<std::chrono::nanoseconds>(watchdog, std::chrono::seconds(1))
                               : std::chrono::seconds(1);
     bool draining = false;
+    auto drainingSince = std::chrono::steady_clock::now();
     for (;;) {
         if (stopSignal == 0) {
-            if (options.idleTimeout && idle.idleFor() >= *options.idleTimeout) {
+            if (options.idleTimeout && idle.idleFor() >= *options.idleTimeout && service.uploadsDone()) {
                 return;
             }
             coord.tick();
@@ -1169,6 +1285,7 @@ void serve(
         } else {
             if (!draining) {
                 draining = true;
+                drainingSince = std::chrono::steady_clock::now();
                 nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "draining"}});
                 if (coord.builder) {
                     coord.builder->setUnavailable(nixgrpc::Builder::Unavailable::stopping, true);
@@ -1176,7 +1293,7 @@ void serve(
                 server.GetHealthCheckService()->SetServingStatus("", false);
             }
             coord.tick(); // gives back unclaimed leases
-            if (stopSignal >= nixgrpc::kCancelBuilds || drained(coord, metrics)) {
+            if (stopSignal >= nixgrpc::kCancelBuilds || drained(coord, metrics, service, drainingSince)) {
                 return;
             }
         }
@@ -1290,7 +1407,8 @@ try {
          {"niks3", options.niks3.url},
          {"max_jobs", std::to_string(options.maxJobs)}});
     NixRemoteService service(
-        options.socketPath, options.storeUri, options.workerName, metrics, idle, options.logLevel, auth, coord);
+        options.socketPath, options.storeUri, options.workerName, metrics, idle, options.logLevel, auth, coord,
+        options.buildLogStore);
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;

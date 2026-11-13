@@ -348,6 +348,13 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
+  test('log-uploader', executable('log-uploader-test',
+    sources : ['tests/log-uploader-test.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    dependencies : prometheus_dep + [threads_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
+
   test('upload-spool', executable('upload-spool-test',
     sources : ['tests/upload-spool-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
