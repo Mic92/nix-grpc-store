@@ -745,10 +745,11 @@ auto GrpcStore::basicForFarm(Store & evalStore, const StorePath & drvPath, const
 // holds before it answers.
 //
 // Lookahead queries use NoSubstitute so answering doesn't download anything
-// (a daemon with a shared cache still reports what the cache has). Only for
-// a derivation that is actually needed do we ask the server to substitute
-// what's missing, like nix does before building. Whatever can't be
-// substituted, e.g. due to an untrusted signature, gets built.
+// (a daemon with a shared cache still reports the paths that cache has as
+// closure roots). Only for a derivation that is actually needed do we ask
+// the server to substitute what's missing, like nix does before building.
+// Whatever can't be substituted, e.g. due to an untrusted signature, gets
+// built.
 auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, BuildMode buildMode, Store & evalStore)
     -> StorePathSet {
   std::map<StorePath, Derivation> drvs;

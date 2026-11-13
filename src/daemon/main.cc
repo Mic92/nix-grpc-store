@@ -34,6 +34,7 @@
 #include <set>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -354,8 +355,8 @@ public:
                 paths.erase(path);
             }
             if (coord.cache.hasRemote()) {
-                // Nodes answer as one store: what the cache has, every node can serve,
-                for (const auto & path : localStore->querySubstitutablePaths(paths)) {
+                // Nodes answer as one store: the cache's closure roots, every node can serve,
+                for (const auto & path : inCache(paths)) {
                     reply->add_paths(std::string(path.to_string()));
                 }
                 // and what only we have must become so before the client relies on it.
@@ -667,6 +668,38 @@ public:
                 ended = true;
             }
         }
+    }
+
+    // Which of `paths` niks3 has as closure roots, as the scheduler's Cached
+    // answer asks it. A path niks3 has only inside another root's closure is
+    // not one. A hit refreshes that root's GC age (at most every ten minutes),
+    // so this writes to niks3. Not what the other substituters offer: no node
+    // may trust its signature, or its NAR may be gone, and a client told that
+    // the farm holds a requested output builds nothing.
+    auto inCache(const nix::StorePathSet & paths) -> std::vector<nix::StorePath>
+    {
+        auto const key = [](const nix::StorePath & path) -> std::string {
+            return std::string(path.hashPart()) + ".narinfo";
+        };
+        std::vector<std::string> keys;
+        keys.reserve(paths.size());
+        for (const auto & path : paths) {
+            keys.push_back(key(path));
+        }
+        std::unordered_set<std::string> present;
+        try {
+            present = coord.cache.present(keys);
+        } catch (std::exception & err) {
+            // As for the scheduler's Cached: unknown counts as absent.
+            nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "present_failed"}, {"error", err.what()}});
+        }
+        std::vector<nix::StorePath> held;
+        for (const auto & path : paths) {
+            if (present.contains(key(path))) {
+                held.push_back(path);
+            }
+        }
+        return held;
     }
 
     // Outputs built on another node live only in the cache. Clients read them back through us.
