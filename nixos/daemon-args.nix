@@ -86,6 +86,14 @@
   "--advertise"
   cfg.advertise
 ]
+++ lib.concatMap (balancer: [
+  "--tunnel"
+  balancer
+]) cfg.tunnel.balancers
+++ lib.optionals (cfg.tunnel.count != null) [
+  "--tunnel-count"
+  (toString cfg.tunnel.count)
+]
 ++ lib.optionals (cfg.niks3 != null) (
   [
     "--niks3"
