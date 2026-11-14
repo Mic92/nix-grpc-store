@@ -12,6 +12,7 @@
 #include <optional>
 #include <ratio>
 #include <string>
+#include <set>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -226,6 +227,23 @@ auto Dispatcher::membership() const -> std::shared_ptr<const Membership>
 {
     const absl::MutexLock lock(publishedMutex);
     return published;
+}
+
+auto Dispatcher::membersFor(const Membership & members, const std::string & system) -> std::vector<Member>
+{
+    if (auto const own = members.find(system); own != members.end()) {
+        return own->second;
+    }
+    std::vector<Member> everyone;
+    std::set<std::string_view> seen;
+    for (const auto & [other, list] : members) {
+        for (const auto & member : list) {
+            if (seen.insert(member.addr).second) {
+                everyone.push_back(member);
+            }
+        }
+    }
+    return everyone;
 }
 
 auto Dispatcher::watchMembership(std::function<void()> wake) -> uint64_t

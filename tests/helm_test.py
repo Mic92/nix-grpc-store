@@ -70,15 +70,10 @@ def envoy(name: str) -> dict[str, Any]:
     return json.loads(pick(name, "ConfigMap", "-lb")["data"]["envoy.json"])
 
 
-def clusters(name: str) -> list[dict[str, Any]]:
-    """The clusters a client's request can be routed to."""
-    found = envoy(name)["static_resources"]["clusters"]
-    return [cluster for cluster in found if cluster["name"] != "admin"]
-
-
 def upstreams(name: str) -> list[dict[str, Any]]:
-    """Those of them that connect somewhere, not to other clusters."""
-    return [cluster for cluster in clusters(name) if "cluster_type" not in cluster]
+    """The clusters that connect somewhere on behalf of a client."""
+    clusters = envoy(name)["static_resources"]["clusters"]
+    return [cluster for cluster in clusters if cluster["name"] != "admin"]
 
 
 def values_of(obj: Any, key: str) -> list[Any]:
@@ -100,9 +95,7 @@ def test_every_set_of_values_renders() -> None:
 
 
 def renamed(name: str) -> str:
-    system, fallback, rest = name.partition("-or-default")
-    group = {"x86_64-linux": "x86", "aarch64-linux": "arm"}.get(system, system)
-    return group + fallback + rest
+    return {"x86_64-linux": "x86", "aarch64-linux": "arm"}.get(name, name)
 
 
 def without_sds_paths(obj: Any) -> Any:
@@ -123,8 +116,6 @@ def without_address(socket_address: dict[str, Any]) -> None:
 def normalized_cluster(cluster: dict[str, Any]) -> dict[str, Any]:
     cluster["name"] = renamed(cluster["name"])
     cluster.pop("dns_lookup_family", None)
-    if members := dig(cluster, "cluster_type", "typed_config", "clusters"):
-        members[:] = map(renamed, members)
     if assignment := cluster.get("load_assignment"):
         assignment["cluster_name"] = renamed(assignment["cluster_name"])
         for endpoint in assignment["endpoints"][0]["lb_endpoints"]:
@@ -350,7 +341,7 @@ def test_upstream_names_are_verified() -> None:
 
 
 def test_long_streams_are_not_capped_at_envoys_default() -> None:
-    for cluster in clusters("default"):
+    for cluster in upstreams("default"):
         limit = dig(cluster, "circuit_breakers", "thresholds", 0, "max_requests")
         assert limit == 1_000_000, cluster["name"]
 
