@@ -49,7 +49,8 @@ let
     };
   caSds = name: caFile: sds name (builtins.dirOf (toString caFile)) { validation_context.trusted_ca = file caFile; };
 
-  upstreamTls = lib.optionalAttrs (cfg.tls.upstream.certFile != null) {
+  upstreamTls = upstreamTlsFor cfg.tls.upstream.sni;
+  upstreamTlsFor = sni: lib.optionalAttrs (cfg.tls.upstream.certFile != null) {
     transport_socket = {
       name = "envoy.transport_sockets.tls";
       typed_config = {
@@ -61,7 +62,7 @@ let
           ];
         }
         // (
-          if cfg.tls.upstream.sni == null then
+          if sni == null then
             { validation_context_sds_secret_config = caSds "ca" cfg.tls.upstream.caFile; }
           else
             {
@@ -69,7 +70,7 @@ let
                 default_validation_context.match_typed_subject_alt_names = [
                   {
                     san_type = "DNS";
-                    matcher.exact = cfg.tls.upstream.sni;
+                    matcher.exact = sni;
                   }
                 ];
                 validation_context_sds_secret_config = caSds "ca" cfg.tls.upstream.caFile;
@@ -77,7 +78,7 @@ let
             }
         );
       }
-      // lib.optionalAttrs (cfg.tls.upstream.sni != null) { inherit (cfg.tls.upstream) sni; };
+      // lib.optionalAttrs (sni != null) { inherit sni; };
     };
   };
 
@@ -279,8 +280,111 @@ let
     }
   ];
 
+  tunnels = cfg.tunnel.listen != null;
+
+  # Builders that connect to the balancer (`--tunnel`). `hostId` picks the
+  # tunnel for a request. The builder's name was checked against its
+  # certificate when it opened the tunnel, so here the chain is enough.
+  tunnelCluster =
+    name: hostId:
+    upstreamTlsFor null
+    // http2
+    // {
+      inherit name;
+      connect_timeout = "5s";
+      lb_policy = "CLUSTER_PROVIDED";
+      cluster_type = {
+        name = "envoy.clusters.reverse_connection";
+        typed_config = {
+          "@type" =
+            "type.googleapis.com/envoy.extensions.clusters.reverse_connection.v3.ReverseConnectionClusterConfig";
+          cleanup_interval = "60s";
+          host_id_format = hostId;
+        };
+      };
+    };
+
+  # A builder joins the set its ALPN name asks for, under its certificate's name.
+  tunnelChain = protocol: validation: {
+    filter_chain_match.application_protocols = [ protocol ];
+    transport_socket = {
+      name = "envoy.transport_sockets.tls";
+      typed_config = {
+        "@type" = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext";
+        require_client_certificate = true;
+        common_tls_context = {
+          tls_certificate_sds_secret_configs = [ (certSds "lb" cfg.tls.certFile cfg.tls.keyFile) ];
+          validation_context_sds_secret_config = caSds "ca" cfg.tls.upstream.caFile;
+        };
+      };
+    };
+    filters = [
+      {
+        name = "envoy.filters.network.reverse_tunnel";
+        typed_config = {
+          "@type" = "type.googleapis.com/envoy.extensions.filters.network.reverse_tunnel.v3.ReverseTunnel";
+          inherit validation;
+        };
+      }
+    ];
+  };
+
+  tunnelListener = {
+    name = "tunnels";
+    address = (endpoint cfg.tunnel.listen).endpoint.address;
+    listener_filters = [
+      {
+        name = "envoy.filters.listener.tls_inspector";
+        typed_config."@type" =
+          "type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector";
+      }
+    ];
+    filter_chains = [
+      (tunnelChain "nix-tunnel" { node_id_format = "%DOWNSTREAM_PEER_DNS_SAN%"; })
+      (tunnelChain "nix-tunnel-any" {
+        node_id_format = "any/%DOWNSTREAM_PEER_DNS_SAN%";
+        cluster_id_format = "any";
+      })
+    ];
+  };
+
+  # A tunnelled builder is known by a name, a dialled one by IP:port.
+  tunnelRoute = {
+    match = {
+      prefix = "/";
+      grpc = { };
+      headers = [
+        {
+          name = "x-nix-worker";
+          present_match = true;
+        }
+        {
+          name = "x-nix-worker";
+          string_match.safe_regex.regex = "^.+:[0-9]+$";
+          invert_match = true;
+        }
+      ];
+    };
+    route = {
+      cluster = "tunnelled";
+      timeout = "0s";
+    };
+  };
+
+  # Without dialled builders, what any builder may answer goes to a tunnelled one.
+  anyTunnelRoute = {
+    match = {
+      prefix = "/";
+      grpc = { };
+    };
+    route = {
+      cluster = "tunnelled-any";
+      timeout = "0s";
+    };
+  };
+
   systems = cfg.systems;
-  ordered = lib.filter (s: s != cfg.defaultSystem) systems ++ [ cfg.defaultSystem ];
+  ordered = lib.optionals (systems != [ ]) (lib.filter (s: s != cfg.defaultSystem) systems ++ [ cfg.defaultSystem ]);
 in
 {
   options.services.nix-grpc-farm-lb = {
@@ -299,7 +403,7 @@ in
     };
 
     systems = lib.mkOption {
-      type = lib.types.nonEmptyListOf lib.types.str;
+      type = lib.types.listOf lib.types.str;
       example = [
         "x86_64-linux"
         "aarch64-linux"
@@ -311,6 +415,9 @@ in
 
         A builder's `services.nix-grpc-daemon.advertise` is its address in
         the cluster, so it has to be an `IP:port`.
+
+        Builders that connect to `tunnel.listen` are in no such cluster.
+        A farm with only those sets this to `[ ]`.
       '';
     };
 
@@ -358,6 +465,29 @@ in
         Log one line per connection to the journal with the TLS handshake
         failure reason and the client certificate subject.
       '';
+    };
+
+    tunnel = {
+      listen = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "[::]:9000";
+        description = ''
+          Where builders that the balancer cannot dial connect to
+          (`nix-grpc-daemon --tunnel`). Such a builder shows its certificate,
+          signed by `tls.upstream.caFile`, and is reached under that
+          certificate's DNS name. Needs `tls.certFile` and `tls.upstream`.
+        '';
+      };
+      threads = lib.mkOption {
+        type = lib.types.ints.between 1 256;
+        default = 4;
+        description = ''
+          Envoy's worker threads, when `tunnel.listen` is set. Each thread
+          needs a tunnel of its own to a builder, so builders must run with
+          `--tunnel-count` of at least this.
+        '';
+      };
     };
 
     maxStreams = lib.mkOption {
@@ -440,10 +570,22 @@ in
           && (cfg.tls.upstream.certFile == null) == (cfg.tls.upstream.caFile == null);
         message = "services.nix-grpc-farm-lb.tls.upstream.{certFile,keyFile,caFile} go together";
       }
+      {
+        assertion = systems != [ ] || tunnels;
+        message = "services.nix-grpc-farm-lb.systems is empty and tunnel.listen is unset: the balancer would reach no builder";
+      }
+      {
+        assertion = !tunnels || (cfg.tls.certFile != null && cfg.tls.upstream.certFile != null);
+        message = "services.nix-grpc-farm-lb.tunnel.listen requires tls.certFile and tls.upstream";
+      }
     ];
     # restart in one step instead of stop ... activate ... start, so a
     # deploy is a sub-second blip that the client's connect retry absorbs.
     systemd.services.envoy.stopIfChanged = false;
+    # The envoy module has no option for flags.
+    systemd.services.envoy.serviceConfig.ExecStart = lib.mkIf tunnels (
+      lib.mkForce "${lib.getExe config.services.envoy.package} -c ${json.generate "envoy.json" config.services.envoy.settings} --concurrency ${toString cfg.tunnel.threads}"
+    );
 
     services.envoy = {
       enable = true;
@@ -455,9 +597,19 @@ in
           id = "nix-grpc-farm-lb";
           cluster = "nix-grpc-farm";
         };
+        bootstrap_extensions = lib.mkIf tunnels [
+          {
+            name = "envoy.bootstrap.reverse_tunnel.upstream_socket_interface";
+            typed_config = {
+              "@type" =
+                "type.googleapis.com/envoy.extensions.bootstrap.reverse_tunnel.upstream_socket_interface.v3.UpstreamReverseConnectionSocketInterface";
+              stat_prefix = "upstream_reverse_connection";
+            };
+          }
+        ];
         admin = lib.mkIf (cfg.admin != null) { address = (endpoint cfg.admin).endpoint.address; };
         static_resources = {
-          listeners = [
+          listeners = lib.optional tunnels tunnelListener ++ [
             {
               name = "farm";
               address = (endpoint cfg.listen).endpoint.address;
@@ -488,7 +640,13 @@ in
                           {
                             name = "farm";
                             domains = [ "*" ];
-                            routes = [ edsRoute schedRoute ] ++ lib.concatMap routesFor ordered;
+                            routes = [
+                              edsRoute
+                              schedRoute
+                            ]
+                            ++ lib.optional tunnels tunnelRoute
+                            ++ lib.concatMap routesFor ordered
+                            ++ lib.optional (systems == [ ]) anyTunnelRoute;
                           }
                         ];
                         http_filters = [
@@ -505,7 +663,13 @@ in
               ];
             }
           ];
-          clusters = map workerCluster systems ++ [ schedCluster ];
+          clusters =
+            map workerCluster systems
+            ++ [ schedCluster ]
+            ++ lib.optionals tunnels [
+              (tunnelCluster "tunnelled" "%REQ(x-nix-worker)%")
+              (tunnelCluster "tunnelled-any" "any")
+            ];
         };
       };
     };
