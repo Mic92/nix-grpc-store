@@ -214,6 +214,15 @@ auto Builder::greet() -> bool
     return true;
 }
 
+void Builder::onAvailability(std::function<void(bool)> changed)
+{
+    std::scoped_lock const lock(unavailableMutex);
+    availability_ = std::move(changed);
+    if (availability_) {
+        availability_(!draining());
+    }
+}
+
 void Builder::setUnavailable(Unavailable why, bool holds)
 {
     std::scoped_lock const lock(unavailableMutex);
@@ -226,6 +235,9 @@ void Builder::setUnavailable(Unavailable why, bool holds)
     }
     metrics.unavailable(name(why), holds);
     bool const draining = this->draining();
+    if (was != draining && availability_) {
+        availability_(!draining);
+    }
     if (was == draining || !greeted_) {
         return;
     }
