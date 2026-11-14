@@ -33,12 +33,15 @@
 #include "niks3-client.hh"
 #include "parse-int.hh"
 #include "scheduler.hh"
+#include "tunnel.hh"
+#include "tunnels.hh"
 #include "xfcc.hh"
 
 namespace nixgrpc {
 
 namespace {
 constexpr unsigned maxLookupThreads = 1024;
+constexpr unsigned maxTunnelCount = 256;
 
 auto parseLogLevel(std::string_view value) -> LogLevel
 {
@@ -213,6 +216,15 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             options.schedulerTokenFile = next();
         } else if (arg == "--advertise") {
             options.advertise = next();
+        } else if (arg == "--tunnel") {
+            options.tunnels.emplace_back(next());
+            (void) tunnel::parseBalancer(options.tunnels.back());
+        } else if (arg == "--tunnel-count") {
+            auto count = parseInt<unsigned>(next());
+            if (!count || *count < 1 || *count > maxTunnelCount) {
+                throw nix::Error("--tunnel-count expects an integer in 1..%d", maxTunnelCount);
+            }
+            options.tunnelCount = *count;
         } else if (arg == "--extra-system") {
             options.extraSystems.emplace_back(next());
         } else if (arg == "--max-jobs") {
@@ -260,6 +272,15 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
     if (options.idleTimeout && !options.schedulerAddr.empty()) {
         // Nothing would bring it back to take work.
         throw nix::Error("--idle-timeout with --scheduler: the builder must stay connected");
+    }
+    if (!options.tunnels.empty()) {
+        if (!options.builder || options.tlsCert.empty()) {
+            throw nix::Error("--tunnel requires --role builder and --tls-cert/--tls-key");
+        }
+        if (!options.advertise.empty()) {
+            throw nix::Error("--tunnel with --advertise: the balancer finds a tunnelled builder by its certificate's name");
+        }
+        options.advertise = tunnel::certName(options.tlsCert);
     }
     options.advertise = bracketHost(options.advertise);
     if (options.advertise.empty()) {

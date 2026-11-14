@@ -43,6 +43,11 @@ struct Options
     std::string schedulerTokenFile; // bearer towards a remote scheduler, optional
     // How the balancer reaches this worker. Goes into Assigned.worker_addr.
     std::string advertise;
+    // Balancers (host:port) this builder opens tunnels to, because they
+    // cannot dial it. It is then advertised by its certificate's name.
+    std::vector<std::string> tunnels;
+    // Tunnels of each kind per balancer address: the balancer's thread count.
+    unsigned tunnelCount = 4;
     // Systems the local nix-daemon builds without them being in extra-platforms,
     // e.g. through external-builders.
     std::vector<std::string> extraSystems;

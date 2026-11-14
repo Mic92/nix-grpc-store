@@ -46,6 +46,7 @@
 #include <grpcpp/resource_quota.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
+#include <grpcpp/passive_listener.h>
 #include <grpcpp/security/server_credentials.h>
 #include <grpcpp/support/status.h>
 #include <grpcpp/support/sync_stream.h>
@@ -81,6 +82,7 @@
 #include "coordinator.hh"
 #include "options.hh"
 #include "push.hh"
+#include "tunnels.hh"
 #include "idle.hh"
 #include "import-paths.hh"
 #include "log-spill.hh"
@@ -1239,6 +1241,34 @@ auto sandboxPolicy(const nixgrpc::Options & options, bool listenFdsEmpty) -> nix
     return policy;
 }
 
+void startTunnels(
+    std::optional<nixgrpc::tunnel::Tunnels> & tunnels,
+    const nixgrpc::Options & options,
+    std::unique_ptr<grpc::experimental::PassiveListener> listener,
+    nixgrpc::Builder & builder)
+{
+    std::vector<nixgrpc::tunnel::Balancer> balancers;
+    balancers.reserve(options.tunnels.size());
+    for (const auto & spec : options.tunnels) {
+        balancers.push_back(nixgrpc::tunnel::parseBalancer(spec));
+    }
+    tunnels.emplace(nixgrpc::tunnel::Tunnels::Config{
+        .balancers = std::move(balancers),
+        .tls = {.cert = options.tlsCert, .key = options.tlsKey, .ca = options.clientCA},
+        .name = options.advertise,
+        .perSet = options.tunnelCount,
+        .adopt = [listener = std::shared_ptr(std::move(listener))](nix::AutoCloseFD sock) -> void {
+            if (auto const status = listener->AcceptConnectedFd(sock.get()); !status.ok()) {
+                // gRPC may or may not have closed it by now.
+                (void) sock.release();
+                throw nix::Error("gRPC did not take the tunnel: %s", std::string(status.message()));
+            }
+            (void) sock.release();
+        },
+    });
+    builder.onAvailability([&tunnels](bool takes) -> void { tunnels->setTakesWork(takes); });
+}
+
 } // namespace
 
 auto main(int argc, char ** argv) -> int
@@ -1291,6 +1321,8 @@ try {
         oidc.emplace(std::move(cfg));
     }
     nixgrpc::Auth auth{.acl = options.acl, .proxies = options.proxies, .oidc = &oidc, .metrics = &metrics};
+    // Outlives the builder, which tells it when to leave.
+    std::optional<nixgrpc::tunnel::Tunnels> tunnels;
     nixgrpc::Coordinator coord(options, auth, metrics, idle);
     nixgrpc::logLine(
         nixgrpc::LogLevel::info,
@@ -1332,6 +1364,10 @@ try {
         acceptor = builder.experimental().AddExternalConnectionAcceptor(
             grpc::ServerBuilder::experimental_type::ExternalConnectionType::FROM_FD, creds);
     }
+    std::unique_ptr<grpc::experimental::PassiveListener> tunnelled;
+    if (!options.tunnels.empty()) {
+        builder.experimental().AddPassiveListener(creds, tunnelled);
+    }
     builder.RegisterService(&service);
     if (coord.scheduler) {
         builder.RegisterService(coord.scheduler.get());
@@ -1350,6 +1386,9 @@ try {
         nixgrpc::LogLevel::info,
         {{"event", "startup"}, {"listen", options.listen}, {"proxy_socket", options.socketPath}});
     coord.start(*server);
+    if (tunnelled && coord.builder) {
+        startTunnels(tunnels, options, std::move(tunnelled), *coord.builder);
+    }
     nixgrpc::sdNotify("READY=1");
 
     serve(*server, service, options, idle, coord, metrics);
@@ -1357,6 +1396,9 @@ try {
     stopSignal = nixgrpc::kCancelBuilds;
     nixgrpc::sdNotify("STOPPING=1");
     server->GetHealthCheckService()->SetServingStatus(false);
+    if (tunnels) {
+        tunnels->stop();
+    }
     coord.restarting();
     // Shutdown() then waits for handlers stuck in nix. Clients already got CANCELLED.
     static constexpr std::chrono::seconds shutdownGrace{5};
@@ -1367,6 +1409,11 @@ try {
     }).detach();
     server->Shutdown(std::chrono::system_clock::now() + shutdownGrace);
     server->Wait();
+    if (coord.builder) {
+        // The builder outlives the tunnels and still reports changes.
+        coord.builder->onAvailability({});
+    }
+    tunnels.reset();
     return 0;
 } catch (const std::exception & err) {
     // Formatting or logging could itself throw and escape main; use plain
