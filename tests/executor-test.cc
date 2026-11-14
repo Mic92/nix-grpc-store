@@ -71,16 +71,64 @@ void bounces()
     exe.onAssigned(job, place("a"));
     exe.next();
     exe.onAssigned(job, place("b"));
-    exe.bounced(job);
+    exe.bounced(job, Clock::now());
     auto again = exe.next();
     assert(again && again->second.addr == "b");
-    exe.bounced(job);
+    exe.bounced(job, Clock::now());
     assert(std::holds_alternative<st::Wantable>(exe.at(job)));
     exe.takeWants();
     exe.onAssigned(job, place("c"));
     exe.next();
-    exe.bounced(job);
+    exe.bounced(job, Clock::now());
     assert(outcome(exe, job) == Outcome::gaveUp);
+}
+
+// The first bounce asks again at once. Later ones wait, each longer than
+// the one before, so a worker that is briefly out of reach can come back.
+void laterBouncesWait()
+{
+    Executor exe({.threads = 1, .rescheduleRetries = Executor::defaultRescheduleRetries, .keepGoing = true});
+    auto const job = exe.add(0, {});
+    auto const grace = std::chrono::minutes(2);
+    auto now = Clock::now();
+    auto const bounce = [&] -> void {
+        exe.takeWants();
+        exe.onAssigned(job, place("a"));
+        exe.next();
+        exe.bounced(job, now);
+    };
+    exe.connected();
+    bounce();
+    assert(std::holds_alternative<st::Wantable>(exe.at(job)));
+    bounce();
+    assert(!std::holds_alternative<st::Wantable>(exe.at(job)));
+    auto const first = exe.reap(now, grace) - now;
+    assert(first < grace);
+    now += first;
+    exe.reap(now, grace);
+    assert(std::holds_alternative<st::Wantable>(exe.at(job)));
+    bounce();
+    assert(exe.reap(now, grace) - now > first);
+}
+
+// Nothing wakes a waiting job once the scheduler is gone, so a bounce
+// after that must end the job instead of making it wait.
+void bounceAfterAbandonIsLost()
+{
+    Executor exe({.threads = 1, .rescheduleRetries = Executor::defaultRescheduleRetries, .keepGoing = true});
+    auto const job = exe.add(0, {});
+    exe.connected();
+    exe.takeWants();
+    exe.onAssigned(job, place("a"));
+    exe.next();
+    exe.bounced(job, Clock::now());
+    exe.takeWants();
+    exe.onAssigned(job, place("a"));
+    exe.next();
+    exe.abandon();
+    exe.bounced(job, Clock::now());
+    assert(outcome(exe, job) == Outcome::lost);
+    assert(exe.remainingJobs() == 0);
 }
 
 // A worker that would not serve a job is named in the next Want, so the
@@ -93,12 +141,12 @@ void refusedPlacementIsNamedOnce()
     exe.takeWants();
     exe.onAssigned(job, place("a"));
     exe.next();
-    exe.bounced(job, true);
+    exe.bounced(job, Clock::now(), true);
     assert(exe.refused(job) == place("a").assignId);
     exe.takeWants();
     exe.onAssigned(job, place("b"));
     exe.next();
-    exe.bounced(job);
+    exe.bounced(job, Clock::now());
     assert(exe.refused(job) == 0);
 }
 
@@ -191,7 +239,7 @@ void everyEndCancels()
     exe.finished(built, true);
     exe.finished(failed, false);
     exe.onCached(cached);
-    exe.bounced(gaveUp);
+    exe.bounced(gaveUp, Clock::now());
     assert((exe.takeCancels() == std::vector<JobId>{built, failed, cached, gaveUp}));
     exe.finished(built, true);
     assert(exe.takeCancels().empty());
@@ -219,7 +267,9 @@ auto main() -> int
         wantsFollowThreads();
         dependantsWait();
         bounces();
-    refusedPlacementIsNamedOnce();
+        laterBouncesWait();
+        bounceAfterAbandonIsLost();
+        refusedPlacementIsNamedOnce();
         stopsWithoutKeepGoing();
         unplaceableGrace();
         reconnectAndAbandon();
