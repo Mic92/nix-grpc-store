@@ -304,8 +304,8 @@ in
         type = lib.types.nullOr (lib.types.ints.between 1 256);
         default = null;
         description = ''
-          Tunnels of each kind per balancer address, 4 by default. At
-          least the balancer's `tunnel.threads`.
+          How many tunnels the builder opens to each balancer address;
+          4 if unset. Must be at least the balancer's `tunnel.threads`.
         '';
       };
     };

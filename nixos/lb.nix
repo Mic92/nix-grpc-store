@@ -416,8 +416,8 @@ in
         A builder's `services.nix-grpc-daemon.advertise` is its address in
         the cluster, so it has to be an `IP:port`.
 
-        Builders that connect to `tunnel.listen` are in no such cluster.
-        A farm with only those sets this to `[ ]`.
+        Builders that connect to `tunnel.listen` are not in these clusters.
+        If all builders of the farm connect that way, set this to `[ ]`.
       '';
     };
 
@@ -473,19 +473,30 @@ in
         default = null;
         example = "[::]:9000";
         description = ''
-          Where builders that the balancer cannot dial connect to
-          (`nix-grpc-daemon --tunnel`). Such a builder shows its certificate,
-          signed by `tls.upstream.caFile`, and is reached under that
-          certificate's DNS name. Needs `tls.certFile` and `tls.upstream`.
+          Address of the tunnel port. Set this when some builders cannot be
+          reached from the balancer, for example because they are behind NAT.
+          Those builders connect to this port instead (their
+          `services.nix-grpc-daemon.tunnel.balancers`) and receive their
+          builds over that connection.
+
+          A builder has to present a certificate signed by
+          `tls.upstream.caFile`. The farm knows it by the DNS name in that
+          certificate.
+
+          Requires `tls.certFile` and `tls.upstream`.
         '';
       };
       threads = lib.mkOption {
         type = lib.types.ints.between 1 256;
         default = 4;
         description = ''
-          Envoy's worker threads, when `tunnel.listen` is set. Each thread
-          needs a tunnel of its own to a builder, so builders must run with
-          `--tunnel-count` of at least this.
+          Number of Envoy worker threads. Only used when `tunnel.listen` is
+          set.
+
+          A thread can only use the tunnels it holds itself, so a builder
+          needs at least one tunnel per thread. Keep the builders'
+          `services.nix-grpc-daemon.tunnel.count` at this value or above;
+          with fewer, some requests to that builder fail.
         '';
       };
     };
