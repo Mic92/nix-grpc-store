@@ -297,7 +297,10 @@ in
           the builder connects to all of them.
 
           The certificate in {option}`tls.certFile` must contain exactly one
-          DNS name. The farm knows the builder by that name.
+          DNS name. The farm knows the builder by that name followed by its
+          {option}`workerName`, for example `builders.example.org/b1`.
+          Builders may therefore share a certificate as long as their worker
+          names differ.
         '';
       };
       count = lib.mkOption {
@@ -434,7 +437,7 @@ in
       }
       {
         assertion = cfg.tunnel.balancers == [ ] || cfg.advertise == null;
-        message = "services.nix-grpc-daemon.tunnel.balancers and advertise exclude each other: a tunnelled builder is reached under its certificate's name";
+        message = "services.nix-grpc-daemon.tunnel.balancers and advertise exclude each other: a tunnelled builder is reached under its certificate's name and worker name";
       }
       {
         assertion = cfg.oidc == null || cfg.tls.certFile != null || (cfg.oidc.allow_insecure or false);

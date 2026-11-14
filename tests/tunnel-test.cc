@@ -268,7 +268,7 @@ struct Fixture
     Wake stop;
     nixgrpc::tunnel::Tls tls{.cert = pki.file("b1.pem"), .key = pki.file("b1.key"), .ca = pki.file("ca.pem")};
     nixgrpc::tunnel::Target target{.host = "lb.test", .address = "127.0.0.1", .port = lis.port, .protocol = std::string(nixgrpc::tunnel::anyProtocol)};
-    nixgrpc::tunnel::Identity self{.node = "any/b1", .group = "any"};
+    nixgrpc::tunnel::Identity self{.node = "any/b1", .group = "any", .instance = ""};
 
     [[nodiscard]] auto open() const -> nix::AutoCloseFD
     {
@@ -458,6 +458,7 @@ struct Tunnel
 {
     nix::AutoCloseFD conn;
     std::string protocol;
+    std::string request;
     // The builder's end is gone, as opposed to merely silent.
     [[nodiscard]] auto ended() const -> bool
     {
@@ -479,6 +480,7 @@ struct Held
         .balancers = {{.host = "lb.test", .port = lis.port}},
         .tls = {.cert = pki.file("b1.pem"), .key = pki.file("b1.key"), .ca = pki.file("ca.pem")},
         .name = "b1",
+        .instance = "pod-7",
         .perSet = 1,
         .adopt = [this](nix::AutoCloseFD sock) -> void {
             const std::scoped_lock lock(mutex);
@@ -500,8 +502,10 @@ struct Held
         if (poll(&pfd, 1, static_cast<int>(patience.count())) <= 0) {
             return std::nullopt;
         }
-        Tunnel tunnel{.conn = nix::AutoCloseFD{accept(lis.sock.get(), nullptr, nullptr)}, .protocol = ""};
-        tunnel.protocol = greet(tunnel.conn.get(), pki, "lb", "200 OK").protocol;
+        Tunnel tunnel{.conn = nix::AutoCloseFD{accept(lis.sock.get(), nullptr, nullptr)}, .protocol = "", .request = ""};
+        auto seen = greet(tunnel.conn.get(), pki, "lb", "200 OK");
+        tunnel.protocol = std::move(seen.protocol);
+        tunnel.request = std::move(seen.request);
         const auto before = taken();
         (void) send(tunnel.conn.get(), unread.data(), unread.size(), 0);
         constexpr int limit = 300;
@@ -527,6 +531,18 @@ struct Held
         return {std::move(*first), std::move(*second)};
     }
 };
+
+// Envoy checks the first half against the certificate and the second
+// against the header, so pods sharing a certificate get a tunnel each.
+void builders_sharing_a_certificate_are_told_apart_by_instance()
+{
+    Held held;
+    const auto [named, any] = held.both();
+    check(named.request.contains("\r\nx-envoy-reverse-tunnel-node-id: b1/pod-7\r\n"), "own tunnels: " + named.request);
+    check(named.request.contains("\r\nx-envoy-reverse-tunnel-cluster-id: b1/pod-7\r\n"), "a certificate's name alone finds nobody");
+    check(any.request.contains("\r\nx-envoy-reverse-tunnel-node-id: any/b1/pod-7\r\n"), "shared tunnels: " + any.request);
+    check(named.request.contains("\r\nx-nix-instance: pod-7\r\n") && any.request.contains("\r\nx-nix-instance: pod-7\r\n"), "instance header");
+}
 
 void a_tunnel_that_ended_is_opened_again()
 {
@@ -587,6 +603,7 @@ try {
         a_balancer_is_reached_by_its_ipv6_address();
         the_watcher_sees_every_way_a_connection_ends();
         a_tunnelled_builders_certificate_has_one_name();
+        builders_sharing_a_certificate_are_told_apart_by_instance();
         a_tunnel_that_ended_is_opened_again();
         a_builder_that_takes_no_work_only_keeps_the_tunnels_for_itself();
     } catch (std::exception & err) {

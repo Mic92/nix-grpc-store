@@ -65,12 +65,23 @@ let
       testCerts.neededBy = [ "nix-grpc-daemon.service" ];
     };
 
+  # Its firewall lets nothing in, so every build reaches it through a tunnel.
+  # Both have the same name in their certificate, as pods of one Deployment
+  # do; the balancer tells them apart by host name.
+  tunnelled = feature: {
+    imports = [ builder ];
+    testCerts.certs.node = cert "worker-2" "DNS:tunnelled";
+    nix.settings.system-features = [ feature ];
+    services.nix-grpc-daemon.roles = [ "builder" ];
+    services.nix-grpc-daemon.tunnel.balancers = [ "lb:${toString tunnelPort}" ];
+  };
+
   jobExpr = pkgs.writeText "job.nix" ''
-    { tag, features }:
+    { tag, feature }:
     derivation {
       name = "tunnel-''${tag}";
       system = builtins.currentSystem;
-      requiredSystemFeatures = features;
+      requiredSystemFeatures = [ feature ];
       builder = "/bin/sh";
       args = [ "-c" "echo ''${tag} > $out" ];
     }
@@ -89,15 +100,8 @@ pkgs.testers.runNixOSTest {
       networking.firewall.allowedTCPPorts = [ 50051 ];
     };
 
-    # Its firewall lets nothing in, so every build reaches it through a tunnel.
-    tunnelled = {
-      imports = [ builder ];
-      # The balancer finds a tunnelled builder by the one name in its certificate.
-      testCerts.certs.node = cert "worker-2" "DNS:tunnelled";
-      nix.settings.system-features = [ "tunnelled" ];
-      services.nix-grpc-daemon.roles = [ "builder" ];
-      services.nix-grpc-daemon.tunnel.balancers = [ "lb:${toString tunnelPort}" ];
-    };
+    tunnelled1 = tunnelled "one";
+    tunnelled2 = tunnelled "two";
 
     lb = {
       imports = [
@@ -150,7 +154,7 @@ pkgs.testers.runNixOSTest {
     lb.wait_for_unit("niks3.service")
     lb.wait_for_open_port(5751)
     lb.wait_for_open_port(50051)
-    for node in [dialled, tunnelled]:
+    for node in [dialled, tunnelled1, tunnelled2]:
         node.systemctl("start nix-grpc-daemon.service")
 
     client.wait_for_unit("test-certs.service")
@@ -162,21 +166,22 @@ pkgs.testers.runNixOSTest {
         out = lb.succeed(f"curl -sf 'localhost:9901/stats?filter=^{stat}$'")
         return int(out.split(":")[1]) if out.strip() else 0
 
-    def build(tag: str) -> str:
-        args = f"-f ${jobExpr} --argstr tag {tag} --arg features '[\"tunnelled\"]'"
+    def build(tag: str, feature: str) -> str:
+        args = f"-f ${jobExpr} --argstr tag {tag} --argstr feature {feature}"
         # The builder may still be connecting, so the first builds can find nobody.
         client.wait_until_succeeds(f"nix build -L --store '{store}' --eval-store auto {args}", timeout=180)
         return client.succeed(f"nix eval --raw {args} outPath")
 
-    with subtest("a build reaches the tunnelled builder next to a dialled one"):
-        tunnelled.succeed(f"test -e {build('mixed')}")
+    with subtest("a build reaches its tunnelled builder next to a dialled one"):
+        tunnelled1.succeed(f"test -e {build('mixed1', 'one')}")
+        tunnelled2.succeed(f"test -e {build('mixed2', 'two')}")
         assert requests("tunnelled") > 0, "the build did not go through a tunnel"
         assert requests("tunnelled-any") == 0, "store queries left the dialled builder"
 
     with subtest("a farm of tunnelled builders answers store queries too"):
         lb.succeed("/run/current-system/specialisation/tunnelsOnly/bin/switch-to-configuration test")
         lb.wait_for_open_port(50051)
-        tunnelled.succeed(f"test -e {build('alone')}")
+        tunnelled2.succeed(f"test -e {build('alone', 'two')}")
         assert requests("tunnelled") > 0, "the build did not go through a tunnel"
         assert requests("tunnelled-any") > 0, "store queries did not go through a tunnel"
   '';
