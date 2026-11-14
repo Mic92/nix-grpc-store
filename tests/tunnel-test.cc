@@ -335,6 +335,18 @@ void a_balancer_with_another_name_is_not_trusted()
     (void) peer.get();
 }
 
+void a_balancer_that_goes_away_inside_a_ping_is_noticed()
+{
+    const Fixture fix;
+    auto peer = balancer(fix.lis, fix.pki, "lb", "200 OK", [](int conn, Seen &) -> void { (void) send(conn, "RPI", 3, 0); });
+    auto opening = std::async(std::launch::async, [&] -> std::string { return fix.fails(); });
+    const bool noticed = opening.wait_for(3s) == std::future_status::ready;
+    fix.stop.set();
+    check(noticed, "open() returns");
+    check(opening.get().contains("closed the tunnel"), "the closed tunnel is reported");
+    (void) peer.get();
+}
+
 void a_port_that_does_not_take_tunnels_is_named_as_the_likely_cause()
 {
     const Fixture fix;
@@ -570,7 +582,8 @@ try {
         a_tunnel_is_handed_over_when_the_balancer_starts_a_request();
         a_refused_tunnel_reports_the_balancers_answer();
         a_balancer_with_another_name_is_not_trusted();
-        a_port_that_does_not_take_tunnels_is_named_as_the_likely_cause();
+        a_balancer_that_goes_away_inside_a_ping_is_noticed();
+    a_port_that_does_not_take_tunnels_is_named_as_the_likely_cause();
         a_balancer_is_reached_by_its_ipv6_address();
         the_watcher_sees_every_way_a_connection_ends();
         a_tunnelled_builders_certificate_has_one_name();

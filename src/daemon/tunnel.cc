@@ -384,14 +384,15 @@ auto open(const Target & target, const Tls & tls, const Identity & self, const W
     if (!sock || handshake(sock.get(), target, tls, self, stop, deadline) == Io::stopped) {
         return {};
     }
-    // Wake up for whole pings only.
-    setOpt(sock.get(), SOL_SOCKET, SO_RCVLOWAT, static_cast<int>(ping.size()));
+    // The start of a ping that came without its end.
+    std::string pending;
     for (;;) {
         if (!await(sock.get(), POLLIN, stop, std::nullopt)) {
             return {};
         }
         std::array<char, ping.size()> head{};
-        const auto got = recv(sock.get(), head.data(), head.size(), MSG_PEEK);
+        // What follows the pings stays in the socket for gRPC.
+        const auto got = recv(sock.get(), head.data(), head.size() - pending.size(), pending.empty() ? MSG_PEEK : 0);
         if (got == 0) {
             throw nix::Error("the balancer closed the tunnel");
         }
@@ -401,20 +402,23 @@ auto open(const Target & target, const Tls & tls, const Identity & self, const W
             }
             throw nix::SysError("reading from the tunnel");
         }
-        switch (front({head.data(), static_cast<size_t>(got)})) {
-        case Front::ping:
-            (void) recv(sock.get(), head.data(), head.size(), 0);
-            echo(sock.get());
-            break;
-        case Front::partial: {
-            // Only where SO_RCVLOWAT does not hold poll() back.
-            constexpr auto pause = std::chrono::milliseconds(10);
-            (void) stop.wait(pause);
-            break;
+        const std::string_view bytes{head.data(), static_cast<size_t>(got)};
+        if (pending.empty()) {
+            if (front(bytes) == Front::data) {
+                return sock;
+            }
+            (void) recv(sock.get(), head.data(), bytes.size(), 0);
         }
+        pending += bytes;
+        switch (front(pending)) {
+        case Front::ping:
+            echo(sock.get());
+            pending.clear();
+            break;
+        case Front::partial:
+            break;
         case Front::data:
-            setOpt(sock.get(), SOL_SOCKET, SO_RCVLOWAT, 1);
-            return sock;
+            throw nix::Error("the balancer sent neither a ping nor a request");
         }
     }
 }
