@@ -26,10 +26,11 @@ let
   };
 
   tls = {
-    certFile = "/run/test-certs/cert.pem";
-    keyFile = "/run/test-certs/key.pem";
+    certFile = "/run/test-certs/node.pem";
+    keyFile = "/run/test-certs/node.key";
     clientCaFile = "/run/test-certs/ca.pem";
   };
+  cert = commonName: subjectAltName: { inherit commonName subjectAltName; };
 
   builder =
     { config, ... }:
@@ -82,8 +83,7 @@ pkgs.testers.runNixOSTest {
   nodes = {
     dialled = {
       imports = [ builder ];
-      testCerts.commonName = "worker-1";
-      testCerts.subjectAltName = "DNS:dialled,IP:${dialledIp}";
+      testCerts.certs.node = cert "worker-1" "DNS:dialled,IP:${dialledIp}";
       services.nix-grpc-daemon.listen = "[::]:50051";
       services.nix-grpc-daemon.advertise = "${dialledIp}:50051";
       networking.firewall.allowedTCPPorts = [ 50051 ];
@@ -92,9 +92,8 @@ pkgs.testers.runNixOSTest {
     # Its firewall lets nothing in, so every build reaches it through a tunnel.
     tunnelled = {
       imports = [ builder ];
-      testCerts.commonName = "worker-2";
       # The balancer finds a tunnelled builder by the one name in its certificate.
-      testCerts.subjectAltName = "DNS:tunnelled";
+      testCerts.certs.node = cert "worker-2" "DNS:tunnelled";
       nix.settings.system-features = [ "tunnelled" ];
       services.nix-grpc-daemon.roles = [ "builder" ];
       services.nix-grpc-daemon.tunnel.balancers = [ "lb:${toString tunnelPort}" ];
@@ -123,9 +122,8 @@ pkgs.testers.runNixOSTest {
         };
       };
       testCerts = {
-        createsCa = true;
-        commonName = "lb-1";
-        subjectAltName = "DNS:lb";
+        createsCas = true;
+        certs.node = cert "lb-1" "DNS:lb";
         neededBy = [ "envoy.service" ];
       };
       specialisation.tunnelsOnly.configuration.services.nix-grpc-farm-lb.systems = pkgs.lib.mkForce [ ];
@@ -142,8 +140,7 @@ pkgs.testers.runNixOSTest {
         module
       ];
       programs.nix-grpc-store.enable = true;
-      testCerts.commonName = "ci-1";
-      testCerts.subjectAltName = "DNS:client";
+      testCerts.certs.node = cert "ci-1" "DNS:client";
       nix.settings.substituters = pkgs.lib.mkForce [ ];
     };
   };
@@ -158,7 +155,7 @@ pkgs.testers.runNixOSTest {
 
     client.wait_for_unit("test-certs.service")
     certs = "/run/test-certs"
-    store = f"grpc://lb:50051?client-cert={certs}/cert.pem&client-key={certs}/key.pem&ca-cert={certs}/ca.pem"
+    store = f"grpc://lb:50051?client-cert={certs}/node.pem&client-key={certs}/node.key&ca-cert={certs}/ca.pem"
 
     def requests(cluster: str) -> int:
         stat = f"cluster.{cluster}.upstream_rq_total"

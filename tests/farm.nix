@@ -27,25 +27,8 @@ let
     worker2 = "192.168.1.4";
   };
 
-  certs = pkgs.runCommand "farm-certs" { nativeBuildInputs = [ pkgs.openssl ]; } ''
-    mkdir $out && cd $out
-    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout ca.key -out ca.pem -subj /CN=farm-ca
-    # The balancer's server cert comes from a "public" CA that nodes and
-    # clients only know through the system trust store, like Let's Encrypt.
-    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout public-ca.key -out public-ca.pem -subj /CN=public-ca
-    issue() {
-      openssl req -newkey rsa:2048 -nodes -keyout $1.key -out $1.csr -subj /CN=$2
-      openssl x509 -req -in $1.csr -days 3650 -CA $4.pem -CAkey $4.key -set_serial 0x$(openssl rand -hex 8) \
-        -extfile <(printf "subjectAltName=$3\nextendedKeyUsage=serverAuth,clientAuth") -out $1.pem
-    }
-    issue lb lb "DNS:lb" public-ca
-    issue lb-client lb-1 "DNS:lb" ca
-    issue worker1 worker-1 "DNS:worker1,DNS:lb,IP:${ip.worker1}" ca
-    issue worker2 worker-2 "DNS:worker2,DNS:lb,IP:${ip.worker2}" ca
-    issue ci ci-1 "DNS:client" ca
-    issue stranger stranger "DNS:client" ca
-    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout foreign.key -out foreign.pem -subj /CN=foreign
-  '';
+  certs = "/run/test-certs";
+  cert = commonName: subjectAltName: { inherit commonName subjectAltName; };
 
   oidcAudience = "grpc://lb:50051";
   oidcConfig = {
@@ -69,7 +52,15 @@ let
 
   common = {
     virtualisation.memorySize = 1536;
-    security.pki.certificateFiles = [ "${certs}/public-ca.pem" ];
+    imports = [ ./lib/test-certs.nix ];
+    # The balancer's server cert comes from a "public" CA that nodes and
+    # clients only know through the system trust store, like Let's Encrypt.
+    testCerts.cas = [
+      "ca"
+      "public-ca"
+      "foreign-ca"
+    ];
+    testCerts.trusted = [ "public-ca" ];
     nix.package = nixPkgs.nix-everything;
     nix.settings.experimental-features = [ "nix-command" ];
   };
@@ -134,6 +125,7 @@ let
       };
       programs.nix-grpc-store.enable = true;
       networking.firewall.allowedTCPPorts = [ 50051 ];
+      testCerts.neededBy = [ "nix-grpc-daemon.service" ];
     };
 
   jobExpr = pkgs.writeText "job.nix" ''
@@ -209,6 +201,7 @@ pkgs.testers.runNixOSTest {
   nodes = {
     worker1 = {
       imports = [ (worker "worker1") ];
+      testCerts.certs.worker1 = cert "worker-1" "DNS:worker1,DNS:lb,IP:${ip.worker1}";
       nix.settings.system-features = [ "vip" ];
       services.nix-grpc-daemon.workerName = "node-a";
       # With worker2, two builders for a system other than the default.
@@ -216,6 +209,7 @@ pkgs.testers.runNixOSTest {
     };
     worker2 = {
       imports = [ (worker "worker2") ];
+      testCerts.certs.worker2 = cert "worker-2" "DNS:worker2,DNS:lb,IP:${ip.worker2}";
       # Pins a build to worker2, like vip does for worker1.
       nix.settings.system-features = [ "w2" ];
       services.nix-grpc-daemon.extraSystems = [ "riscv64-linux" ];
@@ -268,6 +262,14 @@ pkgs.testers.runNixOSTest {
             };
           };
         };
+        testCerts = {
+          createsCas = true;
+          neededBy = [ "envoy.service" ];
+          certs.lb = cert "lb" "DNS:lb" // { ca = "public-ca"; };
+          certs.lb-client = cert "lb-1" "DNS:lb";
+          # One test sends requests from here as the CI client.
+          certs.ci = cert "ci-1" "DNS:client";
+        };
         systemd.services.mock-oidc = {
           wantedBy = [ "multi-user.target" ];
           after = [ "network-online.target" ];
@@ -294,6 +296,12 @@ pkgs.testers.runNixOSTest {
           module
         ];
         programs.nix-grpc-store.enable = true;
+        testCerts.certs = {
+          ci = cert "ci-1" "DNS:client";
+          stranger = cert "stranger" "DNS:client";
+          # From a CA nobody in the farm trusts.
+          foreign = cert "foreign" "DNS:client" // { ca = "foreign-ca"; };
+        };
         nix.settings.substituters = lib.mkForce [ ];
         # build-remote runs inside nix-daemon.service; prove the hook still
         # reaches the balancer with daemon egress filtering on.
