@@ -69,6 +69,7 @@ stdenv.mkDerivation {
         ../../tests/sandbox-test.cc
         ../../tests/log-spill-test.cc
         ../../tests/daemon-probe-test.cc
+        ../../tests/tunnel-test.cc
         ../../tests/builder-test.cc
         ../../tests/local-store-test.cc
         ../../tests/plugin-loader-test.cc

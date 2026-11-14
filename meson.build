@@ -10,6 +10,7 @@ protobuf_dep = dependency('protobuf')
 zstd_dep     = dependency('libzstd')
 threads_dep  = dependency('threads')
 openssl_dep  = dependency('libcrypto')
+ssl_dep      = dependency('libssl')
 
 # src/client is rebuilt for every supported Nix release. The daemon is not.
 build_server = get_option('components') == 'all'
@@ -204,6 +205,7 @@ if build_server
     'src/daemon/coordinator.cc',
     'src/daemon/eds.cc',
     'src/daemon/options.cc',
+    'src/daemon/tunnel.cc',
     {'darwin': 'src/daemon/sandbox-darwin.cc', 'linux': 'src/daemon/sandbox-linux.cc'}.get(host_machine.system(), 'src/daemon/sandbox-unsupported.cc'),
   ] + (host_machine.system() == 'darwin' ? ['src/daemon/sbpl.cc'] : [])
 
@@ -213,7 +215,7 @@ if build_server
     cpp_pch : do_pch ? ['pch/daemon_pch.hh'] : [],
     cpp_args : nix_compat_args + ['-DNIX_GRPC_VERSION="' + meson.project_version() + '"'],
     # nix-store has the native QueryValidPaths / AddMultipleToStore handlers.
-    dependencies : common_deps + prometheus_dep + [dispatcher_dep, nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep, jemalloc_dep, bz2_dep],
+    dependencies : common_deps + prometheus_dep + [dispatcher_dep, nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep, ssl_dep, jemalloc_dep, bz2_dep],
     install : true,
   )
 
@@ -341,6 +343,12 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
+  test('tunnel', executable('tunnel-test',
+    sources : ['tests/tunnel-test.cc', 'src/daemon/tunnel.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    dependencies : [nix_util_dep, threads_dep, openssl_dep, ssl_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
   test('daemon-probe', executable('daemon-probe-test',
     sources : ['tests/daemon-probe-test.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
