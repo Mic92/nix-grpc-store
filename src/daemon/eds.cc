@@ -104,9 +104,6 @@ auto assignment(const std::string & system, const std::vector<Dispatcher::Member
         }
         auto const parsed = parseAddr(member.addr);
         if (!parsed) {
-            logLine(
-                LogLevel::info,
-                {{"event", "eds_bad_addr"}, {"addr", clip(member.addr)}, {"why", std::string(parsed.error())}});
             continue;
         }
         auto * lbe = locality->add_lb_endpoints();
@@ -401,7 +398,22 @@ auto EdsService::render(const std::shared_ptr<const Dispatcher::Membership> & me
         return rendered;
     }
     auto next = std::make_shared<Rendered>();
+    std::set<std::string> undialable;
     for (const auto & [system, list] : *members) {
+        for (const auto & member : list) {
+            // A name without a port is a builder behind a tunnel, which the
+            // balancer finds by that name and not through this list.
+            if (!member.addr.contains(':')) {
+                continue;
+            }
+            auto const parsed = parseAddr(member.addr);
+            if (parsed || !undialable.insert(member.addr).second || reported.contains(member.addr)) {
+                continue;
+            }
+            logLine(
+                LogLevel::info,
+                {{"event", "eds_bad_addr"}, {"addr", clip(member.addr)}, {"why", std::string(parsed.error())}});
+        }
         auto res = assignment(system, list);
         if (res) {
             next->emplace(system, std::move(*res));
@@ -409,6 +421,7 @@ auto EdsService::render(const std::shared_ptr<const Dispatcher::Membership> & me
             logLine(LogLevel::info, {{"event", "eds_error"}, {"system", clip(system)}, {"error", std::string(res.error())}});
         }
     }
+    reported = std::move(undialable);
     renderedFrom = members;
     rendered = std::move(next);
     return rendered;

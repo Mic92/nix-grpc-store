@@ -3,6 +3,7 @@
 #include <atomic>
 #include <flat_map>
 #include <memory>
+#include <set>
 #include <string>
 
 #include <absl/base/thread_annotations.h>
@@ -55,6 +56,8 @@ private:
     absl::Mutex renderMutex;
     std::shared_ptr<const Dispatcher::Membership> renderedFrom ABSL_GUARDED_BY(renderMutex);
     std::shared_ptr<const Rendered> rendered ABSL_GUARDED_BY(renderMutex);
+    // Malformed addresses, logged once while their builder stays connected.
+    std::set<std::string> reported ABSL_GUARDED_BY(renderMutex);
 };
 
 } // namespace nixgrpc
