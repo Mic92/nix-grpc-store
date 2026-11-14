@@ -33,6 +33,31 @@ spec:
       {{- with .Values.lb.service.nodePort }}
       nodePort: {{ . }}
       {{- end }}
+    {{- if .Values.lb.tunnel.enabled }}
+    - name: tunnel
+      port: {{ .Values.lb.tunnel.port }}
+      targetPort: tunnel
+      {{- with .Values.lb.tunnel.nodePort }}
+      nodePort: {{ . }}
+      {{- end }}
+    {{- end }}
+{{- if .Values.lb.tunnel.enabled }}
+---
+{{- /* One address per replica: a builder needs tunnels to each of them. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "farm.fullname" . }}-lb-tunnel
+  labels: {{- include "farm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: lb
+spec:
+  clusterIP: None
+  selector: {{- $sel | nindent 4 }}
+  ports:
+    - name: tunnel
+      port: {{ .Values.lb.tunnel.port }}
+      targetPort: tunnel
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -77,7 +102,16 @@ spec:
         - name: envoy
           image: {{ include "farm.lbImage" . }}
           imagePullPolicy: {{ .Values.lbImage.pullPolicy }}
-          args: [--base-id, "0", --log-level, warn]
+          args:
+            - --base-id
+            - "0"
+            - --log-level
+            - warn
+            {{- if .Values.lb.tunnel.enabled }}
+            # A thread can only use the tunnels it holds itself.
+            - --concurrency
+            - {{ .Values.lb.tunnel.threads | quote }}
+            {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -85,6 +119,9 @@ spec:
           ports:
             - {name: grpc, containerPort: 50051}
             - {name: admin, containerPort: 9901}
+            {{- if .Values.lb.tunnel.enabled }}
+            - {name: tunnel, containerPort: 9443}
+            {{- end }}
           readinessProbe:
             httpGet: {path: /ready, port: admin}
             periodSeconds: 5

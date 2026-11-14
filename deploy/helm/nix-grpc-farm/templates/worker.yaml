@@ -6,6 +6,10 @@
 {{- $svc := include "farm.workerService" (dict "root" $root "group" $g) }}
 {{- $sel := include "farm.workerSelectorLabels" (dict "root" $root "group" $g) }}
 {{- if and $w.advertise (not $w.hostPort) }}{{ fail (printf "workers.%s.advertise needs hostPort" $g) }}{{ end }}
+{{- if $w.tunnel.balancers }}
+{{- if or $w.advertise $w.hostPort }}{{ fail (printf "workers.%s.tunnel.balancers replaces hostPort and advertise, drop them" $g) }}{{ end }}
+{{- if not (include "farm.tlsSecret" (list $root "worker")) }}{{ fail (printf "workers.%s.tunnel.balancers needs tls.worker: the balancer knows a builder by its certificate" $g) }}{{ end }}
+{{- end }}
 {{- $affinity := deepCopy ($w.affinity | default dict) }}
 {{- if $w.advertise }}
 {{- if hasKey $affinity "nodeAffinity" }}{{ fail (printf "workers.%s: advertise sets the nodeAffinity, drop affinity.nodeAffinity" $g) }}{{ end }}
@@ -195,7 +199,14 @@ spec:
           args:
             - --role=builder
             - --listen=[::]:50051
-            {{- if not $w.advertise }}
+            {{- if $w.tunnel.balancers }}
+            {{- range $w.tunnel.balancers }}
+            - --tunnel={{ . }}
+            {{- end }}
+            {{- with $w.tunnel.count }}
+            - --tunnel-count={{ . }}
+            {{- end }}
+            {{- else if not $w.advertise }}
             # What the balancer reaches this pod at, so x-nix-worker pins here.
             - --advertise=$({{ if $w.hostPort }}HOST_IP):{{ $w.hostPort }}{{ else }}POD_IP):50051{{ end }}
             {{- end }}

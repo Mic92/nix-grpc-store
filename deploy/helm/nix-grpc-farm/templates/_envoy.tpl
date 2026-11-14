@@ -127,6 +127,86 @@ load_balancing_policy:
                     "@type": type.googleapis.com/envoy.extensions.load_balancing_policies.least_request.v3.LeastRequest
 {{- end }}
 
+{{/* Builders that connect to the balancer (--tunnel). hostId picks the tunnel
+     for a request. The builder's name was checked against its certificate
+     when it opened the tunnel, so here the chain is enough. */}}
+{{- define "farm.envoy.tunnelCluster" -}}
+name: {{ .name }}
+connect_timeout: 5s
+lb_policy: CLUSTER_PROVIDED
+cluster_type:
+  name: envoy.clusters.reverse_connection
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.clusters.reverse_connection.v3.ReverseConnectionClusterConfig
+    cleanup_interval: 60s
+    host_id_format: {{ .hostId | quote }}
+# Streams last hours; the default 1024 would 503 the next one.
+circuit_breakers:
+  thresholds: [{max_connections: 1000000, max_pending_requests: 1000000, max_requests: 1000000}]
+typed_extension_protocol_options:
+  envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+    "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+    explicit_http_config:
+      http2_protocol_options:
+        max_concurrent_streams: {{ .root.Values.lb.maxStreams }}
+        connection_keepalive: {interval: 30s, timeout: 10s}
+transport_socket:
+  name: envoy.transport_sockets.tls
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+    common_tls_context:
+      alpn_protocols: [h2]
+      tls_certificate_sds_secret_configs: [{{ include "farm.envoy.sds" "lb" }}]
+      validation_context_sds_secret_config: {{ include "farm.envoy.sds" "ca" }}
+{{- end }}
+
+{{/* A builder joins the set its ALPN name asks for, under its certificate's
+     name and worker name. */}}
+{{- define "farm.envoy.tunnelChain" -}}
+filter_chain_match: {application_protocols: [{{ .protocol }}]}
+transport_socket:
+  name: envoy.transport_sockets.tls
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+    require_client_certificate: true
+    common_tls_context:
+      tls_certificate_sds_secret_configs: [{{ include "farm.envoy.sds" "lb" }}]
+      validation_context_sds_secret_config: {{ include "farm.envoy.sds" "ca" }}
+filters:
+  - name: envoy.filters.network.reverse_tunnel
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.network.reverse_tunnel.v3.ReverseTunnel
+      validation: {{ toJson .validation }}
+{{- end }}
+
+{{- define "farm.envoy.tunnelListener" -}}
+name: tunnels
+address:
+  socket_address: {address: "::", port_value: 9443, ipv4_compat: true}
+listener_filters:
+  - name: envoy.filters.listener.tls_inspector
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+filter_chains:
+  - {{- include "farm.envoy.tunnelChain" (dict "protocol" "nix-tunnel" "validation" (dict "node_id_format" "%DOWNSTREAM_PEER_DNS_SAN%/%REQ(x-nix-instance)%")) | nindent 4 }}
+  - {{- include "farm.envoy.tunnelChain" (dict "protocol" "nix-tunnel-any" "validation" (dict "node_id_format" "any/%DOWNSTREAM_PEER_DNS_SAN%/%REQ(x-nix-instance)%" "cluster_id_format" "any")) | nindent 4 }}
+{{- end }}
+
+{{/* A tunnelled builder is known by a name, a dialled one by IP:port. */}}
+{{- define "farm.envoy.tunnelRoute" -}}
+match:
+  prefix: /
+  grpc: {}
+  headers:
+    - {name: x-nix-worker, present_match: true}
+    - name: x-nix-worker
+      string_match: {safe_regex: {regex: "^.+:[0-9]+$"}}
+      invert_match: true
+route:
+  cluster: tunnelled
+  timeout: 0s
+{{- end }}
+
 {{- define "farm.envoy.route" -}}
 match:
   prefix: {{ .prefix }}
@@ -265,6 +345,11 @@ load_assignment:
 {{- $clusters := list }}
 {{- /* Envoy reads the builder list from the scheduler over its own connection. A route for it here would let any client read the list. */}}
 {{- $routes := list (dict "match" (dict "prefix" "/envoy.service.endpoint.v3.EndpointDiscoveryService/" "grpc" (dict)) "direct_response" (dict "status" 404)) (include "farm.envoy.route" (dict "prefix" "/nix.remote.Scheduler/" "cluster" "sched" "system" "" "isDefault" true) | fromYaml) }}
+{{- $tunnels := .Values.lb.tunnel.enabled }}
+{{- if $tunnels }}
+{{- if not (and (include "farm.tlsSecret" (list . "lb")) (include "farm.tlsSecret" (list . "clientCA"))) }}{{ fail "lb.tunnel needs tls.lb and tls.clientCA: the balancer knows a builder by its certificate" }}{{ end }}
+{{- $routes = append $routes (include "farm.envoy.tunnelRoute" . | fromYaml) }}
+{{- end }}
 {{- range $g := concat (without $groups $defaultGroup) (list $defaultGroup) }}
 {{- $w := mustMergeOverwrite (deepCopy $root.Values.workerDefaults) ((index $root.Values.workers $g) | default dict) }}
 {{- $svc := include "farm.workerService" (dict "root" $root "group" $g) }}
@@ -275,9 +360,22 @@ load_assignment:
 {{- end }}
 {{- $clusters = append $clusters (include "farm.envoy.clusterCommon" (dict "root" $root "name" "sched" "service" (include "farm.schedulerNames" $root) "healthService" "nix.scheduler") | fromYaml) }}
 {{- $listener := include "farm.envoy.listener" (dict "Values" .Values "Chart" .Chart "Release" .Release "routes" $routes) | fromYaml }}
-{{- toJson (dict
+{{- $listeners := list $listener (include "farm.envoy.statsListener" . | fromYaml) }}
+{{- $config := dict
   "node" (dict "id" "nix-grpc-farm-lb" "cluster" "nix-grpc-farm")
   "admin" (dict "address" (dict "socket_address" (dict "address" "127.0.0.1" "port_value" 9902)))
-  "static_resources" (dict "listeners" (list $listener (include "farm.envoy.statsListener" . | fromYaml)) "clusters" (append $clusters (include "farm.envoy.adminCluster" . | fromYaml)))
-) }}
+}}
+{{- if $tunnels }}
+{{- $listeners = append $listeners (include "farm.envoy.tunnelListener" . | fromYaml) }}
+{{- $clusters = concat $clusters (list
+  (include "farm.envoy.tunnelCluster" (dict "root" $root "name" "tunnelled" "hostId" "%REQ(x-nix-worker)%") | fromYaml)
+  (include "farm.envoy.tunnelCluster" (dict "root" $root "name" "tunnelled-any" "hostId" "any") | fromYaml)) }}
+{{- $_ := set $config "bootstrap_extensions" (list (dict
+  "name" "envoy.bootstrap.reverse_tunnel.upstream_socket_interface"
+  "typed_config" (dict
+    "@type" "type.googleapis.com/envoy.extensions.bootstrap.reverse_tunnel.upstream_socket_interface.v3.UpstreamReverseConnectionSocketInterface"
+    "stat_prefix" "upstream_reverse_connection"))) }}
+{{- end }}
+{{- $_ := set $config "static_resources" (dict "listeners" $listeners "clusters" (append $clusters (include "farm.envoy.adminCluster" . | fromYaml))) }}
+{{- toJson $config }}
 {{- end }}

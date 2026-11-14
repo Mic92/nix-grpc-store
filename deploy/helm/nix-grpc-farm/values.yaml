@@ -125,6 +125,14 @@ workerDefaults:
   # With hostPort: node name -> IP the balancer reaches it at; pins pods to
   # these nodes. Empty: the node's InternalIP.
   advertise: {}
+  tunnel:
+    # host:port of the tunnel port of every balancer; replaces hostPort and
+    # advertise. A name with several addresses means all of them: inside the
+    # balancer's cluster that is <release>-nix-grpc-farm-lb-tunnel.<namespace>.svc.
+    # The pods may share a certificate, which must carry exactly one DNS name.
+    balancers: []
+    # Tunnels per balancer address, twice. Empty: 4.
+    count: null
   # Node port for scrapers outside the cluster.
   metricsHostPort: null
 # One Deployment per entry, the key names the group. E.g.
@@ -189,6 +197,17 @@ lb:
     # with kubernetes.io/h2c, and adds TLS from a BackendTLSPolicy.
     appProtocol: null
     annotations: {}
+  # For builders the balancer cannot connect to, such as those of another
+  # cluster: they connect to this port (workers.<group>.tunnel.balancers
+  # there) and get their builds over that connection. Needs tls.lb and
+  # tls.clientCA.
+  tunnel:
+    enabled: false
+    port: 9443
+    nodePort: null
+    # Envoy worker threads. A thread can only use the tunnels it holds
+    # itself, so keep the builders' tunnel.count at this value or above.
+    threads: 4
   resources: {}
   nodeSelector: {}
   tolerations: []

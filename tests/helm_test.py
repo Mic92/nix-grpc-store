@@ -136,10 +136,14 @@ def normalized(envoy_config: dict[str, Any]) -> dict[str, Any]:
         (normalized_cluster(c) for c in static["clusters"] if c["name"] != "admin"),
         key=lambda cluster: cluster["name"],
     )
-    (listener,) = (lis for lis in static["listeners"] if lis["name"] != "stats")
-    static["listeners"] = [listener]
-    without_address(listener["address"]["socket_address"])
-    manager = listener["filter_chains"][0]["filters"][0]["typed_config"]
+    static["listeners"] = sorted(
+        (lis for lis in static["listeners"] if lis["name"] != "stats"),
+        key=lambda lis: lis["name"],
+    )
+    for listener in static["listeners"]:
+        without_address(listener["address"]["socket_address"])
+    farm = named(static["listeners"], "farm")
+    manager = dig(farm, "filter_chains", 0, "filters", 0, "typed_config")
     for route in manager["route_config"]["virtual_hosts"][0]["routes"]:
         if "route" in route:
             route["route"]["cluster"] = renamed(route["route"]["cluster"])
@@ -244,6 +248,42 @@ def test_builders_get_the_farm_certificate_under_the_service_name() -> None:
     chain = listeners[0]["filter_chains"][0]
     assert f"{RELEASE}.default.svc" in chain["filter_chain_match"]["server_names"]
     assert dig(chain, *SDS_CERT) == "lb"
+
+
+def test_envoy_config_with_tunnels_is_that_of_the_nixos_module() -> None:
+    nixos = json.loads((RENDERS / "envoy-nixos-tunnel.json").read_text())
+    assert normalized(envoy("tunnel")) == normalized(nixos)
+    assert envoy("tunnel")["bootstrap_extensions"] == nixos["bootstrap_extensions"]
+
+
+def test_builders_reach_the_tunnel_port_of_every_balancer_replica() -> None:
+    ports = pick("tunnel", "Service")["spec"]["ports"]
+    assert dig(named(ports, "tunnel"), "port") == 9443
+    # One address per replica: a builder needs tunnels to each of them.
+    every = pick("tunnel", "Service", "-lb-tunnel")["spec"]
+    assert every["clusterIP"] == "None"
+    assert dig(named(every["ports"], "tunnel"), "port") == 9443
+    assert every["selector"] == pick("tunnel", "Service")["spec"]["selector"]
+
+    lb = container("tunnel", "lb", "envoy")
+    assert dig(named(lb["ports"], "tunnel"), "containerPort") == 9443
+    # Builders open four tunnels per set unless told otherwise, one per thread.
+    assert lb["args"][lb["args"].index("--concurrency") + 1] == "4"
+
+    assert named(pick("default", "Service")["spec"]["ports"], "tunnel") is None
+    assert "--concurrency" not in container("default", "lb", "envoy")["args"]
+
+
+def test_tunnelled_workers_connect_to_the_balancer_and_need_no_node_port() -> None:
+    x86 = container("tunnelled", "worker-x86", "nix-grpc-daemon")
+    assert "--tunnel=farm.example.com:9443" in x86["args"]
+    # The balancer finds the builder by certificate and worker name.
+    assert not [arg for arg in x86["args"] if arg.startswith("--advertise")]
+    assert "--worker-name=$(NODE_NAME)/$(POD_NAME)" in x86["args"]
+    assert dig(named(x86["ports"], "grpc"), "hostPort") is None
+
+    arm = container("tunnelled", "worker-arm", "nix-grpc-daemon")
+    assert not [arg for arg in arm["args"] if arg.startswith("--tunnel")]
 
 
 def test_external_scheduler_leaves_only_workers_on_a_node_port() -> None:
