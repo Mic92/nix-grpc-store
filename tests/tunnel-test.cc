@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono> // NOLINT(misc-include-cleaner): the literals.
 #include <cstddef>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cerrno>
@@ -325,6 +326,16 @@ void a_balancer_with_another_name_is_not_trusted()
     (void) peer.get();
 }
 
+void a_port_that_does_not_take_tunnels_is_named_as_the_likely_cause()
+{
+    const Fixture fix;
+    // Envoy without a listener for the tunnel's ALPN name hangs up like this.
+    auto peer = std::async(std::launch::async, [&] -> void { const nix::AutoCloseFD conn{accept(fix.lis.sock.get(), nullptr, nullptr)}; });
+    const auto msg = fix.fails();
+    check(msg.contains("tunnel port"), "the error asks about the port: " + msg);
+    peer.get();
+}
+
 struct Pair
 {
     nix::AutoCloseFD ours;
@@ -513,10 +524,13 @@ void a_tunnelled_builders_certificate_has_one_name()
 
 auto main() -> int
 try {
+    // As in the daemon: a write to a closed connection is an error, not the end of the process.
+    (void) std::signal(SIGPIPE, SIG_IGN); // NOLINT(misc-include-cleaner)
     try {
         a_tunnel_is_handed_over_when_the_balancer_starts_a_request();
         a_refused_tunnel_reports_the_balancers_answer();
         a_balancer_with_another_name_is_not_trusted();
+        a_port_that_does_not_take_tunnels_is_named_as_the_likely_cause();
         the_watcher_sees_every_way_a_connection_ends();
         a_tunnelled_builders_certificate_has_one_name();
         a_tunnel_that_ended_is_opened_again();

@@ -197,6 +197,11 @@ auto connectTo(const Target & target, const Wake & stop, Clock::time_point deadl
     return sock;
 }
 
+struct Closed : nix::Error
+{
+    using nix::Error::Error;
+};
+
 enum class Io : uint8_t {
     done,
     stopped,
@@ -221,10 +226,14 @@ auto drive(SSL * ssl, int sock, const Wake & stop, Clock::time_point deadline, s
             events = POLLOUT;
             break;
         case SSL_ERROR_ZERO_RETURN:
-            throw nix::Error("%s: the balancer closed the connection", what);
+            throw Closed("%s: the balancer closed the connection", what);
         default:
             if (const auto verify = SSL_get_verify_result(ssl); verify != X509_V_OK) {
                 throw nix::Error("%s: certificate: %s", what, X509_verify_cert_error_string(verify));
+            }
+            // A reset shows as a system error, a plain close as this one.
+            if (SSL_get_error(ssl, ret) == SSL_ERROR_SYSCALL || ERR_GET_REASON(ERR_peek_error()) == SSL_R_UNEXPECTED_EOF_WHILE_READING) {
+                throw Closed("%s: the balancer closed the connection", what);
             }
             throw nix::Error("%s: %s", what, sslError());
         }
@@ -269,8 +278,15 @@ auto handshake(int sock, const Target & target, const Tls & tls, const Identity 
     // The balancer goes on with the bare socket and never ends this session.
     SSL_set_quiet_shutdown(ssl.get(), 1);
 
-    if (drive(ssl.get(), sock, stop, deadline, "TLS handshake", [&] -> int { return SSL_connect(ssl.get()); }) == Io::stopped) {
-        return Io::stopped;
+    try {
+        if (drive(ssl.get(), sock, stop, deadline, "TLS handshake", [&] -> int { return SSL_connect(ssl.get()); }) == Io::stopped) {
+            return Io::stopped;
+        }
+    } catch (Closed &) {
+        // What Envoy does on a port that has no listener for this ALPN name.
+        throw nix::Error(
+            "the balancer closed the connection during the TLS handshake; is %s its tunnel port?",
+            std::format("{}:{}", target.address, target.port));
     }
     const auto req = request(self, target.host);
     // Without partial writes SSL_write succeeds only with all of it.
