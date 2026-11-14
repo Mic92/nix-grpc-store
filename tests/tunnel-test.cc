@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <format>
 #include <functional>
 #include <future>
 #include <memory>
@@ -120,20 +121,26 @@ struct Listener
 {
     nix::AutoCloseFD sock;
     uint16_t port = 0;
-    Listener()
-        : sock(socket(AF_INET, SOCK_STREAM, 0))
+    explicit Listener(int family = AF_INET)
+        : sock(socket(family, SOCK_STREAM, 0))
     {
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-        unsigned len = sizeof addr;
+        // Port and family sit at the same place in both address types.
+        sockaddr_in6 addr{};
+        addr.sin6_family = static_cast<sa_family_t>(family);
+        unsigned len = sizeof(sockaddr_in);
         // NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast)
+        if (family == AF_INET6) {
+            addr.sin6_addr = in6addr_loopback;
+            len = sizeof addr;
+        } else {
+            inet_pton(AF_INET, "127.0.0.1", &reinterpret_cast<sockaddr_in *>(&addr)->sin_addr);
+        }
         if (bind(sock.get(), reinterpret_cast<sockaddr *>(&addr), len) != 0 || listen(sock.get(), 4) != 0
             || getsockname(sock.get(), reinterpret_cast<sockaddr *>(&addr), &len) != 0) {
             throw nix::SysError("listen");
         }
         // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
-        port = ntohs(addr.sin_port);
+        port = ntohs(addr.sin6_port);
     }
 };
 
@@ -147,6 +154,7 @@ struct Pki
         dir = mkdtemp(tmpl.data()); // NOLINT(misc-include-cleaner): <stdlib.h> on Linux, <unistd.h> on macOS.
         save(authority, dir / "ca");
         save(makeCert("DNS:lb.test", &authority), dir / "lb");
+        save(makeCert("IP:::1", &authority), dir / "lb6");
         save(makeCert("DNS:other.test", &authority), dir / "other");
         save(makeCert("DNS:b1", &authority), dir / "b1");
         save(makeCert("DNS:b1,DNS:farm.test", &authority), dir / "two");
@@ -254,8 +262,9 @@ void pingOnce(int conn, Seen & seen)
 
 struct Fixture
 {
+    int family = AF_INET;
     Pki pki;
-    Listener lis;
+    Listener lis{family};
     Wake stop;
     nixgrpc::tunnel::Tls tls{.cert = pki.file("b1.pem"), .key = pki.file("b1.key"), .ca = pki.file("ca.pem")};
     nixgrpc::tunnel::Target target{.host = "lb.test", .address = "127.0.0.1", .port = lis.port, .protocol = std::string(nixgrpc::tunnel::anyProtocol)};
@@ -334,6 +343,37 @@ void a_port_that_does_not_take_tunnels_is_named_as_the_likely_cause()
     const auto msg = fix.fails();
     check(msg.contains("tunnel port"), "the error asks about the port: " + msg);
     peer.get();
+}
+
+void a_balancer_is_reached_by_its_ipv6_address()
+{
+    try {
+        const Listener probe(AF_INET6);
+    } catch (nix::SysError &) {
+        std::println(stderr, "skipped: no IPv6 loopback here");
+        return;
+    }
+    Fixture fix{.family = AF_INET6};
+    const auto parsed = nixgrpc::tunnel::parseBalancer(std::format("[::1]:{}", fix.lis.port));
+    fix.target.host = parsed.host;
+    fix.target.address = parsed.host;
+    fix.target.port = parsed.port;
+    auto peer = balancer(fix.lis, fix.pki, "lb6", "200 OK", [](int conn, Seen &) -> void {
+        (void) send(conn, "\x16", 1, 0);
+        std::array<char, 1> wait{};
+        (void) recv(conn, wait.data(), 1, 0);
+    });
+    check(static_cast<bool>(fix.open()), "the tunnel opens");
+    const auto seen = peer.get();
+    check(seen.request.contains("\r\nhost: [::1]\r\n"), "the address is in brackets in the host header: " + seen.request);
+    check(seen.serverName.empty(), "an address is not sent as TLS server name: " + seen.serverName);
+    for (const auto * bad : {"::1:9000", "[::1]", "[lb.test]:9000"}) {
+        try {
+            (void) nixgrpc::tunnel::parseBalancer(bad);
+            check(false, std::string("accepted ") + bad);
+        } catch (nix::Error &) { // NOLINT(bugprone-empty-catch): refusing is what is checked.
+        }
+    }
 }
 
 struct Pair
@@ -531,6 +571,7 @@ try {
         a_refused_tunnel_reports_the_balancers_answer();
         a_balancer_with_another_name_is_not_trusted();
         a_port_that_does_not_take_tunnels_is_named_as_the_likely_cause();
+        a_balancer_is_reached_by_its_ipv6_address();
         the_watcher_sees_every_way_a_connection_ends();
         a_tunnelled_builders_certificate_has_one_name();
         a_tunnel_that_ended_is_opened_again();

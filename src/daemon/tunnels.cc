@@ -43,10 +43,17 @@ auto parseBalancer(std::string_view spec) -> Balancer
             port = 0;
         }
     }
-    if (port == 0 || !validName(spec.substr(0, colon))) {
-        throw nix::Error("--tunnel expects host:port, not '%s'", spec);
+    auto host = std::string(spec.substr(0, colon));
+    bool valid = validName(host);
+    if (host.starts_with('[') && host.ends_with(']')) {
+        host = host.substr(1, host.size() - 2);
+        in6_addr scratch{};
+        valid = validAddress6(host) && inet_pton(AF_INET6, host.c_str(), &scratch) == 1;
     }
-    return {.host = std::string(spec.substr(0, colon)), .port = port};
+    if (port == 0 || !valid) {
+        throw nix::Error("--tunnel expects host:port or [address]:port, not '%s'", spec);
+    }
+    return {.host = std::move(host), .port = port};
 }
 
 auto addresses(const std::string & host) -> std::vector<std::string>
