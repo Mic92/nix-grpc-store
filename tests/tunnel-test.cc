@@ -7,21 +7,25 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cerrno>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <print>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h> // NOLINT(misc-include-cleaner): timeval.
 #include <unistd.h>
@@ -39,6 +43,7 @@
 
 #include "tunnel-protocol.hh"
 #include "tunnel.hh"
+#include "tunnels.hh"
 
 // NOLINTBEGIN(misc-include-cleaner): which header declares a socket or OpenSSL name differs per platform and version.
 // NOLINTBEGIN(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers): how long the stand-in balancer waits.
@@ -169,19 +174,14 @@ struct Seen
     bool clientCert = false;
 };
 
-// The balancer's side of one tunnel: TLS as `cert`, answers `status`, then
-// goes on in the clear with `after`.
+// The balancer's side of opening a tunnel on `conn`: TLS as `cert`, then `status`.
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-auto balancer(const Listener & lis, const Pki & pki, const std::string & cert, std::string status, std::function<void(int, Seen &)> after)
-    -> std::future<Seen>
+auto greet(int conn, const Pki & pki, const std::string & cert, const std::string & status) -> Seen
 {
-    // NOLINTNEXTLINE(bugprone-exception-escape): a throw reaches the test through the future.
-    return std::async(std::launch::async, [&lis, &pki, cert, status = std::move(status), after = std::move(after)] -> Seen {
         Seen seen;
-        const nix::AutoCloseFD conn{accept(lis.sock.get(), nullptr, nullptr)};
         // A builder that stays silent fails the test instead of hanging it.
         const timeval patience{.tv_sec = 2, .tv_usec = 0};
-        setsockopt(conn.get(), SOL_SOCKET, SO_RCVTIMEO, &patience, sizeof patience);
+        setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &patience, sizeof patience);
         SSL_CTX * ctx = SSL_CTX_new(TLS_server_method());
         SSL_CTX_use_certificate_chain_file(ctx, pki.file(cert + ".pem").c_str());
         SSL_CTX_use_PrivateKey_file(ctx, pki.file(cert + ".key").c_str(), SSL_FILETYPE_PEM);
@@ -201,7 +201,7 @@ auto balancer(const Listener & lis, const Pki & pki, const std::string & cert, s
             },
             &seen);
         SSL * ssl = SSL_new(ctx);
-        SSL_set_fd(ssl, conn.get());
+        SSL_set_fd(ssl, conn);
         if (SSL_accept(ssl) == 1) {
             X509 * peer = SSL_get1_peer_certificate(ssl);
             seen.clientCert = peer != nullptr;
@@ -224,6 +224,18 @@ auto balancer(const Listener & lis, const Pki & pki, const std::string & cert, s
         SSL_set_quiet_shutdown(ssl, 1);
         SSL_free(ssl);
         SSL_CTX_free(ctx);
+        return seen;
+}
+
+// One tunnel: after `status` the balancer goes on in the clear with `after`.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+auto balancer(const Listener & lis, const Pki & pki, const std::string & cert, std::string status, std::function<void(int, Seen &)> after)
+    -> std::future<Seen>
+{
+    // NOLINTNEXTLINE(bugprone-exception-escape): a throw reaches the test through the future.
+    return std::async(std::launch::async, [&lis, &pki, cert, status = std::move(status), after = std::move(after)] -> Seen {
+        const nix::AutoCloseFD conn{accept(lis.sock.get(), nullptr, nullptr)};
+        Seen seen = greet(conn.get(), pki, cert, status);
         if (after) {
             after(conn.get(), seen);
         }
@@ -379,6 +391,106 @@ void the_watcher_sees_every_way_a_connection_ends()
         "data arriving is not an end");
 }
 
+struct Tunnel
+{
+    nix::AutoCloseFD conn;
+    std::string protocol;
+    // The builder's end is gone, as opposed to merely silent.
+    [[nodiscard]] auto ended() const -> bool
+    {
+        std::array<char, 1> byte{};
+        // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection): no lock is held.
+        const auto got = recv(conn.get(), byte.data(), byte.size(), 0);
+        return got == 0 || (got < 0 && errno == ECONNRESET);
+    }
+};
+
+// A builder holding its tunnels to one balancer, one per set.
+struct Held
+{
+    Pki pki;
+    Listener lis;
+    std::mutex mutex;
+    std::vector<nix::AutoCloseFD> adopted;
+    nixgrpc::tunnel::Tunnels tunnels{{
+        .balancers = {{.host = "lb.test", .port = lis.port}},
+        .tls = {.cert = pki.file("b1.pem"), .key = pki.file("b1.key"), .ca = pki.file("ca.pem")},
+        .name = "b1",
+        .perSet = 1,
+        .adopt = [this](nix::AutoCloseFD sock) -> void {
+            const std::scoped_lock lock(mutex);
+            adopted.push_back(std::move(sock));
+        },
+        .resolve = [](const std::string &) -> std::vector<std::string> { return {"127.0.0.1"}; },
+    }};
+
+    auto taken() -> size_t
+    {
+        const std::scoped_lock lock(mutex);
+        return adopted.size();
+    }
+
+    // The next tunnel the builder opens, with a request started on it.
+    auto next(std::chrono::milliseconds patience = 3s) -> std::optional<Tunnel>
+    {
+        pollfd pfd{.fd = lis.sock.get(), .events = POLLIN, .revents = 0};
+        if (poll(&pfd, 1, static_cast<int>(patience.count())) <= 0) {
+            return std::nullopt;
+        }
+        Tunnel tunnel{.conn = nix::AutoCloseFD{accept(lis.sock.get(), nullptr, nullptr)}, .protocol = ""};
+        tunnel.protocol = greet(tunnel.conn.get(), pki, "lb", "200 OK").protocol;
+        const auto before = taken();
+        (void) send(tunnel.conn.get(), unread.data(), unread.size(), 0);
+        constexpr int limit = 300;
+        for (int tries = 0; taken() == before && tries < limit; tries++) {
+            std::this_thread::sleep_for(10ms);
+        }
+        check(taken() > before, "the builder takes the tunnel into use");
+        return tunnel;
+    }
+
+    // The first two tunnels: for this builder, and for any.
+    auto both() -> std::pair<Tunnel, Tunnel>
+    {
+        auto first = next();
+        auto second = next();
+        if (!first || !second) {
+            throw nix::Error("the builder opened no tunnels");
+        }
+        if (first->protocol == nixgrpc::tunnel::anyProtocol) {
+            std::swap(first, second);
+        }
+        check(first->protocol == "nix-tunnel" && second->protocol == "nix-tunnel-any", "one tunnel per set");
+        return {std::move(*first), std::move(*second)};
+    }
+};
+
+void a_tunnel_that_ended_is_opened_again()
+{
+    Held held;
+    auto [named, any] = held.both();
+    named.conn.close();
+    const auto again = held.next();
+    check(again && again->protocol == "nix-tunnel", "the same kind of tunnel comes back");
+}
+
+void a_builder_that_takes_no_work_only_keeps_the_tunnels_for_itself()
+{
+    Held held;
+    const auto [named, any] = held.both();
+    held.tunnels.setTakesWork(false);
+    check(any.ended(), "the tunnel for any builder is cut although it was in use");
+    check(!held.next(700ms), "and not opened again");
+    std::array<char, 1> byte{};
+    check(
+        // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection): no lock is held.
+        recv(named.conn.get(), byte.data(), byte.size(), MSG_DONTWAIT) < 0 && errno == EAGAIN,
+        "the tunnel for this builder stays");
+    held.tunnels.setTakesWork(true);
+    const auto back = held.next();
+    check(back && back->protocol == "nix-tunnel-any", "taking work again opens it again");
+}
+
 void a_tunnelled_builders_certificate_has_one_name()
 {
     using nixgrpc::tunnel::certName;
@@ -407,6 +519,8 @@ try {
         a_balancer_with_another_name_is_not_trusted();
         the_watcher_sees_every_way_a_connection_ends();
         a_tunnelled_builders_certificate_has_one_name();
+        a_tunnel_that_ended_is_opened_again();
+        a_builder_that_takes_no_work_only_keeps_the_tunnels_for_itself();
     } catch (std::exception & err) {
         std::println(stderr, "FAIL: {}", err.what());
         return 1;
