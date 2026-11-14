@@ -201,10 +201,16 @@ void Tunnels::start(Slot & slot, const Group & group)
 {
     slot.thread = {};
     slot.done = false;
-    slot.thread = std::jthread([this, &slot, &group] -> void {
-        run(slot, group);
+    try {
+        slot.thread = std::jthread([this, &slot, &group] -> void {
+            run(slot, group);
+            slot.done = true;
+        });
+    } catch (std::system_error & err) {
+        // Out of threads: the next refresh tries again.
         slot.done = true;
-    });
+        logLine(LogLevel::info, {{"event", "tunnel_failed"}, {"address", slot.target.address}, {"error", err.what()}});
+    }
 }
 
 auto Tunnels::leaves(const Slot & slot) const -> bool
