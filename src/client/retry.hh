@@ -10,6 +10,8 @@
 
 #include <grpcpp/support/status.h>
 
+#include "retry-pause.hh"
+
 namespace nixgrpc {
 
 // TCP/DNS-level failures. TLS rejections are not here: retrying those only
@@ -61,12 +63,10 @@ inline auto streamBroken(const grpc::Status & status) -> bool
     return status.error_message().contains("Stream removed");
 }
 
-// Doubling pause under a deadline.
+// The pauses of one retry loop, under a deadline.
 class Backoff
 {
 public:
-    static constexpr std::chrono::milliseconds firstPause{500};
-    static constexpr std::chrono::milliseconds maxPause{4000};
 
     explicit Backoff(std::chrono::milliseconds budget)
         : deadline(std::chrono::steady_clock::now() + budget)
@@ -74,19 +74,17 @@ public:
     }
 
     // Whether one more pause still ends before the deadline.
-    [[nodiscard]] auto exhausted() const -> bool { return std::chrono::steady_clock::now() + pause > deadline; }
-
-    // The pause to sleep now; the next one is twice as long.
-    [[nodiscard]] auto next() -> std::chrono::milliseconds
+    [[nodiscard]] auto exhausted() const -> bool
     {
-        auto const current = pause;
-        pause = std::min(pause * 2, maxPause);
-        return current;
+        return std::chrono::steady_clock::now() + retryPause(retry) > deadline;
     }
+
+    // The pause to sleep now.
+    [[nodiscard]] auto next() -> std::chrono::milliseconds { return retryPause(retry++); }
 
 private:
     std::chrono::steady_clock::time_point deadline;
-    std::chrono::milliseconds pause = firstPause;
+    unsigned retry = 1;
 };
 
 struct RetryPolicy
