@@ -2,7 +2,9 @@ use crate::fixtures::*;
 use crate::harness::{MACHINE, journal_count};
 
 const INPUT_MIB: usize = 1024;
-const BUILD_TIMEOUT_S: u64 = 120;
+// A deadlocked upload never finishes, so the limit only has to be far above
+// a slow run: on a busy CI host the upload alone took 99 s.
+const BUILD_TIMEOUT_S: u64 = 600;
 
 struct Outcome {
     code: i32,
