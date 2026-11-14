@@ -2,7 +2,6 @@
 #include "dispatcher.hh"
 #include "idle.hh"
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -42,6 +41,7 @@
 #include "builder.hh"
 #include "cache.hh"
 #include "client/channel.hh"
+#include "client/retry-pause.hh"
 #include "daemon-probe.hh"
 #include "keepalive.hh"
 #include "logfmt.hh"
@@ -62,8 +62,6 @@ using nix::remote::WorkerMsgs;
 
 namespace {
 constexpr int minReconnectBackoffMs = 2'000;
-constexpr std::chrono::milliseconds minBackoff{200};
-constexpr std::chrono::milliseconds maxBackoff{5000};
 } // namespace
 
 // ---------------------------------------------------------- SchedulerService
@@ -285,7 +283,7 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
                                                                     : options.schedulerAddr;
     auto const channel = grpc::CreateCustomChannel(target, creds, args);
     auto stub = nix::remote::Scheduler::NewStub(channel);
-    auto backoff = minBackoff;
+    unsigned retry = 1;
     while (!stop.stop_requested()) {
         grpc::ClientContext ctx;
         auto stream = stub->WorkerSession(&ctx);
@@ -302,7 +300,7 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
         const bool helloed = bld.greet();
         if (helloed) {
             logLine(LogLevel::info, {{"event", "scheduler_connected"}, {"addr", options.schedulerAddr}});
-            backoff = minBackoff;
+            retry = 1;
         }
         const std::stop_callback onStop(stop, [&ctx] -> void { ctx.TryCancel(); });
         SchedCmds cmds;
@@ -330,14 +328,13 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
         if (restarting) {
             // Announced: go straight back, the successor is (about to be) up.
             logLine(LogLevel::info, {{"event", "scheduler_restarting"}, {"addr", options.schedulerAddr}});
-            backoff = minBackoff;
+            retry = 1;
         } else {
             logLine(
                 LogLevel::info,
                 {{"event", "scheduler_disconnected"}, {"addr", options.schedulerAddr}, {"error", status.error_message()}});
         }
-        std::this_thread::sleep_for(backoff);
-        backoff = std::min(backoff * 2, maxBackoff);
+        std::this_thread::sleep_for(retryPause(retry++));
     }
 }
 
