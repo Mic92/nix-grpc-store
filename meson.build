@@ -206,6 +206,7 @@ if build_server
     'src/daemon/eds.cc',
     'src/daemon/options.cc',
     'src/daemon/tunnel.cc',
+    'src/daemon/tunnels.cc',
     {'darwin': 'src/daemon/sandbox-darwin.cc', 'linux': 'src/daemon/sandbox-linux.cc'}.get(host_machine.system(), 'src/daemon/sandbox-unsupported.cc'),
   ] + (host_machine.system() == 'darwin' ? ['src/daemon/sbpl.cc'] : [])
 
@@ -344,9 +345,9 @@ if build_server
   ))
 
   test('tunnel', executable('tunnel-test',
-    sources : ['tests/tunnel-test.cc', 'src/daemon/tunnel.cc'],
+    sources : ['tests/tunnel-test.cc', 'src/daemon/tunnel.cc', 'src/daemon/tunnels.cc'],
     include_directories : [src_inc, include_directories('src/daemon')],
-    dependencies : [nix_util_dep, threads_dep, openssl_dep, ssl_dep],
+    dependencies : [nix_util_dep, grpc_dep, threads_dep, openssl_dep, ssl_dep],
     cpp_args : ['-UNDEBUG'],
   ))
   test('daemon-probe', executable('daemon-probe-test',
