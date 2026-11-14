@@ -43,7 +43,9 @@ public:
     {
         std::vector<Balancer> balancers;
         Tls tls;
-        std::string name; // the builder's, as in its certificate
+        std::string name; // as in the builder's certificate
+        // Tells apart builders that share a certificate.
+        std::string instance;
         // A balancer keeps tunnels per thread, so this is its thread count.
         unsigned perSet = 4;
         // Takes a tunnel on which the balancer started a request.

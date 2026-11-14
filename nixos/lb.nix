@@ -340,9 +340,9 @@ let
       }
     ];
     filter_chains = [
-      (tunnelChain "nix-tunnel" { node_id_format = "%DOWNSTREAM_PEER_DNS_SAN%"; })
+      (tunnelChain "nix-tunnel" { node_id_format = "%DOWNSTREAM_PEER_DNS_SAN%/%REQ(x-nix-instance)%"; })
       (tunnelChain "nix-tunnel-any" {
-        node_id_format = "any/%DOWNSTREAM_PEER_DNS_SAN%";
+        node_id_format = "any/%DOWNSTREAM_PEER_DNS_SAN%/%REQ(x-nix-instance)%";
         cluster_id_format = "any";
       })
     ];

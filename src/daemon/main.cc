@@ -82,6 +82,7 @@
 #include "coordinator.hh"
 #include "options.hh"
 #include "push.hh"
+#include "tunnel.hh"
 #include "tunnels.hh"
 #include "idle.hh"
 #include "import-paths.hh"
@@ -1255,7 +1256,8 @@ void startTunnels(
     tunnels.emplace(nixgrpc::tunnel::Tunnels::Config{
         .balancers = std::move(balancers),
         .tls = {.cert = options.tlsCert, .key = options.tlsKey, .ca = options.clientCA},
-        .name = options.advertise,
+        .name = nixgrpc::tunnel::certName(options.tlsCert),
+        .instance = options.workerName,
         .perSet = options.tunnelCount,
         .adopt = [listener = std::shared_ptr(std::move(listener))](nix::AutoCloseFD sock) -> void {
             if (auto const status = listener->AcceptConnectedFd(sock.get()); !status.ok()) {

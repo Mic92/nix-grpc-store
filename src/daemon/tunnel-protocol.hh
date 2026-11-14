@@ -14,12 +14,17 @@
 
 namespace nixgrpc::tunnel {
 
-// The balancer finds a tunnel by `node`, or any tunnel of `group`.
+// The balancer finds a tunnel by `node`, or any tunnel of `group`. It takes
+// the certificate's name from the TLS session and `instance` from the request
+// and refuses a `node` that is not made of the two.
 struct Identity
 {
     std::string node;
     std::string group;
+    std::string instance;
 };
+
+inline constexpr std::string_view instanceHeader = "x-nix-instance";
 
 // `host` is a name or an IP address.
 [[nodiscard]] inline auto request(const Identity & self, std::string_view host) -> std::string
@@ -32,12 +37,21 @@ struct Identity
         "x-envoy-reverse-tunnel-cluster-id: {}\r\n"
         "x-envoy-reverse-tunnel-tenant-id: nix\r\n" // unused, but Envoy refuses an empty one
         "x-envoy-reverse-tunnel-upstream-cluster-name: {}\r\n"
+        "{}: {}\r\n"
         "content-length: 0\r\n"
         "\r\n",
         bracketed,
         self.node,
         self.group,
-        bracketed);
+        bracketed,
+        instanceHeader,
+        self.instance);
+}
+
+// What the scheduler hands to clients and the balancer looks a tunnel up by.
+[[nodiscard]] inline auto nodeName(std::string_view certName, std::string_view instance) -> std::string
+{
+    return std::format("{}/{}", certName, instance);
 }
 
 // Header values end at a line break, so one inside a name would add headers.

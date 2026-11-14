@@ -33,6 +33,7 @@
 #include "niks3-client.hh"
 #include "parse-int.hh"
 #include "scheduler.hh"
+#include "tunnel-protocol.hh"
 #include "tunnel.hh"
 #include "tunnels.hh"
 #include "xfcc.hh"
@@ -278,9 +279,12 @@ auto parseOptions(const std::vector<std::string_view> & args) -> Options
             throw nix::Error("--tunnel requires --role builder and --tls-cert/--tls-key");
         }
         if (!options.advertise.empty()) {
-            throw nix::Error("--tunnel with --advertise: the balancer finds a tunnelled builder by its certificate's name");
+            throw nix::Error("--tunnel with --advertise: the balancer finds a tunnelled builder by its certificate's name and --worker-name");
         }
-        options.advertise = tunnel::certName(options.tlsCert);
+        if (!tunnel::validName(options.workerName)) {
+            throw nix::Error("--tunnel: --worker-name '%s' must consist of letters, digits and -._/", options.workerName);
+        }
+        options.advertise = tunnel::nodeName(tunnel::certName(options.tlsCert), options.workerName);
     }
     options.advertise = bracketHost(options.advertise);
     if (options.advertise.empty()) {
