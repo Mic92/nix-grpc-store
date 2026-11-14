@@ -13,6 +13,8 @@
 #include <variant>
 #include <vector>
 
+#include "retry-pause.hh"
+
 namespace nixgrpc::exec {
 
 using JobId = uint32_t;
@@ -45,6 +47,12 @@ struct Wantable
 {
 };
 
+// Bounced more than once: asks again at `until`.
+struct Resting
+{
+    Clock::time_point until;
+};
+
 struct Wanted
 {
     std::optional<Clock::time_point> unplaceableSince;
@@ -72,7 +80,7 @@ struct Done
 } // namespace state
 
 using JobState =
-    std::variant<state::Blocked, state::Wantable, state::Wanted, state::Assigned, state::Running, state::Done>;
+    std::variant<state::Blocked, state::Wantable, state::Resting, state::Wanted, state::Assigned, state::Running, state::Done>;
 
 class Executor
 {
@@ -277,11 +285,20 @@ public:
         }
     }
 
-    // Fails what stayed unplaceable past `grace`. When to call again.
+    // Fails what stayed unplaceable past `grace` and asks again for what
+    // has rested long enough. When to call again.
     auto reap(Clock::time_point now, Clock::duration grace) -> Clock::time_point
     {
         auto wake = now + grace;
         for (JobId jid = 0; jid < jobs.size(); jid++) {
+            if (const auto * resting = std::get_if<state::Resting>(&jobs.at(jid).state)) {
+                if (resting->until > now) {
+                    wake = std::min(wake, resting->until);
+                } else {
+                    release(jid);
+                }
+                continue;
+            }
             auto * wanted = std::get_if<state::Wanted>(&jobs.at(jid).state);
             if (wanted == nullptr || !wanted->unplaceableSince) {
                 continue;
@@ -324,7 +341,7 @@ public:
     }
 
     // `refused`: the worker did not start on it, so going back there is no use.
-    void bounced(JobId jid, bool refused = false)
+    void bounced(JobId jid, Clock::time_point now, bool refused = false)
     {
         auto & job = jobs.at(jid);
         auto * run = std::get_if<state::Running>(&job.state);
@@ -346,6 +363,11 @@ public:
             return;
         }
         job.refused = refused ? run->at.assignId : 0;
+        // The scheduler may know no better worker than the one that just failed.
+        if (job.bounced > 1 && !abandoned && !stopping) {
+            to(jid, state::Resting{.until = now + retryPause(job.bounced - 1)});
+            return;
+        }
         to(jid, state::Blocked{.waiting = 0});
         release(jid);
     }
@@ -359,7 +381,8 @@ public:
         abandoned = true;
         for (JobId jid = 0; jid < jobs.size(); jid++) {
             auto const & cur = jobs.at(jid).state;
-            if (std::holds_alternative<state::Wantable>(cur) || std::holds_alternative<state::Wanted>(cur)) {
+            if (std::holds_alternative<state::Wantable>(cur) || std::holds_alternative<state::Wanted>(cur)
+                || std::holds_alternative<state::Resting>(cur)) {
                 settle(jid, lostDone());
             }
         }

@@ -342,7 +342,7 @@ struct GrpcStore::Run {
         work->job->result = std::move(*result);
         exe.finished(work->jid, succeeded);
       } else if (const auto * bounce = std::get_if<Bounced>(&res)) {
-        exe.bounced(work->jid, bounce->refused);
+        exe.bounced(work->jid, std::chrono::steady_clock::now(), bounce->refused);
       }
             flushLocked();
     }
