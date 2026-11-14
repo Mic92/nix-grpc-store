@@ -1,5 +1,5 @@
 #pragma once
-// The one pause schedule of the client's retry loops.
+// The one pause schedule of every retry loop, in the client and the daemon.
 
 #include <algorithm>
 #include <chrono>
@@ -10,7 +10,7 @@ namespace nixgrpc {
 constexpr std::chrono::milliseconds firstPause{500};
 constexpr std::chrono::milliseconds maxPause{4000};
 
-// How long every retry loop of the client waits before its `retry`th
+// How long a retry loop waits before its `retry`th
 // retry, counted from 1: `firstPause`, doubling up to `maxPause`.
 [[nodiscard]] constexpr auto retryPause(unsigned retry) noexcept -> std::chrono::milliseconds
 {
