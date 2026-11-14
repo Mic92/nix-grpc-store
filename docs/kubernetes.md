@@ -446,6 +446,52 @@ rollout replaces workers one at a time instead of surging.
 `metricsHostPort` publishes the metrics port the same way, for a scraper
 outside the cluster.
 
+### Add workers from another cluster
+
+Workers in another cluster, or behind NAT, open reverse tunnels to the
+balancer. The balancer sends them their builds through these tunnels,
+so outgoing access to the balancer is all they need.
+
+On the farm, open the balancer's tunnel port:
+
+```yaml
+lb:
+  tunnel:
+    enabled: true # port 9443 on the balancer Service
+```
+
+In the workers' cluster, install the chart with workers only and point
+them at that port:
+
+```yaml
+scheduler:
+  external: farm.example.com:50051 # the farm's balancer
+workers:
+  x86-64:
+    system: x86_64-linux
+    replicas: 3
+    tunnel:
+      balancers: [farm.example.com:9443]
+tls: # certificates from the farm's CA, CN matching its workers' rule
+  clientCA: {existingSecret: farm-ca}
+  worker: {existingSecret: farm-worker-tls}
+auth:
+  trustedProxies: ["lb-*"] # the farm balancer's certificate CN
+```
+
+Certificate: issue one per cluster, with exactly one DNS name, for
+example `workers-b.example.com`. All pods of the release use it, and the
+balancer tells them apart by pod name. With a certificate per cluster
+you can revoke one cluster and keep the others.
+
+Balancer replicas: a worker needs tunnels to each replica. Put into
+`balancers` either the address of each replica, or a DNS name that
+resolves to all of them. Inside the farm's cluster that name is
+`<release>-nix-grpc-farm-lb-tunnel.<namespace>.svc`.
+
+A `LoadBalancer` Service puts the replicas behind a shared address. In
+that case run the balancer without replicas (`lb.replicas: 1`).
+
 ## Step 2: Connect CI jobs in the cluster
 
 Pods in the cluster authenticate with their Kubernetes service account

@@ -98,6 +98,14 @@ let
     };
     workers.arm.hostPort = 50052;
   };
+  # Builders elsewhere connect to the balancer and get their builds over
+  # that connection.
+  valuesTunnel = lib.recursiveUpdate values { lb.tunnel.enabled = true; };
+  # Such builders, in a cluster of their own.
+  valuesTunnelled = lib.recursiveUpdate values {
+    scheduler.external = "farm.example.com:50051";
+    workers.x86.tunnel.balancers = [ "farm.example.com:9443" ];
+  };
   # A Secret mounted into the build container of every group.
   valuesExtraVolumes = lib.recursiveUpdate values {
     workerDefaults = {
@@ -134,6 +142,8 @@ let
     public-cert-manager.values = valuesPublicCertManager;
     public-secret.values = valuesPublicSecret;
     external.values = valuesExternal;
+    tunnel.values = valuesTunnel;
+    tunnelled.values = valuesTunnelled;
     extra-volumes.values = valuesExtraVolumes;
   }
   // lib.listToAttrs (
@@ -168,6 +178,7 @@ let
 
   # Same topology through the NixOS module.
   nixosEnvoy =
+    tunnel:
     (lib.evalModules {
       modules = [
         lbModule
@@ -183,6 +194,7 @@ let
               enable = true;
               defaultSystem = "x86_64-linux";
               accessLog = true;
+              inherit tunnel;
               systems = [
                 "x86_64-linux"
                 "aarch64-linux"
@@ -207,10 +219,15 @@ let
         )
       ];
     }).config.services.envoy.settings;
-  nixosJson = (pkgs.formats.json { }).generate "envoy-nixos.json" (
-    # mkIf leaves `admin` wrapped. Only static_resources is compared.
-    { inherit (nixosEnvoy) static_resources; }
-  );
+  nixosJson =
+    tunnel:
+    json.generate "envoy-nixos.json" (
+      # mkIf leaves `admin` wrapped. Only static_resources is compared.
+      { inherit (nixosEnvoy tunnel) static_resources; }
+      // lib.optionalAttrs (tunnel != { }) {
+        bootstrap_extensions = (nixosEnvoy tunnel).bootstrap_extensions;
+      }
+    );
 
 in
 pkgs.runCommand "nix-grpc-farm-helm-check"
@@ -228,7 +245,8 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
     cp -r ${chart} chart && chmod -R u+w chart
     mkdir renders
     ${lib.concatStrings (lib.mapAttrsToList render renders)}
-    cp ${nixosJson} renders/envoy-nixos.json
+    cp ${nixosJson { }} renders/envoy-nixos.json
+    cp ${nixosJson { listen = "[::]:9443"; }} renders/envoy-nixos-tunnel.json
     pytest -vv -p no:cacheprovider ${./helm_test.py}
     touch $out
   ''
