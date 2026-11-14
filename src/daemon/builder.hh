@@ -123,6 +123,8 @@ public:
         localDaemonDown = 1U << 2U,
     };
     void setUnavailable(Unavailable why, bool holds);
+    // `changed` hears whether the worker takes builds, now and on every change.
+    void onAvailability(std::function<void(bool)> changed);
     // The `reason` label of nix_grpc_unavailable.
     [[nodiscard]] static constexpr auto name(Unavailable why) -> std::string_view
     {
@@ -165,6 +167,7 @@ private:
     // Orders the Load messages of concurrent setUnavailable() calls, and
     // keeps them behind the Hello of their session.
     std::mutex unavailableMutex;
+    std::function<void(bool)> availability_;
     bool greeted_ = false;
     static constexpr std::chrono::seconds expectTimeout{60};
     // How long a call waits for an Expect the scheduler has sent but this
