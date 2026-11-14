@@ -141,6 +141,12 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     extraValues = [ k3s.chartValues ];
   };
 
+  tunnel = import ../tests/tunnel.nix {
+    inherit pkgs niks3;
+    nixPkgs = nixPackages;
+    module = nixosModule;
+  };
+
   farm = import ../tests/farm.nix {
     e2eTests = pkgs.callPackage ../tests/e2e { };
     inherit pkgs niks3;
