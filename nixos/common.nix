@@ -282,6 +282,33 @@ in
         `workers`. Defaults to {option}`listen`.
       '';
     };
+    tunnel = {
+      balancers = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "lb.example.org:9000" ];
+        description = ''
+          Set this on a builder that the balancer cannot connect to, for
+          example one behind NAT. The builder then connects to the balancer
+          and receives its builds over that connection.
+
+          Each entry is the `host:port` of a balancer's tunnel port (its
+          `tunnel.listen`). If the host name resolves to several addresses,
+          the builder connects to all of them.
+
+          The certificate in {option}`tls.certFile` must contain exactly one
+          DNS name. The farm knows the builder by that name.
+        '';
+      };
+      count = lib.mkOption {
+        type = lib.types.nullOr (lib.types.ints.between 1 256);
+        default = null;
+        description = ''
+          Tunnels of each kind per balancer address, 4 by default. At
+          least the balancer's `tunnel.threads`.
+        '';
+      };
+    };
     extraSystems = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -400,6 +427,14 @@ in
       {
         assertion = cfg.trustedProxies == [ ] || cfg.tls.clientCaFile != null;
         message = "services.nix-grpc-daemon.trustedProxies requires tls.clientCaFile";
+      }
+      {
+        assertion = cfg.tunnel.balancers == [ ] || (cfg.tls.certFile != null && lib.elem "builder" cfg.roles);
+        message = "services.nix-grpc-daemon.tunnel.balancers requires tls.certFile/keyFile and the builder role";
+      }
+      {
+        assertion = cfg.tunnel.balancers == [ ] || cfg.advertise == null;
+        message = "services.nix-grpc-daemon.tunnel.balancers and advertise exclude each other: a tunnelled builder is reached under its certificate's name";
       }
       {
         assertion = cfg.oidc == null || cfg.tls.certFile != null || (cfg.oidc.allow_insecure or false);
