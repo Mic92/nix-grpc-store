@@ -21,8 +21,10 @@ struct Identity
     std::string group;
 };
 
+// `host` is a name or an IP address.
 [[nodiscard]] inline auto request(const Identity & self, std::string_view host) -> std::string
 {
+    const auto bracketed = host.contains(':') ? std::format("[{}]", host) : std::string(host);
     return std::format(
         "GET /reverse_connections/request HTTP/1.1\r\n"
         "host: {}\r\n"
@@ -32,10 +34,10 @@ struct Identity
         "x-envoy-reverse-tunnel-upstream-cluster-name: {}\r\n"
         "content-length: 0\r\n"
         "\r\n",
-        host,
+        bracketed,
         self.node,
         self.group,
-        host);
+        bracketed);
 }
 
 // Header values end at a line break, so one inside a name would add headers.
@@ -55,6 +57,21 @@ static_assert(validName("any/b1.example"));
 static_assert(!validName(""));
 static_assert(!validName("b1\r\nx-evil: 1"));
 static_assert(!validName("b1:50051"));
+
+// The characters of an IPv6 address; whether it is one is for inet_pton().
+[[nodiscard]] constexpr auto validAddress6(std::string_view text) noexcept -> bool
+{
+    constexpr size_t maxLen = 45;
+    return text.contains(':') && text.size() <= maxLen && std::ranges::all_of(text, [](char chr) -> bool {
+        return (chr >= '0' && chr <= '9') || (chr >= 'a' && chr <= 'f') || (chr >= 'A' && chr <= 'F') || chr == ':' || chr == '.';
+    });
+}
+
+static_assert(validAddress6("::1"));
+static_assert(validAddress6("::ffff:10.0.0.2"));
+static_assert(!validAddress6("10.0.0.2"));
+static_assert(!validAddress6("fe80::1%eth0"));
+static_assert(!validAddress6("::1\r\nx-evil: 1"));
 
 enum class Reply : uint8_t {
     incomplete,

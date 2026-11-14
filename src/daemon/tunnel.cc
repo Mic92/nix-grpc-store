@@ -264,8 +264,14 @@ auto handshake(int sock, const Target & target, const Tls & tls, const Identity 
     SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_PEER, nullptr);
 
     const Owner<SSL, SSL_free> ssl{SSL_new(ctx.get())};
-    if (!ssl || SSL_set_fd(ssl.get(), sock) != 1 || SSL_set1_host(ssl.get(), target.host.c_str()) != 1
-        || SSL_set_tlsext_host_name(ssl.get(), target.host.c_str()) != 1) {
+    if (!ssl || SSL_set_fd(ssl.get(), sock) != 1 || SSL_set1_host(ssl.get(), target.host.c_str()) != 1) {
+        throw nix::Error("TLS: %s", sslError());
+    }
+    // The server name extension is for names only (RFC 6066).
+    in6_addr scratch{};
+    const bool isAddress =
+        inet_pton(AF_INET, target.host.c_str(), &scratch) == 1 || inet_pton(AF_INET6, target.host.c_str(), &scratch) == 1;
+    if (!isAddress && SSL_set_tlsext_host_name(ssl.get(), target.host.c_str()) != 1) {
         throw nix::Error("TLS: %s", sslError());
     }
     // On the wire: one length byte, then the name. validName() keeps it short enough.
@@ -369,7 +375,8 @@ auto Wake::wait(std::optional<std::chrono::milliseconds> timeout) const -> bool
 
 auto open(const Target & target, const Tls & tls, const Identity & self, const Wake & stop) -> nix::AutoCloseFD
 {
-    if (!validName(self.node) || !validName(self.group) || !validName(target.host) || !validName(target.protocol)) {
+    if (!validName(self.node) || !validName(self.group) || !(validName(target.host) || validAddress6(target.host))
+        || !validName(target.protocol)) {
         throw nix::Error("tunnel: invalid name");
     }
     const auto deadline = Clock::now() + openTimeout;
