@@ -27,7 +27,7 @@ struct Balancer
     uint16_t port = 0;
 };
 
-// "host:port"
+// "host:port" or "[IPv6 address]:port"
 auto parseBalancer(std::string_view spec) -> Balancer;
 
 // The IP addresses of `host`.
