@@ -1,7 +1,10 @@
 # Envoy in front of the nodes. `/nix.remote.Scheduler/*` goes to the one
 # scheduler node (cluster `sched`, gRPC health service "nix.scheduler").
-# Everything else goes to the per-system worker cluster: BuildDerivation to
-# the worker named in x-nix-worker (override_host), the rest least-request.
+# Everything else goes to the per-system worker cluster: requests that name a
+# worker in x-nix-worker (BuildDerivation and its uploads) to that worker
+# (override_host), the rest least-request. A system other than the default
+# falls back to the default system's builders while it has none, except for
+# requests that name a worker.
 # The members of the worker clusters come from the active scheduler over EDS.
 {
   config,
@@ -285,20 +288,44 @@ let
     host_selection_retry_max_attempts = 3;
   };
 
-  routesFor = system: [
-    {
-      match = {
-        prefix = "/";
-        grpc = { };
+  route = cluster: {
+    inherit cluster;
+    timeout = "0s";
+    retry_policy = retryDeadHost;
+  };
+
+  # A request that names its worker (BuildDerivation and the uploads before
+  # it) goes straight to the system's own cluster: behind an aggregate
+  # cluster, override_host never sees x-nix-worker, as envoy hands the child
+  # cluster a load balancer context without the request's stream info, and
+  # picks any builder. The worker it picks refuses a build it was not sent.
+  pinnedRoute = system: {
+    match = {
+      prefix = "/";
+      grpc = { };
+      headers = (systemMatch system).headers ++ [
+        {
+          name = "x-nix-worker";
+          present_match = true;
+        }
+      ];
+    };
+    route = route system;
+  };
+
+  routesFor =
+    system:
+    lib.optional (system != cfg.defaultSystem) (pinnedRoute system)
+    ++ [
+      {
+        match = {
+          prefix = "/";
+          grpc = { };
+        }
+        // systemMatch system;
+        route = route (if system == cfg.defaultSystem then system else withDefault system);
       }
-      // systemMatch system;
-      route = {
-        cluster = if system == cfg.defaultSystem then system else withDefault system;
-        timeout = "0s";
-        retry_policy = retryDeadHost;
-      };
-    }
-  ];
+    ];
 
   systems = cfg.systems;
   ordered = lib.filter (s: s != cfg.defaultSystem) systems ++ [ cfg.defaultSystem ];

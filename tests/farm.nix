@@ -211,6 +211,8 @@ pkgs.testers.runNixOSTest {
       imports = [ (worker "worker1") ];
       nix.settings.system-features = [ "vip" ];
       services.nix-grpc-daemon.workerName = "node-a";
+      # With worker2, a cluster of two for a system other than the default.
+      services.nix-grpc-daemon.extraSystems = [ "riscv64-linux" ];
     };
     worker2 = {
       imports = [ (worker "worker2") ];
@@ -248,6 +250,7 @@ pkgs.testers.runNixOSTest {
           systems = [
             system
             "s390x-linux" # no builder offers it
+            "riscv64-linux" # only as extraSystems
           ];
           scheduler = [
             "${ip.worker1}:50051"

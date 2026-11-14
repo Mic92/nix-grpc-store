@@ -136,3 +136,83 @@ fn an_input_only_one_worker_has_still_reaches_the_builder() {
         succeed(CLIENT, &cmd);
     }
 }
+
+/// Requests per worker of `cluster`, as envoy counts them.
+fn requests(cluster: &str) -> Vec<(Node, i64)> {
+    let mut found: Vec<(Node, i64)> = succeed(LB, &["curl", "-sf", "localhost:9901/clusters"])
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.split("::");
+            let (c, addr, key, n) = (p.next()?, p.next()?, p.next()?, p.next()?);
+            (c == cluster && key == "rq_total").then_some(())?;
+            let ip = addr.split(':').next()?;
+            let w = WORKERS
+                .into_iter()
+                .find(|w| env(&format!("NGS_{}_IP", w.0.to_uppercase())) == ip)?;
+            Some((w, n.parse().ok()?))
+        })
+        .collect();
+    found.sort_by_key(|(n, _)| n.0);
+    found
+}
+
+/// A system other than the default routes through an aggregate cluster that
+/// falls back to the default system's builders. A request naming its worker
+/// must still reach that worker: one that reaches another is refused there as
+/// "not scheduled here", and the client gives up after a few rounds.
+#[test]
+fn a_named_worker_gets_its_requests_on_a_system_other_than_the_default() {
+    farm_ready();
+    let cluster = "riscv64-linux";
+    wait_members(cluster, &WORKERS);
+    let worker = format!("{}:50051", env("NGS_WORKER1_IP"));
+    let c = certs();
+    let before = requests(cluster);
+    let tries = 20;
+    let mut answers = Vec::new();
+    for _ in 0..tries {
+        // Any method will do: envoy counts the request at the host it picked.
+        let o = run_t(
+            LB,
+            &[
+                "curl",
+                "-sS",
+                "--http2",
+                "-D",
+                "-",
+                "-o",
+                "/dev/null",
+                "--cacert",
+                &format!("{c}/public-ca.pem"),
+                "--cert",
+                &format!("{c}/ci.pem"),
+                "--key",
+                &format!("{c}/ci.key"),
+                "-H",
+                "content-type: application/grpc",
+                "-H",
+                "te: trailers",
+                "-H",
+                &format!("x-nix-system: {cluster}"),
+                "-H",
+                &format!("x-nix-worker: {worker}"),
+                "--data-binary",
+                "",
+                "https://lb:50051/nix.remote.NixRemote/Probe",
+            ],
+            30,
+        );
+        answers.push(o.combined());
+    }
+    let sent: Vec<(Node, i64)> = requests(cluster)
+        .into_iter()
+        .zip(before)
+        .map(|((n, after), (_, b))| (n, after - b))
+        .collect();
+    assert_eq!(
+        sent,
+        vec![(WORKER1, tries), (WORKER2, 0)],
+        "first answer: {}",
+        answers[0]
+    );
+}

@@ -152,6 +152,10 @@ match:
   headers:
     - name: x-nix-system
       string_match: {exact: {{ .system }}}
+    {{- if .pinned }}
+    - name: x-nix-worker
+      present_match: true
+    {{- end }}
   {{- end }}
 route:
   cluster: {{ .cluster | quote }}
@@ -290,6 +294,8 @@ load_assignment:
 {{- $clusters = append $clusters (include "farm.envoy.workerCluster" (dict "root" $root "name" $g "edsSystem" $w.system) | fromYaml) }}
 {{- $target := $g }}
 {{- if not $isDefault }}
+{{- /* Behind the aggregate cluster override_host never sees x-nix-worker, so a request that names its worker goes to the group's own cluster. */}}
+{{- $routes = append $routes (include "farm.envoy.route" (dict "prefix" "/" "cluster" $g "system" $w.system "isDefault" false "pinned" true) | fromYaml) }}
 {{- $target = printf "%s-or-default" $g }}
 {{- $clusters = append $clusters (include "farm.envoy.fallbackCluster" (dict "name" $target "clusters" (list $g $defaultGroup)) | fromYaml) }}
 {{- end }}
