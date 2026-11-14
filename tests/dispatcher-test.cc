@@ -221,10 +221,28 @@ void aClientThatCannotReachItsWorkerIsSentElsewhere()
     farm.disp.workerGone(other.conn);
 }
 
+// The balancer asks for the builders of a system nobody builds for.
+// Queries and uploads work on any builder, so it gets all of them, once each.
+void aSystemWithoutBuildersGetsEveryBuilder()
+{
+    const Dispatcher::Membership members{
+        {"arm", {{.addr = "a:1", .draining = false}, {.addr = "both:1", .draining = true}}},
+        {"x86", {{.addr = "both:1", .draining = true}, {.addr = "b:1", .draining = false}}},
+    };
+    auto const own = Dispatcher::membersFor(members, "arm");
+    assert(own.size() == 2 && own.at(0).addr == "a:1");
+    auto const all = Dispatcher::membersFor(members, "riscv");
+    assert(all.size() == 3);
+    assert(all.at(0).addr == "a:1" && all.at(1).addr == "both:1" && all.at(2).addr == "b:1");
+    assert(all.at(1).draining);
+    assert(Dispatcher::membersFor({}, "riscv").empty());
+}
+
 } // namespace
 
 auto main() -> int
 try {
+    aSystemWithoutBuildersGetsEveryBuilder();
     aClientThatCannotReachItsWorkerIsSentElsewhere();
     aWorkerThatRestedGetsItsDerivationBack();
     aFailingWorkerIsRested();

@@ -135,16 +135,31 @@ fn node_for(addr: &str) -> Option<Node> {
         .find(|w| env(&format!("NGS_{}_IP", w.0.to_uppercase())) == ip)
 }
 
-fn health(cluster: &str) -> Vec<(Node, String)> {
+/// What envoy reports under `key` for each worker of `cluster`.
+fn host_stat(cluster: &str, key: &str) -> Vec<(Node, String)> {
     succeed(LB, &["curl", "-sf", "localhost:9901/clusters"])
         .lines()
         .filter_map(|l| {
             let mut p = l.split("::");
-            let (c, addr, key, flags) = (p.next()?, p.next()?, p.next()?, p.next()?);
-            (c == cluster && key == "health_flags").then_some(())?;
-            Some((node_for(addr)?, flags.to_string()))
+            let (c, addr, k, value) = (p.next()?, p.next()?, p.next()?, p.next()?);
+            (c == cluster && k == key).then_some(())?;
+            Some((node_for(addr)?, value.to_string()))
         })
         .collect()
+}
+
+fn health(cluster: &str) -> Vec<(Node, String)> {
+    host_stat(cluster, "health_flags")
+}
+
+/// Requests envoy sent to each worker of `cluster`, ordered by worker.
+pub fn requests(cluster: &str) -> Vec<(Node, i64)> {
+    let mut found: Vec<(Node, i64)> = host_stat(cluster, "rq_total")
+        .into_iter()
+        .filter_map(|(node, n)| Some((node, n.parse().ok()?)))
+        .collect();
+    found.sort_by_key(|(node, _)| node.0);
+    found
 }
 
 pub fn members(cluster: &str) -> Vec<Node> {

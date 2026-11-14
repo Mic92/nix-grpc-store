@@ -120,6 +120,10 @@ public:
     };
     using Membership = std::flat_map<std::string, std::vector<Member>>;
     [[nodiscard]] auto membership() const -> std::shared_ptr<const Membership>;
+    // The builders the balancer may use for `system`. Normally the ones
+    // that build for it. If there are none, all builders: queries and
+    // uploads work on any of them, and no build is assigned for that system.
+    [[nodiscard]] static auto membersFor(const Membership & members, const std::string & system) -> std::vector<Member>;
 
     // `wake` runs without the mutex, after every change.
     auto watchMembership(std::function<void()> wake) -> uint64_t;

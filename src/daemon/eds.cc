@@ -290,7 +290,8 @@ private:
                 dirty = false;
                 want = names;
             }
-            auto const shared = svc.render(disp.membership());
+            auto const members = disp.membership();
+            auto const shared = svc.render(members);
             out.Clear();
             std::string_view failure;
             for (const auto & system : want) {
@@ -299,7 +300,7 @@ private:
                     *out.add_resources() = iter->second;
                     continue;
                 }
-                auto res = assignment(system, {});
+                auto res = assignment(system, Dispatcher::membersFor(*members, system));
                 if (!res) {
                     failure = res.error();
                     break;
