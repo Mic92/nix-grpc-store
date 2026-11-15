@@ -90,7 +90,12 @@ let
           keyFile = "${certs}/${name}.key";
           clientCaFile = "${certs}/ca.pem";
         };
-        trustedProxies = [ "lb-*" ];
+        # The balancer authenticates with an SVID, which has no CN, so the
+        # SPIFFE shape is here next to the CN one.
+        trustedProxies = [
+          "lb-*"
+          "spiffe://test/lb/*"
+        ];
         accessRules = [
           {
             cn = "ci-*";
@@ -99,6 +104,10 @@ let
           {
             # Envoy reads the builder list with its own certificate.
             cn = "lb-*";
+            role = "trusted";
+          }
+          {
+            cn = "spiffe://test/lb/*";
             role = "trusted";
           }
           {
@@ -266,7 +275,8 @@ pkgs.testers.runNixOSTest {
           createsCas = true;
           neededBy = [ "envoy.service" ];
           certs.lb = cert "lb" "DNS:lb" // { ca = "public-ca"; };
-          certs.lb-client = cert "lb-1" "DNS:lb";
+          # An SVID: no subject, the workload is in the URI SAN.
+          certs.lb-client = cert "" "URI:spiffe://test/lb/1";
           # One test sends requests from here as the CI client.
           certs.ci = cert "ci-1" "DNS:client";
         };

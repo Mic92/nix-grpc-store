@@ -135,7 +135,7 @@ services.nix-grpc-daemon = {
 | `minFree` | Below this much free disk the node takes no new builds until space returns. |
 | `buildLogRetention` | How long a builder keeps Nix's build logs, `"30d"` by default. `null` keeps them forever, as Nix does. |
 | `trustedProxies` | Peers with a matching client cert are balancers. The node takes the real client identity from the `x-forwarded-client-cert` header they set. Other peers can't set it. |
-| `accessRules` | Maps CNs to roles. CI needs `trusted`, and so do the other nodes for their connection to the scheduler. |
+| `accessRules` | Maps CNs to roles, or SPIFFE IDs where a node presents an SVID. CI needs `trusted`, and so do the other nodes for their connection to the scheduler. |
 | `schedulerTokenFile` | Bearer token for the connection to the scheduler, instead of or next to the client certificate. The scheduler node maps it to `trusted` through its `oidc` rules. |
 | `niks3.tokenFile`, `niks3.clientCertFile` | How the node authenticates to niks3: a bearer token, a client certificate (defaults to `tls.certFile`), or both. |
 | `workerName` | Name clients see in `worker: building …` lines and in `nix_grpc_build_info`. Defaults to the hostname. |
@@ -383,7 +383,10 @@ that the client passes `client-cert`/`client-key` or `token-file`, and that
 envoy's `tls.clientCaFile` is set.
 
 **`no access rule matches '<cn>'`** — the certificate verified but its CN
-isn't in `accessRules`.
+isn't in `accessRules`. An empty name means the peer's certificate has
+neither a CN nor a SPIFFE ID; if that peer is a balancer, its clients all
+arrive unnamed, because `trustedProxies` never matched it and the
+`x-forwarded-client-cert` header was ignored.
 
 **`no connected, non-draining worker for system … offers features {…}`** —
 no builder for that system (with those `system-features`) is connected

@@ -118,7 +118,10 @@ in
             cn = lib.mkOption {
               type = lib.types.str;
               example = "ci-*";
-              description = "Glob pattern matched against the client certificate CN.";
+              description = ''
+                Glob pattern matched against the client certificate CN, or
+                against its SPIFFE ID when the certificate has no CN.
+              '';
             };
             role = lib.mkOption {
               type = lib.types.enum [
@@ -177,9 +180,13 @@ in
     trustedProxies = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
-      example = [ "lb-*" ];
+      example = [
+        "lb-*"
+        "spiffe://example.org/lb/*"
+      ];
       description = ''
-        CN globs of TLS-terminating balancers (see `services.nix-grpc-farm-lb.tls`).
+        CN globs of TLS-terminating balancers (see `services.nix-grpc-farm-lb.tls`),
+        or SPIFFE ID globs where the balancer presents an SVID.
         A peer with such a certificate is a proxy: the client identity comes
         from the `x-forwarded-client-cert` header it sets, or a forwarded
         bearer token. Requires {option}`tls.clientCaFile`.

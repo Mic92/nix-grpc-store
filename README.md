@@ -222,8 +222,13 @@ cache), certificate holders keep their `--allow` roles. Naming policies
 pair well with a CA like [step-ca](https://smallstep.com/docs/step-ca/),
 where provisioners constrain which CNs each token may request.
 
-`--trusted-proxy CN-PATTERN` is for a TLS-terminating L7 balancer (envoy)
-in front of the daemon. A peer presenting a certificate whose CN matches is
+A certificate with no CN is named by its SPIFFE ID instead, so an SVID
+(`spiffe://trust.domain/path`, which carries the workload in a URI SAN and
+no subject) can be matched by `--allow` and `--trusted-proxy` like any other
+name.
+
+`--trusted-proxy NAME-PATTERN` is for a TLS-terminating L7 balancer (envoy)
+in front of the daemon. A peer presenting a certificate whose name matches is
 a proxy: the daemon takes the client's identity from the
 `x-forwarded-client-cert` header it sets (`Subject` CN, evaluated against
 `--allow`) or a forwarded bearer token, and treats the request as anonymous

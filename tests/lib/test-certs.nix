@@ -20,7 +20,13 @@ in
       type = lib.types.attrsOf (
         lib.types.submodule {
           options = {
-            commonName = lib.mkOption { type = lib.types.str; };
+            commonName = lib.mkOption {
+              type = lib.types.str;
+              description = ''
+                Empty leaves the subject empty, as an SVID does, which makes
+                the SAN critical as RFC 5280 requires.
+              '';
+            };
             subjectAltName = lib.mkOption {
               type = lib.types.str;
               example = "DNS:worker1,IP:192.168.1.3";
@@ -75,10 +81,13 @@ in
       mkdir -p /run/test-certs && cd /run/test-certs
       cp ${shared}/*.pem .
       issue() {
-        openssl req -newkey rsa:2048 -nodes -keyout $1.key -out $1.csr -subj /CN=$2
+        subject=/
+        san=$3
+        if [ -n "$2" ]; then subject=/CN=$2; else san=critical,$3; fi
+        openssl req -newkey rsa:2048 -nodes -keyout $1.key -out $1.csr -subj "$subject"
         openssl x509 -req -in $1.csr -days 2 -CA $4.pem -CAkey ${shared}/$4.key \
           -set_serial 0x$(openssl rand -hex 8) -out $1.pem \
-          -extfile <(printf 'subjectAltName=%s\nextendedKeyUsage=serverAuth,clientAuth' "$3")
+          -extfile <(printf 'subjectAltName=%s\nextendedKeyUsage=serverAuth,clientAuth' "$san")
         rm $1.csr
         # The daemon and Envoy run as their own users.
         chmod 644 $1.key

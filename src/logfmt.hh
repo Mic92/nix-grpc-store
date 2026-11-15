@@ -82,20 +82,26 @@ inline void logLine(LogLevel level, std::initializer_list<LogField> fields)
     logLine(level, std::span<const LogField>(fields.begin(), fields.size()));
 }
 
-// TLS client identity (x509 CN), or nullopt when the client did not present
-// a certificate. Kept optional rather than a "-" sentinel so a certificate
-// whose CN is literally "-" (or absent, SAN-only) cannot pose as anonymous.
+// TLS client identity: the certificate's x509 CN, or its SPIFFE ID when the
+// certificate has no CN. An SVID carries its workload in a URI SAN and leaves
+// the subject empty, so reading the CN alone gives every SPIFFE peer the same
+// empty name, which no --allow or --trusted-proxy pattern can tell apart.
+// nullopt when the client presented no certificate, kept optional rather than
+// a "-" sentinel so a certificate whose CN is literally "-" cannot pose as
+// anonymous.
 inline auto clientCommonName(const grpc::ServerContextBase & context) -> std::optional<std::string>
 {
     auto const auth = context.auth_context();
     if (!auth || auth->FindPropertyValues(GRPC_X509_PEM_CERT_PROPERTY_NAME).empty()) {
         return std::nullopt;
     }
-    auto values = auth->FindPropertyValues(GRPC_X509_CN_PROPERTY_NAME);
-    if (values.empty()) {
-        return "";
+    for (auto const * property : {GRPC_X509_CN_PROPERTY_NAME, GRPC_PEER_SPIFFE_ID_PROPERTY_NAME}) {
+        auto values = auth->FindPropertyValues(property);
+        if (!values.empty() && !values.front().empty()) {
+            return std::string{values.front().data(), values.front().size()};
+        }
     }
-    return std::string{values.front().data(), values.front().size()};
+    return "";
 }
 
 } // namespace nixgrpc
