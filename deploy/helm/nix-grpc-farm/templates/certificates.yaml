@@ -50,6 +50,9 @@ spec:
     - {{ $name }}
     - {{ $name }}.{{ $ns }}
     - {{ $name }}.{{ $ns }}.svc
+    {{- if $root.Values.lb.tunnel.enabled }}
+    - {{ $name }}-lb-tunnel.{{ $ns }}.svc
+    {{- end }}
     {{- range .lb.extraDnsNames }}
     - {{ . }}
     {{- end }}

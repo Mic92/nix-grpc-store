@@ -501,6 +501,10 @@ Then put into `balancers` either the address of each replica, or a DNS
 name that resolves to all of them. Workers inside the farm's cluster use
 `<release>-nix-grpc-farm-lb-tunnel.<namespace>.svc`.
 
+The balancer's certificate must be valid for the host names in
+`balancers`. With cert-manager, list the external ones in
+`tls.certManager.lb.extraDnsNames`.
+
 ## Step 2: Connect CI jobs in the cluster
 
 Pods in the cluster authenticate with their Kubernetes service account
