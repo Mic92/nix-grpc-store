@@ -499,7 +499,7 @@ lb:
 
 Then put into `balancers` either the address of each replica, or a DNS
 name that resolves to all of them. Workers inside the farm's cluster use
-`<release>-nix-grpc-farm-lb-tunnel.<namespace>.svc`.
+`<release>-nix-grpc-farm-lb-tunnel.<namespace>.svc:9443`.
 
 The balancer's certificate must be valid for the host names in
 `balancers`. With cert-manager, list the external ones in

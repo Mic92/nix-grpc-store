@@ -203,9 +203,9 @@ lb:
   # tls.clientCA.
   tunnel:
     enabled: false
+    # One Service per balancer replica, <release>-nix-grpc-farm-lb-<i>, on
+    # this port. Builders outside the cluster need the address of each.
     port: 9443
-    # One Service per balancer replica, <release>-nix-grpc-farm-lb-<i>.
-    # Builders outside the cluster need the address of each.
     service:
       type: ClusterIP
       annotations: {}
