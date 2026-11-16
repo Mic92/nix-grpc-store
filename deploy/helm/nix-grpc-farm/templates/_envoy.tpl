@@ -140,9 +140,10 @@ cluster_type:
     "@type": type.googleapis.com/envoy.extensions.clusters.reverse_connection.v3.ReverseConnectionClusterConfig
     cleanup_interval: 60s
     host_id_format: {{ .hostId | quote }}
-# Streams last hours; the default 1024 would 503 the next one.
+# Streams last hours; the default 1024 would 503 the next one. The default
+# for retries lets three requests at a time wait for a tunnel.
 circuit_breakers:
-  thresholds: [{max_connections: 1000000, max_pending_requests: 1000000, max_requests: 1000000}]
+  thresholds: [{max_connections: 1000000, max_pending_requests: 1000000, max_requests: 1000000, max_retries: 1000000}]
 typed_extension_protocol_options:
   envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
     "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
@@ -205,6 +206,12 @@ match:
 route:
   cluster: tunnelled
   timeout: 0s
+  # A balancer that just started lacks its builders' tunnels for some
+  # seconds. Nothing was sent to a builder when the connection fails.
+  retry_policy:
+    retry_on: connect-failure
+    num_retries: 10
+    retry_back_off: {base_interval: 0.5s, max_interval: 2s}
 {{- end }}
 
 {{- define "farm.envoy.route" -}}

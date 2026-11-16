@@ -291,6 +291,8 @@ let
     // http2
     // {
       inherit name;
+      # The default lets three requests at a time wait for a tunnel.
+      circuit_breakers.thresholds = map (limits: limits // { max_retries = 1000000; }) http2.circuit_breakers.thresholds;
       connect_timeout = "5s";
       lb_policy = "CLUSTER_PROVIDED";
       cluster_type = {
@@ -348,6 +350,17 @@ let
     ];
   };
 
+  # A balancer that just started lacks its builders' tunnels for some
+  # seconds. Nothing was sent to a builder when the connection fails.
+  awaitTunnel = {
+    retry_on = "connect-failure";
+    num_retries = 10;
+    retry_back_off = {
+      base_interval = "0.5s";
+      max_interval = "2s";
+    };
+  };
+
   # A tunnelled builder is known by a name, a dialled one by IP:port.
   tunnelRoute = {
     match = {
@@ -368,6 +381,7 @@ let
     route = {
       cluster = "tunnelled";
       timeout = "0s";
+      retry_policy = awaitTunnel;
     };
   };
 
@@ -380,6 +394,7 @@ let
     route = {
       cluster = "tunnelled-any";
       timeout = "0s";
+      retry_policy = awaitTunnel;
     };
   };
 
