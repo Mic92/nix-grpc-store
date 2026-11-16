@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -50,10 +51,12 @@ private:
 };
 
 // Opens a tunnel and answers the balancer's pings until it starts a request,
-// then returns the socket with that request unread. Returns no socket when
+// then returns the socket with that request unread. Calls `accepted` once the
+// balancer took the tunnel. Returns no socket when
 // `stop` interrupted. Throws when the tunnel cannot be opened or the balancer
 // closes it.
-auto open(const Target & target, const Tls & tls, const Identity & self, const Wake & stop) -> nix::AutoCloseFD;
+auto open(const Target & target, const Tls & tls, const Identity & self, const Wake & stop, const std::function<void()> & accepted = {})
+    -> nix::AutoCloseFD;
 
 enum class End : uint8_t {
     closed,

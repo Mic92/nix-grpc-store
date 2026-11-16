@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -373,7 +374,8 @@ auto Wake::wait(std::optional<std::chrono::milliseconds> timeout) const -> bool
     return nixgrpc::tunnel::wait(-1, 0, *this, timeout ? std::optional{Clock::now() + *timeout} : std::nullopt) == Ready::stop;
 }
 
-auto open(const Target & target, const Tls & tls, const Identity & self, const Wake & stop) -> nix::AutoCloseFD
+auto open(const Target & target, const Tls & tls, const Identity & self, const Wake & stop, const std::function<void()> & accepted)
+    -> nix::AutoCloseFD
 {
     if (!validName(self.node) || !validName(self.group) || !(validName(target.host) || validAddress6(target.host))
         || !validName(target.protocol)) {
@@ -383,6 +385,9 @@ auto open(const Target & target, const Tls & tls, const Identity & self, const W
     auto sock = connectTo(target, stop, deadline);
     if (!sock || handshake(sock.get(), target, tls, self, stop, deadline) == Io::stopped) {
         return {};
+    }
+    if (accepted) {
+        accepted();
     }
     // The start of a ping that came without its end.
     std::string pending;
