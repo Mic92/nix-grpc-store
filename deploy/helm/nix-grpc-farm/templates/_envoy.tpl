@@ -195,7 +195,7 @@ filter_chains:
        tenant is; a builder sends its name there. */}}
   {{- $names := list }}
   {{- range .Values.auth.workerCNs }}
-  {{- $names = append $names (. | replace "." "\\." | replace "*" "[^,+\\\\]*") }}
+  {{- $names = append $names (. | replace "." "\\." | replace "*" "[^,+/\\\\]*") }}
   {{- end }}
   {{- $name := printf "%%CEL(re.extract(connection.subject_peer_certificate, r'^CN=(%s)(,|$)', r'\\1'))%%" (join "|" $names) }}
   {{- $node := print $name "/%REQ(x-nix-instance)%" }}

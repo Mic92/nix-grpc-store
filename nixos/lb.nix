@@ -310,7 +310,7 @@ let
   # Envoy gives the subject as text, common name first.
   peerName =
     let
-      pattern = lib.replaceStrings [ "." "*" ] [ "\\." "[^,+\\\\]*" ];
+      pattern = lib.replaceStrings [ "." "*" ] [ "\\." "[^,+/\\\\]*" ];
       names = lib.concatMapStringsSep "|" pattern cfg.tunnel.names;
     in
     "%CEL(re.extract(connection.subject_peer_certificate, r'^CN=(${names})(,|$)', r'\\1'))%";
@@ -517,7 +517,7 @@ in
         '';
       };
       names = lib.mkOption {
-        type = lib.types.listOf (lib.types.strMatching "[A-Za-z0-9._/*-]+");
+        type = lib.types.listOf (lib.types.strMatching "[A-Za-z0-9._*-]+");
         default = [
           "worker"
           "worker-*"
