@@ -204,7 +204,12 @@ lb:
   tunnel:
     enabled: false
     port: 9443
-    nodePort: null
+    # One Service per balancer replica, <release>-nix-grpc-farm-lb-<i>.
+    # Builders outside the cluster need the address of each.
+    service:
+      type: ClusterIP
+      annotations: {}
+      nodePorts: [] # one per replica
     # Envoy worker threads. A thread can only use the tunnels it holds
     # itself, so keep the builders' tunnel.count at this value or above.
     threads: 4

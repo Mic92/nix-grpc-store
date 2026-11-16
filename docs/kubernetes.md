@@ -457,7 +457,7 @@ On the farm, open the balancer's tunnel port:
 ```yaml
 lb:
   tunnel:
-    enabled: true # port 9443 on the balancer Service
+    enabled: true # port 9443
 ```
 
 In the workers' cluster, install the chart with workers only and point
@@ -484,13 +484,22 @@ example `workers-b.example.com`. All pods of the release use it, and the
 balancer tells them apart by pod name. With a certificate per cluster
 you can revoke one cluster and keep the others.
 
-Balancer replicas: a worker needs tunnels to each replica. Put into
-`balancers` either the address of each replica, or a DNS name that
-resolves to all of them. Inside the farm's cluster that name is
-`<release>-nix-grpc-farm-lb-tunnel.<namespace>.svc`.
+Balancer replicas: a worker needs tunnels to each replica, so with
+`lb.tunnel.enabled` each replica gets a Service of its own,
+`<release>-nix-grpc-farm-lb-0`, `-lb-1` and so on. Expose these to the
+workers, for example as `LoadBalancer` Services:
 
-A `LoadBalancer` Service puts the replicas behind a shared address. In
-that case run the balancer without replicas (`lb.replicas: 1`).
+```yaml
+lb:
+  tunnel:
+    enabled: true
+    service:
+      type: LoadBalancer
+```
+
+Then put into `balancers` either the address of each replica, or a DNS
+name that resolves to all of them. Workers inside the farm's cluster use
+`<release>-nix-grpc-farm-lb-tunnel.<namespace>.svc`.
 
 ## Step 2: Connect CI jobs in the cluster
 
