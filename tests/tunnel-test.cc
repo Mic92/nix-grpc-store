@@ -75,7 +75,8 @@ struct Cert
 using Subject = std::vector<std::pair<std::string, std::string>>;
 
 // A certificate for `names` ("DNS:a,DNS:b"), signed by `issuer` or by itself.
-auto makeCert(const std::string & names, const Cert * issuer, const Subject & entries = {{"CN", "test"}}) -> Cert
+auto makeCert(const std::string & names, const Cert * issuer, const Subject & entries = {{"CN", "test"}}, int encoding = MBSTRING_ASC)
+    -> Cert
 {
     constexpr long hour = 3600;
     constexpr long year = 365L * 24 * hour;
@@ -90,7 +91,8 @@ auto makeCert(const std::string & names, const Cert * issuer, const Subject & en
     X509_NAME * subject = X509_get_subject_name(cert);
     for (const auto & [field, value] : entries) {
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-        X509_NAME_add_entry_by_txt(subject, field.c_str(), MBSTRING_ASC, reinterpret_cast<const unsigned char *>(value.c_str()), -1, -1, 0);
+        const auto * bytes = reinterpret_cast<const unsigned char *>(value.data());
+        X509_NAME_add_entry_by_txt(subject, field.c_str(), encoding, bytes, static_cast<int>(value.size()), -1, 0);
     }
     X509_set_issuer_name(cert, issuer == nullptr ? subject : X509_get_subject_name(issuer->cert.get()));
     X509V3_CTX ctx;
@@ -164,6 +166,8 @@ struct Pki
         save(makeCert("DNS:b1", &authority, {{"CN", "b1"}, {"O", "farm"}}), dir / "name-first");
         save(makeCert("DNS:b1", &authority, {{"O", "farm"}}), dir / "nameless");
         save(makeCert("DNS:b1", &authority, {{"CN", "-"}}), dir / "dash");
+        // Two bytes per character.
+        save(makeCert("DNS:b1", &authority, {{"CN", std::string("\0b\0" "1", 4)}}, V_ASN1_BMPSTRING), dir / "wide");
     }
     ~Pki()
     {
@@ -580,6 +584,7 @@ void a_tunnelled_builder_is_known_by_its_certificates_common_name()
     using nixgrpc::tunnel::certName;
     const Pki pki;
     check(certName(pki.file("named.pem")) == "b1", "the common name is the builder's, whatever else the certificate holds");
+    check(certName(pki.file("wide.pem")) == "b1", "also when the certificate stores it two bytes per character");
     // The balancer reads the name from the end of the subject, and "-" where there is none.
     for (const auto * file : {"name-first.pem", "nameless.pem", "dash.pem"}) {
         try {
