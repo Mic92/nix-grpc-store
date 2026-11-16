@@ -480,8 +480,11 @@ auth:
 ```
 
 Certificate: issue one per cluster, with a common name of its own that
-matches the farm's `auth.workerCNs`, for example `worker-b`. All pods of
-the release use it, and the balancer tells them apart by pod name. With a certificate per cluster
+matches the farm's `auth.workerCNs`, for example `worker-b`. The balancer
+takes tunnels only from such names. The common name has to be the last
+entry of the subject (`O=Example, CN=worker-b`) and consist of letters,
+digits and `-._`. All pods of the release use the certificate, and the
+balancer tells them apart by pod name. With a certificate per cluster
 you can revoke one cluster and keep the others.
 
 Balancer replicas: a worker needs tunnels to each replica, so with

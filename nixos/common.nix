@@ -298,7 +298,12 @@ in
 
           The farm knows the builder by the common name of the certificate in
           {option}`tls.certFile` followed by its {option}`workerName`, for
-          example `worker-b/b1`.
+          example `worker-b/b1`. The balancer must list that common name in
+          its `tunnel.names`.
+
+          The common name has to be the last entry of the certificate's
+          subject, as in `O=Example, CN=worker-b`, and may consist of
+          letters, digits and `-._`.
           Builders may therefore share a certificate as long as their worker
           names differ.
         '';
