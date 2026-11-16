@@ -129,7 +129,6 @@ workerDefaults:
     # host:port of the tunnel port of every balancer; replaces hostPort and
     # advertise. A name with several addresses means all of them: inside the
     # balancer's cluster that is <release>-nix-grpc-farm-lb-tunnel.<namespace>.svc.
-    # The pods may share a certificate, which must carry exactly one DNS name.
     balancers: []
     # Tunnels per balancer address, twice. Empty: 4.
     count: null

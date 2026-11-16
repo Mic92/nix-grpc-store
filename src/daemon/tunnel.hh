@@ -67,9 +67,8 @@ enum class End : uint8_t {
 // the same socket is in use elsewhere.
 auto waitClosed(int sock, const Wake & stop) -> End;
 
-// The DNS name of the certificate in `file`. The balancer checks a tunnel's
-// node id against all DNS names of the certificate at once, so there must be
-// exactly one.
+// The common name of the certificate in `file`: the farm's access rules know
+// the builder by it, and so does the balancer.
 auto certName(const std::string & file) -> std::string;
 
 } // namespace nixgrpc::tunnel

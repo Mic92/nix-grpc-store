@@ -479,9 +479,9 @@ auth:
   trustedProxies: ["lb-*"] # the farm balancer's certificate CN
 ```
 
-Certificate: issue one per cluster, with exactly one DNS name, for
-example `workers-b.example.com`. All pods of the release use it, and the
-balancer tells them apart by pod name. With a certificate per cluster
+Certificate: issue one per cluster, with a common name of its own that
+matches the farm's `auth.workerCNs`, for example `worker-b`. All pods of
+the release use it, and the balancer tells them apart by pod name. With a certificate per cluster
 you can revoke one cluster and keep the others.
 
 Balancer replicas: a worker needs tunnels to each replica, so with

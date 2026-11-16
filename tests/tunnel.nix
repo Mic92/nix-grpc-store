@@ -66,11 +66,11 @@ let
     };
 
   # Its firewall lets nothing in, so every build reaches it through a tunnel.
-  # Both have the same name in their certificate, as pods of one Deployment
-  # do; the balancer tells them apart by host name.
+  # Both have the same certificate name, as pods of one Deployment do; the
+  # balancer tells them apart by host name.
   tunnelled = feature: {
     imports = [ builder ];
-    testCerts.certs.node = cert "worker-2" "DNS:tunnelled";
+    testCerts.certs.node = cert "worker-2" "DNS:tunnelled,DNS:tunnelled.test";
     nix.settings.system-features = [ feature ];
     services.nix-grpc-daemon.roles = [ "builder" ];
     services.nix-grpc-daemon.tunnel.balancers = [ "lb:${toString tunnelPort}" ];
