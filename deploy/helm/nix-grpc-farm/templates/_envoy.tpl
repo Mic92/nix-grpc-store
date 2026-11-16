@@ -188,8 +188,11 @@ listener_filters:
     typed_config:
       "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
 filter_chains:
-  - {{- include "farm.envoy.tunnelChain" (dict "protocol" "nix-tunnel" "validation" (dict "node_id_format" "%DOWNSTREAM_PEER_DNS_SAN%/%REQ(x-nix-instance)%")) | nindent 4 }}
-  - {{- include "farm.envoy.tunnelChain" (dict "protocol" "nix-tunnel-any" "validation" (dict "node_id_format" "any/%DOWNSTREAM_PEER_DNS_SAN%/%REQ(x-nix-instance)%" "cluster_id_format" "any")) | nindent 4 }}
+  {{- /* The common name of the builder's certificate, by which the access
+       rules know it too. Envoy gives the subject as text, common name first. */}}
+  {{- $name := "%CEL(re.extract(connection.subject_peer_certificate, r'^CN=([^,+\\\\]+)(,|$)', r'\\1'))%/%REQ(x-nix-instance)%" }}
+  - {{- include "farm.envoy.tunnelChain" (dict "protocol" "nix-tunnel" "validation" (dict "node_id_format" $name)) | nindent 4 }}
+  - {{- include "farm.envoy.tunnelChain" (dict "protocol" "nix-tunnel-any" "validation" (dict "node_id_format" (print "any/" $name) "cluster_id_format" "any")) | nindent 4 }}
 {{- end }}
 
 {{/* A tunnelled builder is known by a name, a dialled one by IP:port. */}}

@@ -304,6 +304,10 @@ let
       };
     };
 
+  # The common name of the builder's certificate, by which the access rules
+  # know it too. Envoy gives the subject as text, common name first.
+  peerName = "%CEL(re.extract(connection.subject_peer_certificate, r'^CN=([^,+\\\\]+)(,|$)', r'\\1'))%";
+
   # A builder joins the set its ALPN name asks for, under its certificate's name.
   tunnelChain = protocol: validation: {
     filter_chain_match.application_protocols = [ protocol ];
@@ -340,9 +344,9 @@ let
       }
     ];
     filter_chains = [
-      (tunnelChain "nix-tunnel" { node_id_format = "%DOWNSTREAM_PEER_DNS_SAN%/%REQ(x-nix-instance)%"; })
+      (tunnelChain "nix-tunnel" { node_id_format = "${peerName}/%REQ(x-nix-instance)%"; })
       (tunnelChain "nix-tunnel-any" {
-        node_id_format = "any/%DOWNSTREAM_PEER_DNS_SAN%/%REQ(x-nix-instance)%";
+        node_id_format = "any/${peerName}/%REQ(x-nix-instance)%";
         cluster_id_format = "any";
       })
     ];
@@ -480,8 +484,8 @@ in
           builds over that connection.
 
           A builder has to present a certificate signed by
-          `tls.upstream.caFile`. The farm knows it by the DNS name in that
-          certificate.
+          `tls.upstream.caFile`. The farm knows it by the common name of
+          that certificate.
 
           Requires `tls.certFile` and `tls.upstream`.
         '';

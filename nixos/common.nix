@@ -296,9 +296,9 @@ in
           `tunnel.listen`). If the host name resolves to several addresses,
           the builder connects to all of them.
 
-          The certificate in {option}`tls.certFile` must contain exactly one
-          DNS name. The farm knows the builder by that name followed by its
-          {option}`workerName`, for example `builders.example.org/b1`.
+          The farm knows the builder by the common name of the certificate in
+          {option}`tls.certFile` followed by its {option}`workerName`, for
+          example `worker-b/b1`.
           Builders may therefore share a certificate as long as their worker
           names differ.
         '';

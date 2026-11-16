@@ -32,7 +32,6 @@
 #include <openssl/tls1.h>
 #include <openssl/x509.h>
 #include <openssl/x509_vfy.h>
-#include <openssl/x509v3.h>
 
 #include <nix/util/error.hh>
 #include <nix/util/file-descriptor.hh>
@@ -472,24 +471,22 @@ auto certName(const std::string & file) -> std::string
     if (!cert) {
         throw nix::Error("reading '%s': %s", file, sslError());
     }
-    const Owner<GENERAL_NAMES, GENERAL_NAMES_free> names{
-        static_cast<GENERAL_NAMES *>(X509_get_ext_d2i(cert.get(), NID_subject_alt_name, nullptr, nullptr))};
-    std::string found;
-    int count = 0;
-    const int total = names ? sk_GENERAL_NAME_num(names.get()) : 0;
-    for (int idx = 0; idx < total; idx++) {
-        const GENERAL_NAME * name = sk_GENERAL_NAME_value(names.get(), idx);
-        if (name->type != GEN_DNS) {
-            continue;
-        }
-        count++;
-        const ASN1_IA5STRING * dns = name->d.dNSName; // NOLINT(cppcoreguidelines-pro-type-union-access)
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-        found.assign(reinterpret_cast<const char *>(ASN1_STRING_get0_data(dns)), static_cast<size_t>(ASN1_STRING_length(dns)));
+    // The balancer takes the name from the front of the subject as text,
+    // which is the last entry; anywhere else it would not find it.
+    const X509_NAME * subject = X509_get_subject_name(cert.get());
+    const int last = X509_NAME_entry_count(subject) - 1;
+    const X509_NAME_ENTRY * entry = last < 0 ? nullptr : X509_NAME_get_entry(subject, last);
+    const bool isName = entry != nullptr && OBJ_obj2nid(X509_NAME_ENTRY_get_object(entry)) == NID_commonName;
+    const bool alone = last < 1 || X509_NAME_ENTRY_set(entry) != X509_NAME_ENTRY_set(X509_NAME_get_entry(subject, last - 1));
+    if (!isName || !alone) {
+        throw nix::Error("the subject of the certificate '%s' must end in its common name, a builder behind a tunnel is known by it", file);
     }
-    if (count != 1) {
-        throw nix::Error(
-            "the certificate '%s' has %d DNS names, a builder behind a tunnel needs exactly one: its name", file, count);
+    const ASN1_STRING * text = X509_NAME_ENTRY_get_data(entry);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    std::string found(reinterpret_cast<const char *>(ASN1_STRING_get0_data(text)), static_cast<size_t>(ASN1_STRING_length(text)));
+    // "-" is what the balancer reads from a certificate without a name.
+    if (!validName(found) || found == "-") {
+        throw nix::Error("the common name of the certificate '%s' must consist of letters, digits and -._/", file);
     }
     return found;
 }

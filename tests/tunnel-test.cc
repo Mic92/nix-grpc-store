@@ -72,8 +72,10 @@ struct Cert
     std::shared_ptr<EVP_PKEY> key;
 };
 
+using Subject = std::vector<std::pair<std::string, std::string>>;
+
 // A certificate for `names` ("DNS:a,DNS:b"), signed by `issuer` or by itself.
-auto makeCert(const std::string & names, const Cert * issuer) -> Cert
+auto makeCert(const std::string & names, const Cert * issuer, const Subject & entries = {{"CN", "test"}}) -> Cert
 {
     constexpr long hour = 3600;
     constexpr long year = 365L * 24 * hour;
@@ -86,9 +88,10 @@ auto makeCert(const std::string & names, const Cert * issuer) -> Cert
     X509_gmtime_adj(X509_getm_notAfter(cert), year);
     X509_set_pubkey(cert, key);
     X509_NAME * subject = X509_get_subject_name(cert);
-    const std::string common = issuer == nullptr ? "test ca" : names;
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-    X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char *>(common.c_str()), -1, -1, 0);
+    for (const auto & [field, value] : entries) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        X509_NAME_add_entry_by_txt(subject, field.c_str(), MBSTRING_ASC, reinterpret_cast<const unsigned char *>(value.c_str()), -1, -1, 0);
+    }
     X509_set_issuer_name(cert, issuer == nullptr ? subject : X509_get_subject_name(issuer->cert.get()));
     X509V3_CTX ctx;
     X509V3_set_ctx(&ctx, issuer == nullptr ? cert : issuer->cert.get(), cert, nullptr, nullptr, 0);
@@ -147,7 +150,7 @@ struct Listener
 struct Pki
 {
     std::filesystem::path dir;
-    Cert authority = makeCert("", nullptr);
+    Cert authority = makeCert("", nullptr, {{"CN", "test ca"}});
     Pki()
     {
         std::string tmpl = (std::filesystem::temp_directory_path() / "tunnel-test-XXXXXX").string();
@@ -157,8 +160,10 @@ struct Pki
         save(makeCert("IP:::1", &authority), dir / "lb6");
         save(makeCert("DNS:other.test", &authority), dir / "other");
         save(makeCert("DNS:b1", &authority), dir / "b1");
-        save(makeCert("DNS:b1,DNS:farm.test", &authority), dir / "two");
-        save(makeCert("IP:127.0.0.1", &authority), dir / "none");
+        save(makeCert("DNS:a.test,DNS:b.test", &authority, {{"O", "farm"}, {"CN", "b1"}}), dir / "named");
+        save(makeCert("DNS:b1", &authority, {{"CN", "b1"}, {"O", "farm"}}), dir / "name-first");
+        save(makeCert("DNS:b1", &authority, {{"O", "farm"}}), dir / "nameless");
+        save(makeCert("DNS:b1", &authority, {{"CN", "-"}}), dir / "dash");
     }
     ~Pki()
     {
@@ -570,17 +575,18 @@ void a_builder_that_takes_no_work_only_keeps_the_tunnels_for_itself()
     check(back && back->protocol == "nix-tunnel-any", "taking work again opens it again");
 }
 
-void a_tunnelled_builders_certificate_has_one_name()
+void a_tunnelled_builder_is_known_by_its_certificates_common_name()
 {
     using nixgrpc::tunnel::certName;
     const Pki pki;
-    check(certName(pki.file("b1.pem")) == "b1", "the one DNS name is the builder's");
-    for (const auto * file : {"two.pem", "none.pem"}) {
+    check(certName(pki.file("named.pem")) == "b1", "the common name is the builder's, whatever else the certificate holds");
+    // The balancer reads the name from the end of the subject, and "-" where there is none.
+    for (const auto * file : {"name-first.pem", "nameless.pem", "dash.pem"}) {
         try {
             (void) certName(pki.file(file));
             check(false, std::string(file) + " is refused");
         } catch (nix::Error & err) {
-            check(err.info().msg.str().contains("exactly one"), "the error says what is needed");
+            check(err.info().msg.str().contains("common name"), "the error says what is needed");
         }
     }
 }
@@ -602,7 +608,7 @@ try {
         a_port_that_does_not_take_tunnels_is_named_as_the_likely_cause();
         a_balancer_is_reached_by_its_ipv6_address();
         the_watcher_sees_every_way_a_connection_ends();
-        a_tunnelled_builders_certificate_has_one_name();
+        a_tunnelled_builder_is_known_by_its_certificates_common_name();
         builders_sharing_a_certificate_are_told_apart_by_instance();
         a_tunnel_that_ended_is_opened_again();
         a_builder_that_takes_no_work_only_keeps_the_tunnels_for_itself();
