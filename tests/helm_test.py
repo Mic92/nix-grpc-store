@@ -287,6 +287,18 @@ def test_every_balancer_replica_has_an_address_for_tunnels() -> None:
     assert lb["args"][lb["args"].index("--concurrency") + 1] == "4"
 
 
+def test_the_balancer_certificate_is_valid_for_its_tunnel_name() -> None:
+    # Builders inside the cluster open their tunnels to this name and check it.
+    names = pick("public-cert-manager", "Certificate", "-lb")["spec"]["dnsNames"]
+    service = pick("public-cert-manager", "Service", "-lb-tunnel")
+    assert f"{service['metadata']['name']}.default.svc" in names
+    assert not [
+        n
+        for n in pick("cert-manager", "Certificate", "-lb")["spec"]["dnsNames"]
+        if "tunnel" in n
+    ]
+
+
 def test_a_balancer_without_tunnels_stays_a_deployment() -> None:
     assert pick("default", "Deployment", "-lb")
     assert "--concurrency" not in container("default", "lb", "envoy")["args"]

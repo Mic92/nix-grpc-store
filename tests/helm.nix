@@ -62,6 +62,7 @@ let
   };
   # Public client-facing certificate next to the farm PKI, both ways to get one.
   valuesPublicCertManager = lib.recursiveUpdate valuesCertManager {
+    lb.tunnel.enabled = true;
     tls.certManager.public = {
       issuerRef = {
         name = "letsencrypt";
