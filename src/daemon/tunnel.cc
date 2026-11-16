@@ -486,9 +486,15 @@ auto certName(const std::string & file) -> std::string
     if (!isName || !alone) {
         throw nix::Error("the subject of the certificate '%s' must end in its common name, a builder behind a tunnel is known by it", file);
     }
-    const ASN1_STRING * text = X509_NAME_ENTRY_get_data(entry);
+    // As text: the bytes of a certificate's string can be two per character.
+    unsigned char * utf8 = nullptr;
+    const int length = ASN1_STRING_to_UTF8(&utf8, X509_NAME_ENTRY_get_data(entry));
+    if (length < 0) {
+        throw nix::Error("reading the common name of '%s': %s", file, sslError());
+    }
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-    std::string found(reinterpret_cast<const char *>(ASN1_STRING_get0_data(text)), static_cast<size_t>(ASN1_STRING_length(text)));
+    const std::string found(reinterpret_cast<const char *>(utf8), static_cast<size_t>(length));
+    OPENSSL_free(utf8);
     // "-" is what the balancer reads from a certificate without a name.
     if (!validName(found) || found == "-") {
         throw nix::Error("the common name of the certificate '%s' must consist of letters, digits and -._/", file);
