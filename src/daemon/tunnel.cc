@@ -490,9 +490,10 @@ auto certName(const std::string & file) -> std::string
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     const std::string found(reinterpret_cast<const char *>(utf8), static_cast<size_t>(length));
     OPENSSL_free(utf8);
-    // "-" is what the balancer reads from a certificate without a name.
-    if (!validName(found) || found == "-") {
-        throw nix::Error("the common name of the certificate '%s' must consist of letters, digits and -._/", file);
+    // "-" is what the balancer reads from a certificate without a name. With
+    // a slash, "a/b" as pod "c" and "a" as pod "b/c" would be the same builder.
+    if (!validName(found) || found == "-" || found.contains('/')) {
+        throw nix::Error("the common name of the certificate '%s' must consist of letters, digits and -._", file);
     }
     return found;
 }
