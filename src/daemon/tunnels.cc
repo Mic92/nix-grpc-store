@@ -155,8 +155,8 @@ auto Tunnels::makeGroup(const Balancer & balancer, const std::string & address) 
                 .protocol = std::string(any ? anyProtocol : namedProtocol),
             };
             const auto own = nodeName(config.name, config.instance);
-            slot->self = any ? Identity{.node = "any/" + own, .group = "any", .instance = config.instance}
-                             : Identity{.node = own, .group = own, .instance = config.instance};
+            slot->self = any ? Identity{.node = "any/" + own, .group = "any", .instance = config.instance, .name = config.name}
+                             : Identity{.node = own, .group = own, .instance = config.instance, .name = config.name};
             // Not running yet.
             slot->done = true;
             group->slots.push_back(std::move(slot));

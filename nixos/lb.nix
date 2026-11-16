@@ -304,9 +304,14 @@ let
       };
     };
 
-  # The common name of the builder's certificate, by which the access rules
-  # know it too. Envoy gives the subject as text, common name first.
-  peerName = "%CEL(re.extract(connection.subject_peer_certificate, r'^CN=([^,+\\\\]+)(,|$)', r'\\1'))%";
+  # The common name of the builder's certificate if `tunnel.names` lists it.
+  # Envoy gives the subject as text, common name first.
+  peerName =
+    let
+      pattern = lib.replaceStrings [ "." "*" ] [ "\\." "[^,+\\\\]*" ];
+      names = lib.concatMapStringsSep "|" pattern cfg.tunnel.names;
+    in
+    "%CEL(re.extract(connection.subject_peer_certificate, r'^CN=(${names})(,|$)', r'\\1'))%";
 
   # A builder joins the set its ALPN name asks for, under its certificate's name.
   tunnelChain = protocol: validation: {
@@ -344,10 +349,16 @@ let
       }
     ];
     filter_chains = [
-      (tunnelChain "nix-tunnel" { node_id_format = "${peerName}/%REQ(x-nix-instance)%"; })
+      # Envoy refuses a field that comes out empty only if it is the whole
+      # field, which the tenant is; a builder sends its name there.
+      (tunnelChain "nix-tunnel" {
+        node_id_format = "${peerName}/%REQ(x-nix-instance)%";
+        tenant_id_format = peerName;
+      })
       (tunnelChain "nix-tunnel-any" {
         node_id_format = "any/${peerName}/%REQ(x-nix-instance)%";
         cluster_id_format = "any";
+        tenant_id_format = peerName;
       })
     ];
   };
@@ -488,6 +499,21 @@ in
           that certificate.
 
           Requires `tls.certFile` and `tls.upstream`.
+        '';
+      };
+      names = lib.mkOption {
+        type = lib.types.listOf (lib.types.strMatching "[A-Za-z0-9._/*-]+");
+        default = [
+          "worker"
+          "worker-*"
+        ];
+        description = ''
+          Which certificates may open a tunnel, by common name. `*` stands
+          for any characters.
+
+          Every tunnel receives requests meant for builders, so list only
+          the names of builder certificates. A client certificate signed by
+          the same CA, such as `ci-1`, is then refused.
         '';
       };
       threads = lib.mkOption {

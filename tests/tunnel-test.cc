@@ -273,7 +273,7 @@ struct Fixture
     Wake stop;
     nixgrpc::tunnel::Tls tls{.cert = pki.file("b1.pem"), .key = pki.file("b1.key"), .ca = pki.file("ca.pem")};
     nixgrpc::tunnel::Target target{.host = "lb.test", .address = "127.0.0.1", .port = lis.port, .protocol = std::string(nixgrpc::tunnel::anyProtocol)};
-    nixgrpc::tunnel::Identity self{.node = "any/b1", .group = "any", .instance = ""};
+    nixgrpc::tunnel::Identity self{.node = "any/b1", .group = "any", .instance = "", .name = "b1"};
 
     [[nodiscard]] auto open() const -> nix::AutoCloseFD
     {
