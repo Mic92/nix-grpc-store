@@ -56,8 +56,14 @@ def pick(name: str, kind: str, suffix: str = "") -> dict[str, Any]:
     return found
 
 
-def pod(name: str, deployment: str) -> dict[str, Any]:
-    return pick(name, "Deployment", "-" + deployment)["spec"]["template"]["spec"]
+def pod(name: str, workload: str) -> dict[str, Any]:
+    (found,) = (
+        doc
+        for doc in render(name)
+        if doc["kind"] in {"Deployment", "StatefulSet"}
+        and doc["metadata"]["name"] == f"{RELEASE}-{workload}"
+    )
+    return found["spec"]["template"]["spec"]
 
 
 def container(name: str, deployment: str, which: str) -> dict[str, Any]:
@@ -256,22 +262,38 @@ def test_envoy_config_with_tunnels_is_that_of_the_nixos_module() -> None:
     assert envoy("tunnel")["bootstrap_extensions"] == nixos["bootstrap_extensions"]
 
 
-def test_builders_reach_the_tunnel_port_of_every_balancer_replica() -> None:
-    ports = pick("tunnel", "Service")["spec"]["ports"]
-    assert dig(named(ports, "tunnel"), "port") == 9443
-    # One address per replica: a builder needs tunnels to each of them.
+def test_every_balancer_replica_has_an_address_for_tunnels() -> None:
+    # Behind a shared address a builder would reach only some replicas.
+    shared = pick("tunnel", "Service")["spec"]
+    assert named(shared["ports"], "tunnel") is None
+    balancer = pick("tunnel", "StatefulSet", "-lb")["spec"]
+    assert balancer["replicas"] == 2
+    for index in range(balancer["replicas"]):
+        own = pick("tunnel", "Service", f"-lb-{index}")["spec"]
+        assert own["selector"] == shared["selector"] | {
+            "statefulset.kubernetes.io/pod-name": f"{RELEASE}-lb-{index}"
+        }
+        assert dig(named(own["ports"], "tunnel"), "port") == 9443
+
+    # All of them under one name, for builders inside the cluster.
     every = pick("tunnel", "Service", "-lb-tunnel")["spec"]
     assert every["clusterIP"] == "None"
-    assert dig(named(every["ports"], "tunnel"), "port") == 9443
-    assert every["selector"] == pick("tunnel", "Service")["spec"]["selector"]
+    assert every["selector"] == shared["selector"]
+    assert balancer["serviceName"] == f"{RELEASE}-lb-tunnel"
 
     lb = container("tunnel", "lb", "envoy")
     assert dig(named(lb["ports"], "tunnel"), "containerPort") == 9443
     # Builders open four tunnels per set unless told otherwise, one per thread.
     assert lb["args"][lb["args"].index("--concurrency") + 1] == "4"
 
-    assert named(pick("default", "Service")["spec"]["ports"], "tunnel") is None
+
+def test_a_balancer_without_tunnels_stays_a_deployment() -> None:
+    assert pick("default", "Deployment", "-lb")
     assert "--concurrency" not in container("default", "lb", "envoy")["args"]
+    services = [
+        d["metadata"]["name"] for d in render("default") if d["kind"] == "Service"
+    ]
+    assert not [name for name in services if name.startswith(f"{RELEASE}-lb")]
 
 
 def test_tunnelled_workers_connect_to_the_balancer_and_need_no_node_port() -> None:

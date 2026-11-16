@@ -33,17 +33,35 @@ spec:
       {{- with .Values.lb.service.nodePort }}
       nodePort: {{ . }}
       {{- end }}
-    {{- if .Values.lb.tunnel.enabled }}
-    - name: tunnel
-      port: {{ .Values.lb.tunnel.port }}
-      targetPort: tunnel
-      {{- with .Values.lb.tunnel.nodePort }}
-      nodePort: {{ . }}
-      {{- end }}
-    {{- end }}
 {{- if .Values.lb.tunnel.enabled }}
+{{- /* A builder needs tunnels to every replica, so each has an address of
+     its own. Behind a shared one it would reach only some of them. */}}
+{{- range $i := until (int .Values.lb.replicas) }}
+{{- $pod := printf "%s-lb-%d" (include "farm.fullname" $) $i }}
 ---
-{{- /* One address per replica: a builder needs tunnels to each of them. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $pod }}
+  labels: {{- include "farm.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: lb
+  {{- with $.Values.lb.tunnel.service.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $.Values.lb.tunnel.service.type }}
+  selector: {{- $sel | nindent 4 }}
+    statefulset.kubernetes.io/pod-name: {{ $pod }}
+  ports:
+    - name: tunnel
+      port: {{ $.Values.lb.tunnel.port }}
+      targetPort: tunnel
+      {{- if $.Values.lb.tunnel.service.nodePorts }}
+      nodePort: {{ index $.Values.lb.tunnel.service.nodePorts $i }}
+      {{- end }}
+{{- end }}
+---
+{{- /* All replicas under one name, for builders inside the cluster. */}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -60,12 +78,17 @@ spec:
 {{- end }}
 ---
 apiVersion: apps/v1
-kind: Deployment
+{{- /* Pods of a StatefulSet keep their names, which the Services above select. */}}
+kind: {{ ternary "StatefulSet" "Deployment" .Values.lb.tunnel.enabled }}
 metadata:
   name: {{ include "farm.fullname" . }}-lb
   labels: {{- include "farm.labels" . | nindent 4 }}
     app.kubernetes.io/component: lb
 spec:
+  {{- if .Values.lb.tunnel.enabled }}
+  serviceName: {{ include "farm.fullname" . }}-lb-tunnel
+  podManagementPolicy: Parallel
+  {{- end }}
   replicas: {{ .Values.lb.replicas }}
   selector:
     matchLabels: {{- $sel | nindent 6 }}
