@@ -72,8 +72,9 @@ spec:
   clusterIP: None
   selector: {{- $sel | nindent 4 }}
   ports:
+    {{- /* No Service address translates the port here: it is the pods' own. */}}
     - name: tunnel
-      port: {{ .Values.lb.tunnel.port }}
+      port: 9443
       targetPort: tunnel
 {{- end }}
 ---
