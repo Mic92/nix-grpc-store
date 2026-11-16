@@ -22,6 +22,7 @@
 
 #include <nix/util/error.hh>
 #include <nix/util/file-descriptor.hh>
+#include <nix/util/finally.hh>
 #include <nix/util/terminal.hh>
 
 #include "client/retry-pause.hh"
@@ -262,15 +263,36 @@ void Tunnels::run(Slot & slot, Group & group)
 // One tunnel, from opening it until it ended.
 void Tunnels::hold(Slot & slot, Group & group)
 {
-    // One line when a balancer has all its tunnels and one when it loses the
+    // One line when a balancer has all its tunnels and one when it closes the
     // first, however many tunnels there are. The other set comes and goes
     // with the builder's load and is left out.
     const auto report = [&](std::string_view event) -> void {
         logLine(LogLevel::info, {{"event", std::string(event)}, {"balancer", slot.target.host}, {"address", slot.target.address}});
     };
+    bool counted = false;
+    const auto accepted = [&] -> void {
+        counted = !slot.any;
+        if (counted && ++group.open == config.perSet && !group.reported.exchange(true)) {
+            report("tunnels_open");
+        }
+    };
+    // Any end the builder did not choose is a loss, also a failed hand-over.
+    bool left = false;
+    // Finally is nix::Finally in newer versions of nix.
+    using namespace nix; // NOLINT(google-build-using-namespace)
+    const Finally ended([&] -> void {
+        if (!counted) {
+            return;
+        }
+        --group.open;
+        if (!left && group.reported.exchange(false)) {
+            report("tunnel_lost");
+        }
+    });
 
-    auto sock = open(slot.target, config.tls, slot.self, slot.stir);
+    auto sock = open(slot.target, config.tls, slot.self, slot.stir, accepted);
     if (!sock) {
+        left = true;
         return;
     }
     // The second descriptor shows when the new owner's socket ended, and can end it.
@@ -279,24 +301,16 @@ void Tunnels::hold(Slot & slot, Group & group)
         throw nix::SysError("dup");
     }
     config.adopt(std::move(sock));
-    if (!slot.any && ++group.open == config.perSet && !group.reported.exchange(true)) {
-        report("tunnels_open");
-    }
     for (;;) {
         slot.stir.clear();
         if (leaves(slot)) {
             shutdown(watch.get(), SHUT_RDWR);
-            break;
+            left = true;
+            return;
         }
         if (waitClosed(watch.get(), slot.stir) == End::closed) {
-            if (!slot.any && group.reported.exchange(false)) {
-                report("tunnel_lost");
-            }
-            break;
+            return;
         }
-    }
-    if (!slot.any) {
-        --group.open;
     }
 }
 
