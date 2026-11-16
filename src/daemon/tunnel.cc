@@ -376,7 +376,7 @@ auto Wake::wait(std::optional<std::chrono::milliseconds> timeout) const -> bool
 auto open(const Target & target, const Tls & tls, const Identity & self, const Wake & stop, const std::function<void()> & accepted)
     -> nix::AutoCloseFD
 {
-    if (!validName(self.node) || !validName(self.group) || !(validName(target.host) || validAddress6(target.host))
+    if (!validName(self.node) || !validName(self.group) || !validName(self.name) || !(validName(target.host) || validAddress6(target.host))
         || !validName(target.protocol)) {
         throw nix::Error("tunnel: invalid name");
     }

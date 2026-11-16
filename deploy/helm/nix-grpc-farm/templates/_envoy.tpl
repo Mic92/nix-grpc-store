@@ -189,11 +189,18 @@ listener_filters:
     typed_config:
       "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
 filter_chains:
-  {{- /* The common name of the builder's certificate, by which the access
-       rules know it too. Envoy gives the subject as text, common name first. */}}
-  {{- $name := "%CEL(re.extract(connection.subject_peer_certificate, r'^CN=([^,+\\\\]+)(,|$)', r'\\1'))%/%REQ(x-nix-instance)%" }}
-  - {{- include "farm.envoy.tunnelChain" (dict "protocol" "nix-tunnel" "validation" (dict "node_id_format" $name)) | nindent 4 }}
-  - {{- include "farm.envoy.tunnelChain" (dict "protocol" "nix-tunnel-any" "validation" (dict "node_id_format" (print "any/" $name) "cluster_id_format" "any")) | nindent 4 }}
+  {{- /* The common name of the builder's certificate if auth.workerCNs lists
+       it. Envoy gives the subject as text, common name first. It refuses a
+       field that comes out empty only if it is the whole field, which the
+       tenant is; a builder sends its name there. */}}
+  {{- $names := list }}
+  {{- range .Values.auth.workerCNs }}
+  {{- $names = append $names (. | replace "." "\\." | replace "*" "[^,+\\\\]*") }}
+  {{- end }}
+  {{- $name := printf "%%CEL(re.extract(connection.subject_peer_certificate, r'^CN=(%s)(,|$)', r'\\1'))%%" (join "|" $names) }}
+  {{- $node := print $name "/%REQ(x-nix-instance)%" }}
+  - {{- include "farm.envoy.tunnelChain" (dict "protocol" "nix-tunnel" "validation" (dict "node_id_format" $node "tenant_id_format" $name)) | nindent 4 }}
+  - {{- include "farm.envoy.tunnelChain" (dict "protocol" "nix-tunnel-any" "validation" (dict "node_id_format" (print "any/" $node) "cluster_id_format" "any" "tenant_id_format" $name)) | nindent 4 }}
 {{- end }}
 
 {{/* A tunnelled builder is known by a name, a dialled one by IP:port. */}}

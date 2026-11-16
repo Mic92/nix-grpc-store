@@ -146,6 +146,7 @@ pkgs.testers.runNixOSTest {
       programs.nix-grpc-store.enable = true;
       testCerts.certs.node = cert "ci-1" "DNS:client";
       nix.settings.substituters = pkgs.lib.mkForce [ ];
+      environment.systemPackages = [ pkgs.openssl ];
     };
   };
 
@@ -177,6 +178,22 @@ pkgs.testers.runNixOSTest {
         tunnelled2.succeed(f"test -e {build('mixed2', 'two')}")
         assert requests("tunnelled") > 0, "the build did not go through a tunnel"
         assert requests("tunnelled-any") == 0, "store queries left the dialled builder"
+
+    with subtest("a client's certificate opens no tunnel"):
+        # As the builders do it, for the set that gets what any builder may answer.
+        headers = "".join(f"x-envoy-reverse-tunnel-{key}: {value}\\r\\n" for key, value in {
+            "node-id": "any/ci-1/client",
+            "cluster-id": "any",
+            "tenant-id": "ci-1",
+            "upstream-cluster-name": "lb",
+        }.items())
+        request = f"GET /reverse_connections/request HTTP/1.1\\r\\nhost: lb\\r\\n{headers}x-nix-instance: client\\r\\ncontent-length: 0\\r\\n\\r\\n"
+        tls = f"-cert {certs}/node.pem -key {certs}/node.key -CAfile {certs}/ca.pem"
+        # openssl ends with an error once the balancer closes the connection.
+        answer = client.execute(
+            f"(printf '{request}'; sleep 3) | openssl s_client -quiet -connect lb:${toString tunnelPort} -alpn nix-tunnel-any {tls} 2>/dev/null | head -n 1"
+        )[1]
+        assert "403" in answer, f"the balancer answered a client's certificate with: {answer!r}"
 
     with subtest("a farm of tunnelled builders answers store queries too"):
         lb.succeed("/run/current-system/specialisation/tunnelsOnly/bin/switch-to-configuration test")
