@@ -103,6 +103,11 @@ workerDefaults:
   minFree: 20G
   store:
     sizeLimit: null # emptyDir sizeLimit for /nix
+    # A volume of this class and size for /nix, in place of the emptyDir:
+    # the store then has its own filesystem, and minFree and gc.ensureFree
+    # measure the store alone. The volume lives and dies with the pod.
+    storageClass: null
+    size: null # e.g. 100Gi
   spool:
     sizeLimit: null # emptyDir sizeLimit for uploads waiting to be imported
   buildDir:
