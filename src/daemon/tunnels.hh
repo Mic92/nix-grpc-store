@@ -82,15 +82,19 @@ private:
     {
         // An address that left DNS keeps its tunnels until they fail.
         std::atomic<bool> listed{true};
+        // Of the tunnels for requests addressed to this builder.
+        std::atomic<unsigned> open{0};
+        // Whether the log says that all of them are open.
+        std::atomic<bool> reported{false};
         std::vector<std::unique_ptr<Slot>> slots;
     };
 
     void supervise();
     void refresh(size_t index, const Balancer & balancer);
     [[nodiscard]] auto makeGroup(const Balancer & balancer, const std::string & address) const -> std::unique_ptr<Group>;
-    void start(Slot & slot, const Group & group);
-    void run(Slot & slot, const Group & group);
-    void hold(Slot & slot);
+    void start(Slot & slot, Group & group);
+    void run(Slot & slot, Group & group);
+    void hold(Slot & slot, Group & group);
     [[nodiscard]] auto leaves(const Slot & slot) const -> bool;
     void stirAll(bool anyOnly);
 

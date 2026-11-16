@@ -198,7 +198,7 @@ void Tunnels::refresh(size_t index, const Balancer & balancer)
     }
 }
 
-void Tunnels::start(Slot & slot, const Group & group)
+void Tunnels::start(Slot & slot, Group & group)
 {
     slot.thread = {};
     slot.done = false;
@@ -219,7 +219,7 @@ auto Tunnels::leaves(const Slot & slot) const -> bool
     return cutting || (slot.any && !takesWork);
 }
 
-void Tunnels::run(Slot & slot, const Group & group)
+void Tunnels::run(Slot & slot, Group & group)
 {
     unsigned failures = 0;
     while (!stopping) {
@@ -237,7 +237,7 @@ void Tunnels::run(Slot & slot, const Group & group)
         }
         try {
             const auto since = std::chrono::steady_clock::now();
-            hold(slot);
+            hold(slot, group);
             // A tunnel that lasted was not a failure to open one.
             if (std::chrono::steady_clock::now() - since >= maxPause) {
                 failures = 0;
@@ -260,8 +260,15 @@ void Tunnels::run(Slot & slot, const Group & group)
 }
 
 // One tunnel, from opening it until it ended.
-void Tunnels::hold(Slot & slot)
+void Tunnels::hold(Slot & slot, Group & group)
 {
+    // One line when a balancer has all its tunnels and one when it loses the
+    // first, however many tunnels there are. The other set comes and goes
+    // with the builder's load and is left out.
+    const auto report = [&](std::string_view event) -> void {
+        logLine(LogLevel::info, {{"event", std::string(event)}, {"balancer", slot.target.host}, {"address", slot.target.address}});
+    };
+
     auto sock = open(slot.target, config.tls, slot.self, slot.stir);
     if (!sock) {
         return;
@@ -272,15 +279,24 @@ void Tunnels::hold(Slot & slot)
         throw nix::SysError("dup");
     }
     config.adopt(std::move(sock));
+    if (!slot.any && ++group.open == config.perSet && !group.reported.exchange(true)) {
+        report("tunnels_open");
+    }
     for (;;) {
         slot.stir.clear();
         if (leaves(slot)) {
             shutdown(watch.get(), SHUT_RDWR);
-            return;
+            break;
         }
         if (waitClosed(watch.get(), slot.stir) == End::closed) {
-            return;
+            if (!slot.any && group.reported.exchange(false)) {
+                report("tunnel_lost");
+            }
+            break;
         }
+    }
+    if (!slot.any) {
+        --group.open;
     }
 }
 
