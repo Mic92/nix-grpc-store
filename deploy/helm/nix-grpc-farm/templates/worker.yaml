@@ -319,7 +319,18 @@ spec:
           {{- end }}
       volumes:
         - name: nix
+          {{- if $w.store.storageClass }}
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                storageClassName: {{ $w.store.storageClass }}
+                resources:
+                  requests:
+                    storage: {{ required "store.size is required with store.storageClass" $w.store.size }}
+          {{- else }}
           emptyDir: {{- if $w.store.sizeLimit }} {sizeLimit: {{ $w.store.sizeLimit }}} {{- else }} {} {{- end }}
+          {{- end }}
         - name: spool
           emptyDir: {{- if $w.spool.sizeLimit }} {sizeLimit: {{ $w.spool.sizeLimit }}} {{- else }} {} {{- end }}
         - name: build

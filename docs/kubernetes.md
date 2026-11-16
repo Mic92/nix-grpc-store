@@ -161,6 +161,11 @@ taking builds. Both thresholds are measured against the node's disk,
 not per pod, so keep `ensureFree` well above `minFree`.
 `store.sizeLimit` is not a quota: going over it evicts the pod.
 
+With `store.storageClass` and `store.size`, `/nix` is a volume of its own
+(a generic ephemeral volume, created and deleted with the pod). Both
+thresholds then measure the store alone, a full store fails a build
+and does not evict the pod, and `store.sizeLimit` has no use.
+
 For nodes with a 500 GB disk and two workers each:
 
 ```yaml
