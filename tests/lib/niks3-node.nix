@@ -33,9 +33,9 @@ in
   };
   services.garage = {
     enable = true;
-    package = pkgs.garage;
+    package = pkgs.garage_2;
     settings = {
-      replication_mode = "none";
+      replication_factor = 1;
       rpc_bind_addr = "127.0.0.1:3901";
       rpc_secret = "5c1915fa04d0b6739675c61bf5907eb0fe3d9c69850c83820f51b4d25d13868c";
       s3_api = {
@@ -53,7 +53,7 @@ in
     after = [ "garage.service" ];
     before = [ "niks3.service" ];
     requiredBy = [ "niks3.service" ];
-    path = [ pkgs.garage ];
+    path = [ pkgs.garage_2 ];
     # Each step tolerates a rerun, so a restart of the unit stays harmless.
     script = ''
       for i in $(seq 60); do garage status && break; sleep 1; done
