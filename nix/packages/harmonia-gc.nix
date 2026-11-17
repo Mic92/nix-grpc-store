@@ -3,7 +3,9 @@
 {
   lib,
   fetchFromGitHub,
+  pkg-config,
   rustPlatform,
+  sqlite,
 }:
 let
   pin = lib.importJSON ./harmonia-gc.json;
@@ -17,6 +19,8 @@ rustPlatform.buildRustPackage {
     inherit (pin) rev hash;
   };
   inherit (pin) cargoHash;
+  nativeBuildInputs = [ pkg-config ];
+  buildInputs = [ sqlite ];
   cargoBuildFlags = [ "-p" "harmonia-store-gc" ];
   cargoTestFlags = [ "-p" "harmonia-store-gc" ];
   # Tests want a writable store and user namespaces.
