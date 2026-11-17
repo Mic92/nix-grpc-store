@@ -40,6 +40,10 @@
                 nix-expr = prev.nix-expr.overrideAttrs (old: {
                   buildInputs = old.buildInputs ++ [ pkgs.sqlite ];
                 });
+                # The git pack tests build their fixtures with zlib. nixpkgs' packaging lags.
+                nix-fetchers-tests = prev.nix-fetchers-tests.overrideAttrs (old: {
+                  buildInputs = old.buildInputs ++ [ pkgs.zlib ];
+                });
                 # nixpkgs' --gtest_filter replaces nix's default, which skips the root-only tests.
                 nix-util-tests = prev.nix-util-tests.overrideAttrs (old: {
                   excludedTestPatterns = old.excludedTestPatterns ++ [ "Root*" ];
