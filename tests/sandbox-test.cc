@@ -52,7 +52,7 @@ template<typename Addr>
 auto bindTo(const nix::AutoCloseFD & sock, const Addr & addr) -> bool
 {
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): see above.
-    return ::bind(sock.get(), reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) == 0;
+    return sock && ::bind(sock.get(), reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) == 0;
 }
 
 auto canListenUnix(const fs::path & path) -> bool
