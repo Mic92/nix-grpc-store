@@ -26,12 +26,17 @@ fn nix_daemon_restart_does_not_fail_the_next_rpc() {
         "nix-daemon",
         "accepted connection from pid .*nix-grpc-daemon",
     );
+    let main_pid = || {
+        query(
+            MACHINE,
+            &["systemctl", "show", "-P", "MainPID", "nix-daemon.service"],
+        )
+    };
+    let pid = main_pid();
     // SIGKILL, like a crashed container: no orderly close of the pooled connections.
     succeed(&["systemctl", "kill", "-s", "KILL", "nix-daemon.service"]);
-    wait_until_succeeds(
-        &["sh", "-c", "! systemctl is-active nix-daemon.service"],
-        30,
-    );
+    // Not "inactive": the gRPC daemons reconnect on their own and may socket-activate a new one first.
+    retry(30, "the killed nix-daemon is gone", || main_pid() != pid);
     succeed(&["systemctl", "start", "nix-daemon.socket"]);
     succeed(&["nix", "path-info", "--store", STORE, p]);
     write_file("/tmp/warm", "again");
