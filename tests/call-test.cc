@@ -22,19 +22,26 @@
 
 namespace {
 
-class OkService final : public nix::remote::NixRemote::Service
+// Answers only once the client gives up, so every call ends cancelled.
+class HoldingService final : public nix::remote::NixRemote::Service
 {
 public:
-    auto StoreInfo(grpc::ServerContext * /*ctx*/, const nix::remote::StoreInfoRequest * /*request*/,
+    std::atomic<bool> holding = false;
+
+    auto StoreInfo(grpc::ServerContext * ctx, const nix::remote::StoreInfoRequest * /*request*/,
                    nix::remote::StoreInfoReply * /*reply*/) -> grpc::Status override
     {
+        holding = true;
+        while (!ctx->IsCancelled()) {
+            std::this_thread::yield();
+        }
         return grpc::Status::OK;
     }
 };
 
 struct Fixture
 {
-    OkService service;
+    mutable HoldingService service;
     std::unique_ptr<grpc::Server> server;
     std::unique_ptr<nix::remote::NixRemote::Stub> stub;
 
@@ -96,26 +103,30 @@ void startingAfterInterruptThrows()
 }
 
 // Nix copies an interrupt callback under its lock and calls it outside, so
-// it can run after its Call unregistered it. Only a sanitizer sees the
-// difference.
+// it can run after its Call unregistered it. That breaks only for a call in
+// flight: TryCancel still holds the context's mutex when the next Call
+// reuses the stack slot.
 void interruptRacingTheEndOfACallIsHarmless()
 {
-    std::atomic<bool> stop = false;
-    std::thread interrupter([&stop] -> void {
-        while (!stop) {
-            nix::unix::triggerInterrupt();
+    Fixture const fix;
+    constexpr int calls = 2000;
+    std::atomic<int> left = calls;
+    std::jthread signals([&] -> void {
+        while (left > 0) {
+            if (fix.service.holding.exchange(false)) {
+                nix::unix::triggerInterrupt();
+            }
         }
     });
-    constexpr int calls = 20'000;
-    for (int i = 0; i < calls; i++) {
+    for (; left > 0; --left) {
         try {
-            nixgrpc::Call const call;
+            nixgrpc::Call call;
+            assert(fix.storeInfo(call).error_code() == grpc::StatusCode::CANCELLED);
         } catch (nix::Interrupted &) {
             nix::setInterrupted(false);
         }
     }
-    stop = true;
-    interrupter.join();
+    signals.join();
     nix::setInterrupted(false);
 }
 
