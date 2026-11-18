@@ -583,7 +583,7 @@ public:
                 bz2 += ".bz2";
                 bool const compressed = !nix::pathExists(plain);
                 auto const & path = compressed ? bz2 : plain;
-                auto const file = nix::openFileReadonly(path);
+                auto const file = nixcompat::openFileReadonly(path);
                 if (!file) {
                     auto const err = errno;
                     if (compressed && err == ENOENT) {

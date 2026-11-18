@@ -22,7 +22,7 @@
 
 #include <nix/store/globals.hh>
 #include <nix/store/path.hh>
-#include <nix/util/error.hh>
+#include <nix/util/error.hh> // NOLINT(misc-include-cleaner): which header has SysError differs per Nix version.
 #include <nix/util/serialise.hh>
 #include <nix/util/terminal.hh>
 #include <nix/util/unix-domain-socket.hh>

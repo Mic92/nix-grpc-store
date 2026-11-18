@@ -140,7 +140,7 @@ struct Listener
         } else {
             inet_pton(AF_INET, "127.0.0.1", &reinterpret_cast<sockaddr_in *>(&addr)->sin_addr);
         }
-        if (bind(sock.get(), reinterpret_cast<sockaddr *>(&addr), len) != 0 || listen(sock.get(), 4) != 0
+        if (!sock || bind(sock.get(), reinterpret_cast<sockaddr *>(&addr), len) != 0 || listen(sock.get(), 4) != 0
             || getsockname(sock.get(), reinterpret_cast<sockaddr *>(&addr), &len) != 0) {
             throw nix::SysError("listen");
         }
