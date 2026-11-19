@@ -183,13 +183,18 @@ let
     }
   '';
   slowExpr = pkgs.writeText "slow.nix" ''
-    { tag }:
+    { tag, unique ? false }:
     derivation {
       name = "slow-''${tag}";
       system = builtins.currentSystem;
       builder = "/bin/sh";
       # Inner sh so a test can pkill it to let the build succeed early.
-      args = [ "-c" "/bin/sh -c 'read -t 90 x < /dev/zero'; echo ''${tag} > $out" ];
+      args = [
+        "-c"
+        "/bin/sh -c 'read -t 90 x < /dev/zero'; ''${
+          if unique then "read tag < /proc/sys/kernel/random/uuid" else "tag=''${tag}"
+        }; echo $tag > $out"
+      ];
     }
   '';
 in
@@ -336,6 +341,7 @@ pkgs.testers.runNixOSTest {
         "NGS_OIDC_AUDIENCE": "${oidcAudience}",
         "NGS_SIGNING_PUBKEY": "${signingPublicKey}",
         "NGS_NIKS3_URL": "${niks3Url}",
+        "NGS_NIKS3_PUSH": "${lib.getExe niks3Pkgs.niks3} push --server-url ${niks3Url} --auth-token-path ${tokenFile}",
         "NGS_OFFER_URL": "${offerUrl}",
         "NGS_JOB_EXPR": "${jobExpr}",
         "NGS_DEP_EXPR": "${depExpr}",

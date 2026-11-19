@@ -623,6 +623,50 @@ in
     succeed(CLIENT, &["nix", "path-info", "--store", &envoy(), other.trim()]);
 }
 
+/// Two builds of a path that does not build reproducibly: the farm serves
+/// the one the cache published, also from the builder that lost.
+#[test]
+fn a_builder_serves_the_build_the_cache_published() {
+    farm_ready();
+    let slow = expr("SLOW");
+    let args = ["-f", &slow, "--argstr", "tag", "twice", "--arg", "unique", "true"];
+    let mut farm = vec!["systemd-run", "--unit", "twice", "nix", "build", "--store"];
+    let store = envoy();
+    farm.extend_from_slice(&[&store, "--eval-store", "auto"]);
+    farm.extend_from_slice(&args);
+    succeed(CLIENT, &farm);
+    wait_building();
+    let loser = building()[0];
+    let winner = if loser == WORKER1 { WORKER2 } else { WORKER1 };
+
+    // The same derivation, built and pushed on the other node behind the farm's back.
+    let mut inst = vec!["nix-instantiate"];
+    inst.extend_from_slice(&args[1..]);
+    let drv = succeed(CLIENT, &inst).trim().to_string();
+    let script = format!("nix-store --export $(nix-store -qR {drv}) > /tmp/shared/twice.closure");
+    succeed(CLIENT, &["sh", "-c", &script]);
+    succeed(winner, &["sh", "-c", "nix-store --import < /tmp/shared/twice.closure"]);
+    succeed(
+        winner,
+        &["systemd-run", "--unit", "twice-local", "nix-store", "--realise", &drv],
+    );
+    wait_until_succeeds(winner, BUILDER, 60);
+    run_t(winner, &["pkill", "-f", "read -t [9]0 x"], 60);
+    wait_until_succeeds(winner, &["sh", "-c", "! systemctl is-active twice-local"], 60);
+    let mut eval = vec!["nix", "eval", "--raw"];
+    eval.extend_from_slice(&args);
+    eval.push("outPath");
+    let out = succeed(CLIENT, &eval);
+    let push = format!("{} {out}", env("NGS_NIKS3_PUSH"));
+    succeed(winner, &["sh", "-c", &push]);
+
+    run_t(loser, &["pkill", "-f", "read -t [9]0 x"], 60);
+    wait_unit_done("twice", 120);
+    assert_unit_success("twice");
+    let hash = |w| succeed(w, &["nix-store", "--query", "--hash", &out]);
+    assert_eq!(hash(loser), hash(winner), "{} kept its own build", loser.0);
+}
+
 /// When niks3 can't take a build's outputs, the build fails with the upload
 /// error instead of being rebuilt on the other worker.
 #[test]
