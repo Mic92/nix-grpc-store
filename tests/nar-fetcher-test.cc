@@ -239,6 +239,26 @@ void failedFetchIsRetried()
     freshAfterFailure({grpc::StatusCode::UNAVAILABLE, "Stream removed (Socket closed)"}, true, anyUnavailable(), siblings);
 }
 
+// A path recorded twice before any fetch is asked for once.
+void rerecordedPathIsFetchedOnce()
+{
+    Fixture fix([](int, const auto & request, auto & writer) -> grpc::Status {
+        for (int i = 0; i < request.paths_size(); ++i) {
+            sendNar(writer, static_cast<uint32_t>(i), narOf(request.paths(i)));
+        }
+        return grpc::Status::OK;
+    });
+    auto fetcher = fix.fetcher();
+    fetcher->recordOrder({pathA()}, {});
+    fetcher->recordOrder({pathA(), pathB()}, {});
+
+    assert(fetch(*fetcher, pathA()) == narOf(std::string(pathA().to_string())));
+    assert(fetch(*fetcher, pathB()) == narOf(std::string(pathB().to_string())));
+    std::vector<std::vector<std::string>> const once{
+        {std::string(pathA().to_string()), std::string(pathB().to_string())}};
+    assert(fix.service.requests() == once);
+}
+
 // Each unannounced path gets a session; finished ones must not pile up.
 void finishedSessionsGo()
 {
@@ -267,6 +287,7 @@ try {
     connectFailureIsRetried();
     midStreamBreakRefetchesUntouchedPaths();
     nonRetryableFailsAtOnce();
+    rerecordedPathIsFetchedOnce();
     finishedSessionsGo();
     return 0;
 } catch (...) {
