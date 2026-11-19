@@ -10,6 +10,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -148,7 +149,7 @@ void testPush(Suite & tst, nixgrpc::PushProcess & push)
 void testCache(Suite & tst, const std::string & base, const std::string & mock)
 {
     nixgrpc::Cache off(nixgrpc::Niks3Config{});
-    tst.check(!off.hasRemote() && off.present({"a.narinfo"}).empty(), "no niks3: present is empty, publish is a no-op");
+    tst.check(!off.hasRemote() && off.holds({"a.narinfo"}).empty(), "no niks3: the cache holds nothing, publish is a no-op");
     off.publish({"/nix/store/whatever"});
 
     auto const tokenFile = std::filesystem::path(nix::createTempDir()).string() + "/token";
@@ -157,19 +158,19 @@ void testCache(Suite & tst, const std::string & base, const std::string & mock)
         {.url = base + "/", .tokenFile = tokenFile, .pushArgv = {"python3", mock, "push", "--stdin", "--server-url", base}});
     bool denied = false;
     try {
-        (void) cache.present({"x.narinfo"});
+        (void) cache.holds({"x.narinfo"});
     } catch (nix::Error &) {
         denied = true;
     }
-    tst.check(denied, "present with a bad token throws");
+    tst.check(denied, "asking with a bad token throws");
     // Projected volumes swap the file, giving it a new inode.
     nix::writeFile(tokenFile + ".new", "testtoken");
     std::filesystem::rename(tokenFile + ".new", tokenFile);
-    tst.check(cache.present({"aaaa.narinfo"}).empty(), "token rotation picked up; unknown key absent");
+    tst.check(cache.holds({"aaaa.narinfo"}).empty(), "token rotation picked up; unknown key absent");
     cache.publish({"/nix/store/aaaa-foo", "/nix/store/bbbb-bar"});
-    auto const have = cache.present({"aaaa.narinfo", "bbbb.narinfo", "cccc.narinfo"});
-    tst.check(have.size() == 2 && have.contains("aaaa.narinfo") && !have.contains("cccc.narinfo"), "published paths are present");
-    tst.check(cache.present({}).empty(), "empty query, no request");
+    auto const have = cache.holds({"aaaa.narinfo", "bbbb.narinfo", "cccc.narinfo"});
+    tst.check(have == std::unordered_set<std::string>{"aaaa.narinfo", "bbbb.narinfo"}, "published paths are held");
+    tst.check(cache.holds({}).empty(), "empty query, no request");
 }
 
 } // namespace

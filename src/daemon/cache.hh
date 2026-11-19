@@ -66,23 +66,24 @@ public:
         return remote ? &remote->client : nullptr;
     }
 
-    // Subset of `keys` ("<hash>.narinfo") the binary cache has. Empty without niks3.
-    [[nodiscard]] auto present(const std::vector<std::string> & keys) -> std::unordered_set<std::string>
+    // Subset of `keys` ("<hash>.narinfo") the binary cache can serve, pushed
+    // or as the dependency of a pushed path. Empty without niks3.
+    [[nodiscard]] auto holds(const std::vector<std::string> & keys) -> std::unordered_set<std::string>
     {
         std::unordered_set<std::string> res;
         if (!remote || keys.empty()) {
             return res;
         }
-        auto call = remote->client.post("/api/objects/present", nlohmann::json{{"keys", keys}});
+        auto call = remote->client.post("/api/objects/exists", nlohmann::json{{"keys", keys}});
         auto status = call->perform();
         if (!http::ok(status)) {
-            throw nix::Error("niks3 present: HTTP %d: %s", status, call->body());
+            throw nix::Error("niks3 objects/exists: HTTP %d: %s", status, call->body());
         }
         auto reply = nlohmann::json::parse(call->body(), nullptr, /*allow_exceptions=*/false);
-        auto const found = reply.is_object() ? reply.find("present") : reply.end();
+        auto const found = reply.is_object() ? reply.find("exists") : reply.end();
         // Go encodes an empty slice as null.
         if (found == reply.end() || !(found->is_array() || found->is_null())) {
-            throw nix::Error("niks3 present: malformed reply: %s", call->body());
+            throw nix::Error("niks3 objects/exists: malformed reply: %s", call->body());
         }
         for (const auto & key : *found) {
             if (key.is_string()) {
