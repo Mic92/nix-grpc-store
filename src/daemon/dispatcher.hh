@@ -76,7 +76,8 @@ public:
 
     using ClientPtr = std::shared_ptr<Client>;
 
-    auto connectClient(ClientSend send, std::function<void()> abort) -> ClientPtr;
+    // Clients of one `owner` share its place in the queue.
+    auto connectClient(ClientSend send, std::function<void()> abort, std::string_view owner = {}) -> ClientPtr;
     // May hand the batch to the lookup pool; `client` is kept alive until applied.
     void clientMsgs(const ClientPtr & client, const nix::remote::ClientMsgs & msgs);
     void clientGone(const ClientPtr & client);

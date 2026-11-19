@@ -623,7 +623,12 @@ void testWaitQueueMatchesModel()
     std::mt19937 rng(7); // NOLINT(cert-msc32-c,cert-msc51-cpp,bugprone-random-generator-seed): reproducible
     auto const upTo = [&](uint32_t max) -> uint32_t { return std::uniform_int_distribution<uint32_t>(0, max)(rng); };
     WaitQueue queue;
-    Served served;
+    std::map<ClientId, uint32_t> served;
+    std::map<OwnerId, uint32_t> ownerServed;
+    auto const shareOf = [&](ClientId client) -> Share {
+        auto const owner = OwnerId{client % 3};
+        return {.owner = owner, .ownerServed = ownerServed[owner], .served = served[client]};
+    };
     std::map<DrvId, Queued> model;
     for (int step = 0; step < 20000; step++) {
         auto const drv = upTo(40);
@@ -636,7 +641,7 @@ void testWaitQueueMatchesModel()
                 clients.insert(upTo(5));
             }
             auto const key = static_cast<double>(upTo(8));
-            queue.set(drv, key, "", {clients.begin(), clients.end()}, served);
+            queue.set(drv, key, "", {clients.begin(), clients.end()}, shareOf);
             model[drv] = {.key = key, .clients = clients};
             break;
         }
@@ -645,35 +650,76 @@ void testWaitQueueMatchesModel()
             queue.erase(drv, "");
             model.erase(drv);
             break;
-        case 4: {
-            auto const count = upTo(3);
-            served[client] = count;
-            queue.serving(client, count);
+        case 4:
+            served[client] = upTo(3);
+            ownerServed[client % 3] = upTo(3);
+            queue.serving(client, shareOf(client));
             break;
-        }
         default:
             queue.forget(client);
             for (auto & [id, entry] : model) {
                 entry.clients.erase(client);
             }
         }
-        std::optional<std::tuple<uint32_t, double, ClientId, DrvId>> first;
+        // A client stands where its first drv does. An owner goes by its
+        // clients' smallest key and sends its first client.
+        std::map<OwnerId, std::tuple<uint32_t, double, ClientId, DrvId>> firstOf;
+        std::map<OwnerId, double> keyOf;
         for (const auto & [id, entry] : model) {
             for (auto const who : entry.clients) {
                 auto const rank = std::tuple(served[who], entry.key, who, id);
-                // A client's place is that of its first drv.
-                if (!first || rank < *first) {
-                    first = rank;
-                }
+                auto const [iter, fresh] = firstOf.try_emplace(who % 3, rank);
+                iter->second = std::min(iter->second, rank);
+                auto const smallest = keyOf.try_emplace(who % 3, entry.key).first;
+                smallest->second = std::min(smallest->second, entry.key);
+            }
+        }
+        std::optional<std::tuple<uint32_t, double, OwnerId>> first;
+        for (const auto & [owner, key] : keyOf) {
+            auto const mine = std::tuple(ownerServed[owner], key, owner);
+            if (!first || mine < *first) {
+                first = mine;
             }
         }
         assert(queue.size() == model.size());
         assert(queue.top().has_value() == first.has_value());
         if (first) {
             assert(queue.topKey() == WaitQueue::Rank(std::get<0>(*first), std::get<1>(*first)));
-            assert(queue.top() == std::get<3>(*first));
+            assert(queue.top() == std::get<3>(firstOf.at(std::get<2>(*first))));
         }
     }
+}
+
+// Three builds of one owner get together what one build of another gets.
+void testOwnersShareTheirPlace()
+{
+    Core shard;
+    std::vector<Assign> out;
+    for (ClientId client = 1; client <= 3; client++) {
+        shard.clientOwner(client, "ci");
+    }
+    shard.clientOwner(4, "dev");
+    for (ClientId client = 1; client <= 4; client++) {
+        for (auto const * name : {"a", "b", "c", "d"}) {
+            shard.want(client, {.drvPath = std::to_string(client) + name, .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+        }
+    }
+    hello(shard, "w", 4);
+    shard.dispatch(out);
+    assert(out.size() == 4);
+    assert(std::ranges::count_if(out, [](const Assign & asg) -> bool { return asg.clients == std::vector<ClientId>{4}; }) == 2);
+
+    // The owner's count ends with its clients.
+    std::vector<std::pair<DrvId, WorkerId>> revokes;
+    for (ClientId client = 1; client <= 3; client++) {
+        shard.clientGone(client, revokes);
+    }
+    shard.clientOwner(5, "ci");
+    shard.want(5, {.drvPath = "5a", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.done(lease(shard, 0, "4a"), {});
+    out.clear();
+    shard.dispatch(out);
+    assert(out.size() == 1 && shard.entry(out[0].drv)->drvPath == "5a");
 }
 
 } // namespace
@@ -683,6 +729,7 @@ auto main() -> int
 try {
     testLeastServedClientFirst();
     testWaitQueueMatchesModel();
+    testOwnersShareTheirPlace();
     testHeapAgainstMap();
     testFreeIndex();
     testAssignAndDedup();

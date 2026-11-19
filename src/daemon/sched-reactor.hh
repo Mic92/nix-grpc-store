@@ -204,11 +204,11 @@ class ScheduleReactor final
     : public SchedReactorBase<nix::remote::ClientMsgs, nix::remote::SchedMsg, nix::remote::SchedMsgs>
 {
 public:
-    ScheduleReactor(grpc::CallbackServerContext * ctx, Dispatcher & disp, IdleTracker & idle)
+    ScheduleReactor(grpc::CallbackServerContext * ctx, Dispatcher & disp, IdleTracker & idle, std::string_view owner = {})
         : SchedReactorBase(ctx)
         , active(idle)
         , disp(disp)
-        , client(disp.connectClient(sender(disp), [ctx] -> void { ctx->TryCancel(); }))
+        , client(disp.connectClient(sender(disp), [ctx] -> void { ctx->TryCancel(); }, owner))
     {
         start();
     }

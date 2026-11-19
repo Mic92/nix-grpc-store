@@ -180,12 +180,23 @@ public:
 // How many placed drvs each client waits for.
 using Served = absl::flat_hash_map<ClientId, uint32_t>;
 
-// The wait queue of one system. The next drv is taken from the client that
-// waits for the fewest placed ones, so a client with a long queue cannot keep
-// another one waiting behind it. A client's own drvs go by key. A drv several
-// clients wait for is queued with each. Counts its entries by required
-// feature set, so a dispatch pass can tell when everything left is of a set it
-// already found no worker for.
+// Clients of one owner share its place in line.
+using OwnerId = uint64_t;
+
+struct Share
+{
+    OwnerId owner = 0;
+    uint32_t ownerServed = 0; // placed drvs the owner's clients wait for
+    uint32_t served = 0;      // and this client
+};
+
+// The wait queue of one system. The next drv is taken from the owner whose
+// clients wait for the fewest placed ones, and there from the client that
+// waits for the fewest, so a long queue cannot keep another one waiting
+// behind it. A client's own drvs go by key. A drv several clients wait for is
+// queued with each. Counts its entries by required feature set, so a dispatch
+// pass can tell when everything left is of a set it already found no worker
+// for.
 //
 // A drv is not searched for when it leaves: its items lose their stamp and are
 // dropped when they reach the front of a client's heap.
@@ -201,18 +212,31 @@ class WaitQueue
             return std::pair(key, drv) > std::pair(other.key, other.drv);
         }
     };
+    // Members of `Turn` are (served, key of the first item, id).
+    template<typename Id>
+    using Turn = std::set<std::tuple<uint32_t, double, Id>>;
+    using Listed = std::optional<std::pair<uint32_t, double>>;
     struct Line
     {
+        OwnerId owner = 0;
         uint32_t served = 0;
         std::vector<Item> heap; // smallest key first
-        // As listed in `turn`, if it is.
-        std::optional<std::pair<uint32_t, double>> listed;
+        Listed listed;          // as in its group's turn
+    };
+    struct Group
+    {
+        uint32_t served = 0;
+        Turn<ClientId> turn; // its clients with queued drvs
+        // Their first keys. The smallest is the owner's: one that depended
+        // on which client is first could be listed too late by a stale item.
+        std::set<std::pair<double, ClientId>> keys;
+        Listed listed; // as in `turn`
     };
     absl::flat_hash_map<ClientId, Line> lines;
-    // (served, key of the client's first item, client). The first client's
-    // first item is always a queued drv; others may be stale, which can only
-    // list a client too early.
-    std::set<std::tuple<uint32_t, double, ClientId>> turn;
+    absl::flat_hash_map<OwnerId, Group> groups;
+    // The first owner's first client's first item is always a queued drv.
+    // Others may be stale, which can only list them too early.
+    Turn<OwnerId> turn;
     std::vector<uint64_t> stamps; // by drv; 0 when not queued
     uint64_t lastStamp = 0;
     size_t queued = 0;
@@ -223,44 +247,85 @@ class WaitQueue
         return stamps.at(item.drv) != item.stamp;
     }
 
-    void relist(ClientId client, Line & line)
+    template<typename Id>
+    static void list(Turn<Id> & into, Id ident, Listed & listed, Listed now)
     {
-        auto const now = line.heap.empty() ? std::nullopt : std::optional(std::pair(line.served, line.heap.front().key));
-        if (line.listed == now) {
+        if (listed == now) {
             return;
         }
-        if (line.listed) {
-            turn.erase({line.listed->first, line.listed->second, client});
+        if (listed) {
+            into.erase({listed->first, listed->second, ident});
         }
         if (now) {
-            turn.emplace(now->first, now->second, client);
+            into.emplace(now->first, now->second, ident);
         }
-        line.listed = now;
+        listed = now;
     }
 
-    // Drops stale items until the first client's first item is a queued drv.
+    void relist(OwnerId owner, Group & group)
+    {
+        list(turn, owner, group.listed,
+             group.keys.empty() ? std::nullopt : Listed(std::pair(group.served, group.keys.begin()->first)));
+    }
+
+    void relist(ClientId client, Line & line)
+    {
+        auto & group = groups.at(line.owner);
+        if (line.listed) {
+            group.keys.erase({line.listed->second, client});
+        }
+        list(group.turn, client, line.listed,
+             line.heap.empty() ? std::nullopt : Listed(std::pair(line.served, line.heap.front().key)));
+        if (line.listed) {
+            group.keys.emplace(line.listed->second, client);
+        }
+        relist(line.owner, group);
+    }
+
+    // A line whose heap ran empty.
+    void drop(absl::flat_hash_map<ClientId, Line>::iterator iter)
+    {
+        relist(iter->first, iter->second);
+        if (auto const group = groups.find(iter->second.owner); group->second.turn.empty()) {
+            groups.erase(group);
+        }
+        lines.erase(iter);
+    }
+
+    // Drops the stale items at the front of a client's heap. True if any.
+    auto prune(ClientId client) -> bool
+    {
+        auto const iter = lines.find(client);
+        auto & line = iter->second;
+        if (!stale(line.heap.front())) {
+            return false;
+        }
+        while (!line.heap.empty() && stale(line.heap.front())) {
+            std::ranges::pop_heap(line.heap, std::greater{});
+            line.heap.pop_back();
+        }
+        if (line.heap.empty()) {
+            drop(iter);
+        } else {
+            relist(client, line);
+        }
+        return true;
+    }
+
+    // Until the first owner's key and its first client's first item are
+    // those of queued drvs.
     void settle()
     {
         while (!turn.empty()) {
-            auto const client = std::get<2>(*turn.begin());
-            auto const iter = lines.find(client);
-            auto & line = iter->second;
-            if (!stale(line.heap.front())) {
+            const auto & group = groups.at(std::get<2>(*turn.begin()));
+            if (!prune(group.keys.begin()->second) && !prune(std::get<2>(*group.turn.begin()))) {
                 return;
-            }
-            while (!line.heap.empty() && stale(line.heap.front())) {
-                std::ranges::pop_heap(line.heap, std::greater{});
-                line.heap.pop_back();
-            }
-            relist(client, line);
-            if (line.heap.empty()) {
-                lines.erase(iter);
             }
         }
     }
 
 public:
-    // Fewest placed drvs first, then the key.
+    // Where the first owner stands: its placed drvs, then its smallest key.
     using Rank = std::pair<uint32_t, double>;
 
     [[nodiscard]] auto size() const -> size_t
@@ -273,7 +338,8 @@ public:
         if (turn.empty()) {
             return std::nullopt;
         }
-        return lines.at(std::get<2>(*turn.begin())).heap.front().drv;
+        auto const client = std::get<2>(*groups.at(std::get<2>(*turn.begin())).turn.begin());
+        return lines.at(client).heap.front().drv;
     }
 
     [[nodiscard]] auto topKey() const -> std::optional<Rank>
@@ -290,7 +356,9 @@ public:
         return iter == perFeatures.end() ? 0 : iter->second;
     }
 
-    void set(DrvId drv, double key, const std::string & features, const std::vector<ClientId> & clients, const Served & served)
+    // `shareOf` is asked about clients and owners with nothing queued here.
+    template<typename F>
+    void set(DrvId drv, double key, const std::string & features, const std::vector<ClientId> & clients, const F & shareOf)
     {
         if (clients.empty()) {
             erase(drv, features);
@@ -308,8 +376,12 @@ public:
             auto const [iter, fresh] = lines.try_emplace(client);
             auto & line = iter->second;
             if (fresh) {
-                auto const count = served.find(client);
-                line.served = count == served.end() ? 0 : count->second;
+                const Share share = shareOf(client);
+                line.owner = share.owner;
+                line.served = share.served;
+                if (auto const [group, added] = groups.try_emplace(share.owner); added) {
+                    group->second.served = share.ownerServed;
+                }
             }
             line.heap.push_back({.key = key, .drv = drv, .stamp = lastStamp});
             std::ranges::push_heap(line.heap, std::greater{});
@@ -331,16 +403,18 @@ public:
         settle();
     }
 
-    // The client now waits for `served` placed drvs.
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): who, then how many.
-    void serving(ClientId client, uint32_t served)
+    // The client, and its owner's clients together, now wait for this many
+    // placed drvs.
+    void serving(ClientId client, const Share & share)
     {
-        auto const iter = lines.find(client);
-        if (iter == lines.end()) {
-            return;
+        if (auto const group = groups.find(share.owner); group != groups.end()) {
+            group->second.served = share.ownerServed;
+            relist(share.owner, group->second);
         }
-        iter->second.served = served;
-        relist(client, iter->second);
+        if (auto const iter = lines.find(client); iter != lines.end()) {
+            iter->second.served = share.served;
+            relist(client, iter->second);
+        }
         settle();
     }
 
@@ -351,8 +425,7 @@ public:
             return;
         }
         iter->second.heap.clear();
-        relist(client, iter->second);
-        lines.erase(iter);
+        drop(iter);
         settle();
     }
 };
@@ -699,21 +772,41 @@ public:
         return slot->worker;
     }
 
-    void clientGone(ClientId client, std::vector<std::pair<DrvId, WorkerId>> & revokes)
+    // Before the client's first want.
+    void clientOwner(ClientId client, std::string_view name)
     {
-        auto const iter = follows.find(client);
-        if (iter == follows.end()) {
+        if (ownerOf.contains(client)) {
             return;
         }
-        auto const drvs = std::move(iter->second);
-        follows.erase(iter);
-        for (auto const drv : drvs) {
-            if (auto wid = cancel(client, drv)) {
-                revokes.emplace_back(drv, *wid);
+        auto const [iter, fresh] = ownerIds.try_emplace(std::string(name));
+        if (fresh) {
+            iter->second = namedOwner | ++lastOwner;
+            owners.emplace(iter->second, Owner{.name = iter->first});
+        }
+        owners.at(iter->second).clients++;
+        ownerOf.emplace(client, iter->second);
+    }
+
+    void clientGone(ClientId client, std::vector<std::pair<DrvId, WorkerId>> & revokes)
+    {
+        if (auto const iter = follows.find(client); iter != follows.end()) {
+            auto const drvs = std::move(iter->second);
+            follows.erase(iter);
+            for (auto const drv : drvs) {
+                if (auto wid = cancel(client, drv)) {
+                    revokes.emplace_back(drv, *wid);
+                }
+            }
+            for (auto & [name, state] : systems) {
+                state.queue.forget(client);
             }
         }
-        for (auto & [name, state] : systems) {
-            state.queue.forget(client);
+        if (auto const iter = ownerOf.find(client); iter != ownerOf.end()) {
+            if (auto const owner = owners.find(iter->second); --owner->second.clients == 0) {
+                ownerIds.erase(owner->second.name);
+                owners.erase(owner);
+            }
+            ownerOf.erase(iter);
         }
     }
 
@@ -1100,20 +1193,48 @@ private:
     PathMap<std::pair<WorkerId, uint64_t>> lastBuilder;
     uint64_t lastAssignId = 0;
     Served served;
+    // An owner is a certificate name or token subject. A client without one
+    // stands for itself, under its own id.
+    struct Owner
+    {
+        std::string name;
+        uint32_t clients = 0;
+        uint32_t served = 0;
+    };
+    static constexpr OwnerId namedOwner = OwnerId{1} << 63U; // apart from client ids
+    absl::flat_hash_map<std::string, OwnerId> ownerIds;
+    absl::flat_hash_map<OwnerId, Owner> owners;
+    absl::flat_hash_map<ClientId, OwnerId> ownerOf;
+    uint64_t lastOwner = 0;
+
+    [[nodiscard]] auto shareOf(ClientId client) const -> Share
+    {
+        auto const mine = served.find(client);
+        auto const own = mine == served.end() ? 0 : mine->second;
+        auto const owner = ownerOf.find(client);
+        if (owner == ownerOf.end()) {
+            return {.owner = client, .ownerServed = own, .served = own};
+        }
+        return {.owner = owner->second, .ownerServed = owners.at(owner->second).served, .served = own};
+    }
 
     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): who, then +1 or -1.
     void serve(ClientId client, int delta)
     {
+        auto const add = [delta](uint32_t & count) -> void {
+            count = static_cast<uint32_t>(static_cast<int64_t>(count) + delta);
+        };
         auto const iter = served.try_emplace(client).first;
-        auto const before = iter->second;
-        auto const after = static_cast<uint32_t>(static_cast<int64_t>(before) + delta);
-        for (auto & [name, state] : systems) {
-            state.queue.serving(client, after);
-        }
-        if (after == 0) {
+        add(iter->second);
+        if (iter->second == 0) {
             served.erase(iter);
-        } else {
-            iter->second = after;
+        }
+        if (auto const owner = ownerOf.find(client); owner != ownerOf.end()) {
+            add(owners.at(owner->second).served);
+        }
+        auto const share = shareOf(client);
+        for (auto & [name, state] : systems) {
+            state.queue.serving(client, share);
         }
     }
 
@@ -1192,7 +1313,8 @@ private:
     void enqueue(DrvId drv)
     {
         if (const auto & slot = entries.at(drv)) {
-            sys(slot->system).queue.set(drv, prio(*slot), slot->featureKey, slot->followers, served);
+            sys(slot->system).queue.set(drv, prio(*slot), slot->featureKey, slot->followers,
+                                        [this](ClientId client) -> Share { return shareOf(client); });
         }
     }
 

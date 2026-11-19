@@ -84,7 +84,7 @@ auto SchedulerService::Schedule(grpc::CallbackServerContext * context)
     if (auto const status = auth->authorize(caller, "Schedule", Role::write); !status.ok()) {
         return new RejectReactor<ClientMsgs, SchedMsgs>(status); // NOLINT(cppcoreguidelines-owning-memory)
     }
-    return new ScheduleReactor(context, *dispatcher, *idle); // NOLINT(cppcoreguidelines-owning-memory)
+    return new ScheduleReactor(context, *dispatcher, *idle, caller.name); // NOLINT(cppcoreguidelines-owning-memory)
 }
 
 auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)

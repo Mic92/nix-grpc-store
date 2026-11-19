@@ -537,7 +537,7 @@ void Dispatcher::placeabilityChangedLocked()
 
 // ------------------------------------------------------------------ clients
 
-auto Dispatcher::connectClient(ClientSend send, std::function<void()> abort) -> ClientPtr
+auto Dispatcher::connectClient(ClientSend send, std::function<void()> abort, std::string_view owner) -> ClientPtr
 {
     metrics.schedClients(1);
     auto client = std::make_shared<Client>();
@@ -547,6 +547,9 @@ auto Dispatcher::connectClient(ClientSend send, std::function<void()> abort) -> 
     // Known from the start, so restarting() reaches clients that only got Cached so far.
     const Lock lock(*this);
     clients.emplace(client->id, client->send);
+    if (!owner.empty()) {
+        core.clientOwner(client->id, owner);
+    }
     return client;
 }
 

@@ -31,9 +31,14 @@ What happens on a build:
 * The client opens one connection to the scheduler and lists the
   derivations it wants. For each one the scheduler answers *cached*
   (outputs are already in the binary cache), *go to builder X*, or *no
-  builder can take this* (wrong system or missing feature). Derivations
-  on the longest chain go first, and among builders with a free slot
-  the one that already has the inputs wins.
+  builder can take this* (wrong system or missing feature). Among
+  builders with a free slot the one that already has the inputs wins.
+* When more is asked for than the builders have slots, a free slot goes
+  to the user with the fewest builds running, and among that user's
+  `nix build` runs to the one with the fewest. A user is a certificate
+  name or a token's subject. Someone who queues a whole system rebuild
+  therefore does not hold up a colleague's three derivations. Within
+  one run, derivations on the longest chain go first.
 * Each builder keeps a connection to the scheduler open that says which
   system and features it offers and how many builds it takes. The
   scheduler tells it which derivation to expect before the client shows
