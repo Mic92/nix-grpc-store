@@ -166,14 +166,6 @@ private:
     // The live session of each worker. A stale one, replaced by a re-Hello, is not here.
     std::unordered_map<sched::WorkerId, Worker *> workers ABSL_GUARDED_BY(mutex);
     bool lettingGo ABSL_GUARDED_BY(mutex) = false;
-    // Assigned drvs whose last follower left. Revoked unless one is back in time.
-    struct Orphan
-    {
-        sched::DrvId drv;
-        uint64_t assignId;
-        double dueMs;
-    };
-    std::vector<Orphan> orphans ABSL_GUARDED_BY(mutex);
     std::optional<double> statsAtMs ABSL_GUARDED_BY(mutex);
     std::map<sched::Core::StatsKey, std::vector<prometheus::Gauge *>> statGauges ABSL_GUARDED_BY(mutex);
     std::atomic<sched::ClientId> nextClient{1};
@@ -219,7 +211,6 @@ private:
     // Per-system gauges. O(entries), so at most once a second unless forced.
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void exportStats(bool force);
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOn(sched::WorkerId wid, const std::string & drvPath);
-    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOrphans();
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void tickLocked();
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void placeabilityChangedLocked();
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void sendToFollowers(sched::DrvId drv, const nix::remote::SchedMsg & msg);

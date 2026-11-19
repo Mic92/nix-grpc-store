@@ -148,19 +148,57 @@ void testPriority()
     assert(out.size() == 2 && shard.entry(out[1].drv)->drvPath == "high.drv");
 }
 
-void testWorkerGoneRequeues()
+using Revokes = std::vector<std::pair<WorkerId, std::string>>;
+
+// A worker whose session broke may still be building. Its drv is not started
+// a second time unless it stays away, returns without it, or a client says
+// the worker is unreachable.
+void testWorkerGoneHolds()
 {
-    Core shard;
-    std::vector<Assign> out;
-    auto const w0 = hello(shard, "w0", 1);
-    shard.want(1, {.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
-    shard.dispatch(out);
-    assert(out.size() == 1);
-    shard.workerGone(w0);
-    assert(shard.queued() == 1);
-    auto const w1 = hello(shard, "w1", 1);
-    shard.dispatch(out);
-    assert(out.size() == 2 && out[1].worker == w1 && out[1].clients.size() == 1);
+    const Core::WantInfo drv{.drvPath = "a.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0};
+    Revokes revokes;
+    auto const placedOnW0 = [&](Core & shard, std::vector<Assign> & out) -> WorkerId {
+        auto const w0 = hello(shard, "w0", 1);
+        shard.want(1, drv, 0);
+        shard.want(2, drv, 0);
+        shard.dispatch(out);
+        hello(shard, "w1", 1);
+        shard.workerGone(w0, 0);
+        shard.dispatch(out);
+        assert(out.size() == 1 && shard.queued() == 0);
+        return w0;
+    };
+    {
+        Core shard;
+        std::vector<Assign> out;
+        placedOnW0(shard, out);
+        std::vector<Core::Superseded> sup;
+        shard.hello({.addr = "w0", .systems = {"x"}, .features = {}, .maxJobs = 1, .running = {{"a.drv", out[0].assignId}}}, sup);
+        assert(!shard.expire(Core::holdMs, revokes) && shard.queued() == 0);
+    }
+    {
+        Core shard;
+        std::vector<Assign> out;
+        placedOnW0(shard, out);
+        hello(shard, "w0", 1);
+        assert(shard.queued() == 1);
+    }
+    {
+        Core shard;
+        std::vector<Assign> out;
+        placedOnW0(shard, out);
+        assert(!shard.expire(Core::holdMs - 1, revokes) && shard.queued() == 0);
+        assert(shard.expire(Core::holdMs, revokes) && revokes.empty());
+        shard.dispatch(out);
+        assert(out.size() == 2 && out[1].worker != out[0].worker && out[1].clients.size() == 2);
+    }
+    {
+        Core shard;
+        std::vector<Assign> out;
+        auto const w0 = placedOnW0(shard, out);
+        assert(shard.refuse(2, "a.drv", out[0].assignId) == w0);
+        assert(shard.queued() == 1);
+    }
 }
 
 void testHelloReconciles()
@@ -218,9 +256,15 @@ void testCancelAndClientGone()
     shard.want(1, {.drvPath = "b.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
     auto const w0 = hello(shard, "w0", 1);
     shard.dispatch(out);
-    std::vector<std::pair<DrvId, WorkerId>> revokes;
-    shard.clientGone(1, revokes);
-    assert(revokes.size() == 1 && revokes[0].second == w0);
+    // The build is kept for a client that left, counted from its last leave.
+    shard.clientGone(1, 0);
+    shard.want(1, {.drvPath = "b.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    shard.clientGone(1, 30);
+    Revokes revokes;
+    shard.expire(Core::holdMs + 29, revokes);
+    assert(revokes.empty());
+    shard.expire(Core::holdMs + 30, revokes);
+    assert(revokes.size() == 1 && revokes[0].first == w0);
     assert(!shard.cancel(9, "nope.drv"));
 }
 
@@ -387,7 +431,7 @@ void testPlaceabilityFlips()
     shard.placeabilityChanges(changed);
     assert(changed.size() == 1 && !shard.entry(res.drv)->unplaceable);
     changed.clear();
-    shard.workerGone(kvm);
+    shard.workerGone(kvm, 0);
     shard.placeabilityChanges(changed);
     assert(changed.size() == 1 && shard.entry(res.drv)->unplaceable);
 }
@@ -541,7 +585,9 @@ void testNoSlotsRunsNothing()
     shard.giveBack(lease(shard, w0, "a.drv"), GaveBack::drv);
     shard.dispatch(out);
     assert(out.size() == 2 && out[1].worker == w0);
-    shard.workerGone(w0);
+    shard.workerGone(w0, 0);
+    Revokes revokes;
+    shard.expire(Core::holdMs, revokes);
     assert(!shard.placeable(res.drv));
     std::vector<DrvId> changed;
     shard.placeabilityChanges(changed);
@@ -554,8 +600,8 @@ void testStaleDoneAndUnknown()
     auto const w0 = hello(shard, "w0", 1);
     shard.done(lease(shard, w0, "never.drv"), {});
     shard.done(lease(shard, w0, "never.drv"), {});
-    shard.workerGone(w0);
-    shard.workerGone(w0);
+    shard.workerGone(w0, 0);
+    shard.workerGone(w0, 0);
     hello(shard, "w0", 1);
     hello(shard, "w0", 1); // duplicate hello
     assert(shard.workersUp() == 1);
@@ -710,9 +756,8 @@ void testOwnersShareTheirPlace()
     assert(std::ranges::count_if(out, [](const Assign & asg) -> bool { return asg.clients == std::vector<ClientId>{4}; }) == 2);
 
     // The owner's count ends with its clients.
-    std::vector<std::pair<DrvId, WorkerId>> revokes;
     for (ClientId client = 1; client <= 3; client++) {
-        shard.clientGone(client, revokes);
+        shard.clientGone(client, 0);
     }
     shard.clientOwner(5, "ci");
     shard.want(5, {.drvPath = "5a", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
@@ -735,7 +780,7 @@ try {
     testAssignAndDedup();
     testMostFreeAndLocality();
     testPriority();
-    testWorkerGoneRequeues();
+    testWorkerGoneHolds();
     testHelloReconciles();
     testHelloSupersedes();
     testCancelAndClientGone();
