@@ -11,6 +11,7 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <map>
@@ -570,6 +571,7 @@ struct Entry
     double enqMs = 0;
     double cpHint = 0;
     bool unplaceable = false; // as last told to the followers
+    double holdDueMs = 0;     // when its latest hold ends
     std::vector<WorkerId> givers; // could not run it, latest last
 };
 
@@ -745,11 +747,15 @@ public:
             return std::nullopt;
         }
         const auto & slot = entries.at(*found);
-        if (!slot || slot->worker == noWorker || slot->assignId != assignId
-            || slot->followers != std::vector<ClientId>{client}) {
+        if (!slot || slot->worker == noWorker || slot->assignId != assignId) {
             return std::nullopt;
         }
         auto const wid = slot->worker;
+        // Other followers may be building there, unless the worker is gone.
+        auto const alone = slot->followers == std::vector<ClientId>{client};
+        if (!alone && (workers.at(wid).up || !std::ranges::contains(slot->followers, client))) {
+            return std::nullopt;
+        }
         giveBack({.worker = wid, .drvPath = drvPath, .assignId = assignId}, GaveBack::drv);
         return wid;
     }
@@ -807,14 +813,16 @@ public:
         ownerOf.emplace(client, iter->second);
     }
 
-    void clientGone(ClientId client, std::vector<std::pair<DrvId, WorkerId>> & revokes)
+    // A placed drv nobody else waits for is held for the client's return.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): who, then when.
+    void clientGone(ClientId client, double nowMs)
     {
         if (auto const iter = follows.find(client); iter != follows.end()) {
             auto const drvs = std::move(iter->second);
             follows.erase(iter);
             for (auto const drv : drvs) {
-                if (auto wid = cancel(client, drv)) {
-                    revokes.emplace_back(drv, *wid);
+                if (cancel(client, drv)) {
+                    hold(drv, nowMs);
                 }
             }
             for (auto & [name, state] : systems) {
@@ -854,10 +862,9 @@ public:
             throw nix::Error("scheduler: Hello without addr");
         }
         auto const wid = workerId(info.addr);
-        if (workers.at(wid).up) {
-            workerGone(wid);
-        }
+        down(wid);
         auto & wkr = workers.at(wid);
+        auto const before = std::exchange(wkr.running, {});
         wkr.up = true;
         workersUp_++;
         wkr.draining = false;
@@ -886,6 +893,13 @@ public:
             sys(slot->system).queue.erase(drv, slot->featureKey);
             if (std::ranges::find(wkr.running, drv) == wkr.running.end()) {
                 wkr.running.push_back(drv);
+            }
+        }
+        // What it no longer reports, it lost.
+        for (auto const drv : before) {
+            if (auto const & slot = entries.at(drv);
+                slot && slot->worker == wid && !std::ranges::contains(wkr.running, drv)) {
+                unplace(drv);
             }
         }
         refreshFree(wid);
@@ -924,16 +938,11 @@ public:
         if (!slot) {
             return true;
         }
-        place(*slot, noWorker);
         if (why == GaveBack::drv) {
             std::erase(slot->givers, lease.worker);
             slot->givers.push_back(lease.worker);
         }
-        if (slot->followers.empty()) {
-            retire(*found);
-        } else {
-            enqueue(*found);
-        }
+        unplace(*found);
         return true;
     }
 
@@ -988,32 +997,46 @@ public:
         refreshFree(wid);
     }
 
-    // Requeues what still has followers; a reconnecting worker's Hello
-    // reconciles.
-    void workerGone(WorkerId wid)
+    // How long a placed drv waits for a client or worker whose stream broke.
+    static constexpr double holdMs = 60'000;
+
+    // Its drvs are held for its return: a worker that only lost its session
+    // is still building them, and its Hello says which.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): who, then when.
+    void workerGone(WorkerId wid, double nowMs)
     {
-        auto & wkr = workers.at(wid);
-        if (wkr.up) {
-            workersUp_--;
-        }
-        wkr.up = false;
-        wkr.failures = 0;
-        unrest(wid);
-        for (auto const drv : std::exchange(wkr.running, {})) {
-            if (drv >= entries.size()) {
-                continue;
-            }
-            auto & slot = entries.at(drv);
-            if (!slot || slot->worker != wid) {
-                continue;
-            }
-            place(*slot, noWorker);
-            if (slot->followers.empty()) {
-                retire(drv);
-            } else {
-                enqueue(drv);
+        down(wid);
+        for (auto const drv : workers.at(wid).running) {
+            if (auto const & slot = entries.at(drv); slot && slot->worker == wid) {
+                hold(drv, nowMs);
             }
         }
+    }
+
+    // Ends the holds that are due. A drv whose worker did not return is
+    // queued again, and true is returned. One whose client did not return is
+    // added to `revokes`.
+    auto expire(double nowMs, std::vector<std::pair<WorkerId, std::string>> & revokes) -> bool
+    {
+        bool requeued = false;
+        while (!holds.empty() && holds.front().dueMs <= nowMs) {
+            auto const held = holds.front();
+            holds.pop_front();
+            auto & slot = entries.at(held.drv);
+            if (!slot || slot->worker == noWorker || slot->assignId != held.assignId
+                || slot->holdDueMs != held.dueMs) {
+                continue;
+            }
+            auto & wkr = workers.at(slot->worker);
+            if (!wkr.up) {
+                std::erase(wkr.running, held.drv);
+                unplace(held.drv);
+                requeued = true;
+            } else if (slot->followers.empty()) {
+                revokes.emplace_back(slot->worker, slot->drvPath);
+            }
+        }
+        return requeued;
     }
 
     // Across systems, so the most urgent drv wins.
@@ -1285,6 +1308,51 @@ private:
         std::erase(workers.at(lease.worker).running, *found);
         refreshFree(lease.worker);
         return found;
+    }
+
+    // The drv lost its worker.
+    void unplace(DrvId drv)
+    {
+        auto & slot = entries.at(drv);
+        if (!slot) {
+            return;
+        }
+        place(*slot, noWorker);
+        if (slot->followers.empty()) {
+            retire(drv);
+        } else {
+            enqueue(drv);
+        }
+    }
+
+    void down(WorkerId wid)
+    {
+        auto & wkr = workers.at(wid);
+        if (wkr.up) {
+            workersUp_--;
+        }
+        wkr.up = false;
+        wkr.failures = 0;
+        unrest(wid);
+    }
+
+    struct Hold
+    {
+        double dueMs;
+        DrvId drv;
+        uint64_t assignId;
+    };
+    std::deque<Hold> holds; // by due time
+
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): what, then when.
+    void hold(DrvId drv, double nowMs)
+    {
+        auto & slot = entries.at(drv);
+        if (!slot) {
+            return;
+        }
+        slot->holdDueMs = nowMs + holdMs;
+        holds.push_back({.dueMs = slot->holdDueMs, .drv = drv, .assignId = slot->assignId});
     }
 
     void retire(DrvId drv)

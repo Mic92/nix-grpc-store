@@ -40,7 +40,6 @@ constexpr double statsEveryMs = 1000;
 constexpr double msPerSecond = 1000;
 // A client whose stream broke reconnects within its backoff and Wants its
 // assigned drvs again. Until then their builds keep running.
-constexpr double orphanGraceMs = 10'000;
 } // namespace
 
 Dispatcher::Dispatcher(Config config_, Metrics & metrics)
@@ -102,7 +101,14 @@ void Dispatcher::tick()
 
 void Dispatcher::tickLocked()
 {
-    revokeOrphans();
+    std::vector<std::pair<sched::WorkerId, std::string>> revokes;
+    if (core.expire(nowMs(), revokes)) {
+        dispatchLocked();
+        placeabilityChangedLocked();
+    }
+    for (const auto & [wid, drvPath] : revokes) {
+        revokeOn(wid, drvPath);
+    }
     if (core.wake(nowMs())) {
         membershipChangedLocked();
         dispatchLocked();
@@ -378,7 +384,10 @@ auto Dispatcher::dispatchOnceLocked() -> bool
         if (wit == workers.end() || !wit->second->send(cmd)) {
             // Worker stream died under us.
             dropped = true;
-            core.workerGone(asg.worker);
+            // It never heard of this one, so there is nothing to hold.
+            core.giveBack(
+                {.worker = asg.worker, .drvPath = ent->drvPath, .assignId = asg.assignId}, sched::GaveBack::worker);
+            core.workerGone(asg.worker, nowMs());
             membershipChangedLocked();
             untrackLocked(asg.worker);
             metrics.event("expect_undeliverable");
@@ -464,21 +473,6 @@ void Dispatcher::revokeOn(sched::WorkerId wid, const std::string & drvPath)
         cmd.mutable_revoke()->set_drv_path(drvPath);
         wit->second->send(cmd);
     }
-}
-
-void Dispatcher::revokeOrphans()
-{
-    auto const now = nowMs();
-    std::erase_if(orphans, [&](const Orphan & orphan) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) -> bool {
-        if (orphan.dueMs > now) {
-            return false;
-        }
-        const auto & ent = core.entry(orphan.drv);
-        if (ent && ent->assignId == orphan.assignId && ent->worker != sched::noWorker && ent->followers.empty()) {
-            revokeOn(ent->worker, ent->drvPath);
-        }
-        return true;
-    });
 }
 
 auto Dispatcher::assignedMsg(sched::DrvId drv) const -> SchedMsg
@@ -701,13 +695,7 @@ void Dispatcher::clientGone(const ClientPtr & clientPtr)
     const Lock lock(*this);
     client.gone = true;
     clients.erase(client.id);
-    std::vector<std::pair<sched::DrvId, sched::WorkerId>> revokes;
-    core.clientGone(client.id, revokes);
-    for (auto [drv, wid] : revokes) {
-        if (const auto & ent = core.entry(drv)) {
-            orphans.push_back({.drv = drv, .assignId = ent->assignId, .dueMs = nowMs() + orphanGraceMs});
-        }
-    }
+    core.clientGone(client.id, nowMs());
     metrics.schedClients(-1);
     exportStats(false);
 }
@@ -851,7 +839,7 @@ void Dispatcher::workerGone(Worker & worker)
         return;
     }
     logLine(LogLevel::info, {{"event", "worker_gone"}, {"addr", core.worker(*worker.id).addr}});
-    core.workerGone(*worker.id);
+    core.workerGone(*worker.id, nowMs());
     workers.erase(*worker.id);
     membershipChangedLocked();
     dispatchLocked();

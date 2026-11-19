@@ -50,10 +50,9 @@ constexpr uint64_t defaultSeeds = 3000;
 constexpr auto drvs = std::to_array<std::string_view>({"a.drv", "b.drv"});
 // Enough steps for any run to end once the faults have stopped.
 constexpr unsigned settleSteps = 2000;
-// Longer than the scheduler waits for a client that left.
-constexpr double shortWaitMs = 11'000;
-// Longer than a worker keeps a slot nobody came for.
-constexpr double longWaitMs = 61'000;
+// Longer than the scheduler holds a build for a client or worker that left,
+// and than a worker keeps a slot nobody came for.
+constexpr double waitMs = 61'000;
 
 enum class Rule : uint8_t { slots, noSteal, answered };
 
@@ -146,7 +145,7 @@ public:
         if (faults < faultsPerSeed) {
             add(steps, "scheduler restarts", [this] -> void { restartScheduler(); }, true);
         }
-        add(steps, "a short time passes", [this] -> void { wait(shortWaitMs); }, true);
+        add(steps, "a long time passes", [this] -> void { wait(waitMs); }, true);
         return steps;
     }
 
@@ -162,7 +161,7 @@ public:
                     return std::nullopt;
                 }
                 trace += "  a long time passes\n";
-                wait(longWaitMs);
+                wait(waitMs);
             } else {
                 // In turn, so no peer is starved.
                 auto const & pick = steps.at(step % steps.size());
@@ -569,6 +568,8 @@ auto scripts() -> std::vector<Script>
                  "client 0 calls w:0 for a.drv",
                  "w:0 loses its session",
                  "w:1 connects",
+                 // w:0 stays away for longer than a.drv is held for it.
+                 "a long time passes",
                  "scheduler reads from w:1",
                  "w:1 reads",
                  "w:0 connects",

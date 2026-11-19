@@ -65,7 +65,12 @@ the first to take a lock in its database, for as long as it stays
 connected. When it goes away another node has the lock within seconds.
 
 When a builder restarts, its builds fail and the scheduler sends them
-elsewhere.
+elsewhere. A builder that only loses its connection to the scheduler
+keeps building, and the scheduler waits a minute for it to return
+before it starts those builds on another builder. A client that cannot
+reach the builder ends that wait. A build whose client lost its
+connection is kept for a minute as well, so the client finds it still
+running when it comes back. Ctrl-C stops the build at once.
 
 ## Before you begin
 
