@@ -1001,3 +1001,31 @@ fn low_disk_drains_a_worker_and_builds_go_to_the_other() {
     succeed(WORKER1, &["rm", "/nix/.rw-store/fill"]);
     wait_journal_above(WORKER1, UNIT, up, up0, 30);
 }
+
+/// The balancer sends a request to the worker in its `x-nix-worker` header,
+/// for a system both workers build for and for one that nobody builds for.
+/// Any other worker would refuse the build as "not scheduled here".
+/// Counts requests, so nothing else may use the balancer meanwhile.
+#[test]
+fn x_nix_worker_picks_the_worker_on_every_system() {
+    farm_ready();
+    for cluster in ["riscv64-linux", "s390x-linux"] {
+        wait_members(cluster, &WORKERS);
+        let before = requests(cluster);
+        // Any method will do: envoy counts the request at the host it picked.
+        let script = format!(
+            r#"for i in $(seq 20); do curl -s --http2 -o /dev/null --cacert {c}/public-ca.pem --cert {c}/ci.pem --key {c}/ci.key \
+                 -H 'content-type: application/grpc' -H 'te: trailers' -H 'x-nix-system: {cluster}' -H 'x-nix-worker: {ip}:50051' \
+                 --data-binary '' https://lb:50051/nix.remote.NixRemote/Probe || exit 1; done"#,
+            c = certs(),
+            ip = env("NGS_WORKER1_IP"),
+        );
+        succeed(LB, &["sh", "-c", &script]);
+        let sent: Vec<(Node, i64)> = requests(cluster)
+            .into_iter()
+            .zip(before)
+            .map(|((node, after), (_, before))| (node, after - before))
+            .collect();
+        assert_eq!(sent, vec![(WORKER1, 20), (WORKER2, 0)], "{cluster}");
+    }
+}
