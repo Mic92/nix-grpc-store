@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <iterator>
 #include <stdexcept>
 #include <optional>
@@ -146,8 +147,69 @@ inline auto saneCommonName(const std::string & name) -> bool
 
 } // namespace detail
 
-// Identity in the first (client-adjacent) element, e.g.
-//   Hash=..;Subject="CN=ci-1,O=nt";URI=spiffe://nt/ci,By=..
+namespace detail {
+
+struct Fields
+{
+    std::optional<std::string> subject;
+    std::vector<std::string> uris;
+};
+
+// In the order Envoy writes them.
+enum class Kind : uint8_t { other, subject, uri, dns };
+
+inline auto kindOf(std::string_view key) -> Kind
+{
+    if (key == "Subject") {
+        return Kind::subject;
+    }
+    if (key == "URI") {
+        return Kind::uri;
+    }
+    return key == "DNS" ? Kind::dns : Kind::other;
+}
+
+// Envoy writes URI and DNS names unquoted, so one that holds ';' or ',' reads
+// as further pairs. Those can only follow it: Subject counts only before any
+// URI or DNS, a URI only before any DNS, and a second element is refused.
+inline auto readFields(std::string_view value) -> std::optional<Fields>
+{
+    Fields fields;
+    auto last = Kind::other;
+    Cursor cur(value);
+    while (!cur.done()) {
+        auto key = cur.until("=");
+        if (!key) {
+            return std::nullopt;
+        }
+        cur.take();
+        auto val = readPairValue(cur);
+        if (!val) {
+            return std::nullopt;
+        }
+        auto const kind = kindOf(*key);
+        if (kind != Kind::other && (kind < last || (kind == Kind::subject && fields.subject))) {
+            return std::nullopt;
+        }
+        last = std::max(last, kind);
+        if (kind == Kind::subject) {
+            fields.subject = std::move(*val);
+        } else if (kind == Kind::uri) {
+            fields.uris.push_back(std::move(*val));
+        }
+        // ',' would start another hop's element, which a proxy that sets the
+        // header never sends.
+        if (!cur.done() && cur.take() != ';') {
+            return std::nullopt;
+        }
+    }
+    return fields;
+}
+
+} // namespace detail
+
+// Identity in the header's one element, e.g.
+//   Hash=..;Subject="CN=ci-1,O=nt";URI=spiffe://nt/ci
 //     ->  CN "ci-1", SPIFFE ID "spiffe://nt/ci"
 // Envoy sends URI only with set_current_client_cert_details.uri, and one
 // pair per URI SAN: as for a direct peer, the SPIFFE ID counts only when it
@@ -159,39 +221,15 @@ inline auto elementPeer(std::string_view value) -> Peer
     if (value.empty() || value.size() > maxHeaderBytes) {
         return {};
     }
-    std::optional<std::string> subject;
-    std::vector<std::string> uris;
-    detail::Cursor cur(value);
-    while (!cur.done()) {
-        auto key = cur.until("=");
-        if (!key) {
-            return {};
-        }
-        cur.take();
-        auto val = detail::readPairValue(cur);
-        if (!val) {
-            return {};
-        }
-        if (*key == "Subject") {
-            if (subject) {
-                return {};
-            }
-            subject = std::move(*val);
-        } else if (*key == "URI") {
-            uris.push_back(std::move(*val));
-        }
-        if (cur.peek() == ',') {
-            break; // the next hop's element
-        }
-        if (!cur.done() && cur.take() != ';') {
-            return {};
-        }
+    auto fields = detail::readFields(value);
+    if (!fields) {
+        return {};
     }
     Peer peer;
-    if (uris.size() == 1 && saneSpiffeId(uris.front())) {
-        peer.spiffeId = std::move(uris.front());
+    if (fields->uris.size() == 1 && saneSpiffeId(fields->uris.front())) {
+        peer.spiffeId = std::move(fields->uris.front());
     }
-    auto name = subject ? detail::commonNameOfDn(*subject) : std::nullopt;
+    auto name = fields->subject ? detail::commonNameOfDn(*fields->subject) : std::nullopt;
     if (name && !detail::saneCommonName(*name)) {
         return {};
     }

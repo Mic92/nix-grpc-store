@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdlib>
 
+#include "../src/daemon/peer.hh"
 #include "../src/daemon/xfcc.hh"
 #include "support.hh"
 
