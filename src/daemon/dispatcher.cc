@@ -791,8 +791,10 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
     }
     counted->Increment();
     if (done.outcome() == nix::remote::Done::GIVEN_BACK || done.outcome() == nix::remote::Done::NO_SHOW) {
-        bool const held = core.giveBack(
-            lease, done.reason() == nix::remote::Done::DRAINING ? sched::GaveBack::worker : sched::GaveBack::drv);
+        // The client uploads a missing input to this worker, which can then run the drv.
+        bool const blameless =
+            done.reason() == nix::remote::Done::DRAINING || done.reason() == nix::remote::Done::INPUT_UNAVAILABLE;
+        bool const held = core.giveBack(lease, blameless ? sched::GaveBack::worker : sched::GaveBack::drv);
         if (held && done.reason() == nix::remote::Done::TRANSIENT_FAILURE) {
             if (auto const rest = core.failed(wid, nowMs())) {
                 logLine(
