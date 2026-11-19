@@ -272,9 +272,8 @@ fn two_clients_wanting_the_same_drv_build_it_once() {
     let mut ids: Vec<Vec<String>> = WORKERS
         .into_iter()
         .map(|w| {
-            query(w, &["journalctl", "-u", "nix-grpc-daemon", "-o", "cat"])
-                .lines()
-                .filter(|l| l.contains("method=BuildDerivation") && l.contains("slow-dedup"))
+            journal_matches(w, UNIT, "method=BuildDerivation.*slow-dedup")
+                .iter()
                 .filter_map(|l| l.split_whitespace().find(|t| t.starts_with("assign_id=")))
                 .map(String::from)
                 .collect()
