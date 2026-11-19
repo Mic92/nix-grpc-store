@@ -1081,8 +1081,11 @@ public:
                 built.push_back(localStore.printStorePath(path));
             }
             phase.next("publish");
-            // The client rebuilt this because the cache lost its NAR.
-            if (auto const why = publishOutputs(localStore, built, cancelled, caller.cacheLost, outputs)) {
+            // The build is paid for: publish it also when the client left or the
+            // scheduler moved on. The cache keeps one of two builds of a path.
+            auto const stopping = [] -> bool { return stopSignal >= nixgrpc::kCancelBuilds; };
+            // Verify: the client rebuilt this because the cache lost its NAR.
+            if (auto const why = publishOutputs(localStore, built, stopping, caller.cacheLost, outputs)) {
                 res = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, *why);
             } else {
                 outcome = nix::remote::Done::BUILT;

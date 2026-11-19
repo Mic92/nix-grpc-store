@@ -666,6 +666,50 @@ fn a_builder_serves_the_build_the_cache_published() {
     assert_eq!(hash(loser), hash(winner), "{} kept its own build", loser.0);
 }
 
+/// A client that leaves while its finished build is being uploaded does not
+/// waste the build: the next one finds it in the cache.
+#[test]
+fn a_finished_build_is_published_after_its_client_left() {
+    farm_ready();
+    // Uploads to garage hang, niks3 itself stays reachable.
+    fn block(op: &str) {
+        for ipt in ["iptables", "ip6tables"] {
+            succeed(
+                LB,
+                &[ipt, op, "INPUT", "-i", "eth1", "-p", "tcp", "--dport", "9000", "-j", "DROP"],
+            );
+        }
+    }
+    struct Unblock;
+    impl Drop for Unblock {
+        fn drop(&mut self) {
+            block("-D");
+        }
+    }
+    let built = || WORKERS.into_iter().map(|w| events(w, "built")).sum::<i64>();
+    let before = built();
+    spawn_build("left", "left");
+    wait_building();
+    block("-I");
+    let unblock = Unblock;
+    release_slow();
+    retry(60, "the build finished", || built() > before);
+    succeed(CLIENT, &["systemctl", "stop", "left"]);
+    // Longer than a builder takes to notice that its client is gone.
+    sleep(5);
+    drop(unblock);
+    let out = succeed(
+        CLIENT,
+        &["nix", "eval", "--raw", "-f", &expr("SLOW"), "--argstr", "tag", "left", "outPath"],
+    );
+    let cache = env("NGS_NIKS3_URL");
+    // An early miss must not be remembered.
+    let fresh = ["--option", "narinfo-cache-negative-ttl", "0"];
+    let mut query = vec!["nix", "path-info", "--store", &cache, &out];
+    query.extend(fresh);
+    wait_until_succeeds(CLIENT, &query, 120);
+}
+
 /// When niks3 can't take a build's outputs, the build fails with the upload
 /// error instead of being rebuilt on the other worker.
 #[test]
