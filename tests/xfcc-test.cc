@@ -35,9 +35,9 @@ try {
     // '/' separates only in the legacy form
     assert(commonName(R"(Subject="O=a/CN=admin,CN=real")") == "real");
     assert(commonName(R"(Subject="CN=ci-1/x")") == "ci-1/x");
-    // Only the first element is the client; later ones are upstream hops
-    // an attacker could have prepended behind a non-sanitizing proxy.
+    // A proxy that sets the header sends one element.
     assert(commonName(R"(Hash=1;URI=u,Hash=2;Subject="CN=evil")") == std::nullopt);
+    assert(commonName(R"(Hash=1;Subject="CN=ci-1",Hash=2)") == std::nullopt);
     assert(commonName(R"(Hash=1;Subject="O=only")") == std::nullopt);
     assert(commonName("") == std::nullopt);
     assert(commonName("garbage;;==,,") == std::nullopt);
@@ -66,6 +66,14 @@ try {
     assert(spiffeId("Subject=CN=ci-1;URI=spiffe:///ci") == std::nullopt);
     assert(spiffeId("Hash=1;Subject=CN=ci-1,URI=spiffe://nt.example/hop") == std::nullopt);
     assert(!elementPeer("Hash=ab;URI=https://nt.example/ci").present());
+    for (auto const * path : {"/", "//ci", "/ci/", "/./ci", "/ci/.."}) {
+        assert(spiffeId("Subject=CN=ci-1;URI=spiffe://nt.example" + std::string(path)) == std::nullopt);
+    }
+    // Envoy writes URI and DNS names as they are. One that holds ';' or ','
+    // must not pass for another field or cut the ID short.
+    assert(!elementPeer(R"(Hash=ab;URI=spiffe://nt.example/x;Subject="CN=admin")").present());
+    assert(!elementPeer("Hash=ab;DNS=x;URI=spiffe://nt.example/admin").present());
+    assert(!elementPeer("Hash=ab;URI=spiffe://nt.example/admin,x").present());
 
     TrustedProxies proxies;
     assert(!proxies.matches(Peer{.commonName = "lb-1"}));

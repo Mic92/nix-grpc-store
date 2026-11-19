@@ -40,21 +40,33 @@ struct Peer
     }
 };
 
-// Trust domain and path charset of the SPIFFE-ID spec, without its finer
-// rules (no empty or dot segments): enough that an ID is safe to log and
-// cannot smuggle a glob or a NUL into fnmatch.
+// Whether the SPIFFE-ID spec allows it. An ID that passes holds no glob
+// character and no NUL, and is safe to log.
 inline auto saneSpiffeId(std::string_view spiffeId) -> bool
 {
+    constexpr size_t maxTrustDomainBytes = 255;
+    constexpr std::string_view domainChars = "abcdefghijklmnopqrstuvwxyz0123456789.-_";
+    constexpr std::string_view segmentChars = "abcdefghijklmnopqrstuvwxyz0123456789.-_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     if (!spiffeId.starts_with(spiffeScheme) || spiffeId.size() > maxSpiffeIdBytes) {
         return false;
     }
-    constexpr std::string_view domainChars = "abcdefghijklmnopqrstuvwxyz0123456789.-_";
-    constexpr std::string_view pathChars = "abcdefghijklmnopqrstuvwxyz0123456789.-_ABCDEFGHIJKLMNOPQRSTUVWXYZ/";
-    auto const rest = spiffeId.substr(spiffeScheme.size());
+    auto rest = spiffeId.substr(spiffeScheme.size());
     auto const domain = rest.substr(0, rest.find('/'));
-    auto const path = rest.substr(domain.size());
-    return !domain.empty() && domain.find_first_not_of(domainChars) == std::string_view::npos
-           && path.find_first_not_of(pathChars) == std::string_view::npos;
+    if (domain.empty() || domain.size() > maxTrustDomainBytes
+        || domain.find_first_not_of(domainChars) != std::string_view::npos) {
+        return false;
+    }
+    rest.remove_prefix(domain.size());
+    while (!rest.empty()) {
+        rest.remove_prefix(1); // the '/'
+        auto const segment = rest.substr(0, rest.find('/'));
+        if (segment.empty() || segment == "." || segment == ".."
+            || segment.find_first_not_of(segmentChars) != std::string_view::npos) {
+            return false;
+        }
+        rest.remove_prefix(segment.size());
+    }
+    return true;
 }
 
 // A glob from --allow or --trusted-proxy. One that starts with spiffe:// is
