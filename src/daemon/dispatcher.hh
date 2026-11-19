@@ -149,9 +149,17 @@ private:
     using Clock = std::chrono::steady_clock;
     Config config;
     Metrics & metrics;
+    // Looked up once: a lookup by label takes the registry's lock.
     prometheus::Counter & assignedCtr;
+    prometheus::Counter & cachedCtr;
+    prometheus::Histogram & lookupQueuedSeconds;
+    prometheus::Histogram & lookupCacheSeconds;
+    prometheus::Histogram & lookupAsked;
+    prometheus::Histogram & lookupPresent;
     const Clock::time_point epoch = Clock::now();
     absl::Mutex mutex;
+    std::unordered_map<std::string, prometheus::Histogram *> queueWaitBySystem ABSL_GUARDED_BY(mutex);
+    std::unordered_map<int, prometheus::Counter *> doneByOutcome ABSL_GUARDED_BY(mutex);
     std::vector<std::function<void()>> deferred ABSL_GUARDED_BY(mutex);
     sched::Core core ABSL_GUARDED_BY(mutex);
     std::unordered_map<sched::ClientId, ClientSend> clients ABSL_GUARDED_BY(mutex);
