@@ -247,16 +247,28 @@ class WaitQueue
         return stamps.at(item.drv) != item.stamp;
     }
 
+    // Moves a member of an ordered set. Its node is kept, which saves an
+    // allocation on the scheduler's most frequent queue update.
+    template<typename Set>
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): from, then to.
+    static void move(Set & into, const Set::value_type & from, const Set::value_type & dest)
+    {
+        auto node = into.extract(from);
+        node.value() = dest;
+        into.insert(std::move(node));
+    }
+
     template<typename Id>
     static void list(Turn<Id> & into, Id ident, Listed & listed, Listed now)
     {
         if (listed == now) {
             return;
         }
-        if (listed) {
+        if (listed && now) {
+            move(into, {listed->first, listed->second, ident}, {now->first, now->second, ident});
+        } else if (listed) {
             into.erase({listed->first, listed->second, ident});
-        }
-        if (now) {
+        } else {
             into.emplace(now->first, now->second, ident);
         }
         listed = now;
@@ -270,14 +282,22 @@ class WaitQueue
 
     void relist(ClientId client, Line & line)
     {
-        auto & group = groups.at(line.owner);
-        if (line.listed) {
-            group.keys.erase({line.listed->second, client});
+        auto const now = line.heap.empty() ? std::nullopt : Listed(std::pair(line.served, line.heap.front().key));
+        if (line.listed == now) {
+            return;
         }
-        list(group.turn, client, line.listed,
-             line.heap.empty() ? std::nullopt : Listed(std::pair(line.served, line.heap.front().key)));
-        if (line.listed) {
-            group.keys.emplace(line.listed->second, client);
+        auto & group = groups.at(line.owner);
+        auto const was = line.listed;
+        list(group.turn, client, line.listed, now);
+        if (was && now && was->second == now->second) {
+            return; // the owner's key is unchanged
+        }
+        if (was && now) {
+            move(group.keys, {was->second, client}, {now->second, client});
+        } else if (was) {
+            group.keys.erase({was->second, client});
+        } else {
+            group.keys.emplace(now->second, client);
         }
         relist(line.owner, group);
     }
