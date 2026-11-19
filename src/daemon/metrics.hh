@@ -234,23 +234,24 @@ public:
         schedQueuedGauge->Set(static_cast<double>(count));
     }
     // Seconds from enqueue to assignment.
-    void queueWait(std::string_view system, double seconds)
+    // The three below are for hot paths: Add() takes a lock and builds a
+    // histogram to look one up, so callers keep what they get.
+    auto queueWait(std::string_view system) -> prometheus::Histogram &
     {
-        queueSeconds->Add({{"system", std::string(system)}}, buckets).Observe(seconds);
+        return queueSeconds->Add({{"system", std::string(system)}}, buckets);
     }
 
     // Not part of queueWait: a derivation is queued only after its lookup.
-    void lookupStage(const char * stage, double seconds)
+    auto lookupStage(const char * stage) -> prometheus::Histogram &
     {
-        lookupSeconds->Add({{"stage", stage}}, buckets).Observe(seconds);
+        return lookupSeconds->Add({{"stage", stage}}, buckets);
     }
 
     // How long a lookup takes depends on how much it asks about.
-    void lookupSize(size_t asked, size_t present)
+    auto lookupSize(const char * result) -> prometheus::Histogram &
     {
         static const prometheus::Histogram::BucketBoundaries counts{1, 3, 10, 30, 100, 300, 1000, 3000, 10000};
-        lookupKeys->Add({{"result", "asked"}}, counts).Observe(static_cast<double>(asked));
-        lookupKeys->Add({{"result", "present"}}, counts).Observe(static_cast<double>(present));
+        return lookupKeys->Add({{"result", result}}, counts);
     }
 
     // What one build fetched before it started.

@@ -47,6 +47,11 @@ Dispatcher::Dispatcher(Config config_, Metrics & metrics)
     : config(std::move(config_))
     , metrics(metrics)
     , assignedCtr(metrics.eventCounter("assigned"))
+    , cachedCtr(metrics.eventCounter("cached"))
+    , lookupQueuedSeconds(metrics.lookupStage("queued"))
+    , lookupCacheSeconds(metrics.lookupStage("cache"))
+    , lookupAsked(metrics.lookupSize("asked"))
+    , lookupPresent(metrics.lookupSize("present"))
 {
     if (config.present) {
         for (unsigned i = 0; i < config.lookupThreads; i++) {
@@ -127,9 +132,9 @@ void Dispatcher::lookupLoop()
         // Inline, the reactor closes the stream on a throw. Here only this client fails.
         try {
             auto const startMs = nowMs();
-            metrics.lookupStage("queued", (startMs - job.sinceMs) / msPerSecond);
+            lookupQueuedSeconds.Observe((startMs - job.sinceMs) / msPerSecond);
             auto const cached = lookup(job.msgs);
-            metrics.lookupStage("cache", (nowMs() - startMs) / msPerSecond);
+            lookupCacheSeconds.Observe((nowMs() - startMs) / msPerSecond);
             applyClientMsgs(*job.client, job.msgs, cached);
         } catch (std::exception & err) {
             logLine(LogLevel::info, {{"event", "client_failed"}, {"client", std::to_string(job.client->id)}, {"error", err.what()}});
@@ -331,7 +336,8 @@ auto Dispatcher::lookup(const nix::remote::ClientMsgs & msgs) const -> std::vect
     }
     try {
         auto have = config.present(keys);
-        metrics.lookupSize(keys.size(), have.size());
+        lookupAsked.Observe(static_cast<double>(keys.size()));
+        lookupPresent.Observe(static_cast<double>(have.size()));
         for (int i = 0; i < msgs.msgs_size(); i++) {
             const auto & msg = msgs.msgs(i);
             cached.at(static_cast<size_t>(i)) =
@@ -381,7 +387,11 @@ auto Dispatcher::dispatchOnceLocked() -> bool
         }
         sendToFollowers(asg.drv, assignedMsg(asg.drv));
         assignedCtr.Increment();
-        metrics.queueWait(ent->system, (nowMs() - ent->enqMs) / msPerSecond);
+        auto & waited = queueWaitBySystem.try_emplace(ent->system).first->second;
+        if (waited == nullptr) {
+            waited = &metrics.queueWait(ent->system);
+        }
+        waited->Observe((nowMs() - ent->enqMs) / msPerSecond);
         debugLog(
             {{"event", "assigned"},
              {"drv", ent->drvPath},
@@ -631,7 +641,7 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
     if (cached) {
         reply.mutable_cached()->set_drv_path(want.drv_path());
         client.send(reply);
-        metrics.event("cached");
+        cachedCtr.Increment();
         return;
     }
     if (want.system().size() > maxSystemLen) {
@@ -782,7 +792,13 @@ void Dispatcher::untrackLocked(sched::WorkerId wid)
 void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
 {
     sched::Core::Lease const lease{.worker = wid, .drvPath = done.drv_path(), .assignId = done.assign_id()};
-    metrics.event("done_" + nix::remote::Done::Outcome_Name(done.outcome()));
+    // Unknown outcomes share one entry: the name of each is empty.
+    auto const known = nix::remote::Done::Outcome_IsValid(done.outcome()) ? static_cast<int>(done.outcome()) : -1;
+    auto & counted = doneByOutcome.try_emplace(known).first->second;
+    if (counted == nullptr) {
+        counted = &metrics.eventCounter("done_" + nix::remote::Done::Outcome_Name(done.outcome()));
+    }
+    counted->Increment();
     if (done.outcome() == nix::remote::Done::GIVEN_BACK || done.outcome() == nix::remote::Done::NO_SHOW) {
         bool const held = core.giveBack(
             lease, done.reason() == nix::remote::Done::DRAINING ? sched::GaveBack::worker : sched::GaveBack::drv);
