@@ -30,7 +30,9 @@ Why gRPC instead of `ssh-ng://`?
   * **Scales to a build farm.** Point `builders =` or `--store` at one
     `grpc://` address and the daemons behind it spread the derivations
     over all nodes, like Hydra's queue runner but for any Nix client and
-    without a database. See [docs/farm.md](docs/farm.md).
+    without a database. Builders are shared fairly: a free slot goes
+    to the user with the fewest builds running, so one large build does
+    not hold up everyone else's. See [docs/farm.md](docs/farm.md).
 
 Everything that works over `ssh-ng://` works here: remote builds,
 `nix copy`, path queries. The gRPC layer is a thin tunnel to the
