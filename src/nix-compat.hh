@@ -445,6 +445,16 @@ inline void ensurePath(nix::Store &store, const nix::StorePath &path) {
 #endif
 }
 
+// Replaces a valid path with the copy a substituter of `store` offers.
+inline void substituteOver(nix::Store &store, const nix::StorePath &path) {
+  const std::vector<nix::DerivedPath> target{nix::DerivedPath::Opaque{path}};
+#if NIX_COMPAT_HAS_BUILDER
+  store.getBuilder()->buildPaths(target, nix::bmRepair);
+#else
+  store.buildPaths(target, nix::bmRepair);
+#endif
+}
+
 // Nix 2.35 added EnsureRead, which turns a short NAR read into an error
 // instead of silently truncating. Older versions read the NAR unguarded.
 #if NIX_COMPAT_AT_LEAST(2, 35)

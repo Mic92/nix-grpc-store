@@ -142,11 +142,12 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
     };
 
     // Publishing makes our paths everyone's. Without it the client may not rely on them.
-    void publish(
+    // Returns the paths the cache took from us.
+    auto publish(
         nix::Store & localStore,
         const std::vector<std::string> & paths,
         const nixgrpc::Cancelled & cancelled,
-        bool verify = false)
+        bool verify = false) -> nixgrpc::PushProcess::Signatures
     {
         nixgrpc::PushProcess::Signatures signed_;
         try {
@@ -162,6 +163,54 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
         for (const auto & [path, sigs] : signed_) {
             nixcompat::addSignatures(localStore, localStore.parseStorePath(path), sigs);
         }
+        return signed_;
+    }
+
+    // Returns why the cache could not take a build's outputs.
+    auto publishOutputs(
+        nix::Store & localStore,
+        const std::vector<std::string> & built,
+        const nixgrpc::Cancelled & cancelled,
+        bool verify,
+        std::vector<std::pair<std::string, uint64_t>> & outputs) -> std::optional<std::string>
+    {
+        nixgrpc::PushProcess::Signatures taken;
+        try {
+            taken = publish(localStore, built, cancelled, verify);
+        } catch (Unavailable & err) {
+            // niks3 push already retried, and another worker would upload
+            // to the same cache: fail instead of rebuilding elsewhere.
+            metrics.event("publish_failed");
+            return err.what();
+        }
+        for (const auto & path : built) {
+            auto const storePath = localStore.parseStorePath(path);
+            // The cache signs what it takes. An output it did not sign was
+            // published by another build, and a build need not be
+            // reproducible: nodes answer as one store, so this one has to
+            // hold the published copy too.
+            if (coord.cache.hasRemote() && !taken.contains(path)) {
+                adoptPublished(localStore, storePath);
+            }
+            outputs.emplace_back(path, localStore.queryPathInfo(storePath)->narSize);
+        }
+        return std::nullopt;
+    }
+
+    // Failing here gives the build back, and the next Want is answered from the cache.
+    void adoptPublished(nix::Store & localStore, const nix::StorePath & path)
+    {
+        try {
+            nixcompat::substituteOver(localStore, path);
+        } catch (nix::Error & err) {
+            if (nixgrpc::LocalStore::lost(err)) {
+                throw;
+            }
+            throw Unavailable("cannot fetch the published copy of '%s': %s", localStore.printStorePath(path), err.what());
+        }
+        metrics.event("published_copy_adopted");
+        nixgrpc::logLine(
+            nixgrpc::LogLevel::info, {{"event", "published_copy_adopted"}, {"path", localStore.printStorePath(path)}});
     }
 
 public:
@@ -1030,19 +1079,13 @@ public:
             built.reserve(outPaths.size());
             for (const auto & [name, path] : outPaths) {
                 built.push_back(localStore.printStorePath(path));
-                outputs.emplace_back(built.back(), localStore.queryPathInfo(path)->narSize);
             }
             phase.next("publish");
-            try {
-                // The client rebuilt this because the cache lost its NAR.
-                publish(localStore, built, cancelled, caller.cacheLost);
+            // The client rebuilt this because the cache lost its NAR.
+            if (auto const why = publishOutputs(localStore, built, cancelled, caller.cacheLost, outputs)) {
+                res = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, *why);
+            } else {
                 outcome = nix::remote::Done::BUILT;
-            } catch (Unavailable & err) {
-                // niks3 push already retried, and another worker would upload
-                // to the same cache: fail instead of rebuilding elsewhere.
-                metrics.event("publish_failed");
-                outputs.clear();
-                res = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, err.what());
             }
             phase.done();
         } else if (nixcompat::failureStatus(res) == nixcompat::FailureStatus::TransientFailure && nixcompat::isSandboxed(drv)) {
