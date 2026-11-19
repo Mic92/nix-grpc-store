@@ -34,6 +34,7 @@
 #include <set>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -358,7 +359,7 @@ public:
             }
             if (coord.cache.hasRemote()) {
                 // Nodes answer as one store: what the cache has, every node can serve,
-                for (const auto & path : localStore->querySubstitutablePaths(paths)) {
+                for (const auto & path : inCache(paths)) {
                     reply->add_paths(std::string(path.to_string()));
                 }
                 // and what only we have must become so before the client relies on it.
@@ -670,6 +671,35 @@ public:
                 ended = true;
             }
         }
+    }
+
+    // Which of `paths` the farm's cache holds. A path that another
+    // substituter offers is left out: a node may distrust its signature or
+    // its NAR may be gone, and the client would build nothing for it.
+    auto inCache(const nix::StorePathSet & paths) -> std::vector<nix::StorePath>
+    {
+        auto const key = [](const nix::StorePath & path) -> std::string {
+            return std::string(path.hashPart()) + ".narinfo";
+        };
+        std::vector<std::string> keys;
+        keys.reserve(paths.size());
+        for (const auto & path : paths) {
+            keys.push_back(key(path));
+        }
+        std::unordered_set<std::string> held;
+        try {
+            held = coord.cache.holds(keys);
+        } catch (std::exception & err) {
+            // The scheduler does the same: without an answer the path is built.
+            nixgrpc::logLine(nixgrpc::LogLevel::info, {{"event", "present_failed"}, {"error", err.what()}});
+        }
+        std::vector<nix::StorePath> found;
+        for (const auto & path : paths) {
+            if (held.contains(key(path))) {
+                found.push_back(path);
+            }
+        }
+        return found;
     }
 
     // Outputs built on another node live only in the cache. Clients read them back through us.
