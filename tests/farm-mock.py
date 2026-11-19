@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mock niks3 for the Cache/PushProcess unit tests.
 
-`farm-mock.py serve` answers /api/objects/present and records pushes;
+`farm-mock.py serve` answers /api/objects/exists and records pushes;
 `farm-mock.py push --stdin --server-url URL ...` stands in for
 `niks3 push --stdin` and forwards each line to the server so state stays in
 one process. A path containing "fail", "hang" or "crash" makes the push fail,
@@ -76,11 +76,11 @@ class Http(BaseHTTPRequestHandler):
             self.reply(200, push_result(body.decode()))
             return
         req = json.loads(body or b"{}")
-        if self.path == "/api/objects/present":
+        if self.path == "/api/objects/exists":
             with S.lock:
                 have = [k for k in req.get("keys", []) if k in S.pushed]
-            S.record(ev="present", keys=req.get("keys", []))
-            self.reply(200, {"present": have})
+            S.record(ev="exists", keys=req.get("keys", []))
+            self.reply(200, {"exists": have})
         else:
             self.reply(404)
 

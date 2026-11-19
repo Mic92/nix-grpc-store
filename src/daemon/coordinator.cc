@@ -186,7 +186,7 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
         Dispatcher::PresentFn present;
         if (cache.hasRemote()) {
             present = [this](const std::vector<std::string> & keys) -> std::unordered_set<std::string> {
-                return cache.present(keys);
+                return cache.holds(keys);
             };
         }
         dispatcher.emplace(
