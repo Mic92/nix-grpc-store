@@ -7,9 +7,12 @@
 #include <exception>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <random>
+#include <set>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -609,12 +612,77 @@ void testLeastServedClientFirst()
     assert(out.size() == 4 && shard.entry(out[3].drv)->drvPath == "late.drv");
 }
 
+// The queue against a plain model of it, over random operations.
+void testWaitQueueMatchesModel()
+{
+    struct Queued
+    {
+        double key = 0;
+        std::set<ClientId> clients;
+    };
+    std::mt19937 rng(7); // NOLINT(cert-msc32-c,cert-msc51-cpp,bugprone-random-generator-seed): reproducible
+    auto const upTo = [&](uint32_t max) -> uint32_t { return std::uniform_int_distribution<uint32_t>(0, max)(rng); };
+    WaitQueue queue;
+    Served served;
+    std::map<DrvId, Queued> model;
+    for (int step = 0; step < 20000; step++) {
+        auto const drv = upTo(40);
+        auto const client = ClientId{upTo(5)};
+        switch (upTo(5)) {
+        case 0:
+        case 1: {
+            std::set<ClientId> clients{client};
+            if (upTo(3) == 0) {
+                clients.insert(upTo(5));
+            }
+            auto const key = static_cast<double>(upTo(8));
+            queue.set(drv, key, "", {clients.begin(), clients.end()}, served);
+            model[drv] = {.key = key, .clients = clients};
+            break;
+        }
+        case 2:
+        case 3:
+            queue.erase(drv, "");
+            model.erase(drv);
+            break;
+        case 4: {
+            auto const count = upTo(3);
+            served[client] = count;
+            queue.serving(client, count);
+            break;
+        }
+        default:
+            queue.forget(client);
+            for (auto & [id, entry] : model) {
+                entry.clients.erase(client);
+            }
+        }
+        std::optional<std::tuple<uint32_t, double, ClientId, DrvId>> first;
+        for (const auto & [id, entry] : model) {
+            for (auto const who : entry.clients) {
+                auto const rank = std::tuple(served[who], entry.key, who, id);
+                // A client's place is that of its first drv.
+                if (!first || rank < *first) {
+                    first = rank;
+                }
+            }
+        }
+        assert(queue.size() == model.size());
+        assert(queue.top().has_value() == first.has_value());
+        if (first) {
+            assert(queue.topKey() == WaitQueue::Rank(std::get<0>(*first), std::get<1>(*first)));
+            assert(queue.top() == std::get<3>(*first));
+        }
+    }
+}
+
 } // namespace
 // NOLINTEND(*-magic-numbers, *-avoid-unchecked-container-access, bugprone-unchecked-optional-access, readability-identifier-length)
 
 auto main() -> int
 try {
     testLeastServedClientFirst();
+    testWaitQueueMatchesModel();
     testHeapAgainstMap();
     testFreeIndex();
     testAssignAndDedup();

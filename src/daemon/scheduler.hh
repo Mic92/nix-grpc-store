@@ -11,6 +11,7 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <map>
 #include <optional>
@@ -185,55 +186,77 @@ using Served = absl::flat_hash_map<ClientId, uint32_t>;
 // clients wait for is queued with each. Counts its entries by required
 // feature set, so a dispatch pass can tell when everything left is of a set it
 // already found no worker for.
+//
+// A drv is not searched for when it leaves: its items lose their stamp and are
+// dropped when they reach the front of a client's heap.
 class WaitQueue
 {
-    struct Queued
+    struct Item
     {
         double key = 0;
-        std::vector<ClientId> clients;
+        DrvId drv = 0;
+        uint64_t stamp = 0;
+        auto operator>(const Item & other) const -> bool
+        {
+            return std::pair(key, drv) > std::pair(other.key, other.drv);
+        }
     };
-    absl::flat_hash_map<DrvId, Queued> queued;
-    absl::flat_hash_map<ClientId, std::set<std::pair<double, DrvId>>> perClient;
-    // Clients with queued drvs: (served, key of its first drv, client).
+    struct Line
+    {
+        uint32_t served = 0;
+        std::vector<Item> heap; // smallest key first
+        // As listed in `turn`, if it is.
+        std::optional<std::pair<uint32_t, double>> listed;
+    };
+    absl::flat_hash_map<ClientId, Line> lines;
+    // (served, key of the client's first item, client). The first client's
+    // first item is always a queued drv; others may be stale, which can only
+    // list a client too early.
     std::set<std::tuple<uint32_t, double, ClientId>> turn;
+    std::vector<uint64_t> stamps; // by drv; 0 when not queued
+    uint64_t lastStamp = 0;
+    size_t queued = 0;
     absl::flat_hash_map<std::string, uint32_t> perFeatures;
 
-    [[nodiscard]] static auto servedOf(const Served & served, ClientId client) -> uint32_t
+    [[nodiscard]] auto stale(const Item & item) const -> bool
     {
-        auto const iter = served.find(client);
-        return iter == served.end() ? 0 : iter->second;
+        return stamps.at(item.drv) != item.stamp;
     }
 
-    // Changes a client's drvs, keeping its place in `turn` right.
-    template<typename F>
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): served before, then after.
-    void relist(ClientId client, uint32_t before, uint32_t after, F && change)
+    void relist(ClientId client, Line & line)
     {
-        auto iter = perClient.find(client);
-        if (iter != perClient.end()) {
-            turn.erase({before, iter->second.begin()->first, client});
+        auto const now = line.heap.empty() ? std::nullopt : std::optional(std::pair(line.served, line.heap.front().key));
+        if (line.listed == now) {
+            return;
         }
-        std::forward<F>(change)();
-        iter = perClient.find(client);
-        if (iter != perClient.end() && iter->second.empty()) {
-            perClient.erase(iter);
-        } else if (iter != perClient.end()) {
-            turn.emplace(after, iter->second.begin()->first, client);
+        if (line.listed) {
+            turn.erase({line.listed->first, line.listed->second, client});
         }
+        if (now) {
+            turn.emplace(now->first, now->second, client);
+        }
+        line.listed = now;
     }
 
-    auto drop(DrvId drv, const Served & served) -> bool
+    // Drops stale items until the first client's first item is a queued drv.
+    void settle()
     {
-        auto const found = queued.find(drv);
-        if (found == queued.end()) {
-            return false;
+        while (!turn.empty()) {
+            auto const client = std::get<2>(*turn.begin());
+            auto const iter = lines.find(client);
+            auto & line = iter->second;
+            if (!stale(line.heap.front())) {
+                return;
+            }
+            while (!line.heap.empty() && stale(line.heap.front())) {
+                std::ranges::pop_heap(line.heap, std::greater{});
+                line.heap.pop_back();
+            }
+            relist(client, line);
+            if (line.heap.empty()) {
+                lines.erase(iter);
+            }
         }
-        for (auto const client : found->second.clients) {
-            auto const count = servedOf(served, client);
-            relist(client, count, count, [&] -> void { perClient.at(client).erase({found->second.key, drv}); });
-        }
-        queued.erase(found);
-        return true;
     }
 
 public:
@@ -242,7 +265,7 @@ public:
 
     [[nodiscard]] auto size() const -> size_t
     {
-        return queued.size();
+        return queued;
     }
 
     [[nodiscard]] auto top() const -> std::optional<DrvId>
@@ -250,7 +273,7 @@ public:
         if (turn.empty()) {
             return std::nullopt;
         }
-        return perClient.at(std::get<2>(*turn.begin())).begin()->second;
+        return lines.at(std::get<2>(*turn.begin())).heap.front().drv;
     }
 
     [[nodiscard]] auto topKey() const -> std::optional<Rank>
@@ -270,34 +293,67 @@ public:
     void set(DrvId drv, double key, const std::string & features, const std::vector<ClientId> & clients, const Served & served)
     {
         if (clients.empty()) {
-            erase(drv, features, served);
+            erase(drv, features);
             return;
         }
-        if (!drop(drv, served)) {
+        if (drv >= stamps.size()) {
+            stamps.resize(size_t{drv} + 1, 0);
+        }
+        if (stamps.at(drv) == 0) {
             perFeatures.try_emplace(features).first->second++;
+            queued++;
         }
+        stamps.at(drv) = ++lastStamp;
         for (auto const client : clients) {
-            auto const count = servedOf(served, client);
-            relist(client, count, count, [&] -> void { perClient.try_emplace(client).first->second.emplace(key, drv); });
+            auto const [iter, fresh] = lines.try_emplace(client);
+            auto & line = iter->second;
+            if (fresh) {
+                auto const count = served.find(client);
+                line.served = count == served.end() ? 0 : count->second;
+            }
+            line.heap.push_back({.key = key, .drv = drv, .stamp = lastStamp});
+            std::ranges::push_heap(line.heap, std::greater{});
+            relist(client, line);
         }
-        queued.emplace(drv, Queued{.key = key, .clients = clients});
+        settle();
     }
 
-    void erase(DrvId drv, const std::string & features, const Served & served)
+    void erase(DrvId drv, const std::string & features)
     {
-        if (!drop(drv, served)) {
+        if (drv >= stamps.size() || stamps.at(drv) == 0) {
             return;
         }
+        stamps.at(drv) = 0;
+        queued--;
         if (auto const iter = perFeatures.find(features); iter != perFeatures.end() && --iter->second == 0) {
             perFeatures.erase(iter);
         }
+        settle();
     }
 
-    // The client now waits for `after` placed drvs.
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-    void serving(ClientId client, uint32_t before, uint32_t after)
+    // The client now waits for `served` placed drvs.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): who, then how many.
+    void serving(ClientId client, uint32_t served)
     {
-        relist(client, before, after, [] -> void {});
+        auto const iter = lines.find(client);
+        if (iter == lines.end()) {
+            return;
+        }
+        iter->second.served = served;
+        relist(client, iter->second);
+        settle();
+    }
+
+    void forget(ClientId client)
+    {
+        auto const iter = lines.find(client);
+        if (iter == lines.end()) {
+            return;
+        }
+        iter->second.heap.clear();
+        relist(client, iter->second);
+        lines.erase(iter);
+        settle();
     }
 };
 
@@ -656,6 +712,9 @@ public:
                 revokes.emplace_back(drv, *wid);
             }
         }
+        for (auto & [name, state] : systems) {
+            state.queue.forget(client);
+        }
     }
 
     struct HelloInfo
@@ -711,7 +770,7 @@ public:
             }
             place(*slot, wid);
             slot->assignId = assignId;
-            sys(slot->system).queue.erase(drv, slot->featureKey, served);
+            sys(slot->system).queue.erase(drv, slot->featureKey);
             if (std::ranges::find(wkr.running, drv) == wkr.running.end()) {
                 wkr.running.push_back(drv);
             }
@@ -1049,7 +1108,7 @@ private:
         auto const before = iter->second;
         auto const after = static_cast<uint32_t>(static_cast<int64_t>(before) + delta);
         for (auto & [name, state] : systems) {
-            state.queue.serving(client, before, after);
+            state.queue.serving(client, after);
         }
         if (after == 0) {
             served.erase(iter);
@@ -1096,7 +1155,7 @@ private:
         auto const iter = systems.find(slot->system);
         place(*slot, noWorker);
         if (iter != systems.end()) {
-            iter->second.queue.erase(drv, slot->featureKey, served);
+            iter->second.queue.erase(drv, slot->featureKey);
             if (iter->second.queue.size() == 0 && !offered(iter->first)) {
                 systems.erase(iter);
             }
@@ -1170,7 +1229,7 @@ private:
         auto & queue = sys(system).queue;
         auto const drv = queue.top().value_or(0);
         auto & slot = entries.at(drv);
-        queue.erase(drv, slot ? slot->featureKey : std::string(), served);
+        queue.erase(drv, slot ? slot->featureKey : std::string());
         if (!slot || slot->followers.empty() || slot->worker != noWorker) {
             if (slot && slot->followers.empty() && slot->worker == noWorker) {
                 retire(drv); // stale
