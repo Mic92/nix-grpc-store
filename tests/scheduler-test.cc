@@ -583,11 +583,38 @@ void testRunningFollowsTheWorker()
     assert(stat().free == 0 && stat().running == 1);
 }
 
+// A client with a long queue does not keep a later one waiting behind it.
+void testLeastServedClientFirst()
+{
+    Core shard;
+    std::vector<Assign> out;
+    auto const wid = hello(shard, "w", 2);
+    for (auto const * name : {"big0.drv", "big1.drv", "big2.drv", "big3.drv"}) {
+        shard.want(1, {.drvPath = name, .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
+    }
+    shard.dispatch(out);
+    assert(out.size() == 2);
+    shard.want(2, {.drvPath = "small.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 1000);
+    shard.done(lease(shard, wid, shard.entry(out[0].drv)->drvPath), {});
+    shard.dispatch(out);
+    assert(out.size() == 3 && shard.entry(out[2].drv)->drvPath == "small.drv");
+
+    // A drv two clients wait for counts for both: clients 1 and 2 have one
+    // placed each, so client 3 goes first.
+    shard.want(1, {.drvPath = "small.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 1000);
+    shard.want(2, {.drvPath = "more.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 1000);
+    shard.want(3, {.drvPath = "late.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 2000);
+    shard.done(lease(shard, wid, shard.entry(out[1].drv)->drvPath), {});
+    shard.dispatch(out);
+    assert(out.size() == 4 && shard.entry(out[3].drv)->drvPath == "late.drv");
+}
+
 } // namespace
 // NOLINTEND(*-magic-numbers, *-avoid-unchecked-container-access, bugprone-unchecked-optional-access, readability-identifier-length)
 
 auto main() -> int
 try {
+    testLeastServedClientFirst();
     testHeapAgainstMap();
     testFreeIndex();
     testAssignAndDedup();
