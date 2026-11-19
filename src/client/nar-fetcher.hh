@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <ranges>
+#include <set>
 #include <span>
 #include <nix/store/path.hh>
 #include <nix/util/error.hh>
@@ -234,8 +235,10 @@ public:
     void recordOrder(std::vector<nix::StorePath> order, std::map<nix::StorePath, uint64_t> sizes)
     {
         std::scoped_lock const lock(narMutex);
+        // Nix may sort overlapping sets before it copies.
+        std::set<nix::StorePath> queued(pending.begin(), pending.end());
         for (auto & path : order) {
-            if (!live(path)) {
+            if (!live(path) && queued.insert(path).second) {
                 pending.push_back(std::move(path));
             }
         }
