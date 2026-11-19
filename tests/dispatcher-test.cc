@@ -201,6 +201,44 @@ void aFailingWorkerIsRested()
     farm.disp.workerGone(sick.conn);
 }
 
+// One worker gives a build back while the other is busy. True if the build
+// goes back to the giver.
+auto backOnGiverWhileOtherBusy(nix::remote::Done::Reason reason) -> bool
+{
+    Farm farm;
+    Session giver;
+    Session busy;
+    farm.hello(giver.conn, "w:1", 1);
+    farm.want("a.drv");
+    farm.hello(busy.conn, "w:2", 1);
+    farm.want("b.drv");
+    assert(busy.expected == std::vector<std::string>{"b.drv"});
+
+    nix::remote::WorkerMsgs msgs;
+    auto * done = msgs.add_msgs()->mutable_done();
+    done->set_drv_path("a.drv");
+    done->set_assign_id(giver.lastAssignId);
+    done->set_outcome(nix::remote::Done::GIVEN_BACK);
+    done->set_reason(reason);
+    farm.disp.workerMsgs(giver.conn, msgs);
+
+    bool const back = giver.expected == std::vector<std::string>{"a.drv", "a.drv"};
+    assert(back || giver.expected == std::vector<std::string>{"a.drv"});
+    farm.disp.workerGone(giver.conn);
+    farm.disp.workerGone(busy.conn);
+    return back;
+}
+
+void aBuildGivenBackForAMissingInputDoesNotWaitForABusyWorker()
+{
+    assert(backOnGiverWhileOtherBusy(nix::remote::Done::INPUT_UNAVAILABLE));
+}
+
+void aBuildGivenBackForAFailureOfItsWorkerWaitsForTheOther()
+{
+    assert(!backOnGiverWhileOtherBusy(nix::remote::Done::TRANSIENT_FAILURE));
+}
+
 // A client that cannot reach the worker it was sent to is sent to another.
 void aClientThatCannotReachItsWorkerIsSentElsewhere()
 {
@@ -246,6 +284,8 @@ try {
     aClientThatCannotReachItsWorkerIsSentElsewhere();
     aWorkerThatRestedGetsItsDerivationBack();
     aFailingWorkerIsRested();
+    aBuildGivenBackForAFailureOfItsWorkerWaitsForTheOther();
+    aBuildGivenBackForAMissingInputDoesNotWaitForABusyWorker();
     loopbackWorkerMayAnswerACommand();
     endOfADroppedSessionKeepsTheNewOne();
     dropPlacesItsWorkElsewhere();
