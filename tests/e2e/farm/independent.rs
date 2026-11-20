@@ -38,6 +38,16 @@ fn a_system_without_builders_is_served_by_the_default_one() {
     succeed(CLIENT, &["nix", "store", "info", "--store", &store]);
 }
 
+/// The balancer forwards a client's SPIFFE ID, so a node's rule matches it.
+#[test]
+fn a_spiffe_rule_matches_a_client_behind_the_balancer() {
+    farm_ready();
+    let certs = certs();
+    let store =
+        format!("grpc://lb:50051?client-cert={certs}/svid.pem&client-key={certs}/svid.key");
+    succeed(CLIENT, &["nix", "store", "info", "--store", &store]);
+}
+
 #[test]
 fn build_hook_through_nix_daemon() {
     farm_ready();
