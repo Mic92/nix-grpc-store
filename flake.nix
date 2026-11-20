@@ -147,6 +147,10 @@
 
       darwinModules.default = ./nixos/darwin.nix;
 
+      # Run the daemon via flakelet (https://github.com/Mic92/flakelet), see
+      # services.nix-grpc-daemon.flakelet.enable.
+      flakelets.daemon = import ./nix/flakelet-daemon.nix { inherit niks3; };
+
       herculesCI = import ./nix/effects.nix { inherit nixpkgs; };
 
       checks = forAllSystems (
@@ -158,6 +162,7 @@
           nixosModule = self.nixosModules.default;
           nixToolsWithPlugin = self.lib.nixToolsWithPlugin;
           inherit niks3;
+          flakeletDaemon = self.flakelets.daemon;
         }
       );
 

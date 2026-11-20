@@ -9,15 +9,63 @@
 let
   cfg = config.services.nix-grpc-daemon;
   builder = lib.elem "builder" cfg.roles;
-  # A socket unit is not restarted when its listen address changes, and an
-  # idle node would never register with the scheduler.
-  socketActivated = cfg.idleTimeout != null;
+  unit = import ./daemon-unit.nix {
+    inherit cfg lib pkgs;
+    nixPackage = config.nix.package;
+  };
+
+  # Only what the host set: defaults then come from the flakelet's revision,
+  # which may be newer than this module.
+  explicit = lib.concatMapAttrs (
+    n: o:
+    if lib.isOption o then
+      lib.optionalAttrs (o.highestPrio < (lib.mkOptionDefault null).priority) { ${n} = o.value; }
+    else
+      let
+        sub = explicit o;
+      in
+      lib.optionalAttrs (sub != { }) { ${n} = sub; }
+  );
+  flakeletSettings =
+    removeAttrs (explicit options.services.nix-grpc-daemon) [
+      "enable"
+      "package"
+      "flakelet"
+      # applied by this module, on the host
+      "buildLogRetention"
+    ]
+    // lib.optionalAttrs (cfg.niks3 != null) {
+      niks3 = removeAttrs cfg.niks3 [ "package" ];
+    };
 in
 {
   imports = [ ./common.nix ];
 
+  options.services.nix-grpc-daemon.flakelet.enable = lib.mkOption {
+    type = lib.types.bool;
+    default = false;
+    description = ''
+      Run the daemon as a [flakelet](https://github.com/Mic92/flakelet)
+      instead of a unit of this system: it then updates from the
+      nix-grpc-store flake without a rebuild of the host, and
+      {option}`package` and {option}`niks3.package` are ignored. This module
+      still configures the user and Nix, and passes the other options on as
+      the flakelet's settings. Needs the flakelet NixOS module.
+    '';
+  };
+
   config = lib.mkIf cfg.enable (
     lib.mkMerge [
+      (lib.optionalAttrs (options ? services.flakelets) {
+        services.flakelets = lib.mkIf cfg.flakelet.enable {
+          enable = true;
+          services.nix-grpc-daemon = {
+            flake = lib.mkDefault "github:Mic92/nix-grpc-store";
+            output = "flakelets.daemon";
+            settings.daemon = flakeletSettings;
+          };
+        };
+      })
       (
         # Older nixpkgs lack nix.buildLogRetention.
         if options ? nix.buildLogRetention then
@@ -34,10 +82,10 @@ in
           }
       )
       {
-        assertions = [
+        assertions = unit.assertions ++ [
           {
-            assertion = cfg.scheduler == null || cfg.idleTimeout == null;
-            message = "services.nix-grpc-daemon.idleTimeout must be null with scheduler: an idle builder would stop taking work";
+            assertion = !cfg.flakelet.enable || options ? services.flakelets;
+            message = "services.nix-grpc-daemon.flakelet.enable needs the flakelet NixOS module";
           }
         ];
 
@@ -49,63 +97,21 @@ in
         };
         users.groups.nix-grpc-daemon = { };
 
-        systemd.sockets.nix-grpc-daemon = lib.mkIf socketActivated {
-          description = "Nix worker-protocol over gRPC";
-          wantedBy = [ "sockets.target" ];
-          socketConfig.ListenStream = lib.removePrefix "unix:" cfg.listen;
-        };
+        systemd.sockets.nix-grpc-daemon = lib.mkIf (
+          unit.socketActivated && !cfg.flakelet.enable
+        ) unit.socket;
 
-        systemd.services.nix-grpc-daemon = {
-          description = "Nix worker-protocol over gRPC";
-          # niks3 push shells out to `nix path-info`.
-          path = lib.optional (cfg.niks3 != null) config.nix.package;
-          wantedBy = lib.mkIf (!socketActivated) [ "multi-user.target" ];
-          requires = lib.optional socketActivated "nix-grpc-daemon.socket";
-          # nix-daemon is socket-activated; ordering after the socket is enough,
-          # the first proxied connection will start it.
-          after = lib.optional socketActivated "nix-grpc-daemon.socket" ++ [ "nix-daemon.socket" ];
-          wants = [ "nix-daemon.socket" ];
-          # Reload = drain: leave the balancer, finish and publish running
-          # builds, then exit. The socket or Restart=always starts the new
-          # generation.
-          reloadIfChanged = builder;
-          # /tmp is a size-limited tmpfs.
-          environment.TMPDIR = "/var/cache/nix-grpc-daemon";
-          serviceConfig = {
-            CacheDirectory = "nix-grpc-daemon";
-            LimitNOFILE = lib.mkDefault 65536;
-            Type = "notify";
-            WatchdogSec = 30;
-            # Keep RPCs responsive next to builds in nix-daemon.service.
-            CPUWeight = lib.mkDefault 1000;
-            User = "nix-grpc-daemon";
-            Group = "nix-grpc-daemon";
-            Restart = if socketActivated then "on-failure" else "always";
-            ExecStart = lib.escapeShellArgs (import ./daemon-args.nix { inherit cfg lib pkgs; });
-            # Builds run in nix-daemon. This only bounds the proxy.
-            MemoryMax = lib.mkDefault "2G";
+        systemd.services.nix-grpc-daemon = lib.mkIf (!cfg.flakelet.enable) (
+          unit.service
+          // {
+            # Reload = drain: leave the balancer, finish and publish running
+            # builds, then exit. The socket or Restart=always starts the new
+            # generation.
+            reloadIfChanged = builder;
+            serviceConfig =
+              unit.service.serviceConfig // lib.mapAttrs (_: lib.mkDefault) unit.serviceConfigDefaults;
           }
-          // lib.optionalAttrs (!socketActivated) {
-            # Binds listen itself, which may be a port below 1024.
-            AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
-            CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
-          }
-          // lib.optionalAttrs builder {
-            ExecReload = "${pkgs.coreutils}/bin/kill -TERM $MAINPID";
-            # stop drains too, and niks3 push must live on to publish.
-            KillMode = "mixed";
-            TimeoutStopSec = lib.mkDefault "1h";
-            NoNewPrivileges = true;
-            ProtectSystem = "strict";
-            ProtectHome = true;
-            PrivateTmp = true;
-            RestrictAddressFamilies = [
-              "AF_UNIX"
-              "AF_INET"
-              "AF_INET6"
-            ];
-          };
-        };
+        );
       }
     ]
   );

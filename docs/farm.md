@@ -174,6 +174,27 @@ Builds run in `nix-daemon.service`, RPCs and downloads in
 `nix-grpc-daemon.service`. Give both a `CPUWeight`/`MemoryHigh` so a
 heavy build can't starve the daemon.
 
+### Optional: update nodes without a rebuild
+
+With [flakelet](https://github.com/Mic92/flakelet) on the host, the daemon
+can run from this flake instead of the host's system closure:
+
+```nix
+imports = [ flakelet.nixosModules.flakelet ];
+services.nix-grpc-daemon.flakelet.enable = true;
+# optional: follow main, and what used to be systemd.services.….serviceConfig
+services.flakelets.services.nix-grpc-daemon = {
+  autoUpdate.enable = true;
+  settings.serviceConfig.MemoryMax = "16G";
+};
+```
+
+The other options stay as above and become the flakelet's settings.
+`package` and `niks3.package` are ignored, the flakelet builds both.
+`flakelet update nix-grpc-daemon` then drains the builder and starts the
+new version, and `flakelet disable nix-grpc-daemon` takes the node out of
+the farm until `flakelet enable`, across rebuilds and reboots.
+
 ### Optional: accept developer tokens
 
 To let people without a client certificate use the farm, add an OIDC
