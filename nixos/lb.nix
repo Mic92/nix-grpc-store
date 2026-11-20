@@ -566,8 +566,8 @@ in
         type = lib.types.nullOr lib.types.path;
         default = null;
         description = ''
-          Verify client certificates against this CA and forward the subject to
-          workers in `x-forwarded-client-cert`. Clients without a certificate
+          Verify client certificates against this CA and forward the subject and
+          SPIFFE ID to workers in `x-forwarded-client-cert`. Clients without a certificate
           are still accepted so bearer tokens keep working. The header is
           always overwritten, a client cannot inject one.
         '';
@@ -691,7 +691,11 @@ in
                           };
                         };
                         forward_client_cert_details = "SANITIZE_SET";
-                        set_current_client_cert_details.subject = true;
+                        # The URI too: a node matches `spiffe://` rules on it.
+                        set_current_client_cert_details = {
+                          subject = true;
+                          uri = true;
+                        };
                         route_config.virtual_hosts = [
                           {
                             name = "farm";

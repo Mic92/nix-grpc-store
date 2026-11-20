@@ -291,7 +291,8 @@ filter_chains:
             max_concurrent_streams: {{ $root.Values.lb.maxStreams }}
             connection_keepalive: {interval: 10s, timeout: 5s}
           forward_client_cert_details: SANITIZE_SET
-          set_current_client_cert_details: {subject: true}
+          # The URI too: a node matches spiffe:// rules on it.
+          set_current_client_cert_details: {subject: true, uri: true}
           route_config:
             virtual_hosts:
               - name: farm

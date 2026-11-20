@@ -100,6 +100,10 @@ let
             role = "trusted";
           }
           {
+            cn = "spiffe://farm.test/ci/*";
+            role = "trusted";
+          }
+          {
             # Envoy reads the builder list with its own certificate.
             cn = "lb-*";
             role = "trusted";
@@ -308,6 +312,7 @@ pkgs.testers.runNixOSTest {
         testCerts.certs = {
           ci = cert "ci-1" "DNS:client";
           stranger = cert "stranger" "DNS:client";
+          svid = cert "svid-1" "URI:spiffe://farm.test/ci/one";
           # From a CA nobody in the farm trusts.
           foreign = cert "foreign" "DNS:client" // { ca = "foreign-ca"; };
         };
