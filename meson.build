@@ -337,6 +337,13 @@ if build_server
     cpp_args : ['-UNDEBUG'],
   ))
 
+  test('push', executable('push-test',
+    sources : ['tests/push-test.cc'],
+    include_directories : [src_inc, include_directories('src/daemon')],
+    dependencies : [nix_store_dep, nix_util_dep, json_dep, curl_dep, threads_dep],
+    cpp_args : ['-UNDEBUG'],
+  ))
+
   test('local-store', executable('local-store-test',
     sources : ['tests/local-store-test.cc', gen],
     include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
