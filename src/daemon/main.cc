@@ -1073,6 +1073,7 @@ public:
         metrics.event(nixcompat::succeeded(res) ? "built" : "build_failed");
         if (auto const status = nixcompat::failureStatus(res)) {
             metrics.buildFailure(nixcompat::failureStatusName(*status));
+            coord.cache.publishLog(localStore.printStorePath(drvPath));
         }
         if (nixcompat::succeeded(res)) {
             std::vector<std::string> built;
