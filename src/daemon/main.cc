@@ -41,6 +41,7 @@
 #include <sys/socket.h>
 
 #include <bzlib.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <grpc/impl/channel_arg_names.h>
@@ -633,7 +634,8 @@ public:
                 bz2 += ".bz2";
                 bool const compressed = !nix::pathExists(plain);
                 auto const & path = compressed ? bz2 : plain;
-                auto const file = nixcompat::openFileReadonly(path);
+                // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,bugprone-signed-bitwise,misc-include-cleaner): C API takes int flags, and its header differs per platform.
+                auto const file = nix::AutoCloseFD{::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
                 if (!file) {
                     auto const err = errno;
                     if (compressed && err == ENOENT) {
