@@ -9,7 +9,7 @@
   module,
   mockOidc,
   e2eTests,
-  # "main" or "upload"
+  # "main", "upload" or "bench"
   phase ? "main",
 }:
 
@@ -301,9 +301,8 @@ pkgs.testers.runNixOSTest {
         )
         machine.fail("test -e /nix/var/log/nix/drvs/zy/old-retention.drv.bz2")
         machine.succeed("test -e /nix/var/log/nix/drvs/zx/fresh-retention.drv.bz2")
-
-    with subtest("benchmarks"):
-        run_e2e({"machine": machine}, env, "bench::", "--test-threads=1")
+  '' + pkgs.lib.optionalString (phase == "bench") ''
+    run_e2e({"machine": machine}, env, "bench::", "--test-threads=1")
   '' + pkgs.lib.optionalString (phase == "upload") ''
     with subtest("concurrent uploads of one input"):
         run_e2e({"machine": machine}, env, "upload::", "--test-threads=1")

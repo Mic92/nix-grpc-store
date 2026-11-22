@@ -109,6 +109,14 @@
             ;
           # Benchmarks, intentionally not in `checks` so CI skips them.
           bench-closure = nixpkgs.legacyPackages.${system}.callPackage ./tests/bench-closure.nix { };
+          bench-transport = import ./tests/nixos-test.nix {
+            pkgs = nixpkgs.legacyPackages.${system};
+            nixPkgs = nixPackagesFor nixpkgs.legacyPackages.${system};
+            module = self.nixosModules.default;
+            e2eTests = nixpkgs.legacyPackages.${system}.callPackage ./tests/e2e { };
+            mockOidc = niks3.packages.${system}.mock-oidc-server;
+            phase = "bench";
+          };
           bench-latency = import ./tests/latency-test.nix {
             pkgs = nixpkgs.legacyPackages.${system};
             nixPkgs = nixPackagesFor nixpkgs.legacyPackages.${system};
