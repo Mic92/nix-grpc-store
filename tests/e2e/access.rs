@@ -57,7 +57,8 @@ fn missing_client_cert_yields_a_readable_error() {
 
     let err = fail(&["nix", "path-info", "--store", &strict, p]);
     assert!(err.contains("requires a TLS client certificate"), "{err}");
-    assert!(err.contains("no client certificate was presented"), "{err}");
+    assert!(err.contains("no client certificate or token was sent"), "{err}");
+    assert!(!err.contains("handshake failed"), "{err}");
 
     let err = fail(&["nix", "path-info", "--store", "grpc://localhost:50053", p]);
     assert!(err.contains("server certificate is not trusted"), "{err}");
