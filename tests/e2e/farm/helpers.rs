@@ -8,6 +8,8 @@ pub const WORKER1: Node = Node("worker1");
 pub const WORKER2: Node = Node("worker2");
 pub const WORKERS: [Node; 2] = [WORKER1, WORKER2];
 
+pub const UNIT: &str = "nix-grpc-daemon";
+
 pub const BUILDER: &[&str] = &["pgrep", "-f", "read -t [9]0 x"];
 
 pub fn system() -> String {
@@ -295,6 +297,36 @@ pub fn assert_unit_success(unit: &str) {
     }
 }
 
+/// Clients that joined a build another one had asked for.
+pub fn attached() -> i64 {
+    WORKERS.into_iter().map(|w| events(w, "attached")).sum()
+}
+
+pub fn wait_attached(before: i64) {
+    retry(30, "a second client joined the build", || {
+        attached() > before
+    });
+}
+
 pub fn wait_building() {
     retry(60, "a slow build is running", || !building().is_empty());
+}
+
+/// Deletes the NAR of `path` from the bucket without telling niks3.
+pub fn lose_nar(path: &str) {
+    succeed(
+        LB,
+        &[
+            "sh",
+            "-c",
+            r#"set -e
+nar=$(curl -sf "$1/$2.narinfo" | sed -n 's/^URL: //p')
+test -n "$nar"
+curl -sf -X DELETE --aws-sigv4 aws:amz:us-east-1:s3 --user "$(cat /etc/niks3-test/s3-credentials)" "http://lb:9000/farm/$nar"
+test "$(curl -s -o /dev/null -w '%{http_code}' "$1/$nar")" = 404"#,
+            "sh",
+            &env("NGS_NIKS3_URL"),
+            &path["/nix/store/".len()..][..32],
+        ],
+    );
 }
