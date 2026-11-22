@@ -375,6 +375,7 @@ void checkStats(Core & shard)
     auto const stat = [&](const char * sys, const char * feats = "") -> Core::Stats { return sts[{.system = sys, .features = feats}]; };
     assert(stat("aarch64").slots == 2 && stat("aarch64").free == 1 && stat("aarch64").running == 1);
     assert(stat("x86_64").slots == 1 && stat("x86_64").free == 0 && stat("i686").slots == 0);
+    assert(stat("aarch64").workers == 1 && stat("x86_64").workers == 1 && stat("i686").workers == 0);
     assert(stat("x86_64").queued + stat("i686").queued == 1 && stat("x86_64").running + stat("i686").running == 1);
     assert(stat("x86_64").unplaceable + stat("i686").unplaceable == 0);
     assert(stat("riscv").queued == 1 && stat("riscv").unplaceable == 1);
