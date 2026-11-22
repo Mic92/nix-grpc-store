@@ -147,6 +147,18 @@ fn an_input_only_one_worker_has_still_reaches_the_builder() {
     }
 }
 
+/// Nix asks what is missing before it uploads the derivation.
+#[test]
+fn a_derivation_the_farm_has_not_seen_is_announced_as_a_build() {
+    farm_ready();
+    let argv = [
+        "nix", "build", "--dry-run", "--store", &envoy(), "--eval-store", "auto", "-f", &expr("JOB"), "--argstr",
+        "tag", "announced",
+    ];
+    let out = run_t(CLIENT, &argv, 60).combined();
+    assert!(out.contains("will be built") && !out.contains("don't know how to build"), "{out}");
+}
+
 /// `nix log` against the cache shows why a build failed.
 #[test]
 fn the_log_of_a_failed_build_reaches_the_cache() {
