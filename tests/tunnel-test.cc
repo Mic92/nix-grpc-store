@@ -165,6 +165,8 @@ struct Pki
         save(makeCert("DNS:a.test,DNS:b.test", &authority, {{"O", "farm"}, {"CN", "b1"}}), dir / "named");
         save(makeCert("DNS:b1", &authority, {{"CN", "b1"}, {"O", "farm"}}), dir / "name-first");
         save(makeCert("DNS:b1", &authority, {{"O", "farm"}}), dir / "nameless");
+        save(makeCert("URI:spiffe://farm.test/worker/b2", &authority, {{"O", "SPIRE"}}), dir / "svid");
+        save(makeCert("URI:spiffe://farm.test", &authority, {{"O", "SPIRE"}}), dir / "svid-pathless");
         save(makeCert("DNS:b1", &authority, {{"CN", "-"}}), dir / "dash");
         save(makeCert("DNS:b1", &authority, {{"CN", "b1/pod"}}), dir / "slash");
         // Two bytes per character.
@@ -588,7 +590,8 @@ void a_tunnelled_builder_is_known_by_its_certificates_common_name()
     check(certName(pki.file("wide.pem")) == "b1", "also when the certificate stores it two bytes per character");
     // The balancer reads the name from the end of the subject, and "-" where there is none.
     // With a slash it could be taken for another builder's name and pod.
-    for (const auto * file : {"name-first.pem", "nameless.pem", "dash.pem", "slash.pem"}) {
+    check(certName(pki.file("svid.pem")) == "b2", "without a common name, the end of the SPIFFE ID is the builder's name");
+    for (const auto * file : {"name-first.pem", "nameless.pem", "svid-pathless.pem", "dash.pem", "slash.pem"}) {
         try {
             (void) certName(pki.file(file));
             check(false, std::string(file) + " is refused");

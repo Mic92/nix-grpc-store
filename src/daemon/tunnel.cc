@@ -14,6 +14,7 @@
 #include <string_view>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -35,10 +36,12 @@
 #include <openssl/tls1.h>
 #include <openssl/x509.h>
 #include <openssl/x509_vfy.h>
+#include <openssl/x509v3.h>
 
 #include <nix/util/error.hh>
 #include <nix/util/file-descriptor.hh>
 
+#include "peer.hh"
 #include "tunnel-protocol.hh"
 
 // NOLINTBEGIN(misc-include-cleaner): which header declares a socket or OpenSSL name differs per platform and version.
@@ -495,6 +498,24 @@ auto waitClosed(int sock, const Wake & stop) -> End
 
 namespace {
 
+auto uriNames(const X509 & cert) -> std::vector<std::string>
+{
+    std::vector<std::string> uris;
+    const Owner<GENERAL_NAMES, GENERAL_NAMES_free> names{
+        static_cast<GENERAL_NAMES *>(X509_get_ext_d2i(&cert, NID_subject_alt_name, nullptr, nullptr))};
+    // NOLINTBEGIN(cppcoreguidelines-pro-type-cstyle-cast,cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL's stack macros and byte strings.
+    for (int idx = 0; names && idx < sk_GENERAL_NAME_num(names.get()); idx++) {
+        int type = 0;
+        const void * value = GENERAL_NAME_get0_value(sk_GENERAL_NAME_value(names.get(), idx), &type);
+        if (type == GEN_URI) {
+            const auto * uri = static_cast<const ASN1_IA5STRING *>(value);
+            uris.emplace_back(reinterpret_cast<const char *>(ASN1_STRING_get0_data(uri)), static_cast<size_t>(ASN1_STRING_length(uri)));
+        }
+    }
+    // NOLINTEND(cppcoreguidelines-pro-type-cstyle-cast,cppcoreguidelines-pro-type-reinterpret-cast)
+    return uris;
+}
+
 // Nothing without a common name. Throws when it is not where the balancer looks.
 auto commonName(const X509 & cert, const std::string & file) -> std::optional<std::string>
 {
@@ -542,7 +563,13 @@ auto certName(const std::string & file) -> std::string
         }
         return *name;
     }
-    throw nix::Error("the subject of the certificate '%s' must end in its common name, a builder behind a tunnel is known by it", file);
+    // SPIRE issues certificates without a common name.
+    for (const auto & uri : uriNames(*cert)) {
+        if (const auto segment = spiffeLastSegment(uri)) {
+            return std::string(*segment);
+        }
+    }
+    throw nix::Error("the certificate '%s' has neither a common name nor a SPIFFE ID with a path, a builder behind a tunnel is known by one of them", file);
 }
 
 } // namespace nixgrpc::tunnel

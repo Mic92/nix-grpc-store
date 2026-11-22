@@ -316,12 +316,21 @@ let
 
   # The common name of the builder's certificate if `tunnel.names` lists it.
   # Envoy gives the subject as text, common name first.
+  # With `tunnel.spiffeId` a certificate without common name is known by
+  # what follows that prefix in its SPIFFE ID.
   peerName =
     let
       pattern = lib.replaceStrings [ "." "*" ] [ "\\." "[^,+/\\\\]*" ];
       names = lib.concatMapStringsSep "|" pattern cfg.tunnel.names;
+      prefix = lib.replaceStrings [ "." ] [ "\\." ] cfg.tunnel.spiffeId;
+      byName = "re.extract(connection.subject_peer_certificate, r'^CN=(${names})(,|$)', r'\\1')";
+      bySpiffeId = "re.extract(connection.uri_san_peer_certificate, r'^${prefix}([A-Za-z0-9._-]+)$', r'\\1')";
     in
-    "%CEL(re.extract(connection.subject_peer_certificate, r'^CN=(${names})(,|$)', r'\\1'))%";
+    if cfg.tunnel.spiffeId == null then
+      "%CEL(${byName})%"
+    else
+      # A certificate without URI has no such field to test, so ask for the name.
+      "%CEL(connection.subject_peer_certificate.startsWith('CN=') ? ${byName} : ${bySpiffeId})%";
 
   # A builder joins the set its ALPN name asks for, under its certificate's name.
   tunnelChain = protocol: validation: {
@@ -537,6 +546,18 @@ in
           Every tunnel receives requests meant for builders, so list only
           the names of builder certificates. A client certificate signed by
           the same CA, such as `ci-1`, is then refused.
+        '';
+      };
+      spiffeId = lib.mkOption {
+        type = lib.types.nullOr (lib.types.strMatching "spiffe://[a-z0-9._-]+/([A-Za-z0-9._-]+/)*");
+        default = null;
+        example = "spiffe://example.org/farm/worker/";
+        description = ''
+          Which certificates may open a tunnel, by SPIFFE ID, next to
+          those of `tunnel.names`. A certificate may if its ID is this
+          prefix followed by one more segment, and that segment is the
+          builder's name. Meant for certificates without a common name, as
+          SPIRE issues them.
         '';
       };
       threads = lib.mkOption {
