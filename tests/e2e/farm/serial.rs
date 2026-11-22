@@ -833,6 +833,8 @@ fn low_disk_drains_a_worker_and_builds_go_to_the_other() {
         "event=healthy reason=low_disk",
     );
     let (down0, up0) = (count(down), count(up));
+    let slots = || gauge_sum(leader(), r#"kind="slots""#);
+    let slots0 = slots();
     let avail = succeed(WORKER1, &["df", "--output=avail", "-B1", "/nix/store"]);
     let avail: u64 = avail.lines().last().unwrap().trim().parse().unwrap();
     succeed(
@@ -849,6 +851,8 @@ fn low_disk_drains_a_worker_and_builds_go_to_the_other() {
     assert_eq!(holders(&top), [WORKER2]);
     succeed(WORKER1, &["rm", "/nix/.rw-store/fill"]);
     wait_journal_above(WORKER1, UNIT, up, up0, 30);
+    // The scheduler hears of it a moment after the worker logs it.
+    retry(30, "the scheduler counts the worker's slots again", || slots() == slots0);
 }
 
 /// The balancer sends a request to the worker in its `x-nix-worker` header,
