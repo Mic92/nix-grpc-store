@@ -1,6 +1,7 @@
 #include "tunnel.hh"
 
 #include <array>
+#include <concepts>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -12,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -60,6 +62,9 @@ struct Free
 template<typename Owned, auto Release>
 using Owner = std::unique_ptr<Owned, Free<Release>>;
 
+// Frees with a macro, which cannot name a template argument.
+constexpr auto opensslFree = [](unsigned char * text) -> void { OPENSSL_free(text); };
+
 auto sslError() -> std::string
 {
     constexpr size_t maxText = 256;
@@ -73,11 +78,19 @@ auto sslError() -> std::string
     return buf.data();
 }
 
-void setFlag(int sock, int flag)
+void tlsOk(bool worked)
+{
+    if (!worked) {
+        throw nix::Error("TLS: %s", sslError());
+    }
+}
+
+// Neither blocks nor survives an exec. macOS cannot ask for that at creation.
+void makeOurs(int desc)
 {
     // NOLINTBEGIN(cppcoreguidelines-pro-type-vararg,bugprone-signed-bitwise): fcntl's interface.
-    const int flags = fcntl(sock, F_GETFL);
-    if (flags < 0 || fcntl(sock, F_SETFL, flags | flag) < 0) {
+    const int flags = fcntl(desc, F_GETFL);
+    if (flags < 0 || fcntl(desc, F_SETFL, flags | O_NONBLOCK) < 0 || fcntl(desc, F_SETFD, FD_CLOEXEC) < 0) {
         throw nix::SysError("fcntl");
     }
     // NOLINTEND(cppcoreguidelines-pro-type-vararg,bugprone-signed-bitwise)
@@ -96,8 +109,8 @@ enum class Ready : uint8_t {
     late,
 };
 
-// Waits for `events` on `sock` (none if negative), for `stop`, or until `deadline`.
-auto wait(int sock, short events, const Wake & stop, std::optional<Clock::time_point> deadline) -> Ready
+// Waits for `events` on `sock` if there is one, for `stop`, or until `deadline`.
+auto wait(std::optional<int> sock, short events, const Wake & stop, std::optional<Clock::time_point> deadline) -> Ready
 {
     for (;;) {
         int timeoutMs = -1;
@@ -109,7 +122,8 @@ auto wait(int sock, short events, const Wake & stop, std::optional<Clock::time_p
             timeoutMs = static_cast<int>(left);
         }
         std::array<pollfd, 2> fds{{
-            {.fd = sock, .events = events, .revents = 0},
+            // poll() skips a negative descriptor.
+            {.fd = sock.value_or(-1), .events = events, .revents = 0},
             {.fd = stop.fd(), .events = POLLIN, .revents = 0},
         }};
         const int ready = poll(fds.data(), fds.size(), timeoutMs);
@@ -126,42 +140,50 @@ auto wait(int sock, short events, const Wake & stop, std::optional<Clock::time_p
     }
 }
 
-// False when `stop` interrupted. Throws when `deadline` passes.
-auto await(int sock, short events, const Wake & stop, std::optional<Clock::time_point> deadline) -> bool
+enum class Io : uint8_t {
+    done,
+    stopped,
+};
+
+// Throws when `deadline` passes.
+auto await(int sock, short events, const Wake & stop, std::optional<Clock::time_point> deadline) -> Io
 {
     const auto ready = wait(sock, events, stop, deadline);
     if (ready == Ready::late) {
         throw nix::Error("timed out");
     }
-    return ready == Ready::sock;
+    return ready == Ready::sock ? Io::done : Io::stopped;
 }
 
-auto connectTo(const Target & target, const Wake & stop, Clock::time_point deadline) -> nix::AutoCloseFD
+using Address = std::variant<sockaddr_in, sockaddr_in6>;
+
+auto parseAddress(const std::string & text, uint16_t port) -> std::optional<Address>
 {
-    sockaddr_storage addr{};
-    socklen_t len = 0;
-    if (auto * ipv4 = reinterpret_cast<sockaddr_in *>(&addr); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-        inet_pton(AF_INET, target.address.c_str(), &ipv4->sin_addr) == 1) {
-        ipv4->sin_family = AF_INET;
-        ipv4->sin_port = htons(target.port);
-        len = sizeof(sockaddr_in);
-    } else if (auto * ipv6 = reinterpret_cast<sockaddr_in6 *>(&addr); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-               inet_pton(AF_INET6, target.address.c_str(), &ipv6->sin6_addr) == 1) {
-        ipv6->sin6_family = AF_INET6;
-        ipv6->sin6_port = htons(target.port);
-        len = sizeof(sockaddr_in6);
-    } else {
+    if (sockaddr_in ipv4{}; inet_pton(AF_INET, text.c_str(), &ipv4.sin_addr) == 1) {
+        ipv4.sin_family = AF_INET;
+        ipv4.sin_port = htons(port);
+        return ipv4;
+    }
+    if (sockaddr_in6 ipv6{}; inet_pton(AF_INET6, text.c_str(), &ipv6.sin6_addr) == 1) {
+        ipv6.sin6_family = AF_INET6;
+        ipv6.sin6_port = htons(port);
+        return ipv6;
+    }
+    return std::nullopt;
+}
+
+// No socket when `stop` interrupted.
+auto connectTo(const Target & target, const Wake & stop, Clock::time_point deadline) -> std::optional<nix::AutoCloseFD>
+{
+    const auto address = parseAddress(target.address, target.port);
+    if (!address) {
         throw nix::Error("'%s' is not an IP address", target.address);
     }
-    nix::AutoCloseFD sock{socket(addr.ss_family, SOCK_STREAM, 0)};
+    nix::AutoCloseFD sock{socket(std::holds_alternative<sockaddr_in>(*address) ? AF_INET : AF_INET6, SOCK_STREAM, 0)};
     if (!sock) {
         throw nix::SysError("socket");
     }
-    setFlag(sock.get(), O_NONBLOCK);
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
-    if (fcntl(sock.get(), F_SETFD, FD_CLOEXEC) < 0) {
-        throw nix::SysError("fcntl");
-    }
+    makeOurs(sock.get());
 #ifdef SO_NOSIGPIPE
     setOpt(sock.get(), SOL_SOCKET, SO_NOSIGPIPE, 1);
 #endif
@@ -179,13 +201,18 @@ auto connectTo(const Target & target, const Wake & stop, Clock::time_point deadl
     setOpt(sock.get(), IPPROTO_TCP, TCP_KEEPCNT, probes);
     setOpt(sock.get(), IPPROTO_TCP, TCP_NODELAY, 1);
 
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-    if (connect(sock.get(), reinterpret_cast<sockaddr *>(&addr), len) != 0) {
+    const int connected = std::visit(
+        [&](const auto & addr) -> int {
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): the socket interface.
+            return connect(sock.get(), reinterpret_cast<const sockaddr *>(&addr), sizeof addr);
+        },
+        *address);
+    if (connected != 0) {
         if (errno != EINPROGRESS) {
             throw nix::SysError("connect");
         }
-        if (!await(sock.get(), POLLOUT, stop, deadline)) {
-            return {};
+        if (await(sock.get(), POLLOUT, stop, deadline) == Io::stopped) {
+            return std::nullopt;
         }
         int err = 0;
         socklen_t errLen = sizeof err;
@@ -202,14 +229,8 @@ struct Closed : nix::Error
     using nix::Error::Error;
 };
 
-enum class Io : uint8_t {
-    done,
-    stopped,
-};
-
 // Runs `step` (an SSL_* call) until it succeeds, waiting for the socket in between.
-template<typename Step>
-auto drive(SSL * ssl, int sock, const Wake & stop, Clock::time_point deadline, std::string_view what, Step step) -> Io
+auto drive(SSL & ssl, int sock, const Wake & stop, Clock::time_point deadline, std::string_view what, std::invocable auto step) -> Io
 {
     for (;;) {
         ERR_clear_error();
@@ -217,8 +238,9 @@ auto drive(SSL * ssl, int sock, const Wake & stop, Clock::time_point deadline, s
         if (ret > 0) {
             return Io::done;
         }
+        const int error = SSL_get_error(&ssl, ret);
         short events = 0;
-        switch (SSL_get_error(ssl, ret)) {
+        switch (error) {
         case SSL_ERROR_WANT_READ:
             events = POLLIN;
             break;
@@ -228,30 +250,27 @@ auto drive(SSL * ssl, int sock, const Wake & stop, Clock::time_point deadline, s
         case SSL_ERROR_ZERO_RETURN:
             throw Closed("%s: the balancer closed the connection", what);
         default:
-            if (const auto verify = SSL_get_verify_result(ssl); verify != X509_V_OK) {
+            if (const auto verify = SSL_get_verify_result(&ssl); verify != X509_V_OK) {
                 throw nix::Error("%s: certificate: %s", what, X509_verify_cert_error_string(verify));
             }
             // A reset shows as a system error, a plain close as this one.
-            if (SSL_get_error(ssl, ret) == SSL_ERROR_SYSCALL || ERR_GET_REASON(ERR_peek_error()) == SSL_R_UNEXPECTED_EOF_WHILE_READING) {
+            if (error == SSL_ERROR_SYSCALL || ERR_GET_REASON(ERR_peek_error()) == SSL_R_UNEXPECTED_EOF_WHILE_READING) {
                 throw Closed("%s: the balancer closed the connection", what);
             }
             throw nix::Error("%s: %s", what, sslError());
         }
-        if (!await(sock, events, stop, deadline)) {
+        if (await(sock, events, stop, deadline) == Io::stopped) {
             return Io::stopped;
         }
     }
 }
 
-auto handshake(int sock, const Target & target, const Tls & tls, const Identity & self, const Wake & stop, Clock::time_point deadline) -> Io
+// Read anew for every tunnel, so that a renewed certificate is the one shown.
+auto makeContext(const Tls & tls) -> Owner<SSL_CTX, SSL_CTX_free>
 {
-    const Owner<SSL_CTX, SSL_CTX_free> ctx{SSL_CTX_new(TLS_client_method())};
-    if (!ctx) {
-        throw nix::Error("TLS: %s", sslError());
-    }
-    if (SSL_CTX_set_min_proto_version(ctx.get(), TLS1_2_VERSION) != 1 || SSL_CTX_set_default_verify_paths(ctx.get()) != 1) {
-        throw nix::Error("TLS: %s", sslError());
-    }
+    Owner<SSL_CTX, SSL_CTX_free> ctx{SSL_CTX_new(TLS_client_method())};
+    tlsOk(ctx != nullptr);
+    tlsOk(SSL_CTX_set_min_proto_version(ctx.get(), TLS1_2_VERSION) == 1 && SSL_CTX_set_default_verify_paths(ctx.get()) == 1);
     if (!tls.ca.empty() && SSL_CTX_load_verify_locations(ctx.get(), tls.ca.c_str(), nullptr) != 1) {
         throw nix::Error("reading '%s': %s", tls.ca, sslError());
     }
@@ -262,43 +281,34 @@ auto handshake(int sock, const Target & target, const Tls & tls, const Identity 
         throw nix::Error("reading '%s': %s", tls.key, sslError());
     }
     SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_PEER, nullptr);
+    return ctx;
+}
 
-    const Owner<SSL, SSL_free> ssl{SSL_new(ctx.get())};
-    if (!ssl || SSL_set_fd(ssl.get(), sock) != 1 || SSL_set1_host(ssl.get(), target.host.c_str()) != 1) {
-        throw nix::Error("TLS: %s", sslError());
-    }
+auto makeSession(SSL_CTX & ctx, int sock, const Target & target) -> Owner<SSL, SSL_free>
+{
+    Owner<SSL, SSL_free> ssl{SSL_new(&ctx)};
+    tlsOk(ssl != nullptr && SSL_set_fd(ssl.get(), sock) == 1 && SSL_set1_host(ssl.get(), target.host.c_str()) == 1);
     // The server name extension is for names only (RFC 6066).
-    in6_addr scratch{};
-    const bool isAddress =
-        inet_pton(AF_INET, target.host.c_str(), &scratch) == 1 || inet_pton(AF_INET6, target.host.c_str(), &scratch) == 1;
-    if (!isAddress && SSL_set_tlsext_host_name(ssl.get(), target.host.c_str()) != 1) {
-        throw nix::Error("TLS: %s", sslError());
+    if (!parseAddress(target.host, 0)) {
+        tlsOk(SSL_set_tlsext_host_name(ssl.get(), target.host.c_str()) == 1);
     }
     // On the wire: one length byte, then the name. validName() keeps it short enough.
     std::string alpn(1, static_cast<char>(target.protocol.size()));
     alpn += target.protocol;
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-    if (SSL_set_alpn_protos(ssl.get(), reinterpret_cast<const unsigned char *>(alpn.data()), static_cast<unsigned>(alpn.size())) != 0) {
-        throw nix::Error("TLS: %s", sslError());
-    }
+    tlsOk(SSL_set_alpn_protos(ssl.get(), reinterpret_cast<const unsigned char *>(alpn.data()), static_cast<unsigned>(alpn.size())) == 0);
     // The balancer goes on with the bare socket and never ends this session.
     SSL_set_quiet_shutdown(ssl.get(), 1);
+    return ssl;
+}
 
-    try {
-        if (drive(ssl.get(), sock, stop, deadline, "TLS handshake", [&] -> int { return SSL_connect(ssl.get()); }) == Io::stopped) {
-            return Io::stopped;
-        }
-    } catch (Closed &) {
-        // What Envoy does on a port that has no listener for this ALPN name.
-        throw nix::Error(
-            "the balancer closed the connection during the TLS handshake; is %s its tunnel port?",
-            std::format("{}:{}", target.address, target.port));
-    }
+// Asks the balancer for the tunnel and reads its answer.
+auto ask(SSL & ssl, int sock, const Target & target, const Identity & self, const Wake & stop, Clock::time_point deadline) -> Io
+{
     const auto req = request(self, target.host);
     // Without partial writes SSL_write succeeds only with all of it.
-    if (drive(ssl.get(), sock, stop, deadline, "request", [&] -> int {
-            return SSL_write(ssl.get(), req.data(), static_cast<int>(req.size()));
-        }) == Io::stopped) {
+    if (drive(ssl, sock, stop, deadline, "request", [&] -> int { return SSL_write(&ssl, req.data(), static_cast<int>(req.size())); })
+        == Io::stopped) {
         return Io::stopped;
     }
     constexpr size_t maxHead = 16384;
@@ -309,8 +319,8 @@ auto handshake(int sock, const Target & target, const Tls & tls, const Identity 
         }
         std::array<char, 1024> buf{};
         int got = 0;
-        if (drive(ssl.get(), sock, stop, deadline, "answer", [&] -> int {
-                got = SSL_read(ssl.get(), buf.data(), static_cast<int>(buf.size()));
+        if (drive(ssl, sock, stop, deadline, "answer", [&] -> int {
+                got = SSL_read(&ssl, buf.data(), static_cast<int>(buf.size()));
                 return got;
             }) == Io::stopped) {
             return Io::stopped;
@@ -321,6 +331,23 @@ auto handshake(int sock, const Target & target, const Tls & tls, const Identity 
         throw nix::Error("the balancer refused the tunnel: %s", head.substr(0, head.find('\r')));
     }
     return Io::done;
+}
+
+auto handshake(int sock, const Target & target, const Tls & tls, const Identity & self, const Wake & stop, Clock::time_point deadline) -> Io
+{
+    const auto ctx = makeContext(tls);
+    const auto ssl = makeSession(*ctx, sock, target);
+    try {
+        if (drive(*ssl, sock, stop, deadline, "TLS handshake", [&] -> int { return SSL_connect(ssl.get()); }) == Io::stopped) {
+            return Io::stopped;
+        }
+    } catch (Closed &) {
+        // What Envoy does on a port that has no listener for this ALPN name.
+        throw nix::Error(
+            "the balancer closed the connection during the TLS handshake; is %s its tunnel port?",
+            std::format("{}:{}", target.address, target.port));
+    }
+    return ask(*ssl, sock, target, self, stop, deadline);
 }
 
 // The few bytes of a ping fit an idle socket's buffer, or the tunnel is broken.
@@ -346,11 +373,7 @@ Wake::Wake()
     readSide = nix::AutoCloseFD{fds.front()};
     writeSide = nix::AutoCloseFD{fds.back()};
     for (const int end : fds) {
-        setFlag(end, O_NONBLOCK);
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg)
-        if (fcntl(end, F_SETFD, FD_CLOEXEC) < 0) {
-            throw nix::SysError("fcntl");
-        }
+        makeOurs(end);
     }
 }
 
@@ -370,20 +393,24 @@ void Wake::clear() const
 
 auto Wake::wait(std::optional<std::chrono::milliseconds> timeout) const -> bool
 {
-    return nixgrpc::tunnel::wait(-1, 0, *this, timeout ? std::optional{Clock::now() + *timeout} : std::nullopt) == Ready::stop;
+    return nixgrpc::tunnel::wait(std::nullopt, 0, *this, timeout ? std::optional{Clock::now() + *timeout} : std::nullopt) == Ready::stop;
 }
 
 auto open(const Target & target, const Tls & tls, const Identity & self, const Wake & stop, const std::function<void()> & accepted)
-    -> nix::AutoCloseFD
+    -> std::optional<nix::AutoCloseFD>
 {
     if (!validName(self.node) || !validName(self.group) || !validName(self.name) || !(validName(target.host) || validAddress6(target.host))
         || !validName(target.protocol)) {
         throw nix::Error("tunnel: invalid name");
     }
     const auto deadline = Clock::now() + openTimeout;
-    auto sock = connectTo(target, stop, deadline);
-    if (!sock || handshake(sock.get(), target, tls, self, stop, deadline) == Io::stopped) {
-        return {};
+    auto connected = connectTo(target, stop, deadline);
+    if (!connected) {
+        return std::nullopt;
+    }
+    const auto & sock = *connected;
+    if (handshake(sock.get(), target, tls, self, stop, deadline) == Io::stopped) {
+        return std::nullopt;
     }
     if (accepted) {
         accepted();
@@ -391,8 +418,8 @@ auto open(const Target & target, const Tls & tls, const Identity & self, const W
     // The start of a ping that came without its end.
     std::string pending;
     for (;;) {
-        if (!await(sock.get(), POLLIN, stop, std::nullopt)) {
-            return {};
+        if (await(sock.get(), POLLIN, stop, std::nullopt) == Io::stopped) {
+            return std::nullopt;
         }
         std::array<char, ping.size()> head{};
         // What follows the pings stays in the socket for gRPC.
@@ -409,7 +436,7 @@ auto open(const Target & target, const Tls & tls, const Identity & self, const W
         const std::string_view bytes{head.data(), static_cast<size_t>(got)};
         if (pending.empty()) {
             if (front(bytes) == Front::data) {
-                return sock;
+                return connected;
             }
             (void) recv(sock.get(), head.data(), bytes.size(), 0);
         }
@@ -462,9 +489,40 @@ auto waitClosed(int sock, const Wake & stop) -> End
 #else
 auto waitClosed(int sock, const Wake & stop) -> End
 {
-    return await(sock, POLLRDHUP | POLLHUP, stop, std::nullopt) ? End::closed : End::stopped;
+    return await(sock, POLLRDHUP | POLLHUP, stop, std::nullopt) == Io::done ? End::closed : End::stopped;
 }
 #endif
+
+namespace {
+
+// Nothing without a common name. Throws when it is not where the balancer looks.
+auto commonName(const X509 & cert, const std::string & file) -> std::optional<std::string>
+{
+    const X509_NAME * subject = X509_get_subject_name(&cert);
+    if (X509_NAME_get_index_by_NID(subject, NID_commonName, -1) < 0) {
+        return std::nullopt;
+    }
+    // The balancer takes the name from the front of the subject as text,
+    // which is the last entry. Anywhere else it would not find it.
+    const int last = X509_NAME_entry_count(subject) - 1;
+    const X509_NAME_ENTRY * entry = X509_NAME_get_entry(subject, last);
+    const bool isName = OBJ_obj2nid(X509_NAME_ENTRY_get_object(entry)) == NID_commonName;
+    const bool alone = last < 1 || X509_NAME_ENTRY_set(entry) != X509_NAME_ENTRY_set(X509_NAME_get_entry(subject, last - 1));
+    if (!isName || !alone) {
+        throw nix::Error("the subject of the certificate '%s' must end in its common name, a builder behind a tunnel is known by it", file);
+    }
+    // As text: the bytes of a certificate's string can be two per character.
+    unsigned char * raw = nullptr;
+    const int length = ASN1_STRING_to_UTF8(&raw, X509_NAME_ENTRY_get_data(entry));
+    const Owner<unsigned char, opensslFree> utf8{raw};
+    if (length < 0) {
+        throw nix::Error("reading the common name of '%s': %s", file, sslError());
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    return std::string(reinterpret_cast<const char *>(utf8.get()), static_cast<size_t>(length));
+}
+
+} // namespace
 
 auto certName(const std::string & file) -> std::string
 {
@@ -476,31 +534,15 @@ auto certName(const std::string & file) -> std::string
     if (!cert) {
         throw nix::Error("reading '%s': %s", file, sslError());
     }
-    // The balancer takes the name from the front of the subject as text,
-    // which is the last entry; anywhere else it would not find it.
-    const X509_NAME * subject = X509_get_subject_name(cert.get());
-    const int last = X509_NAME_entry_count(subject) - 1;
-    const X509_NAME_ENTRY * entry = last < 0 ? nullptr : X509_NAME_get_entry(subject, last);
-    const bool isName = entry != nullptr && OBJ_obj2nid(X509_NAME_ENTRY_get_object(entry)) == NID_commonName;
-    const bool alone = last < 1 || X509_NAME_ENTRY_set(entry) != X509_NAME_ENTRY_set(X509_NAME_get_entry(subject, last - 1));
-    if (!isName || !alone) {
-        throw nix::Error("the subject of the certificate '%s' must end in its common name, a builder behind a tunnel is known by it", file);
+    if (const auto name = commonName(*cert, file)) {
+        // "-" is what the balancer reads from a certificate without a name. With
+        // a slash, "a/b" as pod "c" and "a" as pod "b/c" would be the same builder.
+        if (!validName(*name) || *name == "-" || name->contains('/')) {
+            throw nix::Error("the common name of the certificate '%s' must consist of letters, digits and -._", file);
+        }
+        return *name;
     }
-    // As text: the bytes of a certificate's string can be two per character.
-    unsigned char * utf8 = nullptr;
-    const int length = ASN1_STRING_to_UTF8(&utf8, X509_NAME_ENTRY_get_data(entry));
-    if (length < 0) {
-        throw nix::Error("reading the common name of '%s': %s", file, sslError());
-    }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-    const std::string found(reinterpret_cast<const char *>(utf8), static_cast<size_t>(length));
-    OPENSSL_free(utf8);
-    // "-" is what the balancer reads from a certificate without a name. With
-    // a slash, "a/b" as pod "c" and "a" as pod "b/c" would be the same builder.
-    if (!validName(found) || found == "-" || found.contains('/')) {
-        throw nix::Error("the common name of the certificate '%s' must consist of letters, digits and -._", file);
-    }
-    return found;
+    throw nix::Error("the subject of the certificate '%s' must end in its common name, a builder behind a tunnel is known by it", file);
 }
 
 } // namespace nixgrpc::tunnel

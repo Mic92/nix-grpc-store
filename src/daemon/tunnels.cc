@@ -296,11 +296,11 @@ void Tunnels::hold(Slot & slot, Group & group)
         return;
     }
     // The second descriptor shows when the new owner's socket ended, and can end it.
-    const nix::AutoCloseFD watch{dup(sock.get())};
+    const nix::AutoCloseFD watch{dup(sock->get())};
     if (!watch) {
         throw nix::SysError("dup");
     }
-    config.adopt(std::move(sock));
+    config.adopt(std::move(*sock));
     for (;;) {
         slot.stir.clear();
         if (leaves(slot)) {
