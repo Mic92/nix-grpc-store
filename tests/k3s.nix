@@ -183,6 +183,12 @@ let
       publicKeys = [ signingPublicKey ];
       auth.serviceAccountToken.enabled = true;
     };
+    # The VM has no route to cache.nixos.org and every build would wait for
+    # its lookup to time out.
+    upstreamCaches = {
+      urls = [ ];
+      publicKeys = [ ];
+    };
     auth.workloadIdentity = {
       enabled = true;
       allowedServiceAccounts = [ "ci:builder" ];
