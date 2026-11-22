@@ -401,11 +401,6 @@ auto EdsService::render(const std::shared_ptr<const Dispatcher::Membership> & me
     std::set<std::string> undialable;
     for (const auto & [system, list] : *members) {
         for (const auto & member : list) {
-            // A name without a port is a builder behind a tunnel, which the
-            // balancer finds by that name and not through this list.
-            if (!member.addr.contains(':')) {
-                continue;
-            }
             auto const parsed = parseAddr(member.addr);
             if (parsed || !undialable.insert(member.addr).second || reported.contains(member.addr)) {
                 continue;
