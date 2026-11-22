@@ -51,10 +51,10 @@ inline auto logfmtValue(std::string_view value) -> std::string
 
 enum class LogLevel : std::uint8_t { info, debug };
 
-// Emit one logfmt line: ts=… level=… key=value …
 using LogField = std::pair<std::string_view, std::string>;
 
-inline void logLine(LogLevel level, std::span<const LogField> fields)
+// Append one logfmt line to `line`: ts=… level=… key=value …
+inline void appendLogLine(std::string & line, LogLevel level, std::span<const LogField> fields)
 {
     auto const now = std::chrono::system_clock::now();
     auto const secs = std::chrono::system_clock::to_time_t(now);
@@ -63,7 +63,7 @@ inline void logLine(LogLevel level, std::span<const LogField> fields)
     std::array<char, sizeof("2000-01-01T00:00:00Z")> timestamp{};
     static_cast<void>(std::strftime(timestamp.data(), timestamp.size(), "%Y-%m-%dT%H:%M:%SZ", &utc));
 
-    std::string line = "ts=";
+    line += "ts=";
     line += timestamp.data();
     line += level == LogLevel::debug ? " level=debug" : " level=info";
     for (const auto & [key, value] : fields) {
@@ -73,6 +73,12 @@ inline void logLine(LogLevel level, std::span<const LogField> fields)
         line += logfmtValue(value);
     }
     line += '\n';
+}
+
+inline void logLine(LogLevel level, std::span<const LogField> fields)
+{
+    std::string line;
+    appendLogLine(line, level, fields);
     // Single write keeps lines from interleaving across handler threads.
     static_cast<void>(std::fputs(line.c_str(), stderr));
 }
