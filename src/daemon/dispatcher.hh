@@ -119,6 +119,7 @@ public:
         std::string addr;
         bool draining = false;
     };
+    // The builders the balancer dials, by system.
     using Membership = std::flat_map<std::string, std::vector<Member>>;
     [[nodiscard]] auto membership() const -> std::shared_ptr<const Membership>;
     // The builders the balancer may use for `system`. Normally the ones

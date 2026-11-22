@@ -276,7 +276,9 @@ void Dispatcher::membershipChangedLocked()
     auto next = std::make_shared<Membership>();
     for (size_t wid = 0; wid < core.workerCount(); wid++) {
         const auto & wkr = core.worker(static_cast<sched::WorkerId>(wid));
-        if (!wkr.up) {
+        // A name without a port is a builder behind a tunnel. The balancer
+        // finds it by that name and has nothing to dial.
+        if (!wkr.up || !wkr.addr.contains(':')) {
             continue;
         }
         for (const auto & system : wkr.systems) {
