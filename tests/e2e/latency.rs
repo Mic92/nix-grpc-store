@@ -7,7 +7,7 @@ const N_DRVS: usize = 20;
 const RTT_MS: u64 = 50;
 const STORE_URI: &str = "grpc://127.0.0.1:50051?insecure=1";
 
-/// Runs `argv` on the VM and returns the elapsed seconds, so ssh latency stays out of it.
+/// Runs `argv` on the VM and returns the elapsed seconds, so the round trip to the VM stays out of it.
 fn timed(argv: &[&str]) -> f64 {
     let script = r#"s=$(date +%s%N); rc=0; "$@" >/root/timed.log 2>&1 || rc=$?; e=$(date +%s%N);
                     echo $(( (e - s) / 1000000 )); exit $rc"#;

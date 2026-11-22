@@ -208,10 +208,10 @@ pkgs.testers.runNixOSTest {
   name = "nix-grpc-farm";
   globalTimeout = 1800;
 
+  # For the vsock device the agent of tests/e2e listens on.
   sshBackdoor.enable = true;
   defaults.virtualisation.qemu.enableSharedMemory = true;
-  # The ssh generator only opens the vsock socket if /dev/vsock exists when it runs.
-  defaults.boot.initrd.kernelModules = [ "vmw_vsock_virtio_transport" ];
+  defaults.imports = [ (import ./lib/e2e-agent.nix { inherit e2eTests; }) ];
 
   nodes = {
     worker1 = {
@@ -329,7 +329,7 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
-    ${import ./lib/e2e.nix { inherit pkgs e2eTests; }}
+    ${import ./lib/e2e.nix { inherit e2eTests; }}
     start_all()
     for n, a in [(client, "${ip.client}"), (lb, "${ip.lb}"), (worker1, "${ip.worker1}"), (worker2, "${ip.worker2}")]:
         n.wait_for_unit("network-addresses-eth1.service")

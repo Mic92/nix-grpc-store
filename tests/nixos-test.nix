@@ -50,12 +50,12 @@ pkgs.testers.runNixOSTest {
   name = "nix-grpc-store-${phase}";
   globalTimeout = 600;
 
-  # The Rust tests in tests/e2e run on the driver host and drive the VM over
-  # the vsock ssh backdoor, so independent tests overlap.
+  # The Rust tests in tests/e2e run on the driver host and drive the VM through
+  # an agent on vsock, so independent tests overlap. The backdoor brings the
+  # vsock device.
   sshBackdoor.enable = true;
   defaults.virtualisation.qemu.enableSharedMemory = true;
-  # The ssh generator only opens the vsock socket if /dev/vsock exists when it runs.
-  defaults.boot.initrd.kernelModules = [ "vmw_vsock_virtio_transport" ];
+  defaults.imports = [ (import ./lib/e2e-agent.nix { inherit e2eTests; }) ];
 
   nodes.machine =
     { config, lib, ... }:
@@ -272,7 +272,7 @@ pkgs.testers.runNixOSTest {
     };
 
   testScript = ''
-    ${import ./lib/e2e.nix { inherit pkgs e2eTests; }}
+    ${import ./lib/e2e.nix { inherit e2eTests; }}
     machine.wait_for_unit("nix-daemon.socket")
     machine.wait_for_unit("nix-grpc-daemon.socket")
 
