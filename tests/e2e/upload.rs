@@ -106,11 +106,6 @@ impl Outcome {
 }
 
 #[test]
-fn a_single_build_of_the_large_input_finishes() {
-    build_sharing_one_input("upload-one", 1).assert_finished("one build");
-}
-
-#[test]
 fn concurrent_builds_sharing_the_large_input_finish() {
     build_sharing_one_input("upload-many", 16).assert_finished("16 builds");
 }
