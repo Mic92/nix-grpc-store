@@ -91,13 +91,50 @@ app.kubernetes.io/component: scheduler
 {{- $_ := required "niks3.cacheURL is required" .Values.niks3.cacheURL }}
 {{- if empty .Values.niks3.publicKeys }}{{ fail "niks3.publicKeys must list the cache's signing keys" }}{{ end }}
 {{- $tok := .Values.niks3.auth }}
-{{- if and $tok.existingSecret $tok.serviceAccountToken.enabled }}{{ fail "set only one of niks3.auth.existingSecret and niks3.auth.serviceAccountToken.enabled" }}{{ end }}
-{{- if not (or $tok.existingSecret $tok.serviceAccountToken.enabled) }}{{ fail "set niks3.auth.existingSecret or niks3.auth.serviceAccountToken.enabled" }}{{ end }}
+{{- $tokens := list $tok.existingSecret $tok.serviceAccountToken.enabled .Values.tls.worker.spire.niks3Token | compact }}
+{{- if gt (len $tokens) 1 }}{{ fail "set only one of niks3.auth.existingSecret, niks3.auth.serviceAccountToken.enabled and tls.worker.spire.niks3Token" }}{{ end }}
+{{- if not $tokens }}{{ fail "set niks3.auth.existingSecret, niks3.auth.serviceAccountToken.enabled or tls.worker.spire.niks3Token" }}{{ end }}
 {{- if empty .Values.workers }}{{ fail "workers is empty, add e.g. workers.x86-64: {system: x86_64-linux, replicas: 2}" }}{{ end }}
-{{- if and (or .Values.auth.accessRules .Values.auth.anonymousRole) (not (or (include "farm.tlsSecret" (list . "clientCA")) (include "farm.oidcProviders" .))) }}{{ fail "auth.accessRules/anonymousRole need tls.clientCA or an OIDC provider" }}{{ end }}
-{{- if and (include "farm.tlsSecret" (list . "clientCA")) (not (include "farm.tlsSecret" (list . "worker"))) }}{{ fail "tls.clientCA requires tls.worker (workers verify the balancer over TLS)" }}{{ end }}
+{{- if and (or .Values.auth.accessRules .Values.auth.anonymousRole) (not (or (include "farm.tlsSecret" (list . "clientCA")) (include "farm.oidcProviders" .) .Values.tls.worker.spire.agentSocket)) }}{{ fail "auth.accessRules/anonymousRole need tls.clientCA, tls.worker.spire or an OIDC provider" }}{{ end }}
+{{- $spire := .Values.tls.worker.spire }}
+{{- if and (include "farm.tlsSecret" (list . "clientCA")) (not (or (include "farm.tlsSecret" (list . "worker")) $spire.agentSocket)) }}{{ fail "tls.clientCA requires tls.worker (workers verify the balancer over TLS)" }}{{ end }}
+{{- if $spire.agentSocket }}
+{{- if or .Values.tls.worker.existingSecret .Values.tls.certManager.enabled }}{{ fail "tls.worker.spire.agentSocket replaces the worker certificate: drop tls.worker.existingSecret and tls.certManager" }}{{ end }}
+{{- if .Values.tls.clientCA.existingSecret }}{{ fail "tls.worker.spire.agentSocket makes the SPIRE bundle the client CA: drop tls.clientCA" }}{{ end }}
+{{- if not .Values.scheduler.external }}{{ fail "tls.worker.spire.agentSocket needs scheduler.external: this release's scheduler and balancer would not trust the SVIDs" }}{{ end }}
+{{- else if $spire.niks3Token }}{{ fail "tls.worker.spire.niks3Token needs tls.worker.spire.agentSocket" }}
+{{- end }}
 {{- if and (include "farm.lbEnabled" .) (include "farm.tlsSecret" (list . "clientCA")) (not (include "farm.tlsSecret" (list . "lb"))) }}{{ fail "tls.clientCA requires tls.lb (the balancer presents it to clients and workers)" }}{{ end }}
 {{- with .Values.defaultGroup }}{{ if not (hasKey $.Values.workers .) }}{{ fail (printf "defaultGroup %q is not a key of workers" .) }}{{ end }}{{ end }}
+{{- end }}
+
+{{/* spiffe-helper config for the worker pods; "daemon" false fetches once (the init container). */}}
+{{- define "farm.spiffeHelperConf" -}}
+agent_address = "/run/spire/agent/{{ base .root.Values.tls.worker.spire.agentSocket }}"
+cert_dir = "/svid"
+svid_file_name = "svid.pem"
+svid_key_file_name = "svid.key"
+svid_bundle_file_name = "bundle.pem"
+key_file_mode = 0640
+daemon_mode = {{ .daemon }}
+{{- if .root.Values.tls.worker.spire.niks3Token }}
+jwt_svids = [{jwt_audience = {{ .root.Values.niks3.serverURL | quote }}, jwt_svid_file_name = "niks3-token"}]
+{{- end }}
+{{- end }}
+
+{{/* The helper writes as the daemon's user, so the daemon reads the key. */}}
+{{- define "farm.spiffeHelperSecurityContext" -}}
+runAsUser: 990
+runAsGroup: 990
+allowPrivilegeEscalation: false
+readOnlyRootFilesystem: true
+capabilities: {drop: [ALL]}
+{{- end }}
+
+{{- define "farm.spiffeHelperMounts" -}}
+- {name: svid, mountPath: /svid}
+- {name: spire-agent-socket, mountPath: /run/spire/agent, readOnly: true}
+- {name: spiffe-helper, mountPath: /etc/spiffe-helper, readOnly: true}
 {{- end }}
 
 {{/* Non-empty when this release runs the balancer: an external scheduler brings its own. */}}

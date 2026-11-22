@@ -66,6 +66,16 @@ tls:
     existingSecret: ""
     # Name the balancer verifies on worker certificates. Empty: chain only.
     serverName: ""
+    # Instead of existingSecret: the pod's X.509-SVID from a SPIRE agent on
+    # the node, kept by a spiffe-helper sidecar. The SPIRE bundle is then
+    # the client CA. Needs scheduler.external, see docs/kubernetes.md.
+    spire:
+      # hostPath of the agent's Workload API socket; empty turns this off
+      agentSocket: ""
+      image: ghcr.io/spiffe/spiffe-helper:0.12.2
+      # Push to niks3 with the JWT-SVID (audience niks3.serverURL) in place
+      # of niks3.auth; niks3 must trust the SPIRE issuer.
+      niks3Token: false
 
 auth:
   # Client certificate CN patterns to roles: read-only | write | trusted.
