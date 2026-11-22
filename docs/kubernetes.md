@@ -322,6 +322,41 @@ tls:
                                              # SAN farm-nix-grpc-farm-scheduler-0.farm.svc, …
 ```
 
+### Identities from SPIRE
+
+Workers that join a farm outside the cluster (`scheduler.external`) can
+take their identity from a [SPIRE](https://spiffe.io) agent on the node
+instead of `tls.worker.existingSecret`:
+
+```yaml
+scheduler:
+  external: farm.example.com:50051
+tls:
+  worker:
+    spire:
+      agentSocket: /run/spire/agent/public/api.sock
+      niks3Token: true          # push with the JWT-SVID, no niks3.auth Secret
+auth:
+  trustedProxies: ["spiffe://example.org/farm/lb/*"]
+  accessRules:
+    - {cn: "spiffe://example.org/farm/client/*", role: trusted}
+```
+
+An init container fetches the X.509-SVID, its key and the trust bundle
+with spiffe-helper before the daemon starts, and a sidecar renews them.
+The bundle is the daemon's client CA, so the farm's balancer must present
+an SVID too. `niks3Token` writes the JWT-SVID for `niks3.serverURL` next
+to the certificate, and niks3 must trust the SPIRE server's OIDC issuer.
+
+SPIRE needs a registration entry for the pods, selected by namespace and
+service account (`serviceAccount.name`):
+
+```
+spire-server entry create -spiffeID spiffe://example.org/farm/worker/k8s \
+  -parentID <the nodes' agent or alias ID> \
+  -selector k8s:ns:farm -selector k8s:sa:farm-nix-grpc-farm
+```
+
 ### Run a standby scheduler
 
 A second scheduler on another node takes over within seconds when the
