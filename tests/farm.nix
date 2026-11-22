@@ -78,6 +78,8 @@ let
       ];
       # The recovery test uploads a floating content-addressed derivation.
       nix.settings.experimental-features = [ "ca-derivations" ];
+      # Without cache.nixos.org, which the VM cannot reach.
+      nix.settings.substituters = lib.mkForce [ config.services.nix-grpc-daemon.niks3.cacheUrl ];
       services.nix-grpc-daemon = {
         enable = true;
         listen = "[::]:50051";
