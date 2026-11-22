@@ -331,6 +331,7 @@ pkgs.testers.runNixOSTest {
     for n, a in [(client, "${ip.client}"), (lb, "${ip.lb}"), (worker1, "${ip.worker1}"), (worker2, "${ip.worker2}")]:
         n.wait_for_unit("network-addresses-eth1.service")
         n.succeed(f"ip -4 addr show | grep -qF {a}/ || {{ ip -4 addr >&2; false; }}")
+    client.wait_for_unit("test-certs.service")
     lb.wait_for_unit("niks3.service")
     lb.wait_for_open_port(5751)
     lb.wait_for_unit("envoy.service")
