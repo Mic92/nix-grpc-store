@@ -1,9 +1,12 @@
 use std::env as std_env;
-use std::io::Read;
-use std::process::{Command, Stdio};
+use std::io::{self, Read};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::{Mutex, Once};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::wire;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Node(pub &'static str);
@@ -14,36 +17,16 @@ pub fn env(key: &str) -> String {
     std_env::var(key).unwrap_or_else(|_| panic!("missing env var {key}"))
 }
 
-fn ssh_args(node: Node) -> Vec<String> {
-    let mut args = vec!["-F".into(), env("NGS_SSH_CONFIG")];
-    for opt in [
-        "User=root",
-        "StrictHostKeyChecking=no",
-        "UserKnownHostsFile=/dev/null",
-        "ConnectTimeout=30",
-        "ServerAliveInterval=30",
-        "ServerAliveCountMax=10",
-        "LogLevel=ERROR",
-    ] {
-        args.push("-o".into());
-        args.push(opt.into());
-    }
-    args.push(format!(
-        "vsock-mux/{}",
-        env(&format!("NGS_{}_SOCK", node.0.to_uppercase()))
-    ));
-    args
-}
-
 pub struct Out {
     pub code: i32,
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
-    /// ssh itself failed (exit 255) and the command never reported its
-    /// status, so we do not know whether it ran to the end. A command that
-    /// returns 255 on its own still reports, so it is not mistaken for this.
+    /// The connection to the node failed and the command never reported its
+    /// status, so we do not know whether it ran to the end.
     pub lost: bool,
+    /// The node took the command, so it may have run.
+    started: bool,
 }
 
 impl Out {
@@ -52,74 +35,86 @@ impl Out {
     }
 }
 
-fn drain<R: Read + Send + 'static>(mut r: R) -> thread::JoinHandle<String> {
-    thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = r.read_to_end(&mut b);
-        String::from_utf8_lossy(&b).into_owned()
-    })
+/// Reads from a stream until a deadline, however many reads that takes.
+struct Until<'a> {
+    stream: &'a UnixStream,
+    deadline: Instant,
 }
 
-fn run_once(node: Node, cmd: &str, timeout: Duration) -> Out {
-    let mut child = Command::new(env("NGS_SSH"))
-        .args(ssh_args(node))
-        .arg(format!(
-            "( set -euo pipefail\n{cmd}\n)\necho \"{RC_MARK}$?\"\n"
-        ))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn ssh");
-    // Readers keep a chatty command from filling the pipe and blocking.
-    let out = drain(child.stdout.take().unwrap());
-    let err = drain(child.stderr.take().unwrap());
-
-    let deadline = Instant::now() + timeout;
-    let mut timed_out = false;
-    let status = loop {
-        if let Some(s) = child.try_wait().expect("try_wait") {
-            break s;
+impl Read for Until<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            timed_out = true;
-            break child.wait().expect("wait after kill");
-        }
-        thread::sleep(Duration::from_millis(100));
-    };
-    let mut stdout = out.join().unwrap();
-    // ssh exits 255 when the remote command dies from a signal, so the
-    // command's own status travels in the output.
-    let (code, lost) = match stdout.rfind(RC_MARK) {
-        Some(at) => {
-            let rc = stdout[at + RC_MARK.len()..].trim().parse().unwrap_or(-1);
-            stdout.truncate(at);
-            (rc, false)
-        }
-        None => (status.code().unwrap_or(-1), status.code() == Some(255)),
-    };
-    Out {
-        code,
-        stdout,
-        stderr: err.join().unwrap(),
-        timed_out,
-        lost,
+        self.stream.set_read_timeout(Some(left))?;
+        let mut stream = self.stream;
+        stream.read(buf)
     }
 }
 
-const RC_MARK: &str = "__NGS_RC=";
+/// Asks vhost-device-vsock, which listens on `sock` for one VM, for the
+/// agent's port on that VM.
+fn connect(sock: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    use std::io::Write;
+    let stream = UnixStream::connect(sock)?;
+    (&stream).write_all(format!("CONNECT {}\n", wire::PORT).as_bytes())?;
+    let mut answer = Vec::new();
+    let mut byte = [0u8; 1];
+    let mut from = Until {
+        stream: &stream,
+        deadline,
+    };
+    while byte[0] != b'\n' {
+        from.read_exact(&mut byte)?;
+        answer.push(byte[0]);
+    }
+    if !answer.starts_with(b"OK ") {
+        return Err(io::Error::other(format!(
+            "no agent: {}",
+            String::from_utf8_lossy(&answer).trim()
+        )));
+    }
+    Ok(stream)
+}
 
-fn connect_failed(stderr: &str) -> bool {
-    [
-        "banner exchange",
-        "Connection refused",
-        "Connection timed out",
-        "Connection closed by remote host",
-        "kex_exchange_identification",
-    ]
-    .iter()
-    .any(|m| stderr.contains(m))
+fn exchange(sock: &Path, argv: &[&str], timeout: Duration) -> Out {
+    let deadline = Instant::now() + timeout;
+    let mut started = false;
+    let mut output = wire::Output::default();
+    let code = (|| {
+        let stream = connect(sock, deadline)?;
+        started = true;
+        wire::write_args(&mut &stream, argv)?;
+        let mut from = Until {
+            stream: &stream,
+            deadline,
+        };
+        wire::receive(&mut from, &mut &stream, &mut output)
+    })();
+    let timed_out = code.as_ref().is_err_and(|e| {
+        matches!(
+            e.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        )
+    });
+    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if let Err(e) = &code {
+        stderr.push_str(&e.to_string());
+    }
+    Out {
+        code: code.as_ref().map_or(-1, |c| *c),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr,
+        timed_out,
+        lost: code.is_err() && !timed_out,
+        started,
+    }
+}
+
+fn run_once(node: Node, argv: &[&str], timeout: Duration) -> Out {
+    let sock = env(&format!("NGS_{}_SOCK", node.0.to_uppercase()));
+    exchange(Path::new(&sock), argv, timeout)
 }
 
 static READY: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
@@ -140,10 +135,10 @@ fn ensure_ready(node: Node) {
         return;
     }
     let deadline = Instant::now() + Duration::from_secs(120);
-    while run_once(node, "true", Duration::from_secs(20)).code != 0 {
+    while run_once(node, &["true"], Duration::from_secs(20)).code != 0 {
         assert!(
             Instant::now() < deadline,
-            "ssh backdoor of {} never became ready",
+            "agent on {} never became ready",
             node.0
         );
         thread::sleep(Duration::from_millis(500));
@@ -151,13 +146,13 @@ fn ensure_ready(node: Node) {
     ready.push(node.0);
 }
 
-/// Runs `attempt` again while ssh fails. A repeatable command is retried even
-/// if it may have started; any other only if ssh could not connect, so it
-/// cannot run twice.
+/// Runs `attempt` again while the connection fails. A repeatable command is
+/// retried even if it may have started; any other only if the node never took
+/// it, so it cannot run twice.
 fn retrying(repeatable: bool, mut attempt: impl FnMut() -> Out) -> Out {
     let mut o = attempt();
     for _ in 0..4 {
-        if o.timed_out || !o.lost || !(repeatable || connect_failed(&o.stderr)) {
+        if o.timed_out || !o.lost || !(repeatable || !o.started) {
             break;
         }
         thread::sleep(Duration::from_secs(2));
@@ -166,30 +161,16 @@ fn retrying(repeatable: bool, mut attempt: impl FnMut() -> Out) -> Out {
     o
 }
 
-/// Quotes `arg` for the remote shell, so it arrives as one word.
-fn quote(arg: &str) -> String {
-    let plain = !arg.is_empty()
-        && arg
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,".contains(c));
-    if plain {
-        arg.to_string()
-    } else {
-        format!("'{}'", arg.replace('\'', r"'\''"))
-    }
-}
-
-/// The remote command line for `argv`. ssh hands it to the login shell.
+/// `argv` for failure messages. The node gets the arguments themselves.
 fn shell_join(argv: &[&str]) -> String {
-    argv.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
+    argv.join(" ")
 }
 
 fn run(node: Node, argv: &[&str], secs: u64, repeatable: bool) -> Out {
     let cmd = shell_join(argv);
-    let cmd = cmd.as_str();
     ensure_ready(node);
     let o = retrying(repeatable, || {
-        run_once(node, cmd, Duration::from_secs(secs))
+        run_once(node, argv, Duration::from_secs(secs))
     });
     assert!(
         !o.timed_out,
@@ -199,7 +180,7 @@ fn run(node: Node, argv: &[&str], secs: u64, repeatable: bool) -> Out {
     );
     assert!(
         !o.lost,
-        "[{}] ssh connection lost: {cmd}\n{}",
+        "[{}] connection lost: {cmd}\n{}",
         node.0,
         o.combined()
     );
@@ -320,7 +301,7 @@ fn grep_pattern(pattern: &str) -> String {
         .join(".*")
 }
 
-/// Filters on the node: long journals over the vsock ssh sometimes stall.
+/// Filters on the node, so a long journal need not cross to the host.
 pub fn journal_matches(node: Node, unit: &str, pattern: &str) -> Vec<String> {
     let regex = grep_pattern(pattern);
     let argv = [
@@ -433,43 +414,124 @@ pub fn unit_result(node: Node, unit: &str) -> String {
 mod tests {
     use super::*;
 
-    fn out(lost: bool, stderr: &str) -> Out {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn out(lost: bool, started: bool) -> Out {
         Out {
-            code: if lost { 255 } else { 0 },
+            code: if lost { -1 } else { 0 },
             stdout: String::new(),
-            stderr: stderr.into(),
+            stderr: String::new(),
             timed_out: false,
             lost,
+            started,
         }
     }
 
-    fn calls(repeatable: bool, stderr: &str) -> u32 {
+    fn calls(repeatable: bool, started: bool) -> u32 {
         let mut n = 0;
         retrying(repeatable, || {
             n += 1;
-            out(n < 3, stderr)
+            out(n < 3, started)
         });
         n
     }
 
     #[test]
     fn a_repeatable_command_is_retried_after_any_drop() {
-        assert_eq!(calls(true, "Connection reset by peer"), 3);
+        assert_eq!(calls(true, true), 3);
     }
 
     #[test]
-    fn another_command_is_retried_only_if_ssh_never_connected() {
-        assert_eq!(calls(false, "Connection reset by peer"), 1);
-        assert_eq!(calls(false, "Connection refused"), 3);
+    fn another_command_is_retried_only_if_the_node_never_took_it() {
+        assert_eq!(calls(false, true), 1);
+        assert_eq!(calls(false, false), 3);
+    }
+
+    /// Stands in for vhost-device-vsock and, if `agent`, the agent behind it.
+    fn node(agent: bool) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let sock = std::env::temp_dir().join(format!(
+            "ngs-{}-{}.sock",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let listener = UnixListener::bind(&sock).unwrap();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                thread::spawn(move || {
+                    let mut hello = String::new();
+                    BufReader::new(&stream).read_line(&mut hello).unwrap();
+                    assert_eq!(hello, format!("CONNECT {}\n", wire::PORT));
+                    if !agent {
+                        return;
+                    }
+                    stream.write_all(b"OK 1073741824\n").unwrap();
+                    let argv = wire::read_args(&mut stream).unwrap();
+                    let mut acks = stream.try_clone().unwrap();
+                    let _ = wire::serve(&[], &argv, &mut stream, || acks.read_exact(&mut [0u8; 1]));
+                });
+            }
+        });
+        sock
     }
 
     #[test]
-    fn arguments_reach_the_remote_shell_as_single_words() {
-        assert_eq!(shell_join(&["ls", "-l", "/nix/store"]), "ls -l /nix/store");
-        assert_eq!(
-            shell_join(&["echo", "a b", "", "it's", "$HOME", "x;y"]),
-            r#"echo 'a b' '' 'it'\''s' '$HOME' 'x;y'"#
+    fn a_command_reports_its_status_and_both_streams() {
+        let o = exchange(
+            &node(true),
+            &["bash", "-c", "echo out; echo err >&2; exit 3"],
+            Duration::from_secs(10),
         );
+        assert_eq!(
+            (o.code, o.stdout.as_str(), o.stderr.as_str()),
+            (3, "out\n", "err\n")
+        );
+        assert!(!o.lost && !o.timed_out);
+    }
+
+    #[test]
+    fn output_larger_than_one_piece_arrives_whole() {
+        let argv = ["head", "-c", "300000", "/dev/zero"];
+        let o = exchange(&node(true), &argv, Duration::from_secs(10));
+        assert_eq!((o.code, o.stdout.len()), (0, 300000));
+    }
+
+    #[test]
+    fn arguments_reach_the_command_untouched() {
+        let argv = ["printf", "<%s>", "a b", "", "it's", "$HOME", "x;y\n*"];
+        let o = exchange(&node(true), &argv, Duration::from_secs(10));
+        assert_eq!(o.stdout, "<a b><><it's><$HOME><x;y\n*>");
+    }
+
+    #[test]
+    fn a_command_killed_by_a_signal_reports_it_like_a_shell() {
+        let o = exchange(
+            &node(true),
+            &["bash", "-c", "kill -KILL $$"],
+            Duration::from_secs(10),
+        );
+        assert_eq!(o.code, 137);
+        assert!(!o.lost);
+    }
+
+    #[test]
+    fn a_command_that_outlives_its_timeout_is_not_waited_for() {
+        let start = Instant::now();
+        let argv = ["bash", "-c", "echo started; sleep 30"];
+        let o = exchange(&node(true), &argv, Duration::from_millis(500));
+        assert!(o.timed_out && !o.lost);
+        assert_eq!(o.stdout, "started\n");
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_node_without_an_agent_never_took_the_command() {
+        let o = exchange(&node(false), &["true"], Duration::from_secs(10));
+        assert!(o.lost && !o.started && !o.timed_out, "{}", o.stderr);
     }
 
     #[test]

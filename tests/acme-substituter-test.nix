@@ -26,10 +26,10 @@ in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-store-acme-substituter";
   globalTimeout = 600;
+  # For the vsock device the agent of tests/e2e listens on.
   sshBackdoor.enable = true;
   defaults.virtualisation.qemu.enableSharedMemory = true;
-  # The ssh generator only opens the vsock socket if /dev/vsock exists when it runs.
-  defaults.boot.initrd.kernelModules = [ "vmw_vsock_virtio_transport" ];
+  defaults.imports = [ (import ./lib/e2e-agent.nix { inherit e2eTests; }) ];
 
   nodes = {
     server =
@@ -194,7 +194,7 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
-    ${import ./lib/e2e.nix { inherit pkgs e2eTests; }}
+    ${import ./lib/e2e.nix { inherit e2eTests; }}
     start_all()
     server.wait_for_unit("step-ca.service")
     server.wait_for_unit("nix-grpc-daemon.socket")

@@ -89,7 +89,7 @@ fn perf_profile_of_grpc_copy() {
     record.extend(copy_cmd(STORE, &path));
     succeed(&record);
     // Keep the report on the machine: with -g it is far too large to stream
-    // back over ssh.
+    // back.
     let report = |sort: &[&str], lines: usize| {
         let mut argv = vec!["perf", "report", "-i", "/root/perf.data", "--stdio"];
         argv.extend(sort);

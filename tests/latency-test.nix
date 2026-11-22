@@ -29,10 +29,10 @@ in
 pkgs.testers.runNixOSTest {
   name = "nix-grpc-store-bench-latency";
   globalTimeout = 1200;
+  # For the vsock device the agent of tests/e2e listens on.
   sshBackdoor.enable = true;
   defaults.virtualisation.qemu.enableSharedMemory = true;
-  # The ssh generator only opens the vsock socket if /dev/vsock exists when it runs.
-  defaults.boot.initrd.kernelModules = [ "vmw_vsock_virtio_transport" ];
+  defaults.imports = [ (import ./lib/e2e-agent.nix { inherit e2eTests; }) ];
 
   nodes.machine =
     { config, ... }:
@@ -61,7 +61,7 @@ pkgs.testers.runNixOSTest {
     };
 
   testScript = ''
-    ${import ./lib/e2e.nix { inherit pkgs e2eTests; }}
+    ${import ./lib/e2e.nix { inherit e2eTests; }}
     machine.wait_for_unit("nix-grpc-daemon.socket")
     machine.wait_for_open_port(50051)
     env = {"NGS_CHAIN_EXPR": "${chainNix}", "NGS_SYSTEM": "${system}"}
