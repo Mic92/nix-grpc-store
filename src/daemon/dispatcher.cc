@@ -403,10 +403,12 @@ auto Dispatcher::dispatchOnceLocked() -> bool
             waited = &metrics.queueWait(ent->system);
         }
         waited->Observe((nowMs() - ent->enqMs) / msPerSecond);
-        debugLog(
+        logLine(
+            LogLevel::info,
             {{"event", "assigned"},
              {"drv", ent->drvPath},
-             {"worker", wkr.addr},
+             {"assign_id", std::to_string(asg.assignId)},
+             {"addr", wkr.addr},
              {"clients", std::to_string(asg.clients.size())}});
     }
     return dropped;
@@ -793,6 +795,18 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
         counted = &metrics.eventCounter("done_" + nix::remote::Done::Outcome_Name(done.outcome()));
     }
     counted->Increment();
+    // A worker logs only the builds it finished, and not on this host: this
+    // line is the one place that has every outcome next to its worker.
+    std::vector<LogField> fields{
+        {"event", "done"},
+        {"drv", done.drv_path()},
+        {"assign_id", std::to_string(done.assign_id())},
+        {"addr", core.worker(wid).addr},
+        {"outcome", nix::remote::Done::Outcome_Name(done.outcome())}};
+    if (done.reason() != nix::remote::Done::REASON_UNSPECIFIED) {
+        fields.emplace_back("reason", nix::remote::Done::Reason_Name(done.reason()));
+    }
+    logLine(LogLevel::info, fields);
     if (done.outcome() == nix::remote::Done::GIVEN_BACK || done.outcome() == nix::remote::Done::NO_SHOW) {
         // The client uploads a missing input to this worker, which can then run the drv.
         bool const blameless =

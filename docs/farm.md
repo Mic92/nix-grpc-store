@@ -370,8 +370,15 @@ cost of one scheduler restart.
 event=rpc method=BuildDerivation cn=ci-build01 duration_s=42 …
 ```
 
-Set `logLevel = "debug"` on the scheduler to also log each request and
-assignment.
+The scheduler logs where each build went and how it ended, also for a
+build that failed or was given back:
+
+```
+event=assigned drv=/nix/store/…-foo.drv assign_id=7 addr=10.0.0.5:50052 clients=1
+event=done drv=/nix/store/…-foo.drv assign_id=7 addr=10.0.0.5:50052 outcome=FAILED
+```
+
+Set `logLevel = "debug"` on the scheduler to also log each request.
 
 **Metrics.** Set `services.nix-grpc-daemon.metricsListen` on workers and
 scrape envoy's admin port (`/stats/prometheus`). The scheduler adds
