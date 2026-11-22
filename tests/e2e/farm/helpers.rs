@@ -250,6 +250,15 @@ pub fn release_slow() {
     }
 }
 
+/// Keeps releasing: a build that died with its worker starts again only once
+/// the scheduler has reassigned it.
+pub fn release_until_done(unit: &str, secs: u64) {
+    retry(secs, &format!("{unit} finished"), || {
+        release_slow();
+        run_t(CLIENT, &["systemctl", "is-active", "-q", unit], 60).code != 0
+    });
+}
+
 pub fn spawn_build(unit: &str, tag: &str) {
     succeed(
         CLIENT,

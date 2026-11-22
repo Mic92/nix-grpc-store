@@ -829,8 +829,7 @@ fn scheduler_restart_mid_build_finishes_without_a_double_build() {
     succeed(ldr, &["systemctl", "start", "nix-grpc-daemon.service"]);
     sleep(5);
     assert!(building().len() <= 1, "{:?}", building());
-    release_slow();
-    wait_unit_done("mid", 120);
+    release_until_done("mid", 120);
     assert_unit_success("mid");
 }
 
@@ -988,7 +987,7 @@ fn required_system_features_are_placed_or_refused() {
             "build",
             "-L",
             "--store",
-            &format!("{}&restart-grace=30", envoy()),
+            &format!("{}&restart-grace=10", envoy()),
             "--eval-store",
             "auto",
             "-f",
