@@ -69,6 +69,16 @@ inline auto saneSpiffeId(std::string_view spiffeId) -> bool
     return true;
 }
 
+// The last path segment of a SPIFFE ID the spec allows, if it has a path.
+inline auto spiffeLastSegment(std::string_view spiffeId) -> std::optional<std::string_view>
+{
+    auto const slash = spiffeId.rfind('/');
+    if (!saneSpiffeId(spiffeId) || slash < spiffeScheme.size()) {
+        return std::nullopt;
+    }
+    return spiffeId.substr(slash + 1);
+}
+
 // A glob from --allow or --trusted-proxy. One that starts with spiffe:// is
 // matched against the SPIFFE ID and nothing else, any other against the CN
 // and nothing else: a CN that spells a SPIFFE ID gains nothing. In a SPIFFE

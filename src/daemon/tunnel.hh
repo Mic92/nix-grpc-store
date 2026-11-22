@@ -66,8 +66,8 @@ enum class End : uint8_t {
 // the same socket is in use elsewhere.
 auto waitClosed(int sock, const Wake & stop) -> End;
 
-// The common name of the certificate in `file`: the farm's access rules know
-// the builder by it, and so does the balancer.
+// The name the balancer knows the builder by: the common name of the
+// certificate in `file`, or without one the last segment of its SPIFFE ID.
 auto certName(const std::string & file) -> std::string;
 
 } // namespace nixgrpc::tunnel
