@@ -1132,7 +1132,8 @@ public:
         size_t unplaceable = 0; // of those, no connected worker could ever run it
         // Keyed by what the worker offers (native system).
         size_t running = 0; // assigned, until the worker's Done
-        size_t slots = 0;   // maxJobs of workers that take work
+        size_t workers = 0; // that take work
+        size_t slots = 0;   // their maxJobs
         size_t free = 0;
     };
 
@@ -1175,6 +1176,7 @@ public:
             if (!wkr.takesWork()) {
                 continue;
             }
+            sst.workers++;
             sst.slots += static_cast<size_t>(wkr.maxJobs);
             sst.free += static_cast<size_t>(std::max(0, wkr.maxJobs - static_cast<int32_t>(wkr.running.size())));
         }

@@ -428,6 +428,7 @@ void Dispatcher::exportStats(bool force)
             metrics.schedSystem(key.system, key.features, "queued", sst.queued),
             metrics.schedSystem(key.system, key.features, "unplaceable", sst.unplaceable),
             metrics.schedSystem(key.system, key.features, "running", sst.running),
+            metrics.schedSystem(key.system, key.features, "workers", sst.workers),
             metrics.schedSystem(key.system, key.features, "slots", sst.slots),
             metrics.schedSystem(key.system, key.features, "free", sst.free),
         };

@@ -5,7 +5,7 @@
     "type": "prometheus",
     "uid": "${DS}"
    },
-   "description": "Envoy active health check per cluster. <100% means a worker is down or drained (low disk).",
+   "description": "Builders that take work, per system, as the active scheduler sees them. A system that had builders within the last day stays listed.",
    "fieldConfig": {
     "defaults": {
      "color": {
@@ -20,16 +20,12 @@
         "value": null
        },
        {
-        "color": "orange",
-        "value": 0.5
-       },
-       {
         "color": "green",
         "value": 1
        }
       ]
      },
-     "unit": "percentunit"
+     "unit": "none"
     },
     "overrides": []
    },
@@ -57,8 +53,8 @@
       "type": "prometheus",
       "uid": "${DS}"
      },
-     "expr": "min by (envoy_cluster_name) (${prefix}envoy_cluster_membership_healthy{envoy_cluster_name!=\"sched\"} / ${prefix}envoy_cluster_membership_total{envoy_cluster_name!=\"sched\"})",
-     "legendFormat": "{{envoy_cluster_name}}",
+     "expr": "sum by (system) (max by (system, features) (${prefix}nix_grpc_sched_system{kind=\"workers\"})) and sum by (system) (max by (system, features) (max_over_time(${prefix}nix_grpc_sched_system{kind=\"workers\"}[1d]))) > 0",
+     "legendFormat": "{{system}}",
      "refId": "A"
     }
    ],
