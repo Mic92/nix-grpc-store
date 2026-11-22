@@ -214,7 +214,7 @@ pkgs.testers.runNixOSTest {
   nodes = {
     worker1 = {
       imports = [ (worker "worker1") ];
-      testCerts.certs.worker1 = cert "worker-1" "DNS:worker1,DNS:lb,IP:${ip.worker1}";
+      testCerts.certs.worker1 = cert "worker-1" "DNS:worker1,DNS:lb,IP:${ip.worker1},URI:spiffe://farm.test/worker/1";
       nix.settings.system-features = [ "vip" ];
       services.nix-grpc-daemon.workerName = "node-a";
       # With worker2, two builders for a system other than the default.
@@ -222,7 +222,7 @@ pkgs.testers.runNixOSTest {
     };
     worker2 = {
       imports = [ (worker "worker2") ];
-      testCerts.certs.worker2 = cert "worker-2" "DNS:worker2,DNS:lb,IP:${ip.worker2}";
+      testCerts.certs.worker2 = cert "worker-2" "DNS:worker2,DNS:lb,IP:${ip.worker2},URI:spiffe://farm.test/worker/2";
       # Pins a build to worker2, like vip does for worker1.
       nix.settings.system-features = [ "w2" ];
       services.nix-grpc-daemon.extraSystems = [ "riscv64-linux" ];
@@ -272,6 +272,7 @@ pkgs.testers.runNixOSTest {
               certFile = "${certs}/lb-client.pem";
               keyFile = "${certs}/lb-client.key";
               caFile = "${certs}/ca.pem";
+              spiffeId = "spiffe://farm.test/worker/";
             };
           };
         };

@@ -62,16 +62,24 @@ let
           ];
         }
         // (
-          if sni == null then
+          if sni == null && cfg.tls.upstream.spiffeId == null then
             { validation_context_sds_secret_config = caSds "ca" cfg.tls.upstream.caFile; }
           else
             {
               combined_validation_context = {
                 default_validation_context.match_typed_subject_alt_names = [
-                  {
-                    san_type = "DNS";
-                    matcher.exact = sni;
-                  }
+                  (
+                    if sni != null then
+                      {
+                        san_type = "DNS";
+                        matcher.exact = sni;
+                      }
+                    else
+                      {
+                        san_type = "URI";
+                        matcher.prefix = cfg.tls.upstream.spiffeId;
+                      }
+                  )
                 ];
                 validation_context_sds_secret_config = caSds "ca" cfg.tls.upstream.caFile;
               };
@@ -596,6 +604,17 @@ in
           default = null;
           description = "SNI and name to verify on worker certificates. Unset verifies the chain only.";
         };
+        spiffeId = lib.mkOption {
+          type = lib.types.nullOr (lib.types.strMatching "spiffe://.+/");
+          default = null;
+          example = "spiffe://example.org/farm/worker/";
+          description = ''
+            Verify workers by SPIFFE ID in place of {option}`sni`: the ID in a
+            worker's certificate must start with this prefix. Use it when
+            {option}`caFile` is the bundle of a trust domain, which signs
+            other workloads too.
+          '';
+        };
       };
     };
   };
@@ -611,6 +630,10 @@ in
       scheduler = lib.mkDefault (lib.head cfg.workers.${cfg.defaultSystem});
     };
     assertions = [
+      {
+        assertion = cfg.tls.upstream.sni == null || cfg.tls.upstream.spiffeId == null;
+        message = "services.nix-grpc-farm-lb.tls.upstream.sni and spiffeId exclude each other";
+      }
       {
         assertion = (cfg.tls.certFile == null) == (cfg.tls.keyFile == null);
         message = "services.nix-grpc-farm-lb.tls.certFile and keyFile go together";
