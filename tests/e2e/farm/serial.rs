@@ -878,3 +878,75 @@ fn x_nix_worker_picks_the_worker_on_every_system() {
         assert_eq!(sent, vec![(WORKER1, 20), (WORKER2, 0)], "{cluster}");
     }
 }
+
+/// An input whose NAR the bucket lost is rebuilt and re-published, and both
+/// of its users (one per worker) wait for that build. Both workers must be
+/// free, or one user starts after the rebuild.
+#[test]
+fn an_input_whose_nar_the_cache_lost_is_built_again() {
+    farm_ready();
+    let (tag, dep) = ("lostnar", expr("DEP"));
+    // vip pins it to worker1; copying it there publishes it to niks3.
+    let input = succeed(
+        CLIENT,
+        &[
+            "nix-build",
+            "--no-out-link",
+            "--option",
+            "extra-system-features",
+            "vip",
+            &dep,
+            "-A",
+            "input",
+            "--argstr",
+            "tag",
+            tag,
+            "--arg",
+            "features",
+            r#"["vip"]"#,
+        ],
+    )
+    .trim()
+    .to_string();
+    succeed(
+        CLIENT,
+        &[
+            "nix",
+            "copy",
+            "--no-check-sigs",
+            "--to",
+            &direct(WORKER1),
+            &input,
+        ],
+    );
+    succeed(CLIENT, &["nix-store", "--delete", &input]);
+    succeed(WORKER1, &["nix-store", "--delete", &input]);
+    lose_nar(&input);
+    let missed = |w| events(w, "input_not_substitutable");
+    let (missed1, missed2) = (missed(WORKER1), missed(WORKER2));
+    let users = format!(
+        r#"map (f: (import {dep} {{ tag = "{tag}"; salt = f; features = [ "vip" ]; jobFeatures = [ f ]; }}).job) [ "vip" "w2" ]"#
+    );
+    let o = run_t(
+        CLIENT,
+        &[
+            "nix",
+            "build",
+            "-L",
+            "--no-link",
+            "--store",
+            &envoy(),
+            "--eval-store",
+            "auto",
+            "--impure",
+            "--expr",
+            &users,
+        ],
+        300,
+    );
+    assert_eq!(o.code, 0, "{}", o.combined());
+    assert!(
+        missed(WORKER1) > missed1 && missed(WORKER2) > missed2,
+        "not both users missed {input}"
+    );
+}
