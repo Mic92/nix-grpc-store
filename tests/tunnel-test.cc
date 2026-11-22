@@ -280,7 +280,7 @@ struct Fixture
     nixgrpc::tunnel::Target target{.host = "lb.test", .address = "127.0.0.1", .port = lis.port, .protocol = std::string(nixgrpc::tunnel::anyProtocol)};
     nixgrpc::tunnel::Identity self{.node = "any/b1", .group = "any", .instance = "", .name = "b1"};
 
-    [[nodiscard]] auto open() const -> nix::AutoCloseFD
+    [[nodiscard]] auto open() const -> std::optional<nix::AutoCloseFD>
     {
         return nixgrpc::tunnel::open(target, tls, self, stop);
     }
@@ -315,9 +315,9 @@ void a_tunnel_is_handed_over_when_the_balancer_starts_a_request()
     auto sock = fix.open();
     check(static_cast<bool>(sock), "open() returns the socket");
     std::array<char, hello.size() + 1> buf{};
-    const auto got = sock ? recv(sock.get(), buf.data(), buf.size(), 0) : 0;
+    const auto got = sock ? recv(sock->get(), buf.data(), buf.size(), 0) : 0;
     check(got > 0 && std::string_view(buf.data(), static_cast<size_t>(got)) == hello, "the request's first bytes are left unread");
-    sock.close();
+    sock.reset();
     const auto seen = peer.get();
     check(seen.clientCert, "the builder presents its certificate");
     check(seen.serverName == "lb.test", "the TLS server name is the balancer's");
