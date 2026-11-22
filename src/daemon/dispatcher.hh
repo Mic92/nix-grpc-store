@@ -19,6 +19,7 @@
 #include <initializer_list>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -195,7 +196,12 @@ private:
     std::thread statsThread;
 
     [[nodiscard]] auto nowMs() const -> double;
-    void debugLog(std::initializer_list<LogField> fields) const;
+    // Log lines of the current critical section. Lock writes them once the
+    // mutex is released, so a slow stderr does not hold up scheduling.
+    std::string logged ABSL_GUARDED_BY(mutex);
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void log(LogLevel level, std::span<const LogField> fields);
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void log(LogLevel level, std::initializer_list<LogField> fields);
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void debugLog(std::initializer_list<LogField> fields);
     [[nodiscard]] auto systemFor(std::string_view system) const -> std::string_view;
     [[nodiscard]] static auto wantsLookup(const nix::remote::Want & want) -> bool;
     // One present() call for all Wants in `msgs`; which of them are cached.
