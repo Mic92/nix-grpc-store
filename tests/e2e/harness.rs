@@ -13,6 +13,9 @@ pub struct Node(pub &'static str);
 
 pub const MACHINE: Node = Node("machine");
 
+/// Between two looks at a condition. A look costs a round trip of about 20ms.
+const POLL: Duration = Duration::from_millis(100);
+
 pub fn env(key: &str) -> String {
     std_env::var(key).unwrap_or_else(|_| panic!("missing env var {key}"))
 }
@@ -141,7 +144,7 @@ fn ensure_ready(node: Node) {
             "agent on {} never became ready",
             node.0
         );
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(POLL);
     }
     ready.push(node.0);
 }
@@ -243,7 +246,7 @@ pub fn wait_until_succeeds(node: Node, argv: &[&str], secs: u64) {
             o.code,
             o.combined()
         );
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(POLL);
     }
 }
 
@@ -361,7 +364,7 @@ pub fn wait_journal_above(node: Node, unit: &str, pattern: &str, before: u64, se
             "[{}] journal of {unit} never got a new line matching: {pattern}",
             node.0
         );
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(POLL);
     }
 }
 
@@ -383,7 +386,7 @@ pub fn retry(secs: u64, what: &str, mut f: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while !f() {
         assert!(Instant::now() < deadline, "not true after {secs}s: {what}");
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(POLL);
     }
 }
 
