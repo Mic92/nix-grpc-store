@@ -273,6 +273,31 @@ void Coordinator::start(grpc::Server & server)
     }
 }
 
+namespace {
+// True if the scheduler announced its restart.
+auto follow(grpc::ClientReaderWriter<WorkerMsgs, SchedCmds> & stream, Builder & bld, grpc::ClientContext & ctx) -> bool
+{
+    SchedCmds cmds;
+    bool restarting = false;
+    while (stream.Read(&cmds)) {
+        for (const auto & cmd : cmds.msgs()) {
+            if (cmd.has_expect()) {
+                bld.onExpect(cmd.expect());
+            } else if (cmd.has_revoke()) {
+                bld.onRevoke(cmd.revoke());
+            } else if (cmd.has_restarting()) {
+                restarting = true;
+            }
+        }
+        if (restarting) {
+            // Leave now. A yielding scheduler keeps the connection open.
+            ctx.TryCancel();
+        }
+    }
+    return restarting;
+}
+} // namespace
+
 void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
 {
     auto const creds = schedulerCreds(options);
@@ -303,30 +328,18 @@ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
         const bool helloed = bld.greet();
         if (helloed) {
             logLine(LogLevel::info, {{"event", "scheduler_connected"}, {"addr", options.schedulerAddr}});
-            retry = 1;
         }
+        auto const began = std::chrono::steady_clock::now();
         const std::stop_callback onStop(stop, [&ctx] -> void { ctx.TryCancel(); });
-        SchedCmds cmds;
-        bool restarting = false;
-        while (helloed && stream->Read(&cmds)) {
-            for (const auto & cmd : cmds.msgs()) {
-                if (cmd.has_expect()) {
-                    bld.onExpect(cmd.expect());
-                } else if (cmd.has_revoke()) {
-                    bld.onRevoke(cmd.revoke());
-                } else if (cmd.has_restarting()) {
-                    restarting = true;
-                }
-            }
-            if (restarting) {
-                // Leave now. A yielding scheduler keeps the connection open.
-                ctx.TryCancel();
-            }
-        }
+        const bool restarting = helloed && follow(*stream, bld, ctx);
         *live = false;
         auto const status = stream->Finish();
         if (stop.stop_requested()) {
             return;
+        }
+        // A balancer without a scheduler accepts the hello too.
+        if (helloed && std::chrono::steady_clock::now() - began >= maxPause) {
+            retry = 1;
         }
         if (restarting) {
             // Announced: go straight back, the successor is (about to be) up.
