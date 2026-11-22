@@ -164,6 +164,10 @@ auto GrpcStore::connectHint(const std::string & msg) const -> std::string
 
 auto GrpcStore::statusError(const grpc::Status & status, const char * opName) const -> Error
 {
+  if (auto const detail = nixgrpc::credentialsFailed(status)) {
+    // NOLINTNEXTLINE(modernize-return-braced-init-list): Error ctor is explicit
+    return Error("gRPC %s on '%s' failed: %s", opName, config->authority.to_string(), *detail);
+  }
   std::string hint;
   auto const code = status.error_code();
   if (!config->insecure && code == grpc::StatusCode::UNAVAILABLE) {
