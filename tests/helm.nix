@@ -159,6 +159,10 @@ let
     tunnel.values = valuesTunnel;
     tunnelled.values = valuesTunnelled;
     extra-volumes.values = valuesExtraVolumes;
+    store-host-path = {
+      inherit values;
+      set = "workerDefaults.store.hostPath=/mnt/local/nix/";
+    };
   }
   // lib.listToAttrs (
     lib.imap0 (idx: extra: {

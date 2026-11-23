@@ -118,6 +118,11 @@ workerDefaults:
     # measure the store alone. The volume lives and dies with the pod.
     storageClass: null
     size: null # e.g. 100Gi
+    # A directory on the node for /nix, in place of the emptyDir: each group
+    # keeps its store in <hostPath>/<namespace>/<release>/<group>, which
+    # outlives the pod. One pod of the group per node. minFree and
+    # gc.ensureFree measure the disk that holds it.
+    hostPath: null # e.g. /mnt/local/nix-grpc-farm
   spool:
     sizeLimit: null # emptyDir sizeLimit for uploads waiting to be imported
   buildDir:

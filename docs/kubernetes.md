@@ -166,6 +166,23 @@ With `store.storageClass` and `store.size`, `/nix` is a volume of its own
 thresholds then measure the store alone, a full store fails a build
 and does not evict the pod, and `store.sizeLimit` has no use.
 
+With `store.hostPath`, `/nix` is a directory on the node, for example on a
+local disk the cluster does not manage:
+
+```yaml
+workerDefaults:
+  store:
+    hostPath: /mnt/local/nix-grpc-farm
+```
+
+Each group keeps its store in `<hostPath>/<namespace>/<release>/<group>`,
+created if missing, and both thresholds measure the disk that holds it.
+The store outlives the pod: a later pod of the group on that node starts
+with its cache unless the image changed, and nothing deletes the
+directory when the group is removed. Only one pod of a group runs per
+node, so a group needs as many nodes as replicas, and a rollout needs a
+free one.
+
 For nodes with a 500 GB disk and two workers each:
 
 ```yaml
