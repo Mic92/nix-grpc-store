@@ -213,6 +213,10 @@ if build_server
     'src/daemon/coordinator.cc',
     'src/daemon/eds.cc',
     'src/daemon/options.cc',
+    'src/daemon/stdio.cc',
+    'src/client/store.cc',
+    'src/client/build.cc',
+    'src/client/transfer.cc',
     'src/daemon/tunnel.cc',
     'src/daemon/tunnels.cc',
     {'darwin': 'src/daemon/sandbox-darwin.cc', 'linux': 'src/daemon/sandbox-linux.cc'}.get(host_machine.system(), 'src/daemon/sandbox-unsupported.cc'),
@@ -220,9 +224,11 @@ if build_server
 
   executable('nix-grpc-daemon',
     sources : daemon_sources + [gen, eds_gen],
-    include_directories : [gen_inc, src_inc],
+    include_directories : [gen_inc, src_inc, include_directories('src/client')],
     cpp_pch : do_pch ? ['pch/daemon_pch.hh'] : [],
-    cpp_args : nix_compat_args + ['-DNIX_GRPC_VERSION="' + meson.project_version() + '"'],
+    # The client store is linked in for --stdio, its plugin entry stays unused.
+    cpp_args : nix_compat_args + ['-DNIX_GRPC_VERSION="' + meson.project_version() + '"',
+                                  '-DNIX_GRPC_BUILT_AGAINST_NIX="' + nix_store_dep.version() + '"'],
     # nix-store has the native QueryValidPaths / AddMultipleToStore handlers.
     dependencies : common_deps + prometheus_dep + [dispatcher_dep, nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep, ssl_dep, jemalloc_dep, bz2_dep],
     install : true,

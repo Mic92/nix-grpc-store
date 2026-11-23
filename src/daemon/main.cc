@@ -103,6 +103,7 @@
 #include "nix_remote.pb.h"
 #include "pump.hh"
 #include "socket-activation.hh"
+#include "stdio.hh"
 #include "session-roots.hh"
 #include "upload-claims.hh"
 #include "parse-int.hh"
@@ -1404,9 +1405,12 @@ try {
 
     // Required before nix::openStore() in the native RPC handlers.
     nix::initLibStore();
-    auto const lookups = lookupCache();
 
     const std::span args(argv, static_cast<size_t>(argc));
+    if (std::ranges::any_of(args, [](const char * arg) -> bool { return std::string_view(arg) == "--stdio"; })) {
+        return nixgrpc::runStdio(args);
+    }
+    auto const lookups = lookupCache();
     auto options = nixgrpc::parseOptions({args.begin(), args.end()});
     auto const listenFds = nixgrpc::systemdListenFds();
     if (options.sandbox) {
