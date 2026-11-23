@@ -2,6 +2,7 @@
 // Local store plus, if configured, a niks3 binary cache. Same calls in every topology.
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -11,13 +12,19 @@
 
 #include <nlohmann/json.hpp>
 
+#include <nix/store/globals.hh>
+#include <nix/store/keys.hh>
 #include <nix/store/path-info.hh>
 #include <nix/store/path.hh>
 #include <nix/store/store-api.hh>
+#include <nix/store/store-open.hh>
 #include <nix/util/environment-variables.hh>
 #include <nix/util/error.hh>
+#include <nix/util/sync.hh>
+#include <nix/util/terminal.hh>
 
 #include "http.hh"
+#include "logfmt.hh"
 #include "nix-compat.hh"
 #include "push.hh"
 #include "niks3-client.hh"
@@ -115,6 +122,51 @@ public:
         remote->push.pushLog(drvPath);
     }
 
+    struct Offered
+    {
+        nix::ref<nix::Store> store;
+        nix::ref<const nix::ValidPathInfo> info;
+    };
+
+    // Finds a path in a substituter. We must not copy it into our store.
+    // A build hook on this machine may hold the lock for that path.
+    auto offered(const nix::Store & local, const nix::StorePath & path) -> std::optional<Offered>
+    {
+        auto const keys = nix::getDefaultPublicKeys();
+        for (const auto & ref : nix::settings.getWorkerSettings().substituters.get()) {
+            auto const name = ref.render();
+            auto const miss = [&](const std::string & why) -> void {
+                logLine(LogLevel::debug, {{"event", "offer_miss"}, {"path", std::string(path.to_string())}, {"substituter", name}, {"error", why}});
+            };
+            try {
+                auto const sub = substituter(ref);
+                auto const info = sub->queryPathInfo(path);
+                if (sub->config.isTrusted || info->isContentAddressed(local) || info->checkSignatures(local, keys) > 0) {
+                    return Offered{.store = sub, .info = info};
+                }
+                miss("no signature by a trusted key");
+            } catch (nix::Error & err) {
+                miss(nix::filterANSIEscapes(err.info().msg.str(), true));
+            }
+        }
+        return std::nullopt;
+    }
+
+private:
+    // Opens a substituter once. If that fails, the next call tries again.
+    auto substituter(const nix::StoreReference & ref) -> nix::ref<nix::Store>
+    {
+        auto opened = substituters.lock();
+        auto const name = ref.render();
+        if (auto const found = opened->find(name); found != opened->end()) {
+            return found->second;
+        }
+        return opened->emplace(name, nix::openStore(nix::StoreReference{ref})).first->second;
+    }
+
+    nix::Sync<std::map<std::string, nix::ref<nix::Store>>> substituters;
+
+public:
     // Path valid locally afterwards, or throws.
     static void substitute(nix::Store & store, const nix::StorePath & path)
     {
