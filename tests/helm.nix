@@ -137,6 +137,15 @@ let
       ];
     };
   };
+  # The ssh gateway for clients without the plugin.
+  valuesSshGateway = lib.recursiveUpdate values {
+    sshGateway = {
+      enabled = true;
+      trustedKeys = [ "ssh-ed25519 AAAAtrusted alice" ];
+      keys = [ "ssh-ed25519 AAAAuntrusted ci" ];
+      hostKeys.existingSecret = "gw-host";
+    };
+  };
   # formats.yaml emits a %YAML directive that helm rejects. JSON is YAML.
   json = pkgs.formats.json { };
   # What tests/helm_test.py reads, by name.
@@ -159,6 +168,7 @@ let
     tunnel.values = valuesTunnel;
     tunnelled.values = valuesTunnelled;
     extra-volumes.values = valuesExtraVolumes;
+    ssh-gateway.values = valuesSshGateway;
     store-host-path = {
       inherit values;
       set = "workerDefaults.store.hostPath=/mnt/local/nix/";

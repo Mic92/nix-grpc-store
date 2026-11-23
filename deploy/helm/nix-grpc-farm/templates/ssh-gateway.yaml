@@ -1,0 +1,187 @@
+{{- /* An ssh-ng:// endpoint for clients without the grpc:// plugin: sshd runs
+     `nix-grpc-daemon --stdio` for every key, against this release's balancer,
+     authenticated with a token of its own service account, which
+     farm.oidcProviders grants admin (= trusted). sshd runs as its one login
+     user, nix-farm, so the pod needs no privileges. */}}
+{{- with .Values.sshGateway }}
+{{- if .enabled }}
+{{- $root := $ }}
+{{- $g := . }}
+{{- $name := printf "%s-ssh-gateway" (include "farm.fullname" $root) }}
+{{- $sel := include "farm.sshGatewaySelectorLabels" $root }}
+{{- if not (include "farm.lbEnabled" $root) }}{{ fail "sshGateway needs this release's balancer: lb.enabled and no scheduler.external" }}{{ end }}
+{{- if not $root.Values.auth.workloadIdentity.enabled }}{{ fail "sshGateway authenticates with its service account token: enable auth.workloadIdentity" }}{{ end }}
+{{- if not (include "farm.tlsSecret" (list $root "clientCA")) }}{{ fail "sshGateway sends a bearer token over TLS and verifies the balancer against tls.clientCA: set tls.clientCA or tls.certManager" }}{{ end }}
+{{- if not (or $g.trustedKeys $g.keys) }}{{ fail "sshGateway: list at least one key in trustedKeys or keys" }}{{ end }}
+{{- $_ := required "sshGateway.hostKeys.existingSecret is required: replicas and restarts must show clients the same host key" $g.hostKeys.existingSecret }}
+{{- $farm := printf "grpc://%s.%s.svc:%v?token-file=/var/run/secrets/nix-grpc-farm/token&ca-cert=/var/run/secrets/nix-grpc-farm/ca.crt" (include "farm.fullname" $root) $root.Release.Namespace $root.Values.lb.service.port }}
+{{- $lines := list }}
+{{- range $g.trustedKeys }}
+{{- $lines = append $lines (printf "restrict,command=\"/bin/nix-grpc-daemon --stdio --trusted --farm '%s'\" %s" $farm .) }}
+{{- end }}
+{{- range $g.keys }}
+{{- $lines = append $lines (printf "restrict,command=\"/bin/nix-grpc-daemon --stdio --farm '%s'\" %s" $farm .) }}
+{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels: {{- include "farm.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: ssh-gateway
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels: {{- include "farm.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: ssh-gateway
+data:
+  authorized_keys: |
+    {{- range $lines }}
+    {{ . }}
+    {{- end }}
+  sshd_config: |
+    Port 2222
+    HostKey /run/sshd/ssh_host_ed25519_key
+    PidFile none
+    AuthorizedKeysFile /etc/ssh/gateway/authorized_keys
+    AllowUsers nix-farm
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    # The ConfigMap is root-owned, which sshd's own user may not change.
+    StrictModes no
+    PermitTTY no
+    AllowTcpForwarding no
+    AllowAgentForwarding no
+    X11Forwarding no
+    PermitUserEnvironment no
+    # The root filesystem is read-only, and nix keeps a cache in the home.
+    SetEnv XDG_CACHE_HOME=/tmp/cache
+    ClientAliveInterval 30
+    LogLevel {{ eq $root.Values.logLevel "debug" | ternary "VERBOSE" "INFO" }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels: {{- include "farm.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: ssh-gateway
+  {{- with $g.service.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $g.service.type }}
+  selector: {{- $sel | nindent 4 }}
+  ports:
+    - name: ssh
+      port: {{ $g.service.port }}
+      targetPort: ssh
+      {{- with $g.service.nodePort }}
+      nodePort: {{ . }}
+      {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels: {{- include "farm.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: ssh-gateway
+spec:
+  replicas: {{ $g.replicas }}
+  selector:
+    matchLabels: {{- $sel | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ print $lines $g.hostKeys | sha256sum }}
+        {{- with $g.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels: {{- $sel | nindent 8 }}
+    spec:
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: false
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $g.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $g.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $g.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "farm.spread" (dict "spread" $g.spread "selector" $sel) | nindent 6 }}
+      securityContext:
+        runAsUser: 991
+        runAsGroup: 991
+        runAsNonRoot: true
+        # Lets sshd's user read the mounted host key.
+        fsGroup: 991
+      # sshd refuses a key that others than its user may read, and a Secret
+      # volume belongs to root.
+      initContainers:
+        - name: host-key
+          image: {{ include "farm.image" $root }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          command: [/bin/sh, -c, "install -m 0600 /etc/ssh/keys/ssh_host_ed25519_key /run/sshd/"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: host-keys, mountPath: /etc/ssh/keys, readOnly: true}
+            - {name: run, mountPath: /run/sshd}
+      containers:
+        - name: sshd
+          image: {{ include "farm.image" $root }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          # -e: log to stderr. sshd re-execs itself, so the full path.
+          command: [/bin/sshd, -D, -e, -f, /etc/ssh/gateway/sshd_config]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          ports:
+            - {name: ssh, containerPort: 2222}
+          readinessProbe:
+            tcpSocket: {port: ssh}
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: {port: ssh}
+            periodSeconds: 30
+          volumeMounts:
+            - {name: config, mountPath: /etc/ssh/gateway, readOnly: true}
+            - {name: run, mountPath: /run/sshd}
+            - {name: farm, mountPath: /var/run/secrets/nix-grpc-farm, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+          {{- with $g.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: config
+          configMap: {name: {{ $name }}}
+        - name: host-keys
+          secret:
+            secretName: {{ $g.hostKeys.existingSecret }}
+            defaultMode: 0440
+            items: [{key: ssh_host_ed25519_key, path: ssh_host_ed25519_key}]
+        - name: farm
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: {{ $root.Values.auth.workloadIdentity.audience }}
+                  expirationSeconds: 3600
+              - secret:
+                  name: {{ include "farm.tlsSecret" (list $root "clientCA") }}
+                  items: [{key: ca.crt, path: ca.crt}]
+        - name: run
+          emptyDir: {medium: Memory}
+        - name: tmp
+          emptyDir: {}
+{{- end }}
+{{- end }}

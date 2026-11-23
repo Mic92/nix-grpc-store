@@ -29,6 +29,11 @@ app.kubernetes.io/component: worker
 nix-grpc-farm/group: {{ .group }}
 {{- end }}
 
+{{- define "farm.sshGatewaySelectorLabels" -}}
+{{ include "farm.selectorLabels" . }}
+app.kubernetes.io/component: ssh-gateway
+{{- end }}
+
 {{- define "farm.lbSelectorLabels" -}}
 {{ include "farm.selectorLabels" . }}
 app.kubernetes.io/component: lb
@@ -156,14 +161,24 @@ capabilities: {drop: [ALL]}
 {{- range (required "auth.workloadIdentity.allowedServiceAccounts must not be empty" .allowedServiceAccounts) }}
 {{- $subjects = append $subjects (printf "system:serviceaccount:%s" .) }}
 {{- end }}
-{{- $_ := set $providers "kubernetes" (dict
+{{- $provider := dict
   "issuer" .issuer
   "jwks_url" "https://kubernetes.default.svc/openid/v1/jwks"
   "audience" .audience
-  "bound_subject" $subjects
-  "scopes" .scopes
   "ca_file" "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-  "bearer_token_file" "/var/run/secrets/kubernetes.io/serviceaccount/token") }}
+  "bearer_token_file" "/var/run/secrets/kubernetes.io/serviceaccount/token" }}
+{{- if $.Values.sshGateway.enabled }}
+{{- /* The gateway's own account is trusted whatever .scopes says: the build
+     hook of its trusted clients sends derivations inline. */}}
+{{- $gateway := printf "system:serviceaccount:%s:%s-ssh-gateway" $.Release.Namespace (include "farm.fullname" $) }}
+{{- $_ := set $provider "rules" (list
+  (dict "bound_subject" $subjects "scopes" .scopes)
+  (dict "bound_subject" (list $gateway) "scopes" (list "admin"))) }}
+{{- else }}
+{{- $_ := set $provider "bound_subject" $subjects }}
+{{- $_ := set $provider "scopes" .scopes }}
+{{- end }}
+{{- $_ := set $providers "kubernetes" $provider }}
 {{- end }}
 {{- end }}
 {{- if $providers }}{{ toJson (dict "providers" $providers) }}{{- end }}

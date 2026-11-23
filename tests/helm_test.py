@@ -471,3 +471,46 @@ def test_changed_upstream_cache_rolls_the_workers() -> None:
         return template["metadata"]["annotations"]["checksum/config"]
 
     assert checksum("default") != checksum("other-upstream-cache")
+
+
+def test_ssh_gateway_forces_the_stdio_daemon_per_key() -> None:
+    names = {doc["metadata"]["name"] for doc in render("default")}
+    assert f"{RELEASE}-ssh-gateway" not in names
+    keys = pick("ssh-gateway", "ConfigMap", "-ssh-gateway")["data"]["authorized_keys"]
+    farm = f"grpc://{RELEASE}.default.svc:50051?token-file=/var/run/secrets/nix-grpc-farm/token&ca-cert=/var/run/secrets/nix-grpc-farm/ca.crt"
+    trusted, untrusted = keys.strip().splitlines()
+    assert trusted == (
+        f"restrict,command=\"/bin/nix-grpc-daemon --stdio --trusted --farm '{farm}'\" "
+        "ssh-ed25519 AAAAtrusted alice"
+    )
+    assert untrusted == (
+        f"restrict,command=\"/bin/nix-grpc-daemon --stdio --farm '{farm}'\" "
+        "ssh-ed25519 AAAAuntrusted ci"
+    )
+
+
+def test_ssh_gateway_runs_unprivileged_with_its_own_account() -> None:
+    spec = pod("ssh-gateway", "ssh-gateway")
+    assert spec["serviceAccountName"] == f"{RELEASE}-ssh-gateway"
+    assert spec["securityContext"]["runAsUser"] == 991
+    sshd = named(spec["containers"], "sshd")
+    assert sshd is not None
+    assert sshd["securityContext"]["capabilities"] == {"drop": ["ALL"]}
+    assert sshd["securityContext"]["readOnlyRootFilesystem"] is True
+    projected = dig(named(spec["volumes"], "farm"), "projected", "sources")
+    assert dig(projected, 0, "serviceAccountToken", "audience") == "nix-grpc-farm"
+    assert dig(projected, 1, "secret", "name") == "ca"
+
+
+def test_ssh_gateway_account_alone_is_trusted() -> None:
+    oidc = json.loads(pick("ssh-gateway", "Secret", "-oidc")["stringData"]["oidc.json"])
+    rules = oidc["providers"]["kubernetes"]["rules"]
+    assert rules == [
+        {"bound_subject": ["system:serviceaccount:ci:builder"], "scopes": ["admin"]},
+        {
+            "bound_subject": [f"system:serviceaccount:default:{RELEASE}-ssh-gateway"],
+            "scopes": ["admin"],
+        },
+    ]
+    default = json.loads(pick("default", "Secret", "-oidc")["stringData"]["oidc.json"])
+    assert "rules" not in default["providers"]["kubernetes"]

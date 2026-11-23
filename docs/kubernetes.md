@@ -717,6 +717,49 @@ certificates, for example the ID tokens GitHub Actions hands to
 workflows. Add the issuer under `auth.oidcProviders`. The format is the
 same as niks3's OIDC configuration.
 
+### Machines without the plugin
+
+A machine that cannot load the `grpc://` plugin, such as one with
+Determinate Nix on macOS, uses the farm through an ssh gateway, as an
+ordinary `ssh-ng://` remote builder. See
+[Step 5](farm.md#step-5-connect-clients-without-the-plugin) of the NixOS
+guide for how it works. The chart runs it next to the balancer.
+
+1. Generate a host key and store it in a Secret, so every replica shows
+   clients the same one:
+
+   ```console
+   $ ssh-keygen -t ed25519 -N "" -f ssh_host_ed25519_key
+   $ kubectl -n farm create secret generic farm-ssh-host \
+       --from-file=ssh_host_ed25519_key=ssh_host_ed25519_key
+   ```
+
+1. Enable it with the clients' public keys. It needs
+   `auth.workloadIdentity` and `tls.clientCA` (or `tls.certManager`): the
+   gateway reaches the balancer with a token of its own service account,
+   `farm-nix-grpc-farm-ssh-gateway`, which the chart gives the trusted
+   role.
+
+   ```yaml
+   sshGateway:
+     enabled: true
+     trustedKeys: ["ssh-ed25519 AAAA… alice"]  # like trusted-users
+     keys: ["ssh-ed25519 AAAA… ci"]            # signed uploads only
+     hostKeys:
+       existingSecret: farm-ssh-host
+     service:
+       type: LoadBalancer
+   ```
+
+1. On the machine, one entry for each system the farm builds:
+
+   ```
+   ssh-ng://nix-farm@<service address> x86_64-linux,aarch64-linux - 64 1 big-parallel
+   ```
+
+sshd runs as the unprivileged `nix-farm` user, and every key is forced
+to run the gateway.
+
 ## Operating the farm
 
 [Managing the farm](farm.md#managing-the-farm) describes draining,

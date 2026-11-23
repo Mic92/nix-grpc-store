@@ -1,6 +1,6 @@
 # Farm images. `worker` runs nix-daemon, nix-grpc-daemon and the harmonia-gc
-# loop as separate containers. `client` is a CI job image whose nix has the
-# grpc:// plugin loaded, see docs/farm.md.
+# loop as separate containers, and sshd for the chart's sshGateway. `client`
+# is a CI job image whose nix has the grpc:// plugin loaded, see docs/farm.md.
 {
   lib,
   dockerTools,
@@ -37,10 +37,18 @@ let
   client = variant == "client";
   # One per slot (at most 63).
   nixbld = lib.genList (i: "nixbld${toString (i + 1)}") 64;
+  # The gateway's sshd runs as its only login user, so it needs neither root
+  # nor PAM.
+  sshd = openssh.override {
+    withKerberos = false;
+    withFIDO = false;
+    withPAM = false;
+  };
   passwd = writeTextDir "etc/passwd" (
     ''
       root:x:0:0:root:/root:/bin/sh
       nix-grpc-daemon:x:990:990::/var/empty:/bin/false
+      nix-farm:x:991:991::/var/empty:/bin/sh
       nobody:x:65534:65534:nobody:/var/empty:/bin/false
     ''
     + lib.concatImapStrings (
@@ -51,6 +59,7 @@ let
     root:x:0:
     nixbld:x:30000:${lib.concatStringsSep "," nixbld}
     nix-grpc-daemon:x:990:
+    nix-farm:x:991:
     nogroup:x:65534:
   '';
   # The chart mounts nix.conf.d/farm.conf. A missing include is ignored.
@@ -103,6 +112,7 @@ let
           nix-grpc-store
           niks3
           harmonia-gc
+          sshd
           busybox
         ];
     pathsToLink = [ "/bin" ];

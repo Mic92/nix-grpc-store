@@ -333,7 +333,9 @@ gateway lets them use the farm as an ordinary `ssh-ng://` remote builder.
 sshd runs `nix-grpc-daemon --stdio` for every connection, which speaks the
 Nix worker protocol on the ssh channel and sends the work on to the farm.
 
-On any machine that can reach the balancer, for example the balancer
+On Kubernetes, the chart runs it, see
+[kubernetes.md](kubernetes.md#machines-without-the-plugin). On NixOS,
+on any machine that can reach the balancer, for example the balancer
 itself:
 
 ```nix

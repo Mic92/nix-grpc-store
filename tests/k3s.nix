@@ -2,7 +2,8 @@
 # and postgres as NixOS services on the node. Workers authenticate to niks3
 # with their service account token, and the client uses one for the farm.
 # The test builds through the balancer, runs a Job with the client image,
-# fills a store to trigger harmonia-gc, and deletes a worker pod mid-build.
+# builds through the ssh gateway, fills a store to trigger harmonia-gc, and
+# deletes a worker pod mid-build.
 {
   pkgs,
   niks3,
@@ -28,6 +29,8 @@ let
 
   hostIP = "192.168.1.1";
   nodePort = 30051;
+  sshNodePort = 30022;
+  snakeoil = import "${pkgs.path}/nixos/tests/ssh-keys.nix" pkgs;
   signingPublicKey = "farm-test-1:RkClDwvfixdOwourBI4UD9hudE3xfU5EBQcMFUVuRV8=";
   niks3Url = "http://${hostIP}:5751";
 
@@ -217,6 +220,18 @@ let
         inherit nodePort;
       };
     };
+    sshGateway = {
+      enabled = true;
+      replicas = 1;
+      trustedKeys = [ snakeoil.snakeOilEd25519PublicKey ];
+      keys = [ snakeoil.snakeOilPublicKey ];
+      hostKeys.existingSecret = "farm-ssh-host";
+      service = {
+        type = "NodePort";
+        port = 22;
+        nodePort = sshNodePort;
+      };
+    };
     logLevel = "debug";
     # Above the slow build (20 s) so a pod delete can drain it.
     terminationGracePeriodSeconds = 60;
@@ -264,6 +279,12 @@ pkgs.testers.runNixOSTest {
         pkgs.openssl
       ];
       environment.sessionVariables.KUBECONFIG = "/etc/rancher/k3s/k3s.yaml";
+      # The build hook runs in nix-daemon as root and knows no host key.
+      programs.ssh.extraConfig = ''
+        Host 127.0.0.1
+          StrictHostKeyChecking no
+          UserKnownHostsFile /dev/null
+      '';
 
       services.niks3 = {
         # What the niks3 chart's workloadIdentity helper renders, pointed at
@@ -346,6 +367,7 @@ pkgs.testers.runNixOSTest {
     };
 
   testScript = ''
+    import json
     import shlex
     from datetime import timedelta
     def sec(n: int) -> timedelta:
@@ -371,10 +393,11 @@ pkgs.testers.runNixOSTest {
     kubectl("create secret tls farm-lb-tls --cert=${certs}/lb.crt --key=${certs}/lb.key")
     kubectl("create secret tls farm-worker-tls --cert=${certs}/worker.crt --key=${certs}/worker.key")
     kubectl("create secret generic farm-ca --from-file=ca.crt=${certs}/ca.crt")
+    kubectl("create secret generic farm-ssh-host --from-file=ssh_host_ed25519_key=${snakeoil.snakeOilEd25519PrivateKey}")
 
     with subtest("chart deploys and workers become Ready"):
         try:
-            for d in ["lb", "scheduler", "worker-${groupName}"]:
+            for d in ["lb", "scheduler", "worker-${groupName}", "ssh-gateway"]:
                 rollout(f"nix-grpc-farm-{d}")
         except Exception:
             dump()
@@ -421,6 +444,22 @@ pkgs.testers.runNixOSTest {
         finally:
             machine.execute("kubectl -n ci logs job/ci >&2")
         machine.succeed(f"curl -sf ${niks3Url}/{out_path('${jobExpr}', 'ci').removeprefix('/nix/store/').split('-')[0]}.narinfo > /dev/null")
+
+    with subtest("a client without the plugin builds through the ssh gateway"):
+        machine.succeed("install -Dm600 ${snakeoil.snakeOilEd25519PrivateKey} /root/.ssh/trusted")
+        machine.succeed("install -Dm600 ${snakeoil.snakeOilPrivateKey} /root/.ssh/untrusted")
+        gw = "ssh-ng://nix-farm@127.0.0.1:${toString sshNodePort}?ssh-key=/root/.ssh/"
+        def trust(key: str) -> bool:
+            # Without --json the report goes to stderr.
+            return json.loads(machine.succeed(f"nix store info --json --store '{gw}{key}'"))["trusted"]
+        assert trust("trusted") is True
+        assert trust("untrusted") is False
+        # No plugin in the hook's path: the daemon's own builders setting.
+        out = machine.succeed(
+            f"nix build -L --max-jobs 0 --builders '{gw}trusted ${system} - 2 1' -f ${jobExpr} --argstr tag gw --print-out-paths 2>&1")
+        assert "machine/nix-grpc-farm-worker-" in out, out
+        machine.succeed(f"curl -sf ${niks3Url}/{out_path('${jobExpr}', 'gw').removeprefix('/nix/store/').split('-')[0]}.narinfo > /dev/null")
+        machine.fail("kubectl -n farm logs -l app.kubernetes.io/component=worker -c nix-grpc-daemon --tail=-1 | grep 'event=rpc method=Connect'")
 
     with subtest("a renewed balancer certificate is served without a rollout"):
         kubectl("create secret tls farm-lb-tls --cert=${certs}/lb-renewed.crt --key=${certs}/lb-renewed.key --dry-run=client -o yaml | kubectl -n farm apply -f -")

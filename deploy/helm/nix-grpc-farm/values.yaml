@@ -239,6 +239,37 @@ lb:
   spread: true # as workerDefaults.spread
   podAnnotations: {}
 
+# An ssh-ng:// remote builder in front of the balancer, for clients that
+# cannot load the grpc:// plugin (Determinate Nix on macOS, for one):
+#   ssh-ng://nix-farm@<service address> x86_64-linux - 64 1 big-parallel
+# Needs auth.workloadIdentity and tls.clientCA (or tls.certManager): the
+# gateway's own service account, <release>-nix-grpc-farm-ssh-gateway, gets
+# the trusted role.
+sshGateway:
+  enabled: false
+  replicas: 2
+  # SSH public keys of trusted clients, like trusted-users on a remote
+  # builder: they may upload unsigned paths and use the build hook.
+  trustedKeys: []
+  # Keys of untrusted clients: signed uploads only, and builds of
+  # derivations whose closure they uploaded.
+  keys: []
+  hostKeys:
+    # Secret with key ssh_host_ed25519_key, the same for every replica:
+    #   ssh-keygen -t ed25519 -N "" -f key && kubectl create secret generic <name> --from-file=ssh_host_ed25519_key=key
+    existingSecret: ""
+  service:
+    type: LoadBalancer
+    port: 22
+    nodePort: null
+    annotations: {}
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  spread: true # as workerDefaults.spread
+  podAnnotations: {}
+
 metrics:
   interval: 30s
   # prometheus-operator
