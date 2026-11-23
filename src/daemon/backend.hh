@@ -73,6 +73,17 @@ struct Backends
         nix::BuildMode mode,
         Limits limits,
         const BuildEventSink & sendLogLine) const -> nix::BuildResult;
+
+    // The drv as sent, for trusted callers whose .drv is in no store (the ssh
+    // gateway). nix-daemon trusts us, so it takes the output paths as claimed.
+    [[nodiscard]] auto inlineBuild(
+        Cancelled cancelled,
+        nix::Store & localStore,
+        const nix::StorePath & drvPath,
+        const nix::BasicDerivation & drv,
+        nix::BuildMode mode,
+        Limits limits,
+        const BuildEventSink & sendLogLine) const -> nix::BuildResult;
 };
 
 template<typename Chunk>

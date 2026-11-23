@@ -61,6 +61,10 @@ message BuildDerivationRequest {
   // The client's build-timeout / max-silent-time settings, 0 = none.
   uint64 build_timeout = 6;
   uint64 max_silent_time = 7;
+  // The client has no store holding drv_path (the ssh gateway): build `drv`
+  // as sent instead of answering NOT_FOUND. Trusted callers only, since an
+  // input-addressed drv sent inline can claim any output path.
+  bool inline_drv = 8;
 }
 
 // `result` is the worker-protocol BuildResult serialisation at the request's

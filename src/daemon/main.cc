@@ -836,6 +836,7 @@ public:
         std::function<bool()> gone; // it no longer waits for the result
         nixgrpc::BuildEventSink log;
         bool cacheLost = false;   // it builds again because the cache lost the NAR
+        bool inlineDrv = false;   // trusted, and its .drv may be in no store: build the drv as sent
         std::string missingInput; // out: the input that could not be fetched
     };
 
@@ -960,7 +961,9 @@ public:
             try {
                 nixcompat::ensurePath(localStore, drvPath);
             } catch (nix::Error &) {
-                return {grpc::StatusCode::NOT_FOUND, "missing: " + localStore.printStorePath(drvPath)};
+                if (!caller.inlineDrv) {
+                    return {grpc::StatusCode::NOT_FOUND, "missing: " + localStore.printStorePath(drvPath)};
+                }
             }
         }
         auto adm = builder.admit(drvName);
@@ -1062,7 +1065,9 @@ public:
         try {
             phase.next("build");
             nixgrpc::Metrics::Held const building(metrics, "build_slot");
-            res = backends.storedBuild(cancelled, localStore, drvPath, mode, limits, log);
+            res = caller.inlineDrv && !localStore.isValidPath(drvPath)
+                      ? backends.inlineBuild(cancelled, localStore, drvPath, drv, mode, limits, log)
+                      : backends.storedBuild(cancelled, localStore, drvPath, mode, limits, log);
             phase.done();
         } catch (nix::Error &) {
             if (cancelled()) {
@@ -1113,6 +1118,9 @@ public:
     {
         return guarded([&] -> grpc::Status {
             auto const rpc = begin(*context, "BuildDerivation", nixgrpc::Role::write, request->build_mode());
+            if (request->inline_drv() && rpc.caller.role != nixgrpc::Role::trusted) {
+                return {grpc::StatusCode::PERMISSION_DENIED, "inline derivations need the trusted role"};
+            }
             // The whole call, attachers too: the drain waits for it.
             nixgrpc::Metrics::Held const inflight(metrics, "BuildDerivation");
             if (request->protocol() != nixcompat::kBuildProtocolWire
@@ -1146,6 +1154,7 @@ public:
                 .gone = [context] -> bool { return context->IsCancelled(); },
                 .log = sendLogLine,
                 .cacheLost = context->client_metadata().contains("x-nix-cache-lost"),
+                .inlineDrv = request->inline_drv(),
             };
             if (auto const status =
                     build(caller, *localStore, drvPath, drv, request->assign_id(), mode, limits, inputs, *chunk.mutable_done());

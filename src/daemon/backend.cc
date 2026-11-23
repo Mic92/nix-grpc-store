@@ -136,6 +136,28 @@ auto Backends::storedBuild(
     return std::move(results.front());
 }
 
+auto Backends::inlineBuild(
+    Cancelled cancelled,
+    nix::Store & localStore,
+    const nix::StorePath & drvPath,
+    const nix::BasicDerivation & drv,
+    nix::BuildMode mode,
+    Limits limits,
+    const BuildEventSink & sendLogLine) const -> nix::BuildResult
+{
+    auto backend = forBuild(std::move(cancelled), localStore);
+    buildLocally(backend->conn, limits);
+    auto & conn = backend->conn;
+    relayBuildLog(conn.from, sendLogLine);
+    conn.to << nix::WorkerProto::Op::BuildDerivation << localStore.printStorePath(drvPath);
+    nixcompat::writeDrv(conn.to, localStore, drv);
+    conn.to << static_cast<uint32_t>(mode);
+    conn.to.flush();
+    relayBuildLog(conn.from, sendLogLine);
+    return nix::WorkerProto::Serialise<nix::BuildResult>::read(
+        localStore, nix::WorkerProto::ReadConn{.from = conn.from, .version = nixcompat::buildProtocolVersion()});
+}
+
 void encodeResult(nix::Store & localStore, nix::BuildResult & res, nix::remote::BuildDerivationDone * done)
 {
     nix::StringSink sink;
