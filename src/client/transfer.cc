@@ -2,6 +2,7 @@
 
 #include "store.hh"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -25,8 +26,12 @@
 #include <nix/store/derived-path.hh>
 #include <nix/store/path-info.hh>
 #include <nix/store/path.hh>
+#include <nix/store/remote-store.hh>
 #include <nix/store/store-api.hh>
 #include <nix/store/worker-protocol.hh>
+#include <nix/util/error.hh>
+#include <nix/util/file-descriptor.hh>
+#include <nix/util/fmt.hh>
 #include <nix/util/logging.hh>
 #include <nix/util/repair-flag.hh>
 #include <nix/util/serialise.hh>
@@ -245,6 +250,44 @@ void GrpcStore::queryPathInfoUncached(const StorePath & path, InfoCallback callb
     } catch (...) {
         callback.rethrow();
     }
+}
+
+namespace {
+// The NAR may be followed by more on the same stream (the daemon's
+// AddMultipleToStore framing), and ReplayableNar drains to EOF.
+class NarOfSize : public Source
+{
+  Source * next;
+  uint64_t left;
+
+public:
+  NarOfSize(Source & next, uint64_t size)
+      : next(&next), left(size)
+  {
+  }
+
+  auto read(char * data, size_t len) -> size_t override
+  {
+    if (left == 0) {
+      throw EndOfFile("end of NAR");
+    }
+    auto const got = next->read(data, static_cast<size_t>(std::min<uint64_t>(len, left)));
+    left -= got;
+    return got;
+  }
+};
+} // namespace
+
+void GrpcStore::addToStore(const ValidPathInfo & info, Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs)
+{
+    if (config->localEvalStore) {
+        RemoteStore::addToStore(info, narSource, repair, checkSigs);
+        return;
+    }
+    PathsSource paths;
+    paths.emplace_back(info, std::make_unique<NarOfSize>(narSource, info.narSize));
+    Activity act(*logger, lvlDebug, actCopyPaths, fmt("copying '%s' to '%s'", printStorePath(info.path), config->authority.to_string()));
+    addMultipleToStoreRouted(std::move(paths), act, repair, checkSigs, {});
 }
 
 void GrpcStore::addMultipleToStoreRouted(

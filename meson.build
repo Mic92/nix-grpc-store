@@ -74,11 +74,19 @@ has_add_temp_roots = cxx.compiles('''
 void f(nix::Store & s) { s.addTempRoots({}); }
 ''', dependencies : [nix_store_dep, nix_util_dep], name : 'Store::addTempRoots')
 
+# The daemon's AddMultipleToStore called Store::addMultipleToStore(Source &)
+# until 2.36 inlined it.
+has_add_multiple_source = cxx.compiles('''
+#include <nix/store/store-api.hh>
+void f(nix::Store & s, nix::Source & src) { s.addMultipleToStore(src); }
+''', dependencies : [nix_store_dep, nix_util_dep], name : 'Store::addMultipleToStore(Source &)')
+
 # Version macros for src/nix-compat.hh.
 nix_compat_args = [
   '-DNIX_COMPAT_VERSION_MAJOR=' + nix_ver[0],
   '-DNIX_COMPAT_VERSION_MINOR=' + nix_ver_minor,
   '-DNIX_COMPAT_HAS_ADD_TEMP_ROOTS=' + (has_add_temp_roots ? '1' : '0'),
+  '-DNIX_COMPAT_HAS_ADD_MULTIPLE_SOURCE=' + (has_add_multiple_source ? '1' : '0'),
 ]
 
 # --- protobuf / gRPC codegen -----------------------------------------------

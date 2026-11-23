@@ -169,6 +169,14 @@ private:
         "nar-connections",
         "Number of parallel TCP connections used for NAR downloads."};
 
+    Setting<bool> localEvalStore{this, true, "local-eval-store",
+        "Look for derivations to build in the local store when no eval store is given. "
+        "Off in `nix-grpc-daemon --stdio`, which has no local store of its own."};
+
+    Setting<bool> inlineDrvs{this, false, "inline-drvs",
+        "Send a derivation the farm has no .drv for inline instead of failing. "
+        "The workers accept that from callers with the trusted role only."};
+
 public:
     explicit GrpcStoreConfig(const Params & params)
         : StoreConfig(NIX_COMPAT_STORE_CONFIG_ARGS(params))
@@ -510,13 +518,15 @@ public:
 
     // One BuildDerivation against the assigned worker. NOT_FOUND: upload the
     // drv closure there and ask again.
-    auto buildAssigned(const Job & job, const nixgrpc::exec::Placement & where, Store & evalStore) -> Attempt;
+    // A null evalStore sends the drv inline.
+    auto buildAssigned(const Job & job, const nixgrpc::exec::Placement & where, Store * evalStore) -> Attempt;
 
     // The build hook and plain `--store grpc://` pass no eval store but
-    // usually have the derivations in the local store.
-    auto localEvalStore(const StorePathSet & drvPaths) -> std::shared_ptr<Store>;
+    // usually have the derivations in the local store. Behind the ssh
+    // gateway they are on the farm, or nowhere: null when inlineOk.
+    auto evalStoreFor(const StorePathSet & drvPaths, bool inlineOk) -> std::shared_ptr<Store>;
 
-    auto runJobs(std::map<StorePath, Job> & jobs, Store & evalStore) -> void;
+    auto runJobs(std::map<StorePath, Job> & jobs, Store * evalStore) -> void;
     auto scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::Status;
 
     // Single drv without a DAG (build hook, legacy buildDerivation callers).
@@ -654,6 +664,24 @@ public:
         addMultipleToStoreRouted(std::move(pathsToCopy), act, repair, checkSigs, {});
     }
 
+    // RemoteStore would tunnel it to whichever worker the balancer picks,
+    // where it stays unpublished. The ssh gateway imports every path this way.
+    // Only there: elsewhere `nix store add` must stay on the tunnel, which
+    // checks that the caller may add a path nobody signed.
+    void addToStore(const ValidPathInfo & info, Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs) override;
+
+#if NIX_COMPAT_HAS_ADD_MULTIPLE_SOURCE
+    // The daemon op before 2.36. RemoteStore would tunnel the batch.
+    void addMultipleToStore(Source & source, RepairFlag repair, CheckSigsFlag checkSigs) override
+    {
+        if (config->localEvalStore) {
+            RemoteStore::addMultipleToStore(source, repair, checkSigs);
+            return;
+        }
+        Store::addMultipleToStore(source, repair, checkSigs);
+    }
+#endif
+
 private:
     // A descriptor per NAR ran out on big closures. Past the cap, NARs are
     // not retried.
@@ -769,11 +797,12 @@ private:
 
 public:
     // copyPaths() roots on the destination since NixOS/nix#16113 (same
-    // 2.36pre as substituter.hh). RemoteStore would open the daemon socket
-    // for it, which the write role may not. The server roots what it gets.
+    // 2.36pre as substituter.hh), and the ssh gateway's clients send
+    // AddTempRoot. RemoteStore would tunnel it to a random worker, which the
+    // write role may not. The server roots what it gets.
 #if NIX_COMPAT_HAS_ADD_TEMP_ROOTS
     void addTempRoots(const StorePathSet & /*paths*/) override {}
-#elif __has_include(<nix/store/substituter.hh>)
+#else
     void addTempRoot(const StorePath & /*path*/) override {}
 #endif
 

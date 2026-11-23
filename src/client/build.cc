@@ -126,7 +126,7 @@ auto GrpcStore::tryBuildDerivation(const remote::BuildDerivationRequest & reques
   return status;
 }
 
-auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & where, Store & evalStore)
+auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & where, Store * evalStore)
     -> Attempt {
   remote::BuildDerivationRequest request;
   request.set_drv_path(std::string(job.drvPath.to_string()));
@@ -135,6 +135,7 @@ auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & 
   request.set_assign_id(where.assignId);
   request.set_build_timeout(static_cast<uint64_t>(nixcompat::buildTimeout()));
   request.set_max_silent_time(static_cast<uint64_t>(nixcompat::maxSilentTime()));
+  request.set_inline_drv(evalStore == nullptr);
   {
     StringSink sink;
     nixcompat::writeDrv(sink, *this, job.drv);
@@ -147,8 +148,8 @@ auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & 
   std::optional<BuildResult> res;
   std::string missing;
   auto status = tryBuildDerivation(request, headers, res, missing);
-  if (status.error_code() == grpc::StatusCode::NOT_FOUND) {
-    uploadDrvClosure(evalStore, {job.drvPath}, headers);
+  if (status.error_code() == grpc::StatusCode::NOT_FOUND && evalStore != nullptr) {
+    uploadDrvClosure(*evalStore, {job.drvPath}, headers);
     status = tryBuildDerivation(request, headers, res, missing);
   }
   // Our own cancel ends the stream CANCELLED, and a dead worker looks the same.
@@ -179,15 +180,25 @@ auto GrpcStore::buildAssigned(const Job & job, const nixgrpc::exec::Placement & 
   return std::move(*res);
 }
 
-auto GrpcStore::localEvalStore(const StorePathSet & drvPaths) -> std::shared_ptr<Store> {
-  std::shared_ptr<Store> local = nix::openStore();
-  if (local.get() == this || !std::ranges::all_of(drvPaths, [&](const StorePath & drv) -> bool {
-        return local->isValidPath(drv);
-      })) {
-    throw Error("'%s' builds from derivations in a local store\nhint: pass --eval-store auto",
-                config->authority.to_string());
+auto GrpcStore::evalStoreFor(const StorePathSet & drvPaths, bool inlineOk) -> std::shared_ptr<Store> {
+  if (config->localEvalStore) {
+    std::shared_ptr<Store> local = nix::openStore();
+    if (local.get() != this && std::ranges::all_of(drvPaths, [&](const StorePath & drv) -> bool {
+          return local->isValidPath(drv);
+        })) {
+      return local;
+    }
   }
-  return local;
+  // Behind the ssh gateway: the client uploaded the .drv closure, or (build
+  // hook, trusted) sends only the resolved drv, which then goes inline.
+  if (!config->localEvalStore && queryValidPaths(drvPaths, NoSubstitute).size() == drvPaths.size()) {
+    return shared_from_this();
+  }
+  if (inlineOk && config->inlineDrvs) {
+    return nullptr;
+  }
+  throw Error("'%s' builds from derivations in a local store\nhint: pass --eval-store auto",
+              config->authority.to_string());
 }
 
 // Wires the executor to the Schedule stream and the build threads.
@@ -195,7 +206,7 @@ struct GrpcStore::Run {
   using JobId = nixgrpc::exec::JobId;
 
   GrpcStore & store;
-  Store & evalStore;
+  Store * evalStore; // null: the jobs carry their derivations inline
   std::map<StorePath, Job> & jobs;
 
   std::mutex mutex;
@@ -207,7 +218,7 @@ struct GrpcStore::Run {
   bool closed = false;           // WritesDone sent
   grpc::ClientReaderWriter<remote::ClientMsgs, remote::SchedMsgs> * stream = nullptr;
 
-  Run(GrpcStore & store, Store & evalStore, std::map<StorePath, Job> & jobs, size_t threads)
+  Run(GrpcStore & store, Store * evalStore, std::map<StorePath, Job> & jobs, size_t threads)
       : store(store), evalStore(evalStore), jobs(jobs),
         exe({.threads = threads,
              .rescheduleRetries = store.config->rescheduleRetries,
@@ -357,21 +368,24 @@ struct GrpcStore::Run {
         throw Error("input '%s' is missing on the farm", pathS);
       }
     }
+    if (evalStore == nullptr) {
+      throw Error("input '%s' is missing on the farm", pathS);
+    }
     auto const producer = work.job->farmInputs.find(path);
     if (producer == work.job->farmInputs.end()) {
       warn("%s: worker lacks '%s', uploading it again", work.job->drvPath.to_string(), pathS);
-      store.uploadDrvClosure(evalStore, {work.job->drvPath}, store.routingFor(work.job->drv, work.where.addr, work.where.system));
+      store.uploadDrvClosure(*evalStore, {work.job->drvPath}, store.routingFor(work.job->drv, work.where.addr, work.where.system));
       return Bounced{};
     }
     warn("%s: farm lacks '%s', building '%s' too", work.job->drvPath.to_string(), pathS,
          producer->second.to_string());
     auto const drvPath = producer->second;
-    auto const full = evalStore.readDerivation(drvPath);
+    auto const full = evalStore->readDerivation(drvPath);
     std::scoped_lock const lock(mutex);
     auto const name = std::string(drvPath.to_string());
     if (!byName.contains(name)) {
       auto noJobs = [](const StorePath &) -> bool { return false; };
-      auto & job = jobs.emplace(drvPath, store.farmJob(evalStore, drvPath, full, noJobs)).first->second;
+      auto & job = jobs.emplace(drvPath, store.farmJob(*evalStore, drvPath, full, noJobs)).first->second;
       job.cpHintMs = work.job->cpHintMs + 1; // ahead of the build waiting for it
       job.mode = work.job->mode == bmRepair ? bmRepair : bmNormal; // as loadJobs
       job.cacheLost = true;
@@ -596,7 +610,7 @@ auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::
   }
 }
 
-void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, Store & evalStore) {
+void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, Store * evalStore) {
   if (jobs.empty()) {
     return;
   }
@@ -609,7 +623,9 @@ void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, Store & evalStore) {
   for (const auto & [drvPath, job] : jobs) {
     drvPaths.push_back(drvPath);
   }
-  uploadDrvClosure(evalStore, std::move(drvPaths), headers);
+  if (evalStore != nullptr) {
+    uploadDrvClosure(*evalStore, std::move(drvPaths), headers);
+  }
   std::vector<std::jthread> threads(threadCount);
   for (auto & thread : threads) {
     thread = std::jthread([&run] -> void { run.work(); });
@@ -655,14 +671,14 @@ auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode b
       }
     }
     if (!drvs.empty()) {
-      local = localEvalStore(drvs);
+      local = evalStoreFor(drvs, false);
       evalStore = local.get();
     }
   }
   std::map<StorePath, Job> jobs;
   if (evalStore != nullptr) {
     loadJobs(reqs, buildMode, *evalStore, jobs);
-    runJobs(jobs, *evalStore);
+    runJobs(jobs, evalStore);
   }
 
   // Opaque paths: "building" them means making them valid, i.e. substituting.
@@ -702,12 +718,12 @@ auto GrpcStore::buildOne(const StorePath & drvPath, const BasicDerivation & drv,
               Store * evalStore) -> BuildResult {
   std::shared_ptr<Store> local;
   if (evalStore == nullptr || evalStore == this) {
-    local = localEvalStore({drvPath});
+    local = evalStoreFor({drvPath}, true);
     evalStore = local.get();
   }
   std::map<StorePath, Job> jobs;
   jobs.emplace(drvPath, Job{.drvPath = drvPath, .drv = drv, .mode = buildMode});
-  runJobs(jobs, *evalStore);
+  runJobs(jobs, evalStore);
   auto & job = jobs.begin()->second;
   if (!job.result) {
     throw Error("'%s' was not built", printStorePath(drvPath));
