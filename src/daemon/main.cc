@@ -71,6 +71,7 @@
 #include <nix/util/file-system.hh>
 #include <nix/util/ref.hh>
 #include <nix/util/repair-flag.hh>
+#include <nix/util/users.hh>
 #include <nix/util/serialise.hh>
 #include <nix/util/strings.hh>
 #include <nix/util/unix-domain-socket.hh>
@@ -1288,7 +1289,6 @@ namespace {
 
 constexpr std::string_view unixPrefix = "unix:";
 
-// What the daemon may write, execute, connect to and listen on after startup.
 // Nix saves substituter lookups in the home directory. Our user has none.
 // We use systemd's cache directory, or a temporary one if it is not set.
 auto lookupCache() -> std::unique_ptr<nix::AutoDelete>
@@ -1300,6 +1300,7 @@ auto lookupCache() -> std::unique_ptr<nix::AutoDelete>
     std::filesystem::path dir;
     if (auto const kept = nix::getEnv("CACHE_DIRECTORY")) {
         dir = std::filesystem::path(kept->substr(0, kept->find(':'))) / "nix";
+        std::filesystem::create_directories(dir);
     } else {
         dir = nix::createTempDir(std::filesystem::temp_directory_path(), "nix-grpc-daemon-lookups");
         temporary = std::make_unique<nix::AutoDelete>(dir);
@@ -1308,6 +1309,7 @@ auto lookupCache() -> std::unique_ptr<nix::AutoDelete>
     return temporary;
 }
 
+// What the daemon may write, execute, connect to and listen on after startup.
 auto sandboxPolicy(const nixgrpc::Options & options, bool listenFdsEmpty) -> nixgrpc::sandbox::Policy
 {
     using nixgrpc::sandbox::CanonicalPath;
@@ -1315,6 +1317,9 @@ auto sandboxPolicy(const nixgrpc::Options & options, bool listenFdsEmpty) -> nix
     nixgrpc::sandbox::Policy policy;
     policy.execPaths.push_back(CanonicalPath::from(options.storeDir));
     policy.writePaths.push_back(CanonicalPath::from(fs::temp_directory_path()));
+    if (auto const lookups = nix::getCacheDir(); fs::exists(lookups)) {
+        policy.writePaths.push_back(CanonicalPath::from(lookups));
+    }
     for (auto const & path : options.sandboxWrite) {
         policy.writePaths.push_back(CanonicalPath::from(path));
     }
