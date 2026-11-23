@@ -8,8 +8,9 @@ S3 binary cache through [niks3](https://github.com/Mic92/niks3).
 ![build farm](farm.svg)
 
 This guide walks you through setting up the cache, the workers, the
-balancer, and two kinds of client: a CI host and a developer laptop, on
-NixOS. For the Helm chart see [kubernetes.md](kubernetes.md).
+balancer, and three kinds of client: a CI host, a developer laptop, and
+a client without the plugin through an ssh gateway, on NixOS. For the
+Helm chart see [kubernetes.md](kubernetes.md).
 
 ## How it works
 
@@ -323,6 +324,49 @@ $ nix copy --from https://cache.example.com $(nix build … --print-out-paths)
 A small wrapper script that fetches the token (an OIDC device-code
 login is a few lines of `curl`) and runs `nix build` makes this a
 one-liner for the team, e.g. `nix run .#nix-farm`.
+
+## Step 5: Connect clients without the plugin
+
+Some clients cannot load the `grpc://` plugin, for example Determinate
+Nix on macOS, whose patched Nix libraries no plugin build matches. An ssh
+gateway lets them use the farm as an ordinary `ssh-ng://` remote builder.
+sshd runs `nix-grpc-daemon --stdio` for every connection, which speaks the
+Nix worker protocol on the ssh channel and sends the work on to the farm.
+
+On any machine that can reach the balancer, for example the balancer
+itself:
+
+```nix
+services.nix-grpc-ssh-gateway = {
+  enable = true;
+  farm = "grpc://farm.example.com:50051?client-cert=/run/keys/gw.crt&client-key=/run/keys/gw.key";
+  trustedKeys = [ "ssh-ed25519 AAAA… alice" ];
+  keys = [ "ssh-ed25519 AAAA… ci-untrusted" ];
+};
+```
+
+| Option | Meaning |
+|---|---|
+| `farm` | The farm's address and the gateway's credentials. They must have the `trusted` role, and be readable by `user`. |
+| `trustedKeys` | Keys of clients that may upload unsigned paths and use the build hook, like `trusted-users` on a remote builder. |
+| `keys` | Keys of untrusted clients. They may only upload signed paths and build derivations whose closure they uploaded. |
+| `user` | The account clients log in as, `nix-farm` by default. Every key is forced to run the gateway, there is no shell. |
+
+On the client, one entry for each system the farm builds:
+
+```
+ssh-ng://nix-farm@gateway.example.com x86_64-linux,aarch64-linux - 64 1 big-parallel,kvm
+```
+
+The gateway stores nothing: uploads, builds and downloads go straight
+through to the farm, and the scheduler places every build as usual.
+Through the build hook, Nix hands over one derivation at a time, so for a
+whole graph at once use a plugin-enabled `nix build --store grpc://`.
+
+The gateway can also run on the client itself, for someone who holds a
+farm token: `ssh-ng://localhost?remote-program=…` runs a script that
+starts `nix-grpc-daemon --stdio --trusted --farm 'grpc://…?token-file=…'`,
+without sshd.
 
 ## Managing the farm
 

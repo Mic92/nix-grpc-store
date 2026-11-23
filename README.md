@@ -33,6 +33,9 @@ Why gRPC instead of `ssh-ng://`?
     without a database. Builders are shared fairly: a free slot goes
     to the user with the fewest builds running, so one large build does
     not hold up everyone else's. See [docs/farm.md](docs/farm.md).
+  * **No plugin needed on clients.** An ssh gateway makes the farm an
+    ordinary `ssh-ng://` remote builder for any Nix, Determinate Nix on
+    macOS included. See [docs/farm.md](docs/farm.md#step-5-connect-clients-without-the-plugin).
 
 Everything that works over `ssh-ng://` works here: remote builds,
 `nix copy`, path queries. The gRPC layer is a thin tunnel to the

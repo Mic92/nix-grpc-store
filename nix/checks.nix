@@ -153,6 +153,12 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
     module = nixosModule;
   };
 
+  ssh-gateway = import ../tests/ssh-gateway.nix {
+    inherit pkgs;
+    nixPkgs = nixPackages;
+    module = nixosModule;
+  };
+
   farm = import ../tests/farm.nix {
     e2eTests = pkgs.callPackage ../tests/e2e { };
     inherit pkgs niks3;

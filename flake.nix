@@ -146,10 +146,12 @@
         server = ./nixos/server.nix;
         lb = ./nixos/lb.nix;
         client = ./nixos/client.nix;
+        ssh-gateway = ./nixos/ssh-gateway.nix;
         default.imports = [
           self.nixosModules.server
           self.nixosModules.client
           self.nixosModules.lb
+          self.nixosModules.ssh-gateway
         ];
       };
 
