@@ -30,6 +30,19 @@ fn outputs_carry_the_cache_signature() {
     );
 }
 
+/// Storing the path would block on a client that runs on the same machine.
+#[test]
+fn a_worker_serves_a_path_it_lacks_without_storing_it() {
+    farm_ready();
+    let out = build(&envoy(), "served", &[]);
+    for w in WORKERS {
+        succeed(CLIENT, &["nix", "path-info", "--store", &direct(w), &out]);
+        let dump = format!("nix store dump-path --store '{}' {out} >/dev/null", direct(w));
+        succeed(CLIENT, &["sh", "-c", &dump]);
+    }
+    assert_eq!(holders(&out).len(), 1, "{:?}", holders(&out));
+}
+
 /// Queries and uploads do not need a builder of the client's system.
 #[test]
 fn a_system_without_builders_is_served_by_the_default_one() {
