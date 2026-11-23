@@ -140,6 +140,10 @@ public:
             };
             try {
                 auto const sub = substituter(ref);
+                if (sub->storeDir != local.storeDir) {
+                    miss("another store directory");
+                    continue;
+                }
                 auto const info = sub->queryPathInfo(path);
                 if (sub->config.isTrusted || info->isContentAddressed(local) || info->checkSignatures(local, keys) > 0) {
                     return Offered{.store = sub, .info = info};
