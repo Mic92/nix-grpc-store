@@ -15,6 +15,13 @@
 {{- if not (include "farm.tlsSecret" (list $root "worker")) }}{{ fail (printf "workers.%s.tunnel.balancers needs tls.worker: the balancer knows a builder by its certificate" $g) }}{{ end }}
 {{- end }}
 {{- $affinity := deepCopy ($w.affinity | default dict) }}
+{{- if $w.store.hostPath }}
+{{- if $w.store.storageClass }}{{ fail (printf "workers.%s: store.hostPath and store.storageClass both place /nix, pick one" $g) }}{{ end }}
+{{- if hasKey $affinity "podAntiAffinity" }}{{ fail (printf "workers.%s: store.hostPath sets the podAntiAffinity, drop affinity.podAntiAffinity" $g) }}{{ end }}
+{{- /* Two pods of the group on one node would share the store. A pod that is
+     still terminating counts too, so a rollout never overlaps them. */}}
+{{- $_ := set $affinity "podAntiAffinity" (dict "requiredDuringSchedulingIgnoredDuringExecution" (list (dict "topologyKey" "kubernetes.io/hostname" "labelSelector" (dict "matchLabels" ($sel | fromYaml))))) }}
+{{- end }}
 {{- if $w.advertise }}
 {{- if hasKey $affinity "nodeAffinity" }}{{ fail (printf "workers.%s: advertise sets the nodeAffinity, drop affinity.nodeAffinity" $g) }}{{ end }}
 {{- $_ := set $affinity "nodeAffinity" (dict "requiredDuringSchedulingIgnoredDuringExecution" (dict "nodeSelectorTerms" (list (dict "matchExpressions" (list (dict "key" "kubernetes.io/hostname" "operator" "In" "values" (keys $w.advertise | sortAlpha))))))) }}
@@ -138,7 +145,7 @@ spec:
       {{- end }}
       {{- include "farm.spread" (dict "spread" $w.spread "selector" $sel) | nindent 6 }}
       initContainers:
-        # /nix is an emptyDir so the store is writable and sized. Seed it
+        # /nix is a volume so the store is writable and sized. Seed it
         # from the image. The image's DB registration comes along.
         - name: seed-store
           image: {{ include "farm.image" $root }}
@@ -359,7 +366,13 @@ spec:
         {{- end }}
       volumes:
         - name: nix
-          {{- if $w.store.storageClass }}
+          {{- if $w.store.hostPath }}
+          hostPath:
+            # The anti-affinity only keeps pods of one group apart, so other
+            # groups, releases and namespaces need a directory of their own.
+            path: {{ printf "%s/%s/%s/%s" (trimSuffix "/" $w.store.hostPath) $root.Release.Namespace $root.Release.Name $g }}
+            type: DirectoryOrCreate
+          {{- else if $w.store.storageClass }}
           ephemeral:
             volumeClaimTemplate:
               spec:

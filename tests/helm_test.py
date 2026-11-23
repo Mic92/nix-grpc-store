@@ -408,6 +408,24 @@ def test_extra_volumes_reach_the_nix_daemon_container_only() -> None:
     assert named(pod("default", "worker-x86")["volumes"], "nix-secrets") is None
 
 
+def test_a_store_on_the_node_gets_a_directory_per_group_and_a_node_per_pod() -> None:
+    for group in ("x86", "arm"):
+        spec = pod("store-host-path", f"worker-{group}")
+        assert named(spec["volumes"], "nix") == {
+            "name": "nix",
+            "hostPath": {
+                "path": f"/mnt/local/nix/default/t/{group}",
+                "type": "DirectoryOrCreate",
+            },
+        }
+        (term,) = dig(
+            spec, "affinity", "podAntiAffinity", "requiredDuringSchedulingIgnoredDuringExecution"
+        )
+        assert term["topologyKey"] == HOSTNAME
+        assert term["labelSelector"]["matchLabels"]["nix-grpc-farm/group"] == group
+    assert dig(pod("default", "worker-x86"), "affinity", "podAntiAffinity") is None
+
+
 @pytest.mark.parametrize("name", ["default", "cert-manager"])
 @pytest.mark.parametrize("deployment", ["worker-x86", "scheduler-0", "lb"])
 def test_only_the_ca_certificate_is_mounted(name: str, deployment: str) -> None:
