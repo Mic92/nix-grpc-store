@@ -219,6 +219,22 @@ workers:
       requests: {cpu: 250m, memory: 256Mi}
 ```
 
+Workers that share nodes with batch jobs may wait behind them for room.
+A `PriorityClass` puts them first in the scheduling queue, and lets them
+preempt lower-priority pods if the class allows it. The scheduler and
+the balancer take one of their own. The chart does not create the
+classes: these names are examples, and pods naming a class the cluster
+lacks are rejected, so create them first or name existing ones:
+
+```yaml
+workerDefaults:
+  priorityClassName: build-farm
+scheduler:
+  priorityClassName: build-farm-control
+lb:
+  priorityClassName: build-farm-control
+```
+
 ### Run KVM builds
 
 NixOS tests and other builds with `requiredSystemFeatures = ["kvm"]` need

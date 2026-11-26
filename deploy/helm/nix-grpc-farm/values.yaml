@@ -138,6 +138,9 @@ workerDefaults:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  # PriorityClass of the group's pods, e.g. so they schedule before, or
+  # preempt, the batch jobs that share their nodes.
+  priorityClassName: ""
   spread: true # prefer one pod per node, "required" to insist, false to turn off
   podAnnotations: {}
   # Node port for a balancer that cannot reach pod IPs.
@@ -173,6 +176,7 @@ scheduler:
   nodeSelector: {}
   tolerations: []
   affinity: {} # replaces the default anti-affinity between replicas
+  priorityClassName: ""
   podAnnotations: {}
   extraArgs: []
 
@@ -236,6 +240,7 @@ lb:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  priorityClassName: ""
   spread: true # as workerDefaults.spread
   podAnnotations: {}
 

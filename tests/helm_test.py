@@ -189,6 +189,15 @@ def test_runtime_class_is_set_only_on_request() -> None:
     assert pod("runtime-class", "worker-x86")["runtimeClassName"] == "cgroup-writable"
 
 
+def test_priority_class_is_set_per_component_and_group_only_on_request() -> None:
+    for name in ("worker-x86", "worker-arm", "scheduler-0", "lb"):
+        assert "priorityClassName" not in pod("default", name)
+    assert pod("priority-class", "worker-x86")["priorityClassName"] == "builds"
+    assert pod("priority-class", "worker-arm")["priorityClassName"] == "arm-builds"
+    assert pod("priority-class", "scheduler-0")["priorityClassName"] == "farm"
+    assert pod("priority-class", "lb")["priorityClassName"] == "farm"
+
+
 @pytest.mark.parametrize("name", ["default", "cert-manager", "in-cluster"])
 def test_worker_is_not_ready_once_its_nix_daemon_container_died(name: str) -> None:
     probe = container(name, "worker-x86", "nix-grpc-daemon")["readinessProbe"]

@@ -118,6 +118,9 @@ spec:
       {{- with .Values.lb.tolerations }}
       tolerations: {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.lb.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       {{- with .Values.lb.affinity }}
       affinity: {{- toYaml . | nindent 8 }}
       {{- end }}

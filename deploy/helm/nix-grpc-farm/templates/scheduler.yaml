@@ -57,6 +57,9 @@ spec:
       {{- with $s.tolerations }}
       tolerations: {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with $s.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       {{- if $s.affinity }}
       affinity: {{- toYaml $s.affinity | nindent 8 }}
       {{- else if gt (int ($s.replicas | default 1)) 1 }}

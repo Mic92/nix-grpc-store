@@ -140,6 +140,9 @@ spec:
       {{- with $w.tolerations }}
       tolerations: {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with $w.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       {{- with $affinity }}
       affinity: {{- toYaml . | nindent 8 }}
       {{- end }}

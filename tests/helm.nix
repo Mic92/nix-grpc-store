@@ -146,6 +146,10 @@ let
       inherit values;
       set = "sandbox.runtimeClassName=cgroup-writable";
     };
+    priority-class = {
+      inherit values;
+      set = "workerDefaults.priorityClassName=builds,workers.arm.priorityClassName=arm-builds,scheduler.priorityClassName=farm,lb.priorityClassName=farm";
+    };
     other-upstream-cache = {
       inherit values;
       set = "upstreamCaches.urls={https://other}";
