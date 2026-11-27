@@ -113,7 +113,17 @@ let
   };
   # Builders elsewhere connect to the balancer and get their builds over
   # that connection.
-  valuesTunnel = lib.recursiveUpdate values { lb.tunnel.enabled = true; };
+  valuesTunnel = lib.recursiveUpdate values {
+    lb.tunnel = {
+      enabled = true;
+      systems = tunnelSystems;
+    };
+  };
+  # riscv64-linux has no worker group, aarch64-linux has one.
+  tunnelSystems = [
+    "riscv64-linux"
+    "aarch64-linux"
+  ];
   # Such builders, in a cluster of their own.
   valuesTunnelled = lib.recursiveUpdate values {
     scheduler.external = "farm.example.com:50051";
@@ -277,7 +287,12 @@ pkgs.runCommand "nix-grpc-farm-helm-check"
     mkdir renders
     ${lib.concatStrings (lib.mapAttrsToList render renders)}
     cp ${nixosJson { }} renders/envoy-nixos.json
-    cp ${nixosJson { listen = "[::]:9443"; }} renders/envoy-nixos-tunnel.json
+    cp ${
+      nixosJson {
+        listen = "[::]:9443";
+        systems = tunnelSystems;
+      }
+    } renders/envoy-nixos-tunnel.json
     pytest -vv -p no:cacheprovider ${./helm_test.py}
     touch $out
   ''

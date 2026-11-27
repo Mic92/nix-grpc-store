@@ -233,6 +233,11 @@ lb:
   # tls.clientCA.
   tunnel:
     enabled: false
+    # Systems that only tunnelled builders build for, e.g. [x86_64-linux].
+    # Path queries and uploads for these systems are sent to such a builder
+    # instead of the default group. Systems of this release's own worker
+    # groups are ignored here.
+    systems: []
     # One Service per balancer replica, <release>-nix-grpc-farm-lb-<i>, on
     # this port. Builders outside the cluster need the address of each.
     port: 9443

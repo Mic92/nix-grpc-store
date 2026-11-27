@@ -1363,6 +1363,7 @@ void startTunnels(
         .tls = {.cert = options.tlsCert, .key = options.tlsKey, .ca = options.clientCA},
         .name = nixgrpc::tunnel::certName(options.tlsCert),
         .instance = options.workerName,
+        .system = nix::settings.thisSystem.get(),
         .perSet = options.tunnelCount,
         .adopt = [listener = std::shared_ptr(std::move(listener))](nix::AutoCloseFD sock) -> void {
             if (auto const status = listener->AcceptConnectedFd(sock.get()); !status.ok()) {
