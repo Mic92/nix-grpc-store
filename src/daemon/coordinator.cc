@@ -34,6 +34,7 @@
 #include <grpcpp/support/sync_stream.h>
 
 #include <nix/store/globals.hh>
+#include <nix/store/store-api.hh>
 #include <nix/util/file-system.hh>
 
 #include "acl.hh"
@@ -181,7 +182,9 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
         // nix.conf may list the daemon's own system under extra-platforms.
         std::unordered_set<std::string_view> seen;
         std::erase_if(self.systems, [&seen](const std::string & system) -> bool { return !seen.insert(system).second; });
-        self.features.append_range(nix::settings.systemFeatures.get());
+        // As nix-daemon builds: system-features plus those its experimental
+        // features imply, such as ca-derivations.
+        self.features.append_range(nix::StoreConfig::getDefaultSystemFeatures());
         builder.emplace(std::move(self), metrics);
         metrics.buildSlots(options.maxJobs);
     }

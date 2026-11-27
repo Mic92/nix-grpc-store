@@ -301,6 +301,9 @@ pkgs.testers.runNixOSTest {
         )
         machine.fail("test -e /nix/var/log/nix/drvs/zy/old-retention.drv.bz2")
         machine.succeed("test -e /nix/var/log/nix/drvs/zx/fresh-retention.drv.bz2")
+
+    with subtest("floating content-addressed builds without a cache"):
+        run_e2e({"machine": machine}, env, "floating::", "--test-threads=1")
   '' + pkgs.lib.optionalString (phase == "bench") ''
     run_e2e({"machine": machine}, env, "bench::", "--test-threads=1")
   '' + pkgs.lib.optionalString (phase == "upload") ''
