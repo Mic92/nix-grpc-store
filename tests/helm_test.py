@@ -474,6 +474,24 @@ def test_worker_settings_reach_nix_daemon() -> None:
     assert "build-dir = /build" in conf.splitlines()
 
 
+def test_public_keys_from_a_secret_reach_both_nix_daemons() -> None:
+    for which in ("nix-daemon", "nix-grpc-daemon"):
+        env = container("public-keys-from", "worker-x86", which)["env"]
+        keys = named(env, "NIKS3_PUBLIC_KEYS")
+        assert dig(keys, "valueFrom") == {
+            "secretKeyRef": {"name": "niks3-signing", "key": "public_key"},
+        }
+        names = [var["name"] for var in env]
+        # $(VAR) expands only variables defined before it.
+        assert names.index("NIKS3_PUBLIC_KEYS") < names.index("NIX_CONFIG")
+        assert named(env, "NIX_CONFIG")["value"] == (
+            "extra-trusted-public-keys = $(NIKS3_PUBLIC_KEYS)"
+        )
+    for which in ("nix-daemon", "nix-grpc-daemon"):
+        env = container("default", "worker-x86", which)["env"]
+        assert named(env, "NIX_CONFIG") is None
+
+
 def test_changed_upstream_cache_rolls_the_workers() -> None:
     def checksum(name: str) -> str:
         template = pick(name, "Deployment", "-worker-x86")["spec"]["template"]

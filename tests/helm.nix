@@ -119,6 +119,14 @@ let
     scheduler.external = "farm.example.com:50051";
     workers.x86.tunnel.balancers = [ "farm.example.com:9443" ];
   };
+  # The cache's public key from a Secret, and none in the values.
+  valuesPublicKeysFrom = lib.recursiveUpdate values {
+    niks3.publicKeys = [ ];
+    niks3.publicKeysFrom.secretKeyRef = {
+      name = "niks3-signing";
+      key = "public_key";
+    };
+  };
   # A Secret mounted into the build container of every group.
   valuesExtraVolumes = lib.recursiveUpdate values {
     workerDefaults = {
@@ -167,6 +175,7 @@ let
       inherit values;
       set = "workerDefaults.store.hostPath=/mnt/local/nix/";
     };
+    public-keys-from.values = valuesPublicKeysFrom;
   }
   // lib.listToAttrs (
     lib.imap0 (idx: extra: {

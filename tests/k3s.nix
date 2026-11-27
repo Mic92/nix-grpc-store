@@ -180,7 +180,11 @@ let
     niks3 = {
       serverURL = niks3Url;
       cacheURL = niks3Url;
-      publicKeys = [ signingPublicKey ];
+      # From a Secret, as for a signing key made outside the chart.
+      publicKeysFrom.secretKeyRef = {
+        name = "niks3-signing";
+        key = "public_key";
+      };
       auth.serviceAccountToken.enabled = true;
     };
     # The VM has no route to cache.nixos.org and every build would wait for
@@ -371,6 +375,7 @@ pkgs.testers.runNixOSTest {
     kubectl("create secret tls farm-lb-tls --cert=${certs}/lb.crt --key=${certs}/lb.key")
     kubectl("create secret tls farm-worker-tls --cert=${certs}/worker.crt --key=${certs}/worker.key")
     kubectl("create secret generic farm-ca --from-file=ca.crt=${certs}/ca.crt")
+    kubectl("create secret generic niks3-signing --from-literal=public_key=${signingPublicKey}")
 
     with subtest("chart deploys and workers become Ready"):
         try:
@@ -393,6 +398,12 @@ pkgs.testers.runNixOSTest {
 
     pods = kubectl("get pods -l app.kubernetes.io/component=worker --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.name}'").split()
     assert len(pods) == 2, pods
+
+    with subtest("workers trust the cache's key from niks3.publicKeysFrom"):
+        # A worker without it would rebuild what the cache has, not fail.
+        for pod in pods:
+            keys = kubectl(f"exec {pod} -c nix-daemon -- nix config show trusted-public-keys").split()
+            assert "${signingPublicKey}" in keys, (pod, keys)
 
     machine.succeed("kubectl -n ci create token builder --audience nix-grpc-farm > /tmp/builder.jwt")
     store = "grpc://127.0.0.1:${toString nodePort}?ca-cert=${certs}/ca.crt&token-file=/tmp/builder.jwt"

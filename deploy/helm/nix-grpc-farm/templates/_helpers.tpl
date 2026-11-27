@@ -89,7 +89,7 @@ app.kubernetes.io/component: scheduler
 {{- define "farm.validate" -}}
 {{- $_ := required "niks3.serverURL is required" .Values.niks3.serverURL }}
 {{- $_ := required "niks3.cacheURL is required" .Values.niks3.cacheURL }}
-{{- if empty .Values.niks3.publicKeys }}{{ fail "niks3.publicKeys must list the cache's signing keys" }}{{ end }}
+{{- if not (or .Values.niks3.publicKeys .Values.niks3.publicKeysFrom) }}{{ fail "niks3.publicKeys or niks3.publicKeysFrom must name the cache's signing keys" }}{{ end }}
 {{- $tok := .Values.niks3.auth }}
 {{- $tokens := list $tok.existingSecret $tok.serviceAccountToken.enabled .Values.tls.worker.spire.niks3Token | compact }}
 {{- if gt (len $tokens) 1 }}{{ fail "set only one of niks3.auth.existingSecret, niks3.auth.serviceAccountToken.enabled and tls.worker.spire.niks3Token" }}{{ end }}
@@ -203,5 +203,16 @@ topologySpreadConstraints:
     matchLabelKeys: [pod-template-hash]
     labelSelector:
       matchLabels: {{- .selector | nindent 8 }}
+{{- end }}
+{{- end }}
+
+{{/* The keys of niks3.publicKeysFrom for a container that reads farm.conf:
+     NIX_CONFIG adds them to its trusted-public-keys, by Kubernetes' $(VAR)
+     expansion of the variable before it. */}}
+{{- define "farm.niks3KeysEnv" -}}
+{{- with .Values.niks3.publicKeysFrom }}
+- name: NIKS3_PUBLIC_KEYS
+  valueFrom: {{- toYaml . | nindent 4 }}
+- {name: NIX_CONFIG, value: "extra-trusted-public-keys = $(NIKS3_PUBLIC_KEYS)"}
 {{- end }}
 {{- end }}

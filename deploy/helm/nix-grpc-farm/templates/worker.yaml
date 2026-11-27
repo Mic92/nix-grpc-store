@@ -198,6 +198,7 @@ spec:
             {{- end }}
           env:
             - {name: TMPDIR, value: /build}
+            {{- include "farm.niks3KeysEnv" $root | nindent 12 }}
           volumeMounts:
             - {name: nix, mountPath: /nix, subPath: nix}
             - {name: build, mountPath: /build}
@@ -292,6 +293,7 @@ spec:
             - name: HOST_IP
               valueFrom: {fieldRef: {fieldPath: status.hostIP}}
             - {name: TMPDIR, value: /spool}
+            {{- include "farm.niks3KeysEnv" $root | nindent 12 }}
           securityContext:
             runAsUser: 990
             runAsGroup: 990

@@ -15,6 +15,13 @@ niks3:
   # other's outputs from it. Clients use the same cache, possibly by another name.
   cacheURL: ""
   publicKeys: []
+  # Where more of the cache's public keys come from, separated by spaces: a
+  # container env's valueFrom, such as
+  #   {secretKeyRef: {name: niks3-signing, key: public_key}}
+  # for a signing key made outside the chart, whose public half is kept
+  # beside it. At least one of publicKeys and this is required. A changed
+  # Secret or ConfigMap reaches a worker when its pod restarts.
+  publicKeysFrom: {}
   pushFlags: [] # extra `niks3 push` flags, e.g. [--max-concurrent-uploads, "8"]
   auth:
     # Secret with key `token`, or
