@@ -115,7 +115,7 @@ static_assert(reply("HTTP/1.1 2000 OK\r\n\r\n") == Reply::refused);
 
 // ALPN names. One port takes both sets of tunnels and checks each differently.
 inline constexpr std::string_view namedProtocol = "nix-tunnel";  // requests for this builder
-inline constexpr std::string_view anyProtocol = "nix-tunnel-any"; // requests any builder may answer
+inline constexpr std::string_view anyProtocol = "nix-tunnel-any"; // requests any builder of its system may answer
 
 inline constexpr std::string_view ping = "RPING";
 

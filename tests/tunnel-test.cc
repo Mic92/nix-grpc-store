@@ -493,6 +493,7 @@ struct Held
         .tls = {.cert = pki.file("b1.pem"), .key = pki.file("b1.key"), .ca = pki.file("ca.pem")},
         .name = "b1",
         .instance = "pod-7",
+        .system = "riscv64-linux",
         .perSet = 1,
         .adopt = [this](nix::AutoCloseFD sock) -> void {
             const std::scoped_lock lock(mutex);
@@ -554,6 +555,13 @@ void builders_sharing_a_certificate_are_told_apart_by_instance()
     check(named.request.contains("\r\nx-envoy-reverse-tunnel-cluster-id: b1/pod-7\r\n"), "a certificate's name alone finds nobody");
     check(any.request.contains("\r\nx-envoy-reverse-tunnel-node-id: any/b1/pod-7\r\n"), "shared tunnels: " + any.request);
     check(named.request.contains("\r\nx-nix-instance: pod-7\r\n") && any.request.contains("\r\nx-nix-instance: pod-7\r\n"), "instance header");
+}
+
+void the_shared_tunnels_are_those_of_the_builders_system()
+{
+    Held held;
+    const auto [named, any] = held.both();
+    check(any.request.contains("\r\nx-envoy-reverse-tunnel-cluster-id: riscv64-linux\r\n"), "shared tunnels: " + any.request);
 }
 
 void a_tunnel_that_ended_is_opened_again()
@@ -620,6 +628,7 @@ try {
         the_watcher_sees_every_way_a_connection_ends();
         a_tunnelled_builder_is_known_by_its_certificates_common_name();
         builders_sharing_a_certificate_are_told_apart_by_instance();
+        the_shared_tunnels_are_those_of_the_builders_system();
         a_tunnel_that_ended_is_opened_again();
         a_builder_that_takes_no_work_only_keeps_the_tunnels_for_itself();
     } catch (std::exception & err) {

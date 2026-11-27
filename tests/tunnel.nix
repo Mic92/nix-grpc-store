@@ -9,6 +9,8 @@
 
 let
   system = pkgs.stdenv.hostPlatform.system;
+  # Only queried, never built for.
+  otherSystem = if system == "x86_64-linux" then "aarch64-linux" else "x86_64-linux";
   apiToken = "farm-token-that-is-at-least-36-characters-long";
   tokenFile = pkgs.writeText "niks3-token" apiToken;
   signingPublicKey = "farm-test-1:RkClDwvfixdOwourBI4UD9hudE3xfU5EBQcMFUVuRV8=";
@@ -108,6 +110,12 @@ pkgs.testers.runNixOSTest {
       testCerts.certs.node = cert null "DNS:tunnelled,URI:spiffe://farm.test/worker/svid";
     };
 
+    # The only builder of otherSystem, reachable only through its tunnel.
+    foreign = {
+      imports = [ (tunnelled "four") ];
+      nix.settings.system = otherSystem;
+    };
+
     lb = {
       imports = [
         common
@@ -122,7 +130,9 @@ pkgs.testers.runNixOSTest {
         systems = [ system ];
         scheduler = [ "${dialledIp}:50051" ];
         healthCheckInterval = "1s";
+        defaultSystem = system;
         tunnel.listen = "[::]:${toString tunnelPort}";
+        tunnel.systems = [ otherSystem ];
         tunnel.spiffeId = "spiffe://farm.test/worker/";
         tls = tls // {
           upstream = {
@@ -136,7 +146,10 @@ pkgs.testers.runNixOSTest {
         certs.node = cert "lb-1" "DNS:lb";
         neededBy = [ "envoy.service" ];
       };
-      specialisation.tunnelsOnly.configuration.services.nix-grpc-farm-lb.systems = pkgs.lib.mkForce [ ];
+      specialisation.tunnelsOnly.configuration.services.nix-grpc-farm-lb = {
+        systems = pkgs.lib.mkForce [ ];
+        tunnel.systems = [ system ];
+      };
       networking.firewall.allowedTCPPorts = [
         50051
         tunnelPort
@@ -161,7 +174,7 @@ pkgs.testers.runNixOSTest {
     lb.wait_for_unit("niks3.service")
     lb.wait_for_open_port(5751)
     lb.wait_for_open_port(50051)
-    for node in [dialled, tunnelled1, tunnelled2, tunnelled3]:
+    for node in [dialled, tunnelled1, tunnelled2, tunnelled3, foreign]:
         node.systemctl("start nix-grpc-daemon.service")
 
     client.wait_for_unit("test-certs.service")
@@ -183,7 +196,18 @@ pkgs.testers.runNixOSTest {
         tunnelled1.succeed(f"test -e {build('mixed1', 'one')}")
         tunnelled2.succeed(f"test -e {build('mixed2', 'two')}")
         assert requests("tunnelled") > 0, "the build did not go through a tunnel"
-        assert requests("tunnelled-any") == 0, "store queries left the dialled builder"
+        assert requests("tunnelled-system") == 0, "store queries left the dialled builder"
+
+    # Only `foreign` has this path, so a query that finds it was routed there.
+    foreign.succeed("echo foreign > /tmp/foreign")
+    only_foreign = foreign.succeed("nix-store --add /tmp/foreign").strip()
+
+    def asks_the_builders_of_its_system() -> None:
+        client.wait_until_succeeds(f"nix path-info --store '{store}&system=${otherSystem}' {only_foreign}", timeout=60)
+        client.fail(f"nix path-info --store '{store}' {only_foreign}")
+
+    with subtest("a store query reaches the tunnelled builders of its system next to dialled ones of another"):
+        asks_the_builders_of_its_system()
 
     with subtest("a builder known by its SPIFFE ID alone gets its build through a tunnel"):
         tunnelled3.succeed(f"test -e {build('svid', 'three')}")
@@ -209,6 +233,7 @@ pkgs.testers.runNixOSTest {
         lb.wait_for_open_port(50051)
         tunnelled2.succeed(f"test -e {build('alone', 'two')}")
         assert requests("tunnelled") > 0, "the build did not go through a tunnel"
-        assert requests("tunnelled-any") > 0, "store queries did not go through a tunnel"
+        assert requests("tunnelled-system") > 0, "store queries did not go through a tunnel"
+        asks_the_builders_of_its_system()
   '';
 }

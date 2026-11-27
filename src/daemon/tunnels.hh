@@ -34,7 +34,8 @@ auto parseBalancer(std::string_view spec) -> Balancer;
 auto addresses(const std::string & host) -> std::vector<std::string>;
 
 // Holds, to every address of every balancer, `perSet` tunnels for requests
-// addressed to this builder and as many for requests any builder may answer.
+// addressed to this builder and as many for requests any builder of its
+// system may answer.
 // The second set is only open while the builder takes work.
 class Tunnels
 {
@@ -46,6 +47,8 @@ public:
         std::string name; // as in the builder's certificate
         // Tells apart builders that share a certificate.
         std::string instance;
+        // Sent to the balancer, which routes path queries and uploads by system.
+        std::string system;
         // A balancer keeps tunnels per thread, so this is its thread count.
         unsigned perSet = 4;
         // Takes a tunnel on which the balancer started a request.

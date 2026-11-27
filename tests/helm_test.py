@@ -271,6 +271,21 @@ def test_envoy_config_with_tunnels_is_that_of_the_nixos_module() -> None:
     assert envoy("tunnel")["bootstrap_extensions"] == nixos["bootstrap_extensions"]
 
 
+def test_store_queries_reach_a_system_that_only_tunnelled_builders_offer() -> None:
+    farm = named(envoy("tunnel")["static_resources"]["listeners"], "farm")
+    manager = dig(farm, "filter_chains", 0, "filters", 0, "typed_config")
+    routes = manager["route_config"]["virtual_hosts"][0]["routes"]
+    through_tunnels = [
+        header["string_match"]["exact"]
+        for route in routes
+        if dig(route, "route", "cluster") == "tunnelled-system"
+        for header in route["match"]["headers"]
+        if header["name"] == "x-nix-system"
+    ]
+    # aarch64-linux has a worker group, so it gets no tunnel route.
+    assert through_tunnels == ["riscv64-linux"]
+
+
 def test_every_balancer_replica_has_an_address_for_tunnels() -> None:
     # Behind a shared address a builder would reach only some replicas.
     shared = pick("tunnel", "Service")["spec"]

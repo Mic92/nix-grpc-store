@@ -357,6 +357,10 @@ let
     ];
   };
 
+  # Accept only a system name. Tunnels are also looked up by builder name,
+  # so a builder must not be able to register under another builder's name.
+  ownSystem = "%CEL(re.extract(request.headers['x-envoy-reverse-tunnel-cluster-id'], r'^([a-z0-9_]+-[a-z0-9]+)$', r'\\1'))%";
+
   tunnelListener = {
     name = "tunnels";
     address = (endpoint cfg.tunnel.listen).endpoint.address;
@@ -376,7 +380,7 @@ let
       })
       (tunnelChain "nix-tunnel-any" {
         node_id_format = "any/${peerName}/%REQ(x-nix-instance)%";
-        cluster_id_format = "any";
+        cluster_id_format = ownSystem;
         tenant_id_format = peerName;
       })
     ];
@@ -417,20 +421,54 @@ let
     };
   };
 
-  # Without dialled builders, what any builder may answer goes to a tunnelled one.
-  anyTunnelRoute = {
+  systemTunnelRoute = {
+    cluster = "tunnelled-system";
+    timeout = "0s";
+    retry_policy = awaitTunnel;
+  };
+
+  # Path queries and uploads for a system that only tunnelled builders have.
+  # Builds carry x-nix-worker and are routed by that header.
+  tunnelledSystemRoute = system: {
+    match = {
+      prefix = "/";
+      grpc = { };
+      headers = [
+        {
+          name = "x-nix-system";
+          string_match.exact = system;
+        }
+        {
+          name = "x-nix-worker";
+          present_match = false;
+        }
+      ];
+    };
+    route = systemTunnelRoute;
+  };
+
+  # Catch-all of a farm without dialled builders: requests for an unlisted
+  # system, or for none, go to the tunnelled builders of the default system.
+  defaultTunnelRoute = {
     match = {
       prefix = "/";
       grpc = { };
     };
-    route = {
-      cluster = "tunnelled-any";
-      timeout = "0s";
-      retry_policy = awaitTunnel;
-    };
+    route = systemTunnelRoute;
+    request_headers_to_add = [
+      {
+        header = {
+          key = "x-nix-system";
+          value = cfg.defaultSystem;
+        };
+        append_action = "OVERWRITE_IF_EXISTS_OR_ADD";
+      }
+    ];
   };
 
   systems = cfg.systems;
+  # A system with dialled builders keeps using them.
+  tunnelledSystems = lib.subtractLists systems cfg.tunnel.systems;
   ordered = lib.optionals (systems != [ ]) (lib.filter (s: s != cfg.defaultSystem) systems ++ [ cfg.defaultSystem ]);
 in
 {
@@ -464,7 +502,8 @@ in
         the cluster, so it has to be an `IP:port`.
 
         Builders that connect to `tunnel.listen` are not in these clusters.
-        If all builders of the farm connect that way, set this to `[ ]`.
+        List their systems in `tunnel.systems`. If all builders of the farm
+        connect that way, set this to `[ ]`.
       '';
     };
 
@@ -488,8 +527,8 @@ in
 
     defaultSystem = lib.mkOption {
       type = lib.types.str;
-      default = lib.head systems;
-      defaultText = lib.literalMD "first entry of `systems`";
+      default = lib.head (systems ++ cfg.tunnel.systems);
+      defaultText = lib.literalMD "first entry of `systems`, or of `tunnel.systems` if that is empty";
       description = "Cluster for requests without or with an unknown `x-nix-system` (store queries, uploads, `builtin`).";
     };
 
@@ -531,6 +570,22 @@ in
           that certificate.
 
           Requires `tls.certFile` and `tls.upstream`.
+        '';
+      };
+      systems = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "x86_64-linux" ];
+        description = ''
+          Systems that only tunnelled builders build for.
+
+          Path queries and uploads for one of these systems (the client
+          sets it with `system=`) are sent to a tunnelled builder of that
+          system. Without this they go to `defaultSystem`. A system that
+          is also in `systems` is ignored here.
+
+          This does not affect builds: a build always reaches the builder
+          the scheduler picked.
         '';
       };
       names = lib.mkOption {
@@ -675,6 +730,14 @@ in
         message = "services.nix-grpc-farm-lb.systems is empty and tunnel.listen is unset: the balancer would reach no builder";
       }
       {
+        assertion = systems != [ ] || !tunnels || cfg.tunnel.systems != [ ];
+        message = "services.nix-grpc-farm-lb.systems is empty, so tunnel.systems has to list the systems of the tunnelled builders";
+      }
+      {
+        assertion = cfg.tunnel.systems == [ ] || tunnels;
+        message = "services.nix-grpc-farm-lb.tunnel.systems requires tunnel.listen";
+      }
+      {
         assertion = !tunnels || (cfg.tls.certFile != null && cfg.tls.upstream.certFile != null);
         message = "services.nix-grpc-farm-lb.tunnel.listen requires tls.certFile and tls.upstream";
       }
@@ -749,8 +812,9 @@ in
                               schedRoute
                             ]
                             ++ lib.optional tunnels tunnelRoute
+                            ++ map tunnelledSystemRoute tunnelledSystems
                             ++ lib.concatMap routesFor ordered
-                            ++ lib.optional (systems == [ ]) anyTunnelRoute;
+                            ++ lib.optional (systems == [ ]) defaultTunnelRoute;
                           }
                         ];
                         http_filters = [
@@ -772,7 +836,7 @@ in
             ++ [ schedCluster ]
             ++ lib.optionals tunnels [
               (tunnelCluster "tunnelled" "%REQ(x-nix-worker)%")
-              (tunnelCluster "tunnelled-any" "any")
+              (tunnelCluster "tunnelled-system" "%REQ(x-nix-system)%")
             ];
         };
       };

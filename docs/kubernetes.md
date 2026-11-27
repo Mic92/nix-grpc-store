@@ -531,7 +531,15 @@ On the farm, open the balancer's tunnel port:
 lb:
   tunnel:
     enabled: true # port 9443
+    systems: [x86_64-linux] # what those workers build for
 ```
+
+List the systems that only these workers build for in `systems`. Path
+queries and uploads for such a system (the client sets it with `system=`)
+are then sent to one of these workers. Without the entry they go to the
+default group, and the worker that later builds has to download the
+inputs again from the cache. Systems of the farm's own worker groups
+do not need to be listed.
 
 In the workers' cluster, install the chart with workers only and point
 them at that port:

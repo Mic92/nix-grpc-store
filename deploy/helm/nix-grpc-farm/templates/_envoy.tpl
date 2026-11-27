@@ -200,7 +200,34 @@ filter_chains:
   {{- $name := printf "%%CEL(re.extract(connection.subject_peer_certificate, r'^CN=(%s)(,|$)', r'\\1'))%%" (join "|" $names) }}
   {{- $node := print $name "/%REQ(x-nix-instance)%" }}
   - {{- include "farm.envoy.tunnelChain" (dict "protocol" "nix-tunnel" "validation" (dict "node_id_format" $node "tenant_id_format" $name)) | nindent 4 }}
-  - {{- include "farm.envoy.tunnelChain" (dict "protocol" "nix-tunnel-any" "validation" (dict "node_id_format" (print "any/" $node) "cluster_id_format" "any" "tenant_id_format" $name)) | nindent 4 }}
+  {{- /* Accept only a system name. Tunnels are also looked up by builder name,
+       so a builder must not be able to register under another builder's name. */}}
+  {{- $system := "%CEL(re.extract(request.headers['x-envoy-reverse-tunnel-cluster-id'], r'^([a-z0-9_]+-[a-z0-9]+)$', r'\\1'))%" }}
+  - {{- include "farm.envoy.tunnelChain" (dict "protocol" "nix-tunnel-any" "validation" (dict "node_id_format" (print "any/" $node) "cluster_id_format" $system "tenant_id_format" $name)) | nindent 4 }}
+{{- end }}
+
+{{- define "farm.envoy.tunnelTarget" -}}
+cluster: {{ . }}
+timeout: 0s
+# A balancer that just started lacks its builders' tunnels for some
+# seconds. Nothing was sent to a builder when the connection fails.
+retry_policy:
+  retry_on: connect-failure
+  num_retries: 10
+  retry_back_off: {base_interval: 0.5s, max_interval: 2s}
+{{- end }}
+
+{{/* Path queries and uploads for a system that only tunnelled builders have.
+     Builds carry x-nix-worker and are routed by that header. */}}
+{{- define "farm.envoy.tunnelledSystemRoute" -}}
+match:
+  prefix: /
+  grpc: {}
+  headers:
+    - name: x-nix-system
+      string_match: {exact: {{ . }}}
+    - {name: x-nix-worker, present_match: false}
+route: {{- include "farm.envoy.tunnelTarget" "tunnelled-system" | nindent 2 }}
 {{- end }}
 
 {{/* A tunnelled builder is known by a name, a dialled one by IP:port. */}}
@@ -213,15 +240,7 @@ match:
     - name: x-nix-worker
       string_match: {safe_regex: {regex: "^.+:[0-9]+$"}}
       invert_match: true
-route:
-  cluster: tunnelled
-  timeout: 0s
-  # A balancer that just started lacks its builders' tunnels for some
-  # seconds. Nothing was sent to a builder when the connection fails.
-  retry_policy:
-    retry_on: connect-failure
-    num_retries: 10
-    retry_back_off: {base_interval: 0.5s, max_interval: 2s}
+route: {{- include "farm.envoy.tunnelTarget" "tunnelled" | nindent 2 }}
 {{- end }}
 
 {{- define "farm.envoy.route" -}}
@@ -367,6 +386,16 @@ load_assignment:
 {{- if $tunnels }}
 {{- if not (and (include "farm.tlsSecret" (list . "lb")) (include "farm.tlsSecret" (list . "clientCA"))) }}{{ fail "lb.tunnel needs tls.lb and tls.clientCA: the balancer knows a builder by its certificate" }}{{ end }}
 {{- $routes = append $routes (include "farm.envoy.tunnelRoute" . | fromYaml) }}
+{{- /* A system that a worker group has keeps using that group. */}}
+{{- $dialled := list }}
+{{- range $g := $groups }}
+{{- $dialled = append $dialled (mustMergeOverwrite (deepCopy $root.Values.workerDefaults) ((index $root.Values.workers $g) | default dict)).system }}
+{{- end }}
+{{- range $system := .Values.lb.tunnel.systems }}
+{{- if not (has $system $dialled) }}
+{{- $routes = append $routes (include "farm.envoy.tunnelledSystemRoute" $system | fromYaml) }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- range $g := concat (without $groups $defaultGroup) (list $defaultGroup) }}
 {{- $w := mustMergeOverwrite (deepCopy $root.Values.workerDefaults) ((index $root.Values.workers $g) | default dict) }}
@@ -387,7 +416,7 @@ load_assignment:
 {{- $listeners = append $listeners (include "farm.envoy.tunnelListener" . | fromYaml) }}
 {{- $clusters = concat $clusters (list
   (include "farm.envoy.tunnelCluster" (dict "root" $root "name" "tunnelled" "hostId" "%REQ(x-nix-worker)%") | fromYaml)
-  (include "farm.envoy.tunnelCluster" (dict "root" $root "name" "tunnelled-any" "hostId" "any") | fromYaml)) }}
+  (include "farm.envoy.tunnelCluster" (dict "root" $root "name" "tunnelled-system" "hostId" "%REQ(x-nix-system)%") | fromYaml)) }}
 {{- $_ := set $config "bootstrap_extensions" (list (dict
   "name" "envoy.bootstrap.reverse_tunnel.upstream_socket_interface"
   "typed_config" (dict
