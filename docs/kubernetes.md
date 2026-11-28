@@ -111,7 +111,7 @@ sandbox:
 ```
 
 Where neither is allowed, turn the sandbox off. Builds then run as root
-in the container with no isolation from each other.
+in the container and can see each other.
 
 ```yaml
 sandbox:
@@ -121,8 +121,8 @@ sandbox:
 ### Writable cgroups
 
 Kubernetes mounts `/sys/fs/cgroup` read-only in every unprivileged
-container, so builds cannot get a cgroup of their own. Where the nodes
-can hand a pod a delegated cgroup, point the workers at it with
+container, so builds cannot get a cgroup of their own. If the nodes can
+delegate a cgroup to a pod, select the runtime class that does so with
 `sandbox.runtimeClassName`:
 
 ```yaml
@@ -130,12 +130,12 @@ sandbox:
   runtimeClassName: cgroup-writable
 ```
 
-On self-managed nodes this takes containerd 2.1 or later with a runtime
-handler that sets `cgroup_writable = true` and `SystemdCgroup = true`, a
-`RuntimeClass` naming that handler, and the kubelet on the systemd
-cgroup driver. Together with `hostUsers: false`, which the chart sets,
-runc then makes the pod's cgroup owned by the pod's root. The pod can
-create child cgroups but cannot change its own `memory.max`.
+On self-managed nodes this requires containerd 2.1 or later with a
+runtime handler that sets `cgroup_writable = true` and `SystemdCgroup =
+true`, a `RuntimeClass` that refers to that handler, and the kubelet on
+the systemd cgroup driver. Together with `hostUsers: false`, which the
+chart sets, runc then makes the pod's cgroup owned by the pod's root.
+The pod can create child cgroups but cannot change its own `memory.max`.
 
 On GKE (1.34.1 or later) enable `writableCgroups` in the node pool's
 containerd config instead and select it per pod:
@@ -156,15 +156,15 @@ equal on every container of the pod.
 
 A worker's `/nix` is an `emptyDir` on the node's disk. When free space
 there drops below `gc.ensureFree`, the harmonia-gc sidecar deletes
-unused store paths. If it still drops below `minFree`, the worker stops
-taking builds. Both thresholds are measured against the node's disk,
-not per pod, so keep `ensureFree` well above `minFree`.
-`store.sizeLimit` is not a quota: going over it evicts the pod.
+unused store paths. If free space still drops below `minFree`, the
+worker stops accepting builds. Both thresholds are measured against the
+node's disk, which all its pods share, so keep `ensureFree` well above
+`minFree`. Going over `store.sizeLimit` evicts the pod.
 
-With `store.storageClass` and `store.size`, `/nix` is a volume of its own
-(a generic ephemeral volume, created and deleted with the pod). Both
-thresholds then measure the store alone, a full store fails a build
-and does not evict the pod, and `store.sizeLimit` has no use.
+With `store.storageClass` and `store.size`, `/nix` is a volume of its
+own (a generic ephemeral volume, created and deleted with the pod). Both
+thresholds then measure the store alone. A full store only fails the
+build, and `store.sizeLimit` is unused.
 
 With `store.hostPath`, `/nix` is a directory on the node, for example on a
 local disk the cluster does not manage:
@@ -175,13 +175,13 @@ workerDefaults:
     hostPath: /mnt/local/nix-grpc-farm
 ```
 
-Each group keeps its store in `<hostPath>/<namespace>/<release>/<group>`,
-created if missing, and both thresholds measure the disk that holds it.
-The store outlives the pod: a later pod of the group on that node starts
-with its cache unless the image changed, and nothing deletes the
-directory when the group is removed. Only one pod of a group runs per
-node, so a group needs as many nodes as replicas, and a rollout needs a
-free one.
+Each group keeps its store in `<hostPath>/<namespace>/<release>/<group>`
+and creates the directory if it is missing. Both thresholds measure the
+disk that holds it. The store outlives the pod. A later pod of the group
+on that node starts with its cache unless the image changed, and the
+directory stays when the group is removed. Only one pod of a group runs
+per node, so a group needs as many nodes as replicas, and a rollout
+needs one free node.
 
 For nodes with a 500 GB disk and two workers each:
 
@@ -204,7 +204,7 @@ gc:
 
 A worker pod has two containers. `nix-daemon` runs the builds, so put
 the CPU and memory requests there (`resources`). `nix-grpc-daemon` only
-handles RPCs and copies store paths, a few hundred MiB is plenty
+handles RPCs and copies store paths, so a few hundred MiB are enough
 (`daemonResources`).
 
 ```yaml
@@ -219,12 +219,12 @@ workers:
       requests: {cpu: 250m, memory: 256Mi}
 ```
 
-Workers that share nodes with batch jobs may wait behind them for room.
-A `PriorityClass` puts them first in the scheduling queue, and lets them
-preempt lower-priority pods if the class allows it. The scheduler and
-the balancer take one of their own. The chart does not create the
-classes: these names are examples, and pods naming a class the cluster
-lacks are rejected, so create them first or name existing ones:
+Workers that share nodes with batch jobs may have to wait until those
+jobs free resources. A `PriorityClass` puts them first in the scheduling
+queue, and lets them preempt lower-priority pods if the class allows it.
+The scheduler and the balancer take a class of their own. Create the
+classes yourself or use existing ones, because Kubernetes rejects a pod
+with an unknown class. The names below are examples:
 
 ```yaml
 workerDefaults:
@@ -309,8 +309,8 @@ tls:
 
 cert-manager then creates a private CA for the farm and issues the
 balancer and worker certificates from it. It also creates an Issuer,
-`farm-nix-grpc-farm`, that signs the client certificates in step 3.
-Renewals are picked up by the running pods without a restart.
+`farm-nix-grpc-farm`, that signs the client certificates in step 3. The
+running pods load renewed certificates without a restart.
 
 The balancer certificate is valid for the Service name,
 `farm-nix-grpc-farm.farm.svc`. Clients that connect from outside the
@@ -325,11 +325,11 @@ tls:
 ```
 
 Those clients then need the farm CA to verify the balancer. To avoid
-that, give the balancer a public certificate towards clients, for example
-from an ACME `ClusterIssuer`. Clients use the system CA bundle and
-authenticate with a token, as in
-[Step 4: Connect a developer laptop](farm.md#step-4-connect-a-developer-laptop).
-The farm-CA certificate stays the balancer's certificate towards the nodes.
+that, give the balancer a public certificate towards clients, for
+example from an ACME `ClusterIssuer`. Clients use the system CA bundle
+and authenticate with a token, as in [Step 4: Connect a developer
+laptop](farm.md#step-4-connect-a-developer-laptop). The balancer keeps
+using the farm-CA certificate towards the nodes.
 
 ```yaml
 tls:
@@ -340,11 +340,11 @@ tls:
       dnsNames: [farm.example.com]
 ```
 
-Without cert-manager, or for a certificate from elsewhere, name its Secret
-in `tls.public.existingSecret` instead.
+Without cert-manager, or for a certificate from elsewhere, set
+`tls.public.existingSecret` to its Secret instead.
 
-Without cert-manager, the three Secrets come from elsewhere and the
-chart only needs their names. The comments in `values.yaml` describe what each
+Without cert-manager, create the three Secrets yourself and give the
+chart their names. The comments in `values.yaml` describe what each
 certificate must contain.
 
 ```yaml
@@ -393,29 +393,28 @@ spire-server entry create -spiffeID spiffe://example.org/farm/worker/k8s \
 ### Run a standby scheduler
 
 A second scheduler on another node takes over within seconds when the
-first one goes away. The two agree on who is active through a lock in
-niks3's database.
+first one goes away. A lock in niks3's database determines which of the
+two is active.
 
 ```yaml
 scheduler:
   replicas: 2
 ```
 
-Worker and balancer pods already prefer separate nodes (`spread: true`).
-Scheduler replicas insist on it.
-Set `spread: required` on a worker group or `lb` to insist on it. The
-spread leaves out nodes with taints the pods don't tolerate, such as a
-control plane.
-Only pods of the same rollout count, so a rolling update spreads the new
-pods even while old ones still drain.
+Worker and balancer pods prefer separate nodes by default (`spread:
+true`), and scheduler replicas require them. Set `spread: required` on a
+worker group or `lb` to require separate nodes there too. The spread
+ignores nodes with taints the pods don't tolerate, such as a control
+plane. It only counts pods of the same rollout, so a rolling update
+spreads the new pods while old ones still drain.
 
 ### Autoscale a worker group
 
-The scheduler exports how many builds are waiting per system and
-feature set (see [Autoscale builders](farm.md#managing-the-farm) for
-the labels). A KEDA `ScaledObject` on a group's Deployment turns that
-into replicas. Scaling down deletes pods, which drain like any other
-pod delete.
+The scheduler exports how many builds are waiting per system and feature
+set (see [Autoscale builders](farm.md#managing-the-farm) for the
+labels). A KEDA `ScaledObject` on a group's Deployment scales the
+replicas on that metric. Scaling down deletes pods, and a deleted pod
+drains first.
 
 ```yaml
 apiVersion: keda.sh/v1alpha1
@@ -486,10 +485,10 @@ that path from clients with an error.
 
 ### Add workers to a farm outside the cluster
 
-The chart can run only workers that join a scheduler outside the cluster,
-for example a farm deployed with the NixOS modules. The external balancer
-cannot reach pod IPs, so each worker takes a port on its node and
-advertises the node's address:
+The chart can also run workers alone, which join a scheduler outside the
+cluster, for example a farm deployed with the NixOS modules. The
+external balancer cannot reach pod IPs, so each worker takes a port on
+its node and advertises the node's address:
 
 ```yaml
 scheduler:
@@ -511,7 +510,7 @@ auth:
   trustedProxies: ["lb-*"] # the farm balancer's certificate CN
 ```
 
-The release then has no scheduler and no balancer. `advertise` also
+The release then consists of workers only. `advertise` also
 restricts the pods to the listed nodes. Without it they advertise the
 node's InternalIP and can run on any node. The port needs the CNI
 `portmap` plugin. Since two pods cannot hold the same node port, a
@@ -522,8 +521,8 @@ outside the cluster.
 ### Add workers from another cluster
 
 Workers in another cluster, or behind NAT, open reverse tunnels to the
-balancer. The balancer sends them their builds through these tunnels,
-so outgoing access to the balancer is all they need.
+balancer. The balancer sends them their builds through these tunnels, so
+they only need outgoing access to the balancer.
 
 On the farm, open the balancer's tunnel port:
 
@@ -560,15 +559,16 @@ auth:
   trustedProxies: ["lb-*"] # the farm balancer's certificate CN
 ```
 
-Certificate: issue one per cluster, with a common name of its own that
-matches the farm's `auth.workerCNs`, for example `worker-b`. The balancer
-takes tunnels only from such names. The common name has to be the last
-entry of the subject (`O=Example, CN=worker-b`) and consist of letters,
-digits and `-._`. All pods of the release use the certificate, and the
-balancer tells them apart by pod name. With a certificate per cluster
-you can revoke one cluster and keep the others.
+Issue one certificate per cluster, with a common name of its own that
+matches the farm's `auth.workerCNs`, for example `worker-b`. The
+balancer accepts tunnels only from certificates with such a name. The
+common name has to be the last entry of the subject (`O=Example,
+CN=worker-b`) and consist of letters, digits and `-._`. All pods of the
+release use the certificate, and the balancer distinguishes them by pod
+name. With a certificate per cluster you can revoke one cluster and keep
+the others.
 
-Balancer replicas: a worker needs tunnels to each replica, so with
+A worker needs tunnels to each balancer replica, so with
 `lb.tunnel.enabled` each replica gets a Service of its own,
 `<release>-nix-grpc-farm-lb-0`, `-lb-1` and so on. Expose these to the
 workers, for example as `LoadBalancer` Services:
@@ -597,12 +597,12 @@ API server and accepts it if `<namespace>:<serviceaccount>` is listed in
 `auth.workloadIdentity.allowedServiceAccounts`.
 
 A CI job then runs in a pod that has nix with the `grpc://` plugin,
-mounts such a token, and passes the farm's address to nix. For the
-first part there is a ready-made image,
-`ghcr.io/mic92/nix-grpc-farm-client`: nix with the plugin loaded, git,
-openssh, nix-eval-jobs and nix-fast-build. It works as the job
-image of a plain Job as well as of GitHub Actions runner scale sets,
-GitLab's Kubernetes executor or Buildkite agents.
+mounts such a token, and passes the farm's address to nix. For the first
+part there is a ready-made image, `ghcr.io/mic92/nix-grpc-farm-client`.
+It contains nix with the plugin loaded, git, openssh, nix-eval-jobs and
+nix-fast-build, and works as the job image of a plain Job as well as of
+GitHub Actions runner scale sets, GitLab's Kubernetes executor or
+Buildkite agents.
 
 1. Make sure the runner's namespace and service account are listed in
    `auth.workloadIdentity.allowedServiceAccounts` (step 1 allowed
@@ -650,9 +650,9 @@ GitLab's Kubernetes executor or Buildkite agents.
                items: [{key: ca.crt, path: ca.crt}]
    ```
 
-1. In the job, build against `$FARM`. Evaluation happens in the pod,
-   builds on the farm, and outputs go from the worker straight to the
-   cache. Nothing is copied into the pod:
+1. In the job, build against `$FARM`. Evaluation happens in the pod, the
+   builds run on the farm, and the worker uploads the outputs directly
+   to the cache:
 
    ```console
    $ nix-fast-build --store "$FARM" --no-download --skip-cached
@@ -688,8 +688,8 @@ inputs.nix-grpc-store.url = "github:Mic92/nix-grpc-store";
 ```
 
 `wrapNix` compiles the plugin against exactly that nix and wraps `nix`,
-`nix-build`, `nix-store` and the other commands with `plugin-files`
-set, so nothing has to be added to `nix.conf`.
+`nix-build`, `nix-store` and the other commands with `plugin-files` set,
+so `nix.conf` stays as it is.
 `nix-grpc-store.packages.${system}.nix-with-plugin` is the same for the
 flake's own nixpkgs.
 
@@ -703,8 +703,8 @@ certificate, the same way as in the NixOS guide. cert-manager issues it.
    `TLSRoute` in passthrough mode. Add the public name to
    `tls.certManager.lb.extraDnsNames`, or give the balancer a public
    certificate for it as described under [Certificates](#certificates),
-   and run `helm upgrade`. With a public certificate, machines that use a token
-   need no farm CA and can skip the next two steps.
+   and run `helm upgrade`. With a public certificate, machines that use
+   a token can skip the next two steps.
 
 1. Request a certificate from the farm's Issuer. Its common name must
    match a pattern in `auth.accessRules`:
@@ -744,17 +744,17 @@ same as niks3's OIDC configuration.
 ## Operating the farm
 
 [Managing the farm](farm.md#managing-the-farm) describes draining,
-failover, metrics and the dashboard. The Kubernetes equivalents:
+failover, metrics and the dashboard. On Kubernetes they work as follows:
 
 **Add or remove workers.** Change `workers.<group>.replicas` and run
 `helm upgrade`, or add another group. New pods take queued builds as
 soon as they have registered with the scheduler.
 
-**Drain a worker.** Delete the pod. Rollouts and scale-downs do the same.
-The worker stops accepting builds, finishes and uploads the ones it has,
-and then exits. Kubernetes waits up to `terminationGracePeriodSeconds`
-(one hour) before it kills what is left, and those builds restart on
-another worker.
+**Drain a worker.** Delete the pod. Rollouts and scale-downs do the
+same. The worker stops accepting builds, finishes the builds it has,
+uploads their outputs, and then exits. Kubernetes waits up to
+`terminationGracePeriodSeconds` (one hour) before it kills the remaining
+builds, which then restart on another worker.
 
 **Restart or upgrade.** `helm upgrade` and
 `kubectl rollout restart` are safe at any time. Workers are replaced one
