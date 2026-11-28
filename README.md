@@ -2,44 +2,43 @@
 
 **Status: Stable.**
 
-Remote Nix store access over gRPC instead of SSH. `nix copy` over a WAN
-link is **5.5x faster than `ssh-ng://`** because round trips are hidden:
-path-info queries are batched and NAR downloads are pipelined, so wall time
-is bandwidth-bound instead of latency-bound.
+Remote Nix store access over gRPC instead of SSH. Over a WAN link
+`nix copy` is 5.5x faster than with `ssh-ng://`. Path-info queries are
+batched and NAR downloads are pipelined, so the wall time is bound by
+bandwidth.
 
-Why gRPC instead of `ssh-ng://`?
+What gRPC changes compared to `ssh-ng://`:
 
-  * **Latency-tolerant `nix copy`.** One RPC batches the path queries
-    for a whole closure and one request per connection downloads all
-    NARs as a server-driven stream. Copying 200 small paths at 50 ms
-    RTT takes 1.3 s instead of the 11.8 s a round-trip-per-path client
-    needs.
-  * **Faster handshakes.** A TLS handshake is much cheaper than an SSH
-    connection setup (no subprocess, no shell, no SSH key exchange and
-    session negotiation), and connections are multiplexed over HTTP/2, so
-    frequent short-lived store operations start quickly.
-  * **Standard TLS certificates.** Authentication uses plain X.509 certs
-    instead of SSH keys, so you can plug into existing PKI — for example a
-    [step-ca](https://smallstep.com/docs/step-ca/) issuing short-lived client
-    and server certs — and reuse load balancers, service meshes and mTLS
-    policies that already speak HTTP/2.
-  * **Compression.** All traffic is zstd-compressed. A whole batch of
-    paths shares a single zstd stream (one compression window across all
-    NARs), unlike ssh's optional zlib, which made the benchmark below
-    slower instead of faster.
-  * **Scales to a build farm.** Point `builders =` or `--store` at one
-    `grpc://` address and the daemons behind it spread the derivations
-    over all nodes, like Hydra's queue runner but for any Nix client and
-    without a database. Builders are shared fairly: a free slot goes
-    to the user with the fewest builds running, so one large build does
-    not hold up everyone else's. See [docs/farm.md](docs/farm.md).
+  * `nix copy` tolerates latency. An RPC batches the path queries for a
+    whole closure, and each connection downloads its NARs as a
+    server-driven stream after one request. Copying 200 small paths at
+    50 ms RTT takes 1.3 s. A client that needs a round trip per path
+    takes 11.8 s.
+  * Connections are cheap to open. A TLS handshake costs much less than
+    an SSH connection setup, which starts a subprocess and a shell and
+    negotiates keys and a session. Connections are multiplexed over
+    HTTP/2, so frequent short-lived store operations start quickly.
+  * Authentication uses X.509 certificates instead of SSH keys. An
+    existing PKI works, for example a
+    [step-ca](https://smallstep.com/docs/step-ca/) that issues
+    short-lived client and server certs, and so do load balancers,
+    service meshes and mTLS policies that already speak HTTP/2.
+  * All traffic is zstd-compressed. A batch of paths shares a zstd
+    stream, so the compression window spans all its NARs. ssh's optional
+    zlib made the benchmark below slower.
+  * It scales to a build farm and has run on clusters of 400 to 500
+    machines. Point `builders =` or `--store` at a `grpc://` address and
+    the daemons behind it spread the derivations over all nodes, like
+    Hydra's queue runner but for any Nix client and without a database.
+    A free slot goes to the user with the fewest builds running, so
+    small builds get through while a large one is queued. See
+    [docs/farm.md](docs/farm.md).
 
-Everything that works over `ssh-ng://` works here: remote builds,
-`nix copy`, path queries. The gRPC layer is a thin tunnel to the
-`nix-daemon` on the other side, with dedicated RPCs for the `nix copy` hot
-path (path info queries, bulk import, NAR download).
-[docs/latency.md](docs/latency.md) shows the round trips each
-operation costs as sequence diagrams.
+It is a full replacement for `ssh-ng://`. The gRPC layer is a thin
+tunnel to the `nix-daemon` on the other side, with dedicated RPCs for
+the `nix copy` hot path (path info queries, bulk import, NAR download).
+[docs/latency.md](docs/latency.md) shows the round trips each operation
+costs as sequence diagrams.
 
 ## Benchmark
 
@@ -47,12 +46,13 @@ operation costs as sequence diagrams.
 
 ![nix copy transport comparison](docs/bench.png)
 
-`nix copy` of a 101-path, 411 MB closure from the same server over a
-wired link with ~47 ms RTT, 10 interleaved runs each.
+The chart shows `nix copy` of a 101-path, 411 MB closure from the same
+server over a wired link with ~47 ms RTT, with 10 interleaved runs per
+transport.
 
-A static HTTP binary cache stays ahead for pure downloads, but it is
-download-only. The gRPC store keeps close while also handling uploads,
-remote builds and mTLS through the same endpoint.
+A static HTTP binary cache is still faster, but it only serves
+downloads. The gRPC store comes close and also handles uploads, remote
+builds and mTLS on the same endpoint.
 
 Reproduce with `./scripts/bench-transports.py`.
 
@@ -60,21 +60,21 @@ Reproduce with `./scripts/bench-transports.py`.
 
 There are two ways to build on a remote machine:
 
-- **hook**: the machine is listed in `builders =`. For every
-  derivation Nix spawns a fresh `build-remote` helper process that
-  opens its own connections, uploads the inputs, runs the build and
-  downloads the outputs.
-- **direct**: the remote store is the target of the build
-  (`nix build --store 'grpc://…'`). One client process drives the
-  whole build graph over a single long-lived connection and outputs
-  stay on the remote store.
+- In **hook** mode the machine is listed in `builders =`. For every
+  derivation Nix spawns a fresh `build-remote` helper process that opens
+  its own connections, uploads the inputs, runs the build and downloads
+  the outputs.
+- In **direct** mode the remote store is the target of the build (`nix
+  build --store 'grpc://…'`). The same client process drives the whole
+  build graph over a long-lived connection, and outputs stay on the
+  remote store.
 
 On a chain of tiny builds over a ~50 ms WAN link, grpc is 1.4x faster
-than `ssh-ng://` in hook mode: one streaming RPC submits a derivation
-and returns the result with its output path infos, where ssh-ng pays
-per-derivation ssh session setup. In direct mode the transports are
-comparable, since a single long-lived connection serves the whole
-build either way:
+than `ssh-ng://` in hook mode. A streaming RPC submits a derivation and
+returns the result with its output path infos, while ssh-ng sets up an
+ssh session for every derivation. In direct mode the transports are
+comparable, since a long-lived connection serves the whole build either
+way:
 
 ![remote build transport comparison](docs/bench-builds.png)
 
@@ -170,39 +170,38 @@ presenting a certificate signed by that CA are accepted.
 ## Trust model
 
 gRPC clients act as the `nix-grpc-daemon` user, which is not trusted by
-default. That is enough for `nix build --store 'grpc://…'`, `nix copy`,
-path queries: sources and derivations are content-addressed, signed
+default. That is enough for `nix build --store 'grpc://…'`, `nix copy` and
+path queries. Sources and derivations are content-addressed, signed
 cache paths are accepted, and the server builds everything itself.
 
-This makes an untrusting server usable as a builder without any special
-setup:
+A server that does not trust its clients therefore works as a builder
+without further setup:
 
     nix build nixpkgs#hello --store 'grpc://builder:50051' --eval-store auto
 
 Evaluation runs locally (`--eval-store auto` keeps the eval artifacts in
-the local store instead of round-tripping them to the server), the
-derivation closure is imported — sources and `.drv` files are
-content-addressed, so they pass signature checks — and all builds happen
-server-side. Nothing unsigned crosses the trust boundary, so
-`trustClients` can stay off.
+the local store instead of round-tripping them to the server). The
+derivation closure is imported, which passes the signature checks
+because sources and `.drv` files are content-addressed, and all builds
+happen server-side. Everything that crosses the trust boundary is
+content-addressed or signed, so `trustClients` can stay off.
 
-Using the server as a remote builder (`builders = grpc://…`) is different:
-there the *client* schedules builds and uploads input paths it built
-locally, which are unsigned — something only trusted users may do. Set
-`services.nix-grpc-daemon.trustClients = true` for that. Every
-authenticated client then has trusted-user privileges, so require client
-certs (`tls.clientCaFile`).
+Using the server as a remote builder (`builders = grpc://…`) is
+different. There the *client* schedules builds and uploads input paths
+it built locally. These are unsigned, and only trusted users may import
+unsigned paths. Set `services.nix-grpc-daemon.trustClients = true` for
+that. Every authenticated client then has trusted-user privileges, so
+require client certs (`tls.clientCaFile`).
 
 ## Access control
 
 With mTLS, `--allow 'pattern=role'` maps client certificate CNs or
-SPIFFE IDs to roles via glob patterns. The first match wins and unmatched
-clients are
-denied. Without any rules every authenticated client gets `write`, or
-`trusted` with `--trust-clients` (`trustClients` in the NixOS module).
-Once `--client-ca`, `--client-spiffe-bundles` or `--oidc-config` is set,
-callers that present neither a certificate nor a token are denied unless
-`--allow-anonymous` is given.
+SPIFFE IDs to roles via glob patterns. The first match wins and
+unmatched clients are denied. Without any rules every authenticated
+client gets `write`, or `trusted` with `--trust-clients` (`trustClients`
+in the NixOS module). Once `--client-ca`, `--client-spiffe-bundles` or
+`--oidc-config` is set, callers that present neither a certificate nor a
+token are denied unless `--allow-anonymous` is given.
 
     nix-grpc-daemon ... --client-ca ca.pem \
         --allow 'ci-*=trusted' \
@@ -210,37 +209,38 @@ callers that present neither a certificate nor a token are denied unless
         --allow '*=write' \
         --allow-anonymous read-only    # optional: cert-less clients
 
-  * `read-only` — path queries, NAR downloads (`nix copy --from`) and
-    every build log the daemon's store keeps (`nix log --store`)
-  * `write` — additionally imports (signature checking is enforced
+  * `read-only` allows path queries, NAR downloads (`nix copy --from`)
+    and reading every build log the daemon's store keeps
+    (`nix log --store`).
+  * `write` also allows imports (signature checking is enforced
     regardless of `--no-check-sigs`) and server-side builds
-    (`nix build --store 'grpc://…'`)
-  * `trusted` — everything, including the raw worker-protocol tunnel
+    (`nix build --store 'grpc://…'`).
+  * `trusted` allows everything, including the raw worker-protocol tunnel
     (`nix store add`, repair) and unsigned imports (still subject to
-    the nix-daemon's trust in the proxy user, see above)
+    the nix-daemon's trust in the proxy user, see above).
 
-`--allow-anonymous ROLE` relaxes the client-certificate requirement:
-cert-less clients connect with that role (e.g. a public read-only
-cache), certificate holders keep their `--allow` roles. Naming policies
-pair well with a CA like [step-ca](https://smallstep.com/docs/step-ca/),
-where provisioners constrain which CNs each token may request.
+`--allow-anonymous ROLE` lets clients without a certificate connect with
+that role (e.g. a public read-only cache). Certificate holders keep
+their `--allow` roles. Rules on names rely on the CA to control who gets
+which name. In [step-ca](https://smallstep.com/docs/step-ca/),
+provisioners constrain which CNs each token may request.
 
 `--trusted-proxy PATTERN` is for a TLS-terminating L7 balancer (envoy)
-in front of the daemon. A peer presenting a certificate whose CN or SPIFFE
-ID matches is
-a proxy: the daemon takes the client's identity from the
-`x-forwarded-client-cert` header it sets (`Subject` CN, evaluated against
-`--allow`) or a forwarded bearer token, and treats the request as anonymous
-if neither is present. From any other peer the header is ignored. The
-proxy must overwrite the header (envoy `forward_client_cert_details:
-SANITIZE_SET`) and authenticate to the daemon with its own client cert.
+in front of the daemon. A peer presenting a certificate whose CN or
+SPIFFE ID matches is a proxy. From such a peer the daemon takes the
+client's identity from the `x-forwarded-client-cert` header the proxy
+sets (`Subject` CN, evaluated against `--allow`) or a forwarded bearer
+token, and treats the request as anonymous if neither is present. From
+any other peer the header is ignored. The proxy must overwrite the
+header (envoy `forward_client_cert_details: SANITIZE_SET`) and
+authenticate to the daemon with its own client cert.
 
 ### SPIFFE IDs
 
 A pattern that starts with `spiffe://` is matched against the client
 certificate's SPIFFE ID (its single URI SAN) and never against the CN.
-Its `*` stays inside one path segment, so it reaches neither a deeper path
-nor another trust domain:
+Its `*` matches within one path segment, so it matches neither a deeper
+path nor another trust domain:
 
     nix-grpc-daemon ... --client-spiffe-bundles bundles.json \
         --allow 'spiffe://example.org/farm/client/*=trusted' \
@@ -256,16 +256,16 @@ trusts more than one trust domain. The file is a SPIFFE bundle map
     }}
 
 A client must then present an X.509-SVID whose chain leads to the bundle
-of the trust domain its SPIFFE ID names. With `--client-ca` and one file
+of the trust domain in its SPIFFE ID. With `--client-ca` and one file
 that holds both CAs, `partner.example`'s CA could sign
 `spiffe://example.org/farm/client/x` and the daemon would accept it. A
 certificate without a SPIFFE ID fails the handshake. The file is re-read
 when it changes, so a federated bundle can rotate.
 
-`--trusted-proxy` takes `spiffe://` patterns too. Behind such a proxy the
-SPIFFE ID comes from the header's `URI` (envoy
+`--trusted-proxy` takes `spiffe://` patterns too. Behind such a proxy
+the SPIFFE ID comes from the header's `URI` (envoy
 `set_current_client_cert_details: {subject: true, uri: true}`), and the
-proxy is the one that verifies the chain against the right trust domain.
+proxy verifies the chain against the right trust domain.
 
 NixOS:
 
@@ -288,26 +288,25 @@ Role needed per use case:
 
 Builds are submitted through a dedicated RPC and run entirely
 server-side, so the `write` role suffices. Only operations that tunnel
-the raw worker protocol need `trusted`, and repair builds are treated
-like the rest of the repair surface.
+the raw worker protocol need `trusted`, and repair builds need `trusted`
+like the other repair operations.
 
-For host-based access, pair this with a CA that issues certs with the
-host's domain name in the CN, e.g. a
-[step-ca](https://smallstep.com/docs/step-ca/) ACME provisioner with
-`forceCN = true`: each host obtains its certificate via ordinary ACME
-(`security.acme`) and an `accessRules` glob like `*.example.com =
-read-only` grants it substituter access. See
-[`tests/acme-substituter-test.nix`](tests/acme-substituter-test.nix)
-for a complete, tested NixOS setup (built as the `acme-vm` check).
+For host-based access, use a CA that issues certs with the host's domain
+name in the CN, e.g. a [step-ca](https://smallstep.com/docs/step-ca/)
+ACME provisioner with `forceCN = true`. Each host then obtains its
+certificate via ordinary ACME (`security.acme`) and an `accessRules`
+glob like `*.example.com = read-only` grants it substituter access. See
+[`tests/acme-substituter-test.nix`](tests/acme-substituter-test.nix) for
+a complete, tested NixOS setup (built as the `acme-vm` check).
 
 ### OIDC bearer tokens
 
 Instead of (or next to) client certificates the daemon accepts
 `authorization: Bearer <jwt>` and maps token claims to the same roles.
 `--oidc-config FILE` takes the JSON schema of
-[niks3](https://github.com/Mic92/niks3)'s `--oidc-config`, so one file
-can serve the cache and the daemon. Scopes map to roles: `read` →
-`read-only`, `write` → `write`, `admin` → `trusted`.
+[niks3](https://github.com/Mic92/niks3)'s `--oidc-config`, so the same file
+can serve the cache and the daemon. The scope `read` gives the
+role `read-only`, `write` gives `write` and `admin` gives `trusted`.
 
     {
       "providers": {
@@ -328,22 +327,23 @@ can serve the cache and the daemon. Scopes map to roles: `read` →
       }
     }
 
-Without `issuer`, it is taken from `bearer_token_file` (Kubernetes
-workload identity). `jwks_url` skips discovery. Signing keys are
-fetched on first use and cached for an hour, so the daemon starts while
-the issuer is down and refuses tokens until it comes back. A presented
-client certificate takes precedence over a token.
-Rules are alternatives: a token gets the highest role of all rules it
-matches, so each rule must bind the repository or owner on its own.
-Providers may share an issuer if their audiences differ. A token is
-checked against the providers whose audience it carries and gets the
-highest role among them, so a client that asks for an audience of its
-own, such as a read-only mirror, meets only that provider's rules. A
-verified token that matches no rule is denied, it does not fall back to `--allow-anonymous`.
-In logs and metrics the caller shows as `oidc:<provider>:<sub>`.
+Without `issuer`, the issuer is read from the token in
+`bearer_token_file` (Kubernetes workload identity). `jwks_url` skips
+discovery. Signing keys are fetched on first use and cached for an hour,
+so the daemon can start while the issuer is down. It then refuses tokens
+until the issuer is back. A presented client certificate takes
+precedence over a token. Rules are alternatives. A token gets the
+highest role of all rules it matches, so each rule must bind the
+repository or owner on its own. Providers may share an issuer if their
+audiences differ. A token is checked against the providers whose
+audience it carries and gets the highest role among them, so a client
+that asks for an audience of its own, such as a read-only mirror, is
+checked only against that provider's rules. A verified token that
+matches no rule is denied and does not fall back to `--allow-anonymous`.
+In logs and metrics the caller appears as `oidc:<provider>:<sub>`.
 
 Clients pass the token with the `token-file` URI parameter or
-`$NIX_GRPC_TOKEN_FILE` (default: `token` next to the default
+`$NIX_GRPC_TOKEN_FILE` (by default `token` next to the default
 `client-cert`). The file is re-read for every call, so rotating it in
 place works. TLS is required.
 
@@ -351,9 +351,10 @@ NixOS: `services.nix-grpc-daemon.oidc = { providers.github = { … }; };`
 
 ## Scaling out
 
-One daemon is a farm of one: it schedules builds onto itself. More nodes
-behind a balancer, one of them the scheduler, with deduplicated builds and
-S3 outputs: see [docs/farm.md](docs/farm.md) for NixOS and
+A daemon on its own schedules builds onto itself. A farm puts several
+nodes behind a balancer, one of them the scheduler, builds each
+derivation once and stores the outputs in S3. See
+[docs/farm.md](docs/farm.md) for NixOS and
 [docs/kubernetes.md](docs/kubernetes.md) for the Helm chart.
 
 [![farm dashboard](https://github.com/Mic92/nix-grpc-store/releases/download/assets/farm-dashboard.png)](docs/farm.md#managing-the-farm)
@@ -370,59 +371,81 @@ S3 outputs: see [docs/farm.md](docs/farm.md) for NixOS and
 TLS uses the system CA bundle and the client key pair from
 `/run/nix-grpc-store` or `/var/lib/nix-grpc-store` by default (see below).
 
-With access control enabled, remote builders need the `trusted` role.
-The builder protocol imports unsigned outputs built on the client,
-which also requires `trustClients` (see above).
+With access rules, remote builders need the `trusted` role, because the
+builder protocol imports unsigned outputs built on the client. Without
+access rules, set `trustClients` (see above).
 
 ## URI parameters
 
-  * `insecure` — plaintext, no TLS (testing only)
-  * `ca-cert` — PEM CA to verify the server. Defaults to `$NIX_SSL_CERT_FILE`,
-    `$SSL_CERT_FILE` or the system CA bundle
-  * `client-cert`, `client-key` — PEM pair to present for mTLS. Default to
-    `$NIX_GRPC_CLIENT_CERT`/`$NIX_GRPC_CLIENT_KEY`, then `client.crt`/`client.key`
-    in `$XDG_DATA_HOME/nix-grpc-store`, then `/run/nix-grpc-store`, then
-    `/var/lib/nix-grpc-store` (unreadable candidates are skipped, and none
-    is looked up when `token-file` is given)
-  * `token-file` — OIDC bearer token, re-read per call. Defaults to
-    `$NIX_GRPC_TOKEN_FILE`, then `token` in the directories above
-  * `connect-timeout` (default 30) — seconds the first call keeps retrying
-    "connection refused" and similar.
-  * `restart-grace` (default 120) — once the server has answered, seconds
-    to ride out a worker or scheduler restart, and to wait while the
-    scheduler says no worker can take a build.
-  * `reschedule-retries` (default 8) — how often a derivation whose
+  * `insecure` uses plaintext without TLS (testing only).
+  * `ca-cert` is the PEM CA that verifies the server. It defaults to
+    `$NIX_SSL_CERT_FILE`, `$SSL_CERT_FILE` or the system CA bundle.
+  * `client-cert` and `client-key` are the PEM pair presented for mTLS.
+    They default to `$NIX_GRPC_CLIENT_CERT`/`$NIX_GRPC_CLIENT_KEY`, then
+    `client.crt`/`client.key` in `$XDG_DATA_HOME/nix-grpc-store`, then
+    `/run/nix-grpc-store`, then `/var/lib/nix-grpc-store`. Unreadable
+    candidates are skipped, and none is looked up when `token-file` is
+    given.
+  * `token-file` is an OIDC bearer token, re-read per call. It defaults
+    to `$NIX_GRPC_TOKEN_FILE`, then `token` in the directories above.
+  * `connect-timeout` (default 30) is how many seconds the first call
+    keeps retrying "connection refused" and similar.
+  * `restart-grace` (default 120) is how many seconds the client keeps
+    retrying during a worker or scheduler restart once the server has
+    answered, and how long it waits while the scheduler reports that no
+    worker can take a build.
+  * `reschedule-retries` (default 8) is how often a derivation whose
     assigned worker went away is handed back to the scheduler. The first
-    time at once, then after 0.5 s, 1 s, 2 s and from then on 4 s.
-  * `max-builds` (default 64) — concurrent `BuildDerivation` streams.
-  * `system` — send `x-nix-system` on every call, not just builds, so a
-    balancer routes input uploads and substitution to a worker of that
-    system. Use one `nix.buildMachines` entry per system.
-  * `debug` — print which CA bundle and client certificate were loaded and
-    turn on gRPC's TCP/TLS handshake tracing on stderr. `NIX_GRPC_DEBUG=1`
-    does the same and also reaches the build hook.
+    retry is immediate, the next ones follow after 0.5 s, 1 s and 2 s,
+    and all later ones after 4 s.
+  * `max-builds` (default 64) limits concurrent `BuildDerivation`
+    streams.
+  * `system` sends `x-nix-system` on every call, so a balancer also
+    routes input uploads and substitution to a worker of that system.
+    Use one `nix.buildMachines` entry per system.
+  * `debug` prints which CA bundle and client certificate were loaded
+    and turns on gRPC's TCP/TLS handshake tracing on stderr.
+    `NIX_GRPC_DEBUG=1` does the same and also applies to the build hook.
 
 ## Server flags
 
-  * `--listen ADDR` — default `0.0.0.0:50051`
-  * `--proxy-socket PATH` — nix-daemon socket, default `/nix/var/nix/daemon-socket/socket`
-  * `--tls-cert`, `--tls-key`, `--client-ca` — see above
-  * `--client-spiffe-bundles FILE` — verify clients per SPIFFE trust domain, see access control
-  * `--allow 'pattern=role'`, `--allow-anonymous ROLE`, `--trust-clients`, `--trusted-proxy PATTERN` — see access control
-  * `--oidc-config FILE` — accept OIDC bearer tokens, see access control
-  * `--metrics-listen ADDR` — serve Prometheus metrics, disabled if unset
-  * `--worker-name NAME` — name in build-log prefixes and `nix_grpc_build_info`, default hostname
-  * `--role builder,scheduler`, `--scheduler ADDR`, `--scheduler-token-file FILE`, `--advertise IP:PORT`, `--extra-system SYSTEM`, `--max-jobs N`, `--min-free SIZE` — see [docs/farm.md](docs/farm.md). The defaults make a single node schedule onto itself
-  * `--lookup-threads N` — how many cache lookups a scheduler runs at once for incoming Wants, default 32. Raise it when Wants wait on a slow cache while the scheduler is idle
-  * `--niks3 URL [--niks3-token-file FILE] [--niks3-client-cert FILE --niks3-client-key FILE] [--niks3-push CMD]` — publish build outputs and uploads to a niks3 cache; authenticate with a bearer token, a client certificate (defaults to `--tls-cert/--tls-key`), or both
-  * `--log-level info|debug` — access log verbosity, default `info`
+  * `--listen ADDR` defaults to `0.0.0.0:50051`.
+  * `--proxy-socket PATH` is the nix-daemon socket, by default
+    `/nix/var/nix/daemon-socket/socket`.
+  * `--tls-cert`, `--tls-key` and `--client-ca` are described under
+    [TLS and mTLS](#tls-and-mtls).
+  * `--client-spiffe-bundles FILE` verifies clients per SPIFFE trust
+    domain, see [SPIFFE IDs](#spiffe-ids).
+  * `--allow 'pattern=role'`, `--allow-anonymous ROLE`, `--trust-clients`
+    and `--trusted-proxy PATTERN` are described under
+    [Access control](#access-control).
+  * `--oidc-config FILE` accepts OIDC bearer tokens, see
+    [OIDC bearer tokens](#oidc-bearer-tokens).
+  * `--metrics-listen ADDR` serves Prometheus metrics, which are off
+    by default.
+  * `--worker-name NAME` is the name in build-log prefixes and
+    `nix_grpc_build_info`, by default the hostname.
+  * `--role builder,scheduler`, `--scheduler ADDR`,
+    `--scheduler-token-file FILE`, `--advertise IP:PORT`,
+    `--extra-system SYSTEM`, `--max-jobs N` and `--min-free SIZE` are
+    described in [docs/farm.md](docs/farm.md). The defaults make a single
+    node schedule onto itself.
+  * `--lookup-threads N` is how many cache lookups a scheduler runs at
+    once for incoming Wants, 32 by default. Raise it when Wants wait on a
+    slow cache while the scheduler is idle.
+  * `--niks3 URL [--niks3-token-file FILE] [--niks3-client-cert FILE --niks3-client-key FILE] [--niks3-push CMD]`
+    publishes build outputs and uploads to a niks3 cache. The daemon
+    authenticates with a bearer token, a client certificate (defaults to
+    `--tls-cert/--tls-key`), or both.
+  * `--log-level info|debug` sets the access log verbosity, `info` by
+    default.
 
 ## Monitoring
 
-All gRPC clients act as the same local user, so activity is attributed to the
-client certificate CN, or to its SPIFFE ID when it has no CN (`cn=-` without
-mTLS). Have your CA put a user name in
-the CN and logs and metrics are per user.
+All gRPC clients act as the same local user, so activity is attributed
+to the client certificate CN, or to its SPIFFE ID when it has no CN
+(`cn=-` without mTLS). If your CA puts a user name in the CN, logs and
+metrics are per user.
 
 ### Access log
 
@@ -435,8 +458,8 @@ The daemon writes one logfmt line per RPC to stderr (journald):
 | `rpc` | tunnel sessions, transfers, builds | duration, then per method: bytes in/out, path count, NAR bytes, drv |
 | `rpc_start`, path queries | only at `--log-level debug` | |
 
-Every line carries the client certificate CN and the peer address, so one
-user's activity is a grep away:
+Every line carries the client certificate CN and the peer address, so
+grep finds a user's activity:
 
     journalctl -u nix-grpc-daemon | grep cn=alice
 
@@ -465,13 +488,13 @@ Only CA-issued CNs appear as labels, so cardinality stays bounded.
 
     nix build .#checks.x86_64-linux.vm -L
 
-End-to-end NixOS VM test plus a 256 MiB throughput benchmark against the unix
-socket and `perf` counters. See `src/pump.hh` for design notes on chunk
-coalescing and flushable zstd.
+This runs an end-to-end NixOS VM test, a 256 MiB throughput benchmark
+against the unix socket, and `perf` counters. See `src/pump.hh` for
+design notes on chunk coalescing and flushable zstd.
 
     nix build .#bench-latency -L
 
-VM benchmark measuring `nix copy` of 200 small paths at an emulated 50 ms
-RTT. `scripts/bench-transports.py` and `scripts/bench-builds.py`
+This VM benchmark measures `nix copy` of 200 small paths at an emulated
+50 ms RTT. `scripts/bench-transports.py` and `scripts/bench-builds.py`
 benchmark real hosts and `scripts/bench-plot.py` renders the charts
 above.
